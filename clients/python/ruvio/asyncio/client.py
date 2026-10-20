@@ -697,6 +697,10 @@ class Ruvio(Commands):
                     return True
                 self._install(new)
                 cur.multi = False
+                # replies still on their way on the old socket (other refused commands) are read before it closes
+                end = proto.loop.time() + 1.0
+                while proto.pending and not proto.closed and proto.loop.time() < end:
+                    await asyncio.sleep(0.005)
                 if proto.transport is not None:
                     proto.transport.close()
                 return True
