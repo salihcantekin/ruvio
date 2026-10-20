@@ -135,10 +135,16 @@ impl Sightings {
 
     /// Milliseconds since `member` of `group` last answered, as [`RpcRequest::Observe`]
     /// reports it.
-    pub fn age(&self, group: &str, member: &str) -> Option<u64> {
-        self.get(group, member)
-            .last_ok
-            .map(|at| at.elapsed().as_millis() as u64)
+    pub fn age(&self, group: &str, member: &str) -> u64 {
+        self.silent_for(&self.get(group, member)).as_millis() as u64
+    }
+
+    /// How long the member of `sighting` has not answered this coordinator: since its last
+    /// answer, or since this coordinator started when it has not answered yet. A coordinator
+    /// that just started has not looked yet, and does not count a member it has not heard as
+    /// down before `down_after` passes.
+    pub fn silent_for(&self, sighting: &Sighting) -> Duration {
+        sighting.last_ok.unwrap_or(self.1.0.started).elapsed()
     }
 }
 
@@ -1081,7 +1087,7 @@ async fn objectively_down(
 ) -> (Verdict, bool) {
     let down_after = config.down_after.as_millis() as u64;
     let is_down = |age: Option<u64>| age.is_none_or(|age| age > down_after);
-    let mut heard_down = usize::from(is_down(sightings.age(&group.name, primary)));
+    let mut heard_down = usize::from(is_down(Some(sightings.age(&group.name, primary))));
     let mut lease_on = config.primary_lease.is_some();
     let mut ended = usize::from(match config.primary_lease {
         Some((_, safe)) => sightings.grants().report(&group.name, primary, safe),
@@ -1324,12 +1330,16 @@ impl Leader {
             config.down_after,
             &machine.commits(),
         );
-        let primary_age = seen[at].last_ok.map(|at| at.elapsed());
-
         // Held until the failover is recorded, so no coordinator is confirmed this primary
         // between reporting its lease ended and the record naming another member.
-        if primary_age.is_none_or(|age| age > config.down_after) {
+        if sightings.silent_for(&seen[at]) > config.down_after {
             let decided = sightings.grants().decision(&group.name).await;
+
+            // A failover recorded while this waited for the decision (`FORCE`): tended
+            // again on the next tick, from the new record.
+            if machine.primaries().get(&group.name) != Some(&primary) {
+                return;
+            }
 
             match objectively_down(config, raft, sightings, group, &primary.member)
                 .await
@@ -1971,6 +1981,13 @@ pub async fn force_failover(force: Force<'_>, configured: &Group) -> Result<Stri
     // coordinator grants no lease, since the others may.
     let decided = force.sightings.grants().decision(&group.name).await;
 
+    // The leader's own tending may have failed the group over while this waited.
+    if force.machine.primaries().get(&group.name) != Some(&primary) {
+        return Err(format!(
+            "ERR the primary of {} changed; try again",
+            group.name
+        ));
+    }
     match objectively_down(
         force.config,
         force.raft,
@@ -2194,6 +2211,28 @@ mod tests {
 
     fn following(group: &Group, member: usize) -> Role {
         Role::Replica(Some(group.members[member].replication.to_string()))
+    }
+
+    #[test]
+    fn a_member_not_heard_yet_is_silent_only_since_the_coordinator_started() {
+        let sightings = Sightings::default();
+        let earlier = Instant::now() - Duration::from_secs(5);
+
+        // Just started, nothing looked at yet: silent for no longer than this coordinator ran,
+        // so not down before `down_after` passes.
+        assert!(sightings.age("main", &address(1)) < 1000);
+        sightings.set(
+            "main",
+            &address(1),
+            Sighting {
+                last_ok: Some(earlier),
+                ..sharded(&[10])
+            },
+        );
+        assert!(sightings.age("main", &address(1)) >= 5000);
+        assert!(
+            sightings.silent_for(&sightings.get("main", &address(1))) >= Duration::from_secs(5)
+        );
     }
 
     #[test]

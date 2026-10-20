@@ -22,6 +22,8 @@ Without coordinators nothing changes: a primary and its replicas run as describe
 2. When the Raft leader among the coordinators has not heard from the primary for `down_after_ms`, it
    asks the others. The primary is down when a majority of coordinators (the leader included) have not
    heard from it within `down_after_ms`. One coordinator's own network trouble cannot start a failover.
+   A coordinator that just started counts a member it has not heard from yet as silent only since its
+   start, so restarting the coordinators does not fail over a primary that answers.
 3. The leader picks the replica that answers, is not still copying its primary (`LOADING`), and holds the
    most of the history (the largest sum of `wal_durable_sequence` over its shards); ties go to the member
    listed first. With `CLIENT DURABILITY` in use it must also hold every committed write (see below).
