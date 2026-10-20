@@ -46,6 +46,7 @@ pub(super) fn attach_replication(
                 shard_id,
                 primary,
                 state.published_config.replication.primary_name.clone(),
+                false,
             )
             .map(Some)
         }
@@ -148,12 +149,14 @@ fn replication_client(state: &ShardState) -> io::Result<Option<Arc<crate::tls::R
         .map(|client| Some(Arc::new(client)))
 }
 
-/// Starts following `primary` (the base address; this shard dials its own port).
+/// Starts following `primary` (the base address; this shard dials its own port); `yields`
+/// claims no epoch to it (see `demote`).
 fn spawn_reader(
     state: &ShardState,
     shard_id: u32,
     primary: SocketAddr,
     primary_name: Option<(String, u16)>,
+    yields: bool,
 ) -> io::Result<crate::replication::ReplicationThread> {
     let (inbound, outbound) = mpsc::sync_channel(crate::replication::QUEUE_FRAMES);
     let dialed = shard_port(primary, shard_id)?;
@@ -186,6 +189,7 @@ fn spawn_reader(
             .filter(|_| state.published_config.replication.announced),
         peers: Arc::clone(&state.durable_acks),
         tls: replication_client(state)?,
+        yields,
     });
 
     *state.replica_frames.borrow_mut() = Some(outbound);
@@ -193,8 +197,9 @@ fn spawn_reader(
     Ok(thread)
 }
 
-/// `REPLICAOF host port` or `REPLICAOF NO ONE [FORCE]` for the whole process: checked here,
-/// applied on this shard, then on every other shard on its own thread; `OK` once all have.
+/// `REPLICAOF host port [YIELD]` or `REPLICAOF NO ONE [FORCE]` for the whole process: checked
+/// here, applied on this shard, then on every other shard on its own thread; `OK` once all
+/// have. `force` is `FORCE` for a promotion and `YIELD` for a demotion.
 pub(super) async fn replicaof(
     state: &ShardState,
     primary: Option<(&[u8], &[u8])>,
@@ -278,7 +283,7 @@ impl RoleChange {
             .map_or(0, |route| route.shard_id as u32);
         let result = match &self.target {
             None => promote(state, shard_id, self.force),
-            Some((primary, name)) => demote(state, shard_id, *primary, name.clone()),
+            Some((primary, name)) => demote(state, shard_id, *primary, name.clone(), self.force),
         };
 
         if let Err(error) = result {
@@ -444,11 +449,18 @@ pub(super) fn promote(state: &ShardState, shard_id: u32, force: bool) -> io::Res
 /// history it wrote and follow `primary`. The shard resumes from its own log when the new
 /// primary's history continues its own (it was promoted from this shard's replica and this
 /// shard wrote nothing past the fork); otherwise it takes a full copy.
+///
+/// With `YIELD` (`yields`, what `ruvio coordinator` sends) the shard claims no epoch to
+/// `primary` while it follows it: whoever chose that primary knows better than the epoch this
+/// shard wrote or followed. Without it, a shard that saw a newer epoch than `primary`'s fences
+/// `primary`. The flag lives only in the link: the recorded epoch stays, so a restart forks
+/// above it as before.
 pub(super) fn demote(
     state: &ShardState,
     shard_id: u32,
     primary: SocketAddr,
     primary_name: Option<(String, u16)>,
+    yields: bool,
 ) -> io::Result<()> {
     state.write_gate.set(crate::replication::WriteGate::Replica);
     // Grants were for this node as a primary; promoted again, it waits for new ones.
@@ -488,7 +500,13 @@ pub(super) fn demote(
     state.epoch.set(0);
     // Promoted again later, it commits in the new primary's log, not in the one it wrote.
     state.durable_replies.reset();
-    *state.replication.borrow_mut() = Some(spawn_reader(state, shard_id, primary, primary_name)?);
+    *state.replication.borrow_mut() = Some(spawn_reader(
+        state,
+        shard_id,
+        primary,
+        primary_name,
+        yields,
+    )?);
     warn!(shard_id, %primary, "following a new primary");
     Ok(())
 }

@@ -349,6 +349,19 @@ primary sends its own:
   replica already follows a primary that replaced this one.
 - A replica does not follow a primary with a lower epoch than the one it followed.
 
+A shard whose last role was replica forks one epoch up whenever it starts as a
+writer, also when that start was only a restart with a primary's configuration
+and not a promotion. Pointed at the real primary afterwards with plain
+`REPLICAOF host port`, it would claim that newer epoch and fence the real
+primary. `REPLICAOF host port YIELD` (a Ruvio extension, what `ruvio coordinator`
+sends) makes every shard claim no epoch to the primary it is pointed at: it
+follows that primary whatever epoch it wrote or followed, and takes a full copy
+when its log does not continue the primary's history. The epoch recorded on disk
+is not lowered, so a restart before the primary accepts the shard forks above it
+as before. `YIELD` trusts that the named primary is the current one: pointed at
+an old primary, the shard drops the newer writes it held and does not fence it.
+Plain `REPLICAOF` keeps the fencing above.
+
 `INFO` does not show the lineage yet. A shard of a server that never replicated
 (role `off`, no `UPSTREAM_####`) writes no lineage file.
 

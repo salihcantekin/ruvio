@@ -26,11 +26,14 @@ Without coordinators nothing changes: a primary and its replicas run as describe
    most of the history (the largest sum of `wal_durable_sequence` over its shards); ties go to the member
    listed first. With `CLIENT DURABILITY` in use it must also hold every committed write (see below).
 4. It records "primary = that member, epoch + 1" in the Raft log (a majority must accept it), sends the
-   member `REPLICAOF NO ONE`, points the other members at it with `REPLICAOF host port`, and publishes
+   member `REPLICAOF NO ONE`, points the other members at it with `REPLICAOF host port YIELD`, and publishes
    `+switch-master` to subscribers.
 5. A member that answers again and disagrees with the record is corrected: an old primary is made a
    replica of the new one. It continues from its own log when it wrote nothing after the new primary
-   forked, and takes a full copy otherwise (see *Write history* in [RECOVERY.md](RECOVERY.md)).
+   forked, and takes a full copy otherwise (see *Write history* in [RECOVERY.md](RECOVERY.md)). `YIELD`
+   keeps a member that forked a newer epoch of its own (a replica restarted with a primary's
+   configuration) from fencing the recorded primary; a member of an older build that does not know
+   `YIELD` gets plain `REPLICAOF`.
 
 If the leader coordinator dies, the remaining ones elect a new leader (one to two seconds) and carry on.
 Commands to data nodes are repeated on every tick until the members agree with the record, so a failover

@@ -537,7 +537,8 @@ pub enum Command<'a> {
     /// connection that receives it.
     ConfigSet(Vec<(Bytes<'a>, Bytes<'a>)>),
     ConfigRewrite,
-    /// `REPLICAOF host port`, or `REPLICAOF NO ONE [FORCE]` (`primary` is `None`).
+    /// `REPLICAOF host port [YIELD]`, or `REPLICAOF NO ONE [FORCE]` (`primary` is `None`);
+    /// `force` is `FORCE` or `YIELD`.
     ReplicaOf {
         primary: Option<(Bytes<'a>, Bytes<'a>)>,
         force: bool,
