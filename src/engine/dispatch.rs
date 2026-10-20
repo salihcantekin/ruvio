@@ -620,11 +620,7 @@ pub fn execute_in_database<'a, C: Clock, I: StorageIndex, S: MutationSink, W: Li
                 Err(_) => return Ok(wrong_type()),
             };
 
-            let expires_at = shard
-                .now_unix_millis()
-                .get()
-                .saturating_add(ttl_ms)
-                .min(crate::UnixMillis::MAX_DEADLINE);
+            let expires_at = shard.now_unix_millis().get().saturating_add(ttl_ms);
             let extra = if shard.deadline_present(&key) {
                 0
             } else {
