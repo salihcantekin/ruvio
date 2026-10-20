@@ -613,6 +613,7 @@ class Ruvio(Commands):
     async def _follow(self) -> None:
         st = self._st
         failed: List[_Proto] = []
+        closed: Optional[ConnectionError] = None
         try:
             while st.refusals:
                 batch, st.refusals = st.refusals, []
@@ -626,15 +627,19 @@ class Ruvio(Commands):
                             if not item[1].done():
                                 item[1].set_exception(exc)
                         batch.pop(0)
+                except asyncio.CancelledError:
+                    # the client was closed during the search: the held commands fail like commands in flight
+                    closed = ConnectionError("the client was closed during a search for the primary")
+                    raise
                 finally:
                     # cancelled or failed mid-way: nobody is left hanging on a future
                     for item in batch:
                         if not item[1].done():
-                            item[1].set_exception(item[5])
+                            item[1].set_exception(closed or item[5])
         finally:
             for item in st.refusals:
                 if not item[1].done():
-                    item[1].set_exception(item[5])
+                    item[1].set_exception(closed or item[5])
             st.refusals = []
             st.task = None
 
@@ -881,8 +886,13 @@ class Ruvio(Commands):
         """Closes the connection. Commands in flight fail with :class:`ruvio.ConnectionError`; the client can
         be used again (the next command reconnects). ``close`` is an alias.
         """
-        proto = self._st.proto
-        self._st.proto = None
+        st = self._st
+        proto = st.proto
+        st.proto = None
+        task = st.task
+        if task is not None and task is not asyncio.current_task():
+            # a search for a primary is running for refused commands: end it, or it would open the connection again
+            task.cancel()
         if proto is not None and proto.transport is not None:
             proto.transport.close()
             await asyncio.sleep(0)
