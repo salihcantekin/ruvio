@@ -14,8 +14,8 @@ use tracing::{info, warn};
 use super::{
     config::{CoordinatorConfig, Group, Member},
     raft::{
-        Commit, NodeId, Primary, Raft, Raised, Recorded, Request, RpcRequest, RpcResponse,
-        StateMachine, raise,
+        Commit, Leadership, NodeId, Primary, Raft, Raised, Recorded, Request, RpcRequest,
+        RpcResponse, StateMachine, raise,
     },
     resp::{NodeClient, Value},
 };
@@ -39,6 +39,16 @@ pub struct Sighting {
     /// The cluster map version it serves (`RUVIO TOPOLOGY VERSION`), read only when the
     /// coordinators manage a multi-node cluster.
     pub topology: Option<u64>,
+    /// How many shards it runs, and how many of them answered `ROLE` and `INFO replication`.
+    pub shards: u16,
+    pub shards_answering: u16,
+}
+
+impl Sighting {
+    /// Every shard answered: a look at a member with a shard down does not count as an answer.
+    pub fn complete(&self) -> bool {
+        self.shards_answering == self.shards
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,14 +58,33 @@ pub enum Role {
     Replica(Option<String>),
 }
 
-/// Every member's latest sighting, by group and member index, and this coordinator's lease
-/// grants.
+/// Every member's latest sighting, by group and member index, this coordinator's lease
+/// grants, and what it did as the leader.
 #[derive(Clone, Default)]
-pub struct Sightings(Arc<Mutex<HashMap<(String, usize), Sighting>>>, Grants);
+pub struct Sightings(
+    Arc<Mutex<HashMap<(String, usize), Sighting>>>,
+    Grants,
+    Arc<Stats>,
+);
 
 impl Sightings {
     pub fn grants(&self) -> &Grants {
         &self.1
+    }
+
+    pub fn stats(&self) -> &Stats {
+        &self.2
+    }
+
+    /// How many members of `group` answered on every shard within `fresh`.
+    pub fn answering(&self, group: &Group, fresh: Duration) -> usize {
+        (0..group.members.len())
+            .filter(|&member| {
+                let sighting = self.get(&group.name, member);
+
+                sighting.complete() && sighting.last_ok.is_some_and(|at| at.elapsed() <= fresh)
+            })
+            .count()
     }
 
     pub fn get(&self, group: &str, member: usize) -> Sighting {
@@ -67,11 +96,21 @@ impl Sightings {
             .unwrap_or_default()
     }
 
+    /// Takes in a look at a member. One where a shard did not answer keeps the last complete
+    /// sighting and only updates how many shards answered: the member is not heard from, so it
+    /// is down once `down_after` passes without a complete answer, and is no candidate meanwhile.
     fn set(&self, group: &str, member: usize, sighting: Sighting) {
-        self.0
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert((group.to_owned(), member), sighting);
+        let mut sightings = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let key = (group.to_owned(), member);
+
+        if sighting.complete() {
+            sightings.insert(key, sighting);
+        } else {
+            let known = sightings.entry(key).or_default();
+
+            known.shards = sighting.shards;
+            known.shards_answering = sighting.shards_answering;
+        }
     }
 
     /// Milliseconds since each member of `group` last answered, as [`RpcRequest::Observe`]
@@ -209,6 +248,107 @@ impl Grants {
     }
 }
 
+impl Grants {
+    /// When this coordinator last granted `member` of `group` a lease, if it did since it started.
+    pub fn last(&self, group: &str, member: usize) -> Option<Instant> {
+        self.with(group, member, |granting| granting.last)
+    }
+}
+
+/// Where a group stands, as the leader last tended it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupState {
+    /// The primary answers, or a majority of coordinators still hear it.
+    Ok,
+    /// A majority lost the primary, but its lease has not ended for a majority yet.
+    LeaseRunning,
+    /// The primary is down and no replica holds every committed record.
+    Waiting,
+    /// The primary is down and no replica can take over.
+    NoCandidate,
+}
+
+impl GroupState {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::LeaseRunning => "lease_running",
+            Self::Waiting => "waiting",
+            Self::NoCandidate => "no_candidate",
+        }
+    }
+}
+
+/// What this coordinator did as the leader, for `INFO`.
+#[derive(Default)]
+pub struct Stats {
+    failovers: std::sync::atomic::AtomicU64,
+    last_failover_unix_ms: std::sync::atomic::AtomicU64,
+    /// Per group: its state, since when, and when a warning about it was last logged.
+    groups: Mutex<HashMap<String, (GroupState, Instant, Instant)>>,
+}
+
+/// How often at most a group that stays without a writer is warned about.
+const WARN_EVERY: Duration = Duration::from_secs(10);
+
+impl Stats {
+    /// Records that `group` is in `state`; whether a warning about it is due: when it enters
+    /// the state, then every [`WARN_EVERY`] while it stays.
+    pub fn enter(&self, group: &str, state: GroupState) -> bool {
+        let now = Instant::now();
+        let mut groups = self
+            .groups
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
+        match groups.get_mut(group) {
+            Some((known, _, warned)) if *known == state => {
+                let due = now.duration_since(*warned) >= WARN_EVERY;
+
+                if due {
+                    *warned = now;
+                }
+                due
+            }
+            _ => {
+                groups.insert(group.to_owned(), (state, now, now));
+                true
+            }
+        }
+    }
+
+    /// `group`'s state and how long it has been in it; `None` until this coordinator led.
+    pub fn state(&self, group: &str) -> Option<(GroupState, Duration)> {
+        self.groups
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(group)
+            .map(|&(state, since, _)| (state, since.elapsed()))
+    }
+
+    fn failed_over(&self) {
+        use std::sync::atomic::Ordering;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64);
+
+        self.failovers.fetch_add(1, Ordering::Relaxed);
+        self.last_failover_unix_ms.store(now, Ordering::Relaxed);
+    }
+
+    /// Failovers this coordinator did as the leader, and when the last one was (Unix ms, 0
+    /// for none).
+    pub fn failovers(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+
+        (
+            self.failovers.load(Ordering::Relaxed),
+            self.last_failover_unix_ms.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// A group's [`Grants::decision`] lock.
 pub type DecisionGuard = tokio::sync::OwnedMutexGuard<()>;
 
@@ -243,6 +383,53 @@ pub async fn confirm_locally(
         .flatten()
 }
 
+/// The coordinators that vote, with their addresses: the Raft membership once there is one,
+/// `peers` from the file before that (a coordinator that has not started or joined yet).
+pub fn coordinators(config: &CoordinatorConfig, raft: &Raft) -> Vec<(NodeId, String)> {
+    let metrics = raft.metrics();
+    let metrics = metrics.borrow();
+    let membership = metrics.membership_config.membership();
+    let voters: Vec<(NodeId, String)> = membership
+        .voter_ids()
+        .filter_map(|id| membership.get_node(&id).map(|node| (id, node.addr.clone())))
+        .collect();
+
+    if voters.is_empty() {
+        config
+            .peers
+            .iter()
+            .map(|(id, address)| (*id, address.to_string()))
+            .collect()
+    } else {
+        voters
+    }
+}
+
+/// Where coordinator `id` listens: from the Raft membership (voters and learners), else from
+/// `peers`.
+pub fn address_of(config: &CoordinatorConfig, raft: &Raft, id: NodeId) -> Option<String> {
+    let known = raft
+        .metrics()
+        .borrow()
+        .membership_config
+        .membership()
+        .get_node(&id)
+        .map(|node| node.addr.clone());
+
+    known.or_else(|| {
+        config
+            .peers
+            .iter()
+            .find(|(peer, _)| *peer == id)
+            .map(|(_, address)| address.to_string())
+    })
+}
+
+/// How many of `voters` coordinators make a majority.
+pub fn quorum(voters: usize) -> usize {
+    voters / 2 + 1
+}
+
 /// The group's primary as the current leader confirms it ([`confirm_locally`]).
 async fn confirm(
     config: &CoordinatorConfig,
@@ -256,10 +443,10 @@ async fn confirm(
     if leader == config.id {
         return confirm_locally(raft, machine, grants, group).await;
     }
-    let (_, address) = config.peers.iter().find(|(id, _)| *id == leader)?;
+    let address = address_of(config, raft, leader)?;
 
     match super::raft::call(
-        &address.to_string(),
+        &address,
         config.secret.as_deref().unwrap_or(""),
         RpcRequest::Confirm {
             group: group.to_owned(),
@@ -318,7 +505,7 @@ async fn renew(
     let words = [
         token.to_string(),
         config.id.to_string(),
-        config.peers.len().to_string(),
+        coordinators(config, raft).len().to_string(),
         primary.epoch.to_string(),
         lease.as_millis().to_string(),
     ];
@@ -374,6 +561,11 @@ pub async fn renew_leases(
             let Some(primary) = primaries.get(&group.name).copied() else {
                 continue;
             };
+            // A primary with a shard this coordinator cannot reach is not renewed: it would
+            // keep writing on the others while the coordinators fail it over.
+            if !sightings.get(&group.name, primary.member).complete() {
+                continue;
+            }
             {
                 let mut running = running.lock().unwrap_or_else(|error| error.into_inner());
 
@@ -473,22 +665,19 @@ async fn look(member: &Member, auth: Option<&str>, cluster: bool) -> Option<Sigh
         _ => 1,
     };
 
+    sighting.shards = shards;
     for shard in 0..shards {
-        let address = member.address.plus(shard);
+        // Shard 0 answered `ROLE` above; every other shard must answer it too, so a member
+        // with one shard down is not heard from (see `Sightings::set`).
         let info = if shard == 0 {
             client
                 .call(&[b"INFO", b"replication"], CALL_TIMEOUT)
                 .await
                 .ok()
         } else {
-            match NodeClient::connect(&address, auth, CALL_TIMEOUT).await {
-                Ok(mut other) => other
-                    .call(&[b"INFO", b"replication"], CALL_TIMEOUT)
-                    .await
-                    .ok(),
-                Err(_) => None,
-            }
+            other_shard(&member.address.plus(shard), auth, &mut sighting).await
         };
+        sighting.shards_answering += u16::from(info.is_some());
         let text = info.and_then(|info| info.text()).unwrap_or_default();
         let field = |name: &str| {
             text.lines()
@@ -508,14 +697,50 @@ async fn look(member: &Member, auth: Option<&str>, cluster: bool) -> Option<Sigh
     Some(sighting)
 }
 
-/// Sends one command to a member; `Ok` when it answers `OK`.
-async fn command(member: &Member, auth: Option<&str>, args: &[&[u8]]) -> Result<(), String> {
+/// Shard `address` of a member: its `INFO replication` when it answers `ROLE` and that, or
+/// `None`. A shard still loading marks the member loading.
+async fn other_shard(
+    address: &super::config::Endpoint,
+    auth: Option<&str>,
+    sighting: &mut Sighting,
+) -> Option<Value> {
+    let mut client = NodeClient::connect(address, auth, CALL_TIMEOUT)
+        .await
+        .ok()?;
+
+    match client.call(&[b"ROLE"], CALL_TIMEOUT).await.ok()? {
+        Value::Error(error) if error.starts_with("LOADING") || error.starts_with("MASTERDOWN") => {
+            sighting.loading = true;
+        }
+        Value::Array(Some(_)) => {}
+        _ => return None,
+    }
+    client
+        .call(&[b"INFO", b"replication"], CALL_TIMEOUT)
+        .await
+        .ok()
+}
+
+/// How long a member may take to answer a command: `down_after`, at least 1 s. `REPLICAOF`
+/// answers before any copy starts, so a member slower than that is stuck, and waiting longer
+/// only delays the group.
+fn command_timeout(config: &CoordinatorConfig) -> Duration {
+    config.down_after.max(CALL_TIMEOUT)
+}
+
+/// Sends one command to a member; `Ok` when it answers `OK` within `timeout`.
+async fn command(
+    member: &Member,
+    auth: Option<&str>,
+    args: &[&[u8]],
+    timeout: Duration,
+) -> Result<(), String> {
     let mut client = NodeClient::connect(&member.address, auth, CALL_TIMEOUT)
         .await
         .map_err(|error| error.to_string())?;
 
     match client
-        .call(args, Duration::from_secs(10))
+        .call(args, timeout)
         .await
         .map_err(|error| error.to_string())?
     {
@@ -662,8 +887,8 @@ fn holds(sighting: &Sighting, committed: &[u64]) -> bool {
         .all(|(shard, &sequence)| at(&sighting.shard_durable, shard) >= sequence)
 }
 
-/// The member to promote: answering, a replica with a complete copy that holds every
-/// committed record, holding the most of the history; ties go to the lowest index.
+/// The member to promote: answering on every shard, a replica with a complete copy that holds
+/// every committed record, holding the most of the history; ties go to the lowest index.
 pub fn choose_candidate(
     group: &Group,
     primary: usize,
@@ -677,6 +902,7 @@ pub fn choose_candidate(
             let sighting = &sightings[member];
 
             !sighting.loading
+                && sighting.complete()
                 && sighting.last_ok.is_some_and(|at| at.elapsed() <= fresh)
                 && matches!(sighting.role, Some(Role::Replica(_)))
                 && holds(sighting, committed)
@@ -797,6 +1023,7 @@ pub fn verdict(heard_down: usize, lease_ended: usize, lease_on: bool, quorum: us
 /// counts for hearing. Also whether any coordinator grants leases.
 async fn objectively_down(
     config: &CoordinatorConfig,
+    raft: &Raft,
     sightings: &Sightings,
     group: &Group,
     primary: usize,
@@ -815,13 +1042,14 @@ async fn objectively_down(
         None => true,
     });
     let mut calls = tokio::task::JoinSet::new();
+    let voters = coordinators(config, raft);
 
-    for (id, address) in &config.peers {
+    for (id, address) in &voters {
         if *id == config.id {
             continue;
         }
         let (address, secret, name) = (
-            address.to_string(),
+            address.clone(),
             config.secret.clone().unwrap_or_default(),
             group.name.clone(),
         );
@@ -863,13 +1091,47 @@ async fn objectively_down(
     }
 
     (
-        verdict(heard_down, ended, lease_on, config.quorum()),
+        verdict(heard_down, ended, lease_on, quorum(voters.len())),
         lease_on,
     )
 }
 
+/// Asked before each command to a data node: whether this coordinator may still act on them.
+pub trait Fence: Sync {
+    fn holds(&self) -> impl Future<Output = bool> + Send;
+}
+
+/// The leader's [`Fence`]: a majority of coordinators confirmed it within the last window
+/// ([`Leadership::confirm`], cached for that window), and it applied its own term. A leader
+/// that lost its majority in the middle of a tick stops before its next command, so it never
+/// points members at a primary a newer leader replaced.
+pub struct Leading<'a> {
+    pub leadership: &'a Leadership,
+    pub raft: &'a Raft,
+}
+
+impl Fence for Leading<'_> {
+    async fn holds(&self) -> bool {
+        self.leadership.confirm(self.raft).await && caught_up(self.raft)
+    }
+}
+
+/// What the leader's loop shares with the task tending each group.
+#[derive(Clone)]
+struct Leader {
+    config: Arc<CoordinatorConfig>,
+    raft: Raft,
+    machine: StateMachine,
+    sightings: Sightings,
+    commits: Commits,
+    switches: Switches,
+    leadership: Arc<Leadership>,
+}
+
 /// The leader's loop: start each group from its configured primary, fail over a primary a
-/// majority sees down, and point every answering member at the agreed primary.
+/// majority sees down, and point every answering member at the agreed primary. Each group is
+/// tended on its own task, so a member that accepts connections but does not answer delays
+/// only its own group; a group still being tended from an earlier tick is skipped.
 pub async fn lead(
     config: Arc<CoordinatorConfig>,
     raft: Raft,
@@ -879,6 +1141,16 @@ pub async fn lead(
     switches: Switches,
     moves: super::migrate::Context,
 ) {
+    let leader = Leader {
+        config: Arc::clone(&config),
+        raft: raft.clone(),
+        machine: machine.clone(),
+        sightings: sightings.clone(),
+        commits: commits.clone(),
+        switches,
+        leadership: Arc::clone(&moves.leadership),
+    };
+    let tending: Arc<Mutex<Vec<usize>>> = Arc::default();
     let mut tick = tokio::time::interval(config.ping_interval);
     let mut recorded_at: Option<Instant> = None;
 
@@ -889,7 +1161,8 @@ pub async fn lead(
         // does not step it down), so a majority confirms it before anything is done on the
         // data nodes. A new leader also acts only once it has applied what earlier leaders
         // recorded: until then its primaries and committed sequences may be those of an old
-        // snapshot. Until both hold it only learns, like a follower.
+        // snapshot. Until both hold it only learns, like a follower. Both are asked again
+        // before each command to a data node (see [`Leading`]).
         if !moves.leadership.confirm(&raft).await || !caught_up(&raft) {
             // Every coordinator learns what was committed, so a new leader also knows what
             // rose after the last record.
@@ -908,58 +1181,27 @@ pub async fn lead(
             continue;
         }
 
-        let recorded = machine.commits();
+        for index in 0..config.groups.len() {
+            {
+                let mut tending = tending.lock().unwrap_or_else(|error| error.into_inner());
 
-        for group in &config.groups {
-            let seen: Vec<Sighting> = (0..group.members.len())
-                .map(|member| sightings.get(&group.name, member))
-                .collect();
-            let Some(primary) = machine.primaries().get(&group.name).copied() else {
-                // First start: record the member that already is the primary. Nothing is
-                // changed on the data nodes until exactly one of them answers as one.
-                let masters: Vec<usize> = (0..seen.len())
-                    .filter(|&member| seen[member].role == Some(Role::Master))
-                    .collect();
-
-                match masters.as_slice() {
-                    [only] => {
-                        propose(&raft, group, *only, 1, None).await;
-                    }
-                    [] => {}
-                    _ => {
-                        warn!(group = %group.name, "several members answer as primary; waiting for one")
-                    }
-                }
-                continue;
-            };
-            let committed = commits.learn(group, primary, &seen, config.down_after, &recorded);
-            let primary_age = seen[primary.member].last_ok.map(|at| at.elapsed());
-
-            // Held until the failover is recorded, so no coordinator is confirmed this primary
-            // between reporting its lease ended and the record naming another member.
-            if primary_age.is_none_or(|age| age > config.down_after) {
-                let decided = sightings.grants().decision(&group.name).await;
-
-                if objectively_down(&config, &sightings, group, primary.member)
-                    .await
-                    .0
-                    == Verdict::Down
-                {
-                    let failing = Failing {
-                        group,
-                        primary,
-                        seen: &seen,
-                        committed: &committed,
-                        commits: &commits,
-                    };
-                    let _ = failover(&config, &raft, &machine, &switches, failing, false, decided)
-                        .await;
+                if tending.contains(&index) {
                     continue;
                 }
+                tending.push(index);
             }
+            let (leader, tending) = (leader.clone(), Arc::clone(&tending));
 
-            reconcile(&config, group, primary, &seen).await;
+            tokio::spawn(async move {
+                leader.tend(&leader.config.groups[index]).await;
+                tending
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .retain(|known| *known != index);
+            });
         }
+
+        let recorded = machine.commits();
 
         if recorded_at.is_none_or(|at| at.elapsed() >= RECORD_EVERY)
             && record_commits(&raft, &commits, &recorded).await
@@ -969,6 +1211,86 @@ pub async fn lead(
         push_cluster_map(&config, &machine, &sightings).await;
         // A move the previous leader began continues here.
         super::migrate::resume(&moves);
+    }
+}
+
+impl Leader {
+    /// One tick of one group: record its first primary, fail it over when a majority sees the
+    /// primary down, or point its members at the agreed primary.
+    async fn tend(&self, group: &Group) {
+        let Self {
+            config,
+            raft,
+            machine,
+            sightings,
+            commits,
+            switches,
+            leadership,
+        } = self;
+        let fence = Leading { leadership, raft };
+        let seen: Vec<Sighting> = (0..group.members.len())
+            .map(|member| sightings.get(&group.name, member))
+            .collect();
+        let Some(primary) = machine.primaries().get(&group.name).copied() else {
+            // First start: record the member that already is the primary. Nothing is
+            // changed on the data nodes until exactly one of them answers as one.
+            let masters: Vec<usize> = (0..seen.len())
+                .filter(|&member| seen[member].role == Some(Role::Master))
+                .collect();
+
+            match masters.as_slice() {
+                [only] => {
+                    propose(raft, group, *only, 1, None).await;
+                }
+                [] => {}
+                _ => {
+                    warn!(group = %group.name, "several members answer as primary; waiting for one")
+                }
+            }
+            return;
+        };
+        let committed = commits.learn(group, primary, &seen, config.down_after, &machine.commits());
+        let primary_age = seen[primary.member].last_ok.map(|at| at.elapsed());
+
+        // Held until the failover is recorded, so no coordinator is confirmed this primary
+        // between reporting its lease ended and the record naming another member.
+        if primary_age.is_none_or(|age| age > config.down_after) {
+            let decided = sightings.grants().decision(&group.name).await;
+
+            match objectively_down(config, raft, sightings, group, primary.member)
+                .await
+                .0
+            {
+                Verdict::Down => {
+                    let failing = Failing {
+                        group,
+                        primary,
+                        seen: &seen,
+                        committed: &committed,
+                        commits,
+                        decided,
+                        stats: sightings.stats(),
+                    };
+                    let _ = failover(config, raft, machine, switches, failing, false, &fence).await;
+                    return;
+                }
+                Verdict::LeaseRunning => {
+                    if sightings
+                        .stats()
+                        .enter(&group.name, GroupState::LeaseRunning)
+                    {
+                        info!(group = %group.name, "primary is down; waiting for its lease to end (repeated at most every 10 s)");
+                    }
+                }
+                Verdict::Up => {
+                    sightings.stats().enter(&group.name, GroupState::Ok);
+                }
+            }
+        } else {
+            sightings.stats().enter(&group.name, GroupState::Ok);
+        }
+
+        reconcile(config, group, primary, &seen, &fence).await;
     }
 }
 
@@ -1018,11 +1340,14 @@ async fn push_cluster_map(
                 group.name.clone(),
             );
 
+            let timeout = command_timeout(config);
+
             tokio::spawn(async move {
                 let result = command(
                     &member,
                     auth.as_deref(),
                     &[b"RUVIO", b"TOPOLOGY", b"SET", &map],
+                    timeout,
                 )
                 .await;
 
@@ -1116,18 +1441,22 @@ async fn propose(
     }
 }
 
-/// A group whose primary is down, as the leader sees it.
+/// A group whose primary is down, as the leader sees it, and its decision lock
+/// ([`Grants::decision`]), released once the promotion is recorded.
 struct Failing<'a> {
     group: &'a Group,
     primary: Primary,
     seen: &'a [Sighting],
     committed: &'a [u64],
     commits: &'a Commits,
+    decided: DecisionGuard,
+    stats: &'a Stats,
 }
 
 /// Promotes a replica of a group whose primary is down: one that holds every committed record,
 /// or with `force` or `unclean_failover` the best one anyway. The promoted member's address.
-/// `decided` is the group's decision lock, released once the promotion is recorded.
+/// Each command to a data node waits for `fence`; the promotion stands in the record either
+/// way, and the leader after this one points the members at it.
 async fn failover(
     config: &CoordinatorConfig,
     raft: &Raft,
@@ -1135,7 +1464,7 @@ async fn failover(
     switches: &Switches,
     failing: Failing<'_>,
     force: bool,
-    decided: DecisionGuard,
+    fence: &impl Fence,
 ) -> Result<String, String> {
     let Failing {
         group,
@@ -1143,6 +1472,8 @@ async fn failover(
         seen,
         committed,
         commits,
+        decided,
+        stats,
     } = failing;
     let choice = choose(
         group,
@@ -1164,14 +1495,18 @@ async fn failover(
             candidate
         }
         Choice::Wait => {
-            warn!(
-                group = %group.name,
-                "primary is down and no replica holds every record a durable reply was released for; waiting (unclean_failover or COORDINATOR FAILOVER group FORCE promotes one anyway)"
-            );
+            if stats.enter(&group.name, GroupState::Waiting) {
+                warn!(
+                    group = %group.name,
+                    "primary is down and no replica holds every record a durable reply was released for; waiting (unclean_failover or COORDINATOR FAILOVER group FORCE promotes one anyway; repeated at most every 10 s)"
+                );
+            }
             return Err("ERR no replica holds every committed record; waiting for one".into());
         }
         Choice::Nobody => {
-            warn!(group = %group.name, "primary is down and no replica can take over");
+            if stats.enter(&group.name, GroupState::NoCandidate) {
+                warn!(group = %group.name, "primary is down and no replica can take over (repeated at most every 10 s)");
+            }
             return Err("ERR no replica can take over".into());
         }
     };
@@ -1194,28 +1529,43 @@ async fn failover(
     if !propose(raft, group, candidate, primary.epoch + 1, Some(kept)).await {
         return Err("ERR the failover was not recorded; try again".into());
     }
+    stats.failed_over();
+    stats.enter(&group.name, GroupState::Ok);
     // Applied here once recorded: a confirmation waiting for the decision reads the new
     // primary. The calls to the data nodes below need not hold it up.
     drop(decided);
 
     let promoted = &group.members[candidate];
+    let timeout = command_timeout(config);
+    let new = &promoted.address;
 
     // The newest map first: a range the group gave away is then answered with `MOVED`
     // before the promoted member takes writes.
-    if let Some((_, map)) = config.cluster_map(&machine.primaries(), &machine.moves().moved)
-        && let Err(error) = command(
+    if let Some((_, map)) = config.cluster_map(&machine.primaries(), &machine.moves().moved) {
+        if !fence.holds().await {
+            warn!(group = %group.name, primary = %new, "recorded the failover but no longer leads; the next leader promotes the member");
+            return Ok(new.to_string());
+        }
+        if let Err(error) = command(
             promoted,
             config.auth.as_deref(),
             &[b"RUVIO", b"TOPOLOGY", b"SET", map.as_bytes()],
+            timeout,
         )
         .await
-    {
-        warn!(group = %group.name, %error, "the chosen replica refused the cluster map before its promotion");
+        {
+            warn!(group = %group.name, %error, "the chosen replica refused the cluster map before its promotion");
+        }
+    }
+    if !fence.holds().await {
+        warn!(group = %group.name, primary = %new, "recorded the failover but no longer leads; the next leader promotes the member");
+        return Ok(new.to_string());
     }
     if let Err(error) = command(
         promoted,
         config.auth.as_deref(),
         &[b"REPLICAOF", b"NO", b"ONE"],
+        timeout,
     )
     .await
     {
@@ -1225,7 +1575,6 @@ async fn failover(
     }
 
     let old = &group.members[primary.member].address;
-    let new = &promoted.address;
     let _ = switches.send(format!(
         "{} {} {} {} {}",
         group.name, old.host, old.port, new.host, new.port
@@ -1239,6 +1588,7 @@ async fn failover(
             epoch: primary.epoch + 1,
         },
         seen,
+        fence,
     )
     .await;
     Ok(new.to_string())
@@ -1252,6 +1602,7 @@ pub struct Force<'a> {
     pub sightings: &'a Sightings,
     pub commits: &'a Commits,
     pub switches: &'a Switches,
+    pub leadership: &'a Leadership,
 }
 
 /// `COORDINATOR FAILOVER group FORCE` on the leader: promotes the best answering replica of a
@@ -1285,7 +1636,15 @@ pub async fn force_failover(force: Force<'_>, group: &Group) -> Result<String, S
     // coordinator grants no lease, since the others may.
     let decided = force.sightings.grants().decision(&group.name).await;
 
-    match objectively_down(force.config, force.sightings, group, primary.member).await {
+    match objectively_down(
+        force.config,
+        force.raft,
+        force.sightings,
+        group,
+        primary.member,
+    )
+    .await
+    {
         (Verdict::LeaseRunning, _) => {
             return Err(format!(
                 "ERR the primary of {} may still hold its lease; try again once a majority of coordinators saw it end",
@@ -1313,6 +1672,12 @@ pub async fn force_failover(force: Force<'_>, group: &Group) -> Result<String, S
         seen: &seen,
         committed: &committed,
         commits: force.commits,
+        decided,
+        stats: force.sightings.stats(),
+    };
+    let fence = Leading {
+        leadership: force.leadership,
+        raft: force.raft,
     };
 
     failover(
@@ -1322,15 +1687,23 @@ pub async fn force_failover(force: Force<'_>, group: &Group) -> Result<String, S
         force.switches,
         failing,
         true,
-        decided,
+        &fence,
     )
     .await
 }
 
 /// Makes every answering member agree with the record: the primary takes writes, the others
-/// follow it.
-async fn reconcile(config: &CoordinatorConfig, group: &Group, primary: Primary, seen: &[Sighting]) {
+/// follow it. Stops at the first command `fence` does not let through: the record it acts on
+/// may be stale by then.
+async fn reconcile(
+    config: &CoordinatorConfig,
+    group: &Group,
+    primary: Primary,
+    seen: &[Sighting],
+    fence: &impl Fence,
+) {
     let target = &group.members[primary.member];
+    let timeout = command_timeout(config);
 
     for (index, member) in group.members.iter().enumerate() {
         let sighting = &seen[index];
@@ -1343,20 +1716,28 @@ async fn reconcile(config: &CoordinatorConfig, group: &Group, primary: Primary, 
             continue;
         }
 
+        let agrees = if index == primary.member {
+            sighting.role == Some(Role::Master)
+        } else {
+            sighting.role == Some(Role::Replica(Some(target.replication.to_string())))
+        };
+
+        if agrees {
+            continue;
+        }
+        if !fence.holds().await {
+            warn!(group = %group.name, "no longer confirmed as the leader; leaving the group's members as they are");
+            return;
+        }
         let result = if index == primary.member {
-            if sighting.role == Some(Role::Master) {
-                continue;
-            }
             command(
                 member,
                 config.auth.as_deref(),
                 &[b"REPLICAOF", b"NO", b"ONE"],
+                timeout,
             )
             .await
         } else {
-            if sighting.role == Some(Role::Replica(Some(target.replication.to_string()))) {
-                continue;
-            }
             let host = target.replication.host.clone();
             let port = target.replication.port.to_string();
 
@@ -1364,6 +1745,7 @@ async fn reconcile(config: &CoordinatorConfig, group: &Group, primary: Primary, 
                 member,
                 config.auth.as_deref(),
                 &[b"REPLICAOF", host.as_bytes(), port.as_bytes()],
+                timeout,
             )
             .await
         };
@@ -1419,6 +1801,8 @@ mod tests {
             shard_committed: vec![0; durable.len()],
             loading: false,
             topology: None,
+            shards: durable.len() as u16,
+            shards_answering: durable.len() as u16,
         }
     }
 
@@ -1433,6 +1817,103 @@ mod tests {
 
     fn following(group: &Group, member: usize) -> Role {
         Role::Replica(Some(group.members[member].replication.to_string()))
+    }
+
+    #[test]
+    fn a_member_with_a_shard_down_is_not_heard_from_and_is_no_candidate() {
+        let sightings = Sightings::default();
+        let earlier = Instant::now() - Duration::from_secs(5);
+        let whole = Sighting {
+            last_ok: Some(earlier),
+            shards: 2,
+            shards_answering: 2,
+            ..sharded(&[10, 10])
+        };
+
+        sightings.set("main", 1, whole);
+        // Shard 1 stops answering: the last complete sighting stays, with the count.
+        sightings.set(
+            "main",
+            1,
+            Sighting {
+                shards: 2,
+                shards_answering: 1,
+                ..sharded(&[20, 0])
+            },
+        );
+        let kept = sightings.get("main", 1);
+
+        assert_eq!(kept.last_ok, Some(earlier));
+        assert_eq!(kept.shard_durable, [10, 10]);
+        assert!(!kept.complete());
+        // Never seen whole: not heard from at all.
+        sightings.set(
+            "main",
+            2,
+            Sighting {
+                shards: 2,
+                shards_answering: 1,
+                ..sharded(&[20, 0])
+            },
+        );
+        assert_eq!(sightings.get("main", 2).last_ok, None);
+
+        // A fresh replica with a shard down is passed over for a complete one.
+        let group = group(3);
+        let fresh = Duration::from_secs(1);
+        let partial = Sighting {
+            shards: 2,
+            shards_answering: 1,
+            ..sharded(&[50, 50])
+        };
+        let complete = Sighting {
+            shards: 2,
+            shards_answering: 2,
+            ..sharded(&[10, 10])
+        };
+
+        assert_eq!(
+            choose_candidate(
+                &group,
+                0,
+                &[replica(0), partial.clone(), complete],
+                fresh,
+                &[]
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            choose_candidate(
+                &group,
+                0,
+                &[replica(0), partial.clone(), partial],
+                fresh,
+                &[]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_group_state_is_warned_about_when_entered_then_at_most_every_ten_seconds() {
+        let stats = Stats::default();
+
+        assert_eq!(stats.state("main"), None);
+        assert!(stats.enter("main", GroupState::Waiting));
+        assert!(!stats.enter("main", GroupState::Waiting));
+        assert_eq!(stats.state("main").unwrap().0, GroupState::Waiting);
+        // Another group, or another state, is warned about at once.
+        assert!(stats.enter("other", GroupState::Waiting));
+        assert!(stats.enter("main", GroupState::NoCandidate));
+        // Ten seconds on, the same state is due again.
+        stats.groups.lock().unwrap().get_mut("main").unwrap().2 -= WARN_EVERY;
+        assert!(stats.enter("main", GroupState::NoCandidate));
+        assert!(!stats.enter("main", GroupState::NoCandidate));
+
+        assert_eq!(stats.failovers(), (0, 0));
+        stats.failed_over();
+        assert_eq!(stats.failovers().0, 1);
+        assert!(stats.failovers().1 > 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1876,5 +2357,127 @@ mod tests {
         assert!(!applied_own_term(applied(2, 900), 3));
         // Its own blank entry is applied: so is everything before it.
         assert!(applied_own_term(applied(3, 901), 3));
+    }
+
+    /// Lets through as many commands as it holds.
+    struct Allow(std::sync::atomic::AtomicUsize);
+
+    impl Fence for Allow {
+        async fn holds(&self) -> bool {
+            use std::sync::atomic::Ordering;
+
+            self.0
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+        }
+    }
+
+    /// Members listening on loopback that count the commands they get and answer `+OK`, or
+    /// never answer when `silent`.
+    async fn listening(count: usize, silent: bool) -> (Group, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let commands = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut group = group(count);
+
+        for member in &mut group.members {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let commands = Arc::clone(&commands);
+
+            member.address =
+                super::super::config::Endpoint::parse(&format!("127.0.0.1:{port}")).unwrap();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let commands = Arc::clone(&commands);
+
+                    tokio::spawn(async move {
+                        let mut buffer = [0; 512];
+
+                        while matches!(stream.read(&mut buffer).await, Ok(read) if read > 0) {
+                            commands.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if !silent && stream.write_all(b"+OK\r\n").await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        (group, commands)
+    }
+
+    fn config(down_after: Duration) -> CoordinatorConfig {
+        CoordinatorConfig {
+            id: 1,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            data_dir: std::path::PathBuf::new(),
+            peers: Vec::new(),
+            ping_interval: Duration::from_millis(100),
+            down_after,
+            unclean_failover: false,
+            primary_lease: None,
+            auth: None,
+            secret: None,
+            tls: Default::default(),
+            groups: Vec::new(),
+            join: false,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_leader_that_stops_leading_mid_tick_sends_no_further_commands() {
+        let (group, commands) = listening(3, false).await;
+        let primary = Primary {
+            member: 0,
+            epoch: 2,
+        };
+        // Every member disagrees with the record: three commands to send.
+        let seen = vec![
+            member(Role::Replica(None), &[10], &[0]),
+            member(Role::Master, &[10], &[0]),
+            member(Role::Master, &[10], &[0]),
+        ];
+        let config = config(Duration::from_millis(1000));
+        let sent = || commands.load(std::sync::atomic::Ordering::SeqCst);
+
+        reconcile(&config, &group, primary, &seen, &Allow(0.into())).await;
+        assert_eq!(sent(), 0);
+        // Confirmed for the first command, then lost.
+        reconcile(&config, &group, primary, &seen, &Allow(1.into())).await;
+        assert_eq!(sent(), 1);
+        reconcile(&config, &group, primary, &seen, &Allow(3.into())).await;
+        assert_eq!(sent(), 4);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_member_that_never_answers_holds_a_command_for_down_after_not_longer() {
+        let (group, commands) = listening(2, true).await;
+        let primary = Primary {
+            member: 0,
+            epoch: 2,
+        };
+        let seen = vec![
+            member(Role::Master, &[10], &[0]),
+            member(Role::Master, &[10], &[0]),
+        ];
+        let started = Instant::now();
+
+        reconcile(
+            &config(Duration::from_millis(1000)),
+            &group,
+            primary,
+            &seen,
+            &Allow(1.into()),
+        )
+        .await;
+        assert_eq!(commands.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

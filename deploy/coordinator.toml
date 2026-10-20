@@ -5,6 +5,9 @@ id = 1
 listen = "10.0.0.1:26400"
 data_dir = "/var/lib/ruvio-coordinator"
 peers = ["1@10.0.0.1:26400", "2@10.0.0.2:26400", "3@10.0.0.3:26400"]
+# Only for a coordinator added to running ones: set join = true and run COORDINATOR ADD on their
+# leader (see "Adding and removing coordinators" in docs/COORDINATOR.md).
+# join = true
 # The same on every coordinator. RUVIO_COORDINATOR_SECRET overrides it.
 secret = "change-me"
 ping_interval_ms = 500

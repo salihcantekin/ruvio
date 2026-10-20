@@ -476,7 +476,7 @@ test('TRYAGAIN is retried after a short wait and the later success is returned',
   }
 });
 
-test('TRYAGAIN is retried three times; the fourth answer is returned to the caller', async () => {
+test('TRYAGAIN is retried seven times; the eighth answer is returned to the caller', async () => {
   const a = await fakeServer((args) => {
     if (args[0] === 'CLUSTER') return slotsReply([[0, 16383, a.port]]);
     if (args[0] === 'GET') return err('TRYAGAIN slot is being handed over');
@@ -488,8 +488,8 @@ test('TRYAGAIN is retried three times; the fourth answer is returned to the call
     const t0 = process.hrtime.bigint();
     await assert.rejects(c.get('k'), isErr('TRYAGAIN'));
     const ms = Number(process.hrtime.bigint() - t0) / 1e6;
-    assert.equal(a.count('GET'), 4, 'the first send and three retries');
-    assert.ok(ms >= 30, `waited ${ms} ms in total (5 + 10 + 20)`);
+    assert.equal(a.count('GET'), 8, 'the first send and seven retries');
+    assert.ok(ms >= 630, `waited ${ms} ms in total (5 + 10 + 20 + 40 + 80 + 160 + 320)`);
   } finally {
     c.disconnect();
     await a.close();

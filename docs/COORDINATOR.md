@@ -13,7 +13,12 @@ Without coordinators nothing changes: a primary and its replicas run as describe
 ## What happens on a failure
 
 1. Every coordinator connects to every member each `ping_interval_ms` and reads `ROLE`, `CONFIG GET
-   shards` and `INFO replication` (the synced and the committed sequence of every shard).
+   shards` and, from every shard on its own port, `ROLE` and `INFO replication` (the synced and the
+   committed sequence of every shard). A member is heard from only when all its shards answer: a
+   primary with one shard down is failed over like a dead one, and a replica with a shard down is not
+   promoted. With the primary lease, a coordinator does not renew the lease of a primary with a
+   shard it cannot reach. A member that answers on some shards keeps the role it had and is pointed at the agreed
+   primary once all its shards answer again.
 2. When the Raft leader among the coordinators has not heard from the primary for `down_after_ms`, it
    asks the others. The primary is down when a majority of coordinators (the leader included) have not
    heard from it within `down_after_ms`. One coordinator's own network trouble cannot start a failover.
@@ -34,10 +39,14 @@ interrupted half way is finished by the next leader.
 When the coordinators are partitioned from each other, only the side with a majority acts. The Raft
 library keeps a leader that lost its majority believing it leads, so before each tick's work on the data
 nodes (a failover, pointing members at the agreed primary, sending the cluster map, a step of a slot
-move) and before `COORDINATOR FAILOVER group FORCE`, `MOVE` and `CANCEL`, the leader confirms with a
-heartbeat that a majority of coordinators still follows it. One confirmation per tick is shared by
-everything in that tick; it waits at most one `ping_interval_ms` (capped at 1 second, below the election
-timeout). A leader cut off from the others, even one that still reaches every data node, therefore does
+move) and before `COORDINATOR FAILOVER group FORCE`, `MOVE`, `CANCEL`, `ADD` and `REMOVE`, the leader confirms with a
+heartbeat that a majority of coordinators still follows it. It confirms again before every command it
+sends a data node; a confirmation is trusted for one `ping_interval_ms` (capped at 1 second, below the
+election timeout) and shared by everything in that window, and waits at most that long. So a leader that
+loses its majority in the middle of a tick sends no further `REPLICAOF` or map from a record a newer
+leader may have replaced. Each group is tended on its own task, and a data node gets `down_after_ms`
+(at least 1 second) to answer a command: a member that accepts connections but stops answering holds up
+only its own group, never a failover elsewhere. A leader cut off from the others, even one that still reaches every data node, therefore does
 nothing to them: it logs one warning, those commands answer `ERR this leader cannot reach a majority of
 coordinators; try again`, and it acts again (logging that once) when the majority answers it, or follows
 the leader the majority elected meanwhile. The other side, if it is a majority, elects a new leader and
@@ -240,12 +249,13 @@ coordinator; to shorten it (or lower the drift), restart the coordinators one at
 old lease length after each restart, so no coordinator reports a lease ended by the new, shorter
 length while a grant of the old length runs.
 
-Changing the number of coordinators (all restarted with the new `peers`, see *Limits of this
-version*): each grant names its sender's coordinator count, and a primary needs a majority of the
+Changing the coordinators (`COORDINATOR ADD`/`REMOVE`, see *Adding and removing coordinators*):
+each grant names its sender's coordinator count, and a primary needs a majority of the
 largest count among its running grants. Adding coordinators raises the bar at once. After removing
 some, the grants of the larger count keep the higher bar until they end, at most `primary_lease_ms`
 after the last one was sent; until then the primary refuses writes unless a majority of the old count
-still grants it. To avoid that pause, turn `primary-lease` off on the data nodes for the change.
+still grants it. To avoid that pause, turn `primary-lease` off on the data nodes for the change, or
+remove a coordinator only while a majority of the larger set still runs.
 
 Checked with Docker (debug build, `ping_interval_ms` 500, `down_after_ms` 3000, `primary_lease_ms`
 2000, `min-replicas-to-write 1` on every node), the old primary and one replica on one network, the
@@ -305,6 +315,7 @@ unclean_failover = false                # default false: wait for a replica with
 primary_lease_ms = 0                    # default 0 (off); 2000 with the defaults above, see "Primary lease"
 primary_lease_drift_percent = 10        # default 10: how much faster or slower than real time a clock may run; below 100
 auth = "password"                       # how coordinators log in to data nodes; "user password" works too
+join = false                            # true only when adding a coordinator to running ones
 tls_cert = ""                           # default empty: the coordinator port in clear text; see "Security"
 tls_key = ""
 tls_ca = ""                             # CA of the other coordinators' and the data nodes' certificates
@@ -360,7 +371,7 @@ support connects to the coordinators with the group name as the service name:
 | `SENTINEL sentinels group` | The other coordinators |
 | `SUBSCRIBE +switch-master` | `group old-host old-port new-host new-port` on every failover |
 | `ROLE` | `["sentinel", [groups]]` |
-| `INFO` | `coordinator_id`, `leader_id`, `is_leader`, and `group_<name>:primary=…,epoch=…` (with `,recorded=…` (the Raft record) and `,committed=…` (what this coordinator knows) per shard, joined by `/`, once a durable reply was released) |
+| `INFO` | `coordinator_id`, `leader_id`, `is_leader`, `failovers_total` and `last_failover_unix_ms` (failovers this coordinator recorded as the leader, 0 for none), and per group `group_<name>:primary=…,epoch=…,members_answering=n/m` (members that answered on every shard within `down_after_ms`), then `,state=…,state_ms=…` once this coordinator led (`ok`, `lease_running`: the primary is down and its lease has not ended for a majority, `waiting`: no replica holds every committed record, `no_candidate`: no replica can take over; on a follower, as of when it last led), `,lease_grant_ms=…` with `primary_lease_ms` (since this coordinator last granted the primary a lease, -1 for never), and `,recorded=…` (the Raft record) and `,committed=…` (what this coordinator knows) per shard, joined by `/`, once a durable reply was released |
 | `AUTH secret` | Required first when `secret` is set; `NOAUTH` otherwise |
 
 Checked with redis-py's `Sentinel` (5.2): it discovers the primary, writes through it, and writes to
@@ -439,15 +450,19 @@ receive ranges this way. One move runs at a time.
 
 1. The leader records the move (Raft), then tells the target group's primary to expect the range on that
    shard (`RUVIO MIGRATE IMPORT`) and the source group's primary to send it (`RUVIO MIGRATE EXPORT`).
-2. The source copies the range to the target shard over its client port, in batches, then the keys
-   written meanwhile, until few are left. Clients keep using the source.
-3. The source freezes the range: its commands get `TRYAGAIN`, which every Ruvio client retries after 5,
-   10 and 20 ms. It sends the last changes and the target syncs them to its log. The source then keeps
-   the frozen range on disk (`MIGRATE_OUT`), so a restart cannot serve it again on its own.
-4. The leader waits until the target's connected replicas hold the prepared copy (at most 10 s, or the
-   move is cancelled and started again), commits the move only if neither group failed over since it
-   began, and sends the new map to the target's primary, then the source's, then
-   every other member. The target serves the range; the source answers `MOVED` naming the target and
+2. The source copies the range to the target shard over its client port, in batches. It then waits
+   until the target's connected replicas hold what was copied (`RUVIO MIGRATE REPLICAS`, at most 10 s),
+   and sends the keys written meanwhile, until few are left. Clients keep using the source.
+3. The source freezes the range: its commands get `TRYAGAIN`, which every Ruvio client retries for
+   635 ms (7 retries, waits doubling from 5 ms). It sends the last changes and the target syncs them to
+   its log. The source then keeps the frozen range on disk (`MIGRATE_OUT`), so a restart cannot serve
+   it again on its own. If the target does not finish within one second of the freeze (a busy disk),
+   the source serves the range again and the leader starts the move again, as after a failover.
+4. The leader, asking every 10 ms, waits until the target's connected replicas hold the prepared copy
+   (at most 10 s, or the move is cancelled and started again), commits the move only if neither group
+   failed over since it began, and sends the new map to the target's primary, then the source's, then
+   every other member. The target gets it first because until then it redirects the range back to
+   the source. The target serves the range; the source answers `MOVED` naming the target and
    drops its copy in bounded steps. Each range of the new map names its shard (`"100-199@0"`), so the
    other ranges stay on the shards that hold their data.
 
@@ -457,11 +472,40 @@ ends the running move before its commit, and the source serves the range again (
 in Raft before the nodes are told, so a late cancel never undoes a committed move). Send cancels to the
 coordinators, not with `RUVIO MIGRATE CANCEL` to the nodes. Before a failover the leader sends the
 newest map to the replica it promotes. A failover of either
-group before the commit cancels the move and starts it again with the new primaries (up to three
-times); a new leader takes over a move its predecessor began. After the commit nothing undoes the move:
+group before the commit, or a target too slow to prepare, cancels the move and starts it again (with
+the new primaries after a failover; up to three starts); a new leader takes over a move its predecessor began. After the commit nothing undoes the move:
 move the range back with another `COORDINATOR MOVE`. The copy rate of a source is capped by
 `migration_max_bytes_per_sec` in its configuration (0, the default, means no cap); the frozen hand-over
 is never slowed down. Nodes need durability `memory`, `everysec` or `always` (not `snapshot`).
+
+The range is frozen from step 3 until the source gets the new map. Measured locally (debug build, one
+Mac running other builds, two groups of a primary and a replica with durability `always`, 303 keys,
+one client writing the range throughout, 5 runs): the writer saw `TRYAGAIN` for 168-237 ms (median
+170 ms). Before the source waited for the target's replicas the same test froze for 1.30-1.73 s, most
+of it the target's replica syncing the copy record by record. The time grows with the keys written
+during the freeze, not with the size of the range. Not measured on release builds or real machines.
+
+## Adding and removing coordinators
+
+The coordinators that vote are the ones in the Raft record; `peers` in the file is only the first
+membership, proposed on the very first start. Majorities (failovers, the lease, `SENTINEL` `quorum`)
+count the recorded coordinators, and `INFO` lists them as `coordinators:id@host:port,…`.
+
+To add one, give it its own `id`, `listen` and an empty `data_dir`, `join = true`, and the same
+`secret`, groups and settings as the others (`peers` must list at least itself), start it, then on the
+leader:
+
+```text
+COORDINATOR ADD 4 ruvio-4:26400
+```
+
+It catches up as a learner and then votes; the command answers `OK` once the change is committed
+(at most 30 s; a coordinator that is not running with `join = true` is refused). To remove one,
+`COORDINATOR REMOVE 3` on the leader, then stop it; a coordinator that is already down can be removed
+the same way. One change at a time, and keep an odd number: four survive the loss of one, like three.
+Without `join = true` a new coordinator would propose `peers` as a membership of its own; with it, it
+waits to be added. A coordinator that starts with `peers` different from the record logs a warning and
+uses the record.
 
 ## Upgrading
 
@@ -547,8 +591,6 @@ releases side by side, so the refused handshake itself was not part of the run. 
 ## Limits of this version
 
 - Groups are declared in the file; replicas are not discovered from the primary yet.
-- The coordinators do not change membership at run time (adding a coordinator means restarting all of
-  them with the new `peers`).
 - Ranges move only when an operator asks (`COORDINATOR MOVE`); nothing rebalances by load yet.
 
 ## Tests

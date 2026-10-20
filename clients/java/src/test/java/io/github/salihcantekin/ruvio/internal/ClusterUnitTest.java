@@ -491,15 +491,18 @@ class ClusterUnitTest {
 
     @Test
     @Timeout(20)
-    void tryAgainFourTimesReturnsTheErrorAfterThreeRetries() throws Exception {
+    void tryAgainEightTimesReturnsTheErrorAfterSevenRetries() throws Exception {
         Pair p = new Pair();
         RuvioClient<String, String> c = p.client();
         String k = p.key(true, 0);
         p.a.node.handler = a -> a.get(0).equalsIgnoreCase("GET")
                 ? FakeNode.error("TRYAGAIN slot is being moved") : p.a.handle(a);
+        long started = System.nanoTime();
         RuvioServerException e = assertThrows(RuvioServerException.class, () -> c.get(k));
+        long waitedMs = (System.nanoTime() - started) / 1_000_000;
         assertEquals("TRYAGAIN", e.code());
-        assertEquals(4, p.a.commands("GET").size(), "sent once plus three retries");
+        assertEquals(8, p.a.commands("GET").size(), "sent once plus seven retries");
+        assertTrue(waitedMs >= 630, "waited " + waitedMs + " ms, want 5 + 10 + 20 + 40 + 80 + 160 + 320");
     }
 
     @Test

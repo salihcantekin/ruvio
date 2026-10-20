@@ -323,7 +323,7 @@ async def test_tryagain_is_retried_after_a_short_sleep(kind, make, fc):
     await c.aclose()
 
 
-async def test_tryagain_four_times_gives_the_error_after_three_retries(kind, make, fc):
+async def test_tryagain_eight_times_gives_the_error_after_seven_retries(kind, make, fc):
     k = key_in(8192, 16383)
     cluster = fc(extra={"GET": lambda cl_, node, args: err("TRYAGAIN slot is being handed over")})
     c = bounded(kind, make, cluster.nodes[0].addr)
@@ -331,8 +331,8 @@ async def test_tryagain_four_times_gives_the_error_after_three_retries(kind, mak
     with pytest.raises(ruvio.ResponseError, match="^TRYAGAIN") as info:
         await within(c.get(k))
     assert not isinstance(info.value, ruvio.MovedError)
-    assert time.monotonic() - t0 >= 0.034  # 5 + 10 + 20 ms
-    assert len(cluster.nodes[1].commands("GET")) == 4
+    assert time.monotonic() - t0 >= 0.634  # 5 + 10 + 20 + 40 + 80 + 160 + 320 ms
+    assert len(cluster.nodes[1].commands("GET")) == 8
     await c.aclose()
 
 

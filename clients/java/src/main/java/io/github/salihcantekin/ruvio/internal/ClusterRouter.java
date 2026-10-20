@@ -44,8 +44,11 @@ public final class ClusterRouter implements AutoCloseable {
     public static final int SLOTS = 16384;
     /** MOVED redirects followed per command (each to the node the reply names) before the error is returned. */
     public static final int MAX_REDIRECTS = 3;
-    /** Sends again after {@code TRYAGAIN} per command (waiting 5, 10 and 20 ms) before the error is returned. */
-    public static final int MAX_TRYAGAIN = 3;
+    /**
+     * Sends again after {@code TRYAGAIN} per command (waiting 5, 10, 20, 40, 80, 160 and 320 ms, 635 ms in all:
+     * a slot range moving between nodes is frozen for a few hundred milliseconds) before the error is returned.
+     */
+    public static final int MAX_TRYAGAIN = 7;
     /** The wait before the first {@code TRYAGAIN} retry; it doubles for each further one. */
     private static final long TRYAGAIN_WAIT_MS = 5;
     private static final byte[] ASKING = "*1\r\n$6\r\nASKING\r\n".getBytes(java.nio.charset.StandardCharsets.US_ASCII);

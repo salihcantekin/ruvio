@@ -133,6 +133,10 @@ struct FileConfig {
     node_tls: bool,
     #[serde(default)]
     groups: Vec<Group>,
+    /// Joining a running set of coordinators: wait to be added with `COORDINATOR ADD` instead
+    /// of proposing `peers` as the first membership.
+    #[serde(default)]
+    join: bool,
 }
 
 fn default_ping_interval_ms() -> u64 {
@@ -180,6 +184,8 @@ pub struct CoordinatorConfig {
     pub secret: Option<String>,
     pub tls: TlsSettings,
     pub groups: Vec<Group>,
+    /// Waits to be added to running coordinators instead of starting a new set.
+    pub join: bool,
 }
 
 /// The coordinator's TLS files; everything off by default.
@@ -353,10 +359,12 @@ impl CoordinatorConfig {
                 .filter(|secret| !secret.is_empty()),
             tls: TlsSettings::parse(file.tls_cert, file.tls_key, file.tls_ca, file.node_tls)?,
             groups: file.groups,
+            join: file.join,
         })
     }
 
-    /// How many coordinators make a majority.
+    /// How many of the coordinators in `peers` make a majority; once running, the Raft
+    /// membership counts instead.
     pub fn quorum(&self) -> usize {
         self.peers.len() / 2 + 1
     }

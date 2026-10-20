@@ -41,6 +41,10 @@ struct Group {
     resp: Vec<SocketAddr>,
     replication: Vec<SocketAddr>,
     coordinators: Vec<SocketAddr>,
+    /// A free address for a coordinator that joins later.
+    spare: SocketAddr,
+    /// Shards per data node; shard i of a node listens on its ports plus i.
+    shards: u16,
     /// Data nodes serve only TLS on their RESP ports when set.
     tls: Option<TestTls>,
     _ports: (test_ports::PortBlock, test_ports::PortBlock),
@@ -48,13 +52,25 @@ struct Group {
 
 impl Group {
     fn new() -> Self {
+        Self::with_shards(1)
+    }
+
+    fn with_shards(shards: u16) -> Self {
         let data = test_ports::reserve();
         let replication = test_ports::reserve();
 
         Self {
-            resp: (0..3).map(|index| data.address_at(index)).collect(),
-            replication: (0..3).map(|index| replication.address_at(index)).collect(),
-            coordinators: (3..6).map(|index| data.address_at(index)).collect(),
+            resp: (0..3)
+                .map(|index| data.address_at(index * shards))
+                .collect(),
+            replication: (0..3)
+                .map(|index| replication.address_at(index * shards))
+                .collect(),
+            coordinators: (0..3)
+                .map(|index| data.address_at(3 * shards + index))
+                .collect(),
+            spare: data.address_at(3 * shards + 3),
+            shards,
             tls: None,
             _ports: (data, replication),
         }
@@ -111,6 +127,7 @@ impl Group {
                 "RUVIO_REPLICATION_LISTEN",
                 self.replication[index].to_string(),
             )
+            .env("RUVIO_SHARDS", self.shards.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         match follow {
@@ -206,8 +223,33 @@ impl Group {
         )
     }
 
+    /// `args` on whichever coordinator takes it as the leader.
+    fn on_leader(&self, args: &[&str]) -> Option<String> {
+        self.coordinators.iter().find_map(|coordinator| {
+            call_with_secret(&coordinator.to_string(), args).filter(|reply| {
+                !reply.starts_with("ERR not the leader")
+                    && !reply.starts_with("ERR no leader")
+                    && !reply.starts_with("ERR this leader")
+            })
+        })
+    }
+
+    /// `INFO` of the coordinator that answers as the leader.
+    fn leader_info(&self) -> Option<String> {
+        self.coordinators.iter().find_map(|coordinator| {
+            call_with_secret(&coordinator.to_string(), &["INFO"])
+                .filter(|info| info.contains("is_leader:1\r\n"))
+        })
+    }
+
     /// The primary coordinator `index` names, as an index into the data nodes.
     fn primary_by(&self, index: usize) -> Option<usize> {
+        self.primary_among(index, &self.resp)
+    }
+
+    /// The primary coordinator `index` names, as an index into `addresses`: the data nodes'
+    /// addresses as the coordinators were given them.
+    fn primary_among(&self, index: usize, addresses: &[SocketAddr]) -> Option<usize> {
         let address = self.coordinators[index].to_string();
         let question = ["SENTINEL", "get-master-addr-by-name", "main"];
         let reply = match &self.tls {
@@ -221,7 +263,7 @@ impl Group {
         };
         let port: u16 = reply.split_whitespace().nth(1)?.parse().ok()?;
 
-        self.resp.iter().position(|address| address.port() == port)
+        addresses.iter().position(|address| address.port() == port)
     }
 }
 
@@ -387,6 +429,12 @@ fn coordinators_fail_over_a_dead_primary_and_bring_it_back_as_a_replica() {
     });
     assert_eq!(group.primary_by(1), Some(promoted));
     assert_eq!(group.primary_by(2), Some(promoted));
+    // The leader counts the failover; the old primary no longer answers.
+    let info = group.leader_info().unwrap();
+
+    assert!(info.contains("failovers_total:1\r\n"), "{info}");
+    assert!(!info.contains("last_failover_unix_ms:0\r\n"), "{info}");
+    assert!(info.contains(",members_answering=2/3,state=ok,"), "{info}");
 
     // The old primary returns as a writer and is made a replica of the new one.
     nodes[0] = group.node(dir.path(), 0, None);
@@ -599,6 +647,13 @@ fn a_replica_missing_a_committed_record_is_promoted_only_when_forced() {
     for index in 0..3 {
         assert_eq!(group.primary_by(index), Some(0));
     }
+    let info = group.leader_info().unwrap();
+
+    assert!(info.contains("failovers_total:0\r\n"), "{info}");
+    assert!(
+        info.contains(",members_answering=1/3,state=waiting,"),
+        "{info}"
+    );
     assert!(
         call(&returned, &["SET", "x", "1"])
             .unwrap()
@@ -630,6 +685,10 @@ fn a_replica_missing_a_committed_record_is_promoted_only_when_forced() {
         call(&returned, &["SET", "after", "1"]).as_deref() == Some("OK")
     });
     assert_eq!(call(&returned, &["GET", "kept"]).as_deref(), Some("(nil)"));
+    let info = group.leader_info().unwrap();
+
+    assert!(info.contains("failovers_total:1\r\n"), "{info}");
+    assert!(info.contains(",state=ok,"), "{info}");
 }
 
 /// The committed sequences are in Raft: after the primary and the only replica holding a
@@ -913,19 +972,31 @@ fn a_failover_in_one_group_moves_the_redirects_of_the_others() {
 struct TwoGroups {
     resp: Vec<SocketAddr>,
     coordinator: String,
-    processes: Vec<Process>,
+    processes: Vec<Option<Process>>,
+    _stand_ins: Vec<StandIn>,
     _ports: (test_ports::PortBlock, test_ports::PortBlock),
 }
 
 impl TwoGroups {
     /// `env`: extra settings of every data node.
     fn start(dir: &Path, env: &[(&str, &str)]) -> Self {
+        Self::start_with(dir, env, |_, _| None)
+    }
+
+    /// Like [`TwoGroups::start`], but node `index` is whatever `stand_in(index, address)`
+    /// starts when it returns `Some`.
+    fn start_with(
+        dir: &Path,
+        env: &[(&str, &str)],
+        stand_in: impl Fn(usize, SocketAddr) -> Option<StandIn>,
+    ) -> Self {
         let data = test_ports::reserve();
         let replication = test_ports::reserve();
         let resp: Vec<SocketAddr> = (0..4).map(|index| data.address_at(index)).collect();
         let repl: Vec<SocketAddr> = (0..4).map(|index| replication.address_at(index)).collect();
         let coordinator = data.address_at(4);
         let topology = dir.join("topology.toml");
+        let mut stand_ins = Vec::new();
 
         std::fs::write(
             &topology,
@@ -940,8 +1011,12 @@ impl TwoGroups {
             ),
         )
         .unwrap();
-        let mut processes: Vec<Process> = (0..4)
+        let mut processes: Vec<Option<Process>> = (0..4)
             .map(|index| {
+                if let Some(stand_in) = stand_in(index, resp[index]) {
+                    stand_ins.push(stand_in);
+                    return None;
+                }
                 let group = if index < 2 { "a" } else { "b" };
                 let mut command = Command::new(env!("CARGO_BIN_EXE_ruvio"));
 
@@ -965,7 +1040,7 @@ impl TwoGroups {
                 let process = Process(command.spawn().unwrap());
 
                 wait_until("a data node to answer", || ping(&resp[index].to_string()));
-                process
+                Some(process)
             })
             .collect();
         let members = |first: usize| {
@@ -994,7 +1069,7 @@ impl TwoGroups {
             ),
         )
         .unwrap();
-        processes.push(Process(
+        processes.push(Some(Process(
             Command::new(env!("CARGO_BIN_EXE_ruvio"))
                 .arg("coordinator")
                 .arg("--config")
@@ -1003,12 +1078,13 @@ impl TwoGroups {
                 .stderr(Stdio::null())
                 .spawn()
                 .unwrap(),
-        ));
+        )));
 
         let groups = Self {
             resp,
             coordinator: coordinator.to_string(),
             processes,
+            _stand_ins: stand_ins,
             _ports: (data, replication),
         };
 
@@ -1070,6 +1146,10 @@ fn a_slot_range_moves_between_groups_while_a_client_keeps_writing() {
 
         std::thread::spawn(move || {
             let (mut acked, mut retried) = (0u64, 0u64);
+            // From the first `TRYAGAIN` of a write to its `OK`: how long a caller waits
+            // while the range is frozen.
+            let mut frozen: Option<std::time::Instant> = None;
+            let mut longest = Duration::ZERO;
 
             for value in 1u64.. {
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
@@ -1079,17 +1159,25 @@ fn a_slot_range_moves_between_groups_while_a_client_keeps_writing() {
                     match call(&address, &["SET", &busy, &value.to_string()]).as_deref() {
                         Some("OK") => {
                             acked = value;
+                            if let Some(since) = frozen.take() {
+                                longest = longest.max(since.elapsed());
+                            }
                             break;
                         }
                         Some(reply) if reply.starts_with("MOVED") => address = b.clone(),
                         Some(reply) if reply.starts_with("TRYAGAIN") => {
                             retried += 1;
+                            frozen.get_or_insert_with(std::time::Instant::now);
                             std::thread::sleep(Duration::from_millis(5));
                         }
                         other => panic!("unexpected reply {other:?}"),
                     }
                 }
             }
+            eprintln!(
+                "move freeze seen by a writer: {:.1} ms over {retried} TRYAGAIN replies",
+                longest.as_secs_f64() * 1000.0
+            );
             (acked, retried, address)
         })
     };
@@ -1206,7 +1294,7 @@ fn a_failover_of_the_source_during_a_move_starts_it_again_with_the_new_primary()
         call(&groups.node(0), &["RUVIO", "MIGRATE", "STATUS"])
             .is_some_and(|status| status.contains("state copying"))
     });
-    groups.processes[0].kill();
+    groups.processes[0].as_mut().unwrap().kill();
 
     wait_until("the move to finish with a's new primary", || {
         call_with_secret(&groups.coordinator, &["COORDINATOR", "STATUS"])
@@ -1525,6 +1613,258 @@ fn a_stalled_member_does_not_hold_up_the_primary_lease() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(writes > 20, "only {writes} writes in four seconds");
+}
+
+/// A data node that answers what the coordinators ask when they look at it (`ROLE` as a
+/// replica of nobody in the group, one shard, map version 3) and never answers anything else,
+/// such as `REPLICAOF`: a member stuck after it was seen.
+struct StandIn {
+    address: SocketAddr,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl StandIn {
+    fn start(address: SocketAddr) -> Self {
+        let listener = std::net::TcpListener::bind(address).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = std::sync::Arc::clone(&stop);
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                let Ok(stream) = stream else { continue };
+                let stopped = std::sync::Arc::clone(&stopped);
+
+                std::thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                    let mut writer = stream.try_clone().unwrap();
+                    let mut reader = BufReader::new(stream);
+
+                    while !stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                        let Some(words) = read_command(&mut reader) else {
+                            continue;
+                        };
+                        let words: Vec<String> =
+                            words.iter().map(|word| word.to_ascii_uppercase()).collect();
+                        let reply: &[u8] = match words.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+                            ["PING"] => b"+PONG\r\n",
+                            ["ROLE"] => {
+                                b"*5\r\n$5\r\nslave\r\n$9\r\n127.0.0.1\r\n:1\r\n$9\r\nconnected\r\n:0\r\n"
+                            }
+                            ["CONFIG", "GET", "SHARDS"] => b"*2\r\n$6\r\nshards\r\n$1\r\n1\r\n",
+                            ["INFO", ..] => b"$0\r\n\r\n",
+                            ["RUVIO", "TOPOLOGY", "VERSION"] => b":3\r\n",
+                            // Stuck: read on, answer nothing.
+                            _ => continue,
+                        };
+                        if writer.write_all(reply).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        Self { address, stop }
+    }
+}
+
+impl Drop for StandIn {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Wakes the accept loop so it sees the flag and drops the listener.
+        let _ = std::net::TcpStream::connect_timeout(&self.address, Duration::from_millis(300));
+    }
+}
+
+/// One RESP command (an array of bulk strings); `None` on a timeout or anything else.
+fn read_command(reader: &mut impl BufRead) -> Option<Vec<String>> {
+    let mut line = String::new();
+
+    reader.read_line(&mut line).ok()?;
+    let count: usize = line.trim_end().strip_prefix('*')?.parse().ok()?;
+    let mut words = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        line.clear();
+        reader.read_line(&mut line).ok()?;
+        let length: usize = line.trim_end().strip_prefix('$')?.parse().ok()?;
+        let mut word = vec![0; length + 2];
+
+        reader.read_exact(&mut word).ok()?;
+        word.truncate(length);
+        words.push(String::from_utf8_lossy(&word).into_owned());
+    }
+    Some(words)
+}
+
+/// Each group is tended on its own task: a member of group `a` that answers the coordinator's
+/// looks but never its `REPLICAOF` holds up only group `a`, and group `b` still fails over
+/// within about `down_after`. Before, one such member held every group for ten seconds a tick.
+#[test]
+fn a_stuck_member_of_one_group_does_not_delay_a_failover_in_another() {
+    let dir = tempfile::tempdir().unwrap();
+    // Node 1, group a's replica, is stuck.
+    let mut groups = TwoGroups::start_with(dir.path(), &[], |index, address| {
+        (index == 1).then(|| StandIn::start(address))
+    });
+
+    // A few ticks in which the leader tries to point the stuck member at group a's primary.
+    std::thread::sleep(Duration::from_millis(600));
+    let killed = Instant::now();
+
+    groups.processes[2].as_mut().unwrap().kill();
+    wait_until("group b's replica to take over", || {
+        call(&groups.node(3), &["ROLE"]).is_some_and(|role| role.starts_with("master"))
+    });
+    let took = killed.elapsed();
+
+    // down_after is 1 s; a tick, the coordinators' verdict and the promotion fit in the rest.
+    assert!(
+        took < Duration::from_secs(4),
+        "group b failed over {took:?} after its primary died"
+    );
+}
+
+/// A primary one of whose shards the coordinators cannot reach is not heard from: they fail it
+/// over as if it were down, and do not promote a replica with a shard they cannot reach.
+#[test]
+fn a_primary_with_one_shard_cut_off_is_failed_over() {
+    primary_with_one_shard_cut_off(false);
+}
+
+/// With the lease, the coordinators stop renewing such a primary, so its lease ends and the
+/// failover goes ahead.
+#[test]
+fn with_the_lease_a_primary_with_one_shard_cut_off_is_failed_over() {
+    primary_with_one_shard_cut_off(true);
+}
+
+fn primary_with_one_shard_cut_off(lease: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let group = Group::with_shards(2);
+    let ports = test_ports::reserve();
+    let shard =
+        |address: SocketAddr, offset: u16| SocketAddr::new(address.ip(), address.port() + offset);
+    // The coordinators reach node 0's two shards through these.
+    let proxies = [
+        Proxy::start(ports.address_at(0), group.resp[0]),
+        Proxy::start(ports.address_at(1), shard(group.resp[0], 1)),
+    ];
+    let env = [("RUVIO_PRIMARY_LEASE", if lease { "yes" } else { "no" })];
+    let extra = if lease {
+        "primary_lease_ms = 700\nprimary_lease_drift_percent = 5"
+    } else {
+        ""
+    };
+    let _nodes = [
+        group.node_with(dir.path(), 0, None, &env),
+        group.node_with(dir.path(), 1, Some(0), &env),
+        group.node_with(dir.path(), 2, Some(0), &env),
+    ];
+    let mut addresses = group.resp.clone();
+
+    addresses[0] = ports.address_at(0);
+    let _coordinators: Vec<Process> = (0..3)
+        .map(|index| group.coordinator_with(dir.path(), index, extra, &addresses, None))
+        .collect();
+
+    wait_until("the coordinators to agree on node 0", || {
+        group.primary_among(0, &addresses) == Some(0)
+    });
+    // Shard 0 still answers through its proxy; shard 1 no longer does.
+    proxies[1].cut();
+    wait_until("a replica to be promoted", || {
+        matches!(group.primary_among(0, &addresses), Some(1 | 2))
+    });
+    let promoted = group.primary_among(0, &addresses).unwrap();
+
+    wait_until("the promoted replica to take writes on both shards", || {
+        (0..2).all(|offset| {
+            call(&shard(group.resp[promoted], offset).to_string(), &["ROLE"])
+                .is_some_and(|role| role.starts_with("master"))
+        })
+    });
+}
+
+/// A coordinator joins running ones with `COORDINATOR ADD` and one leaves with `COORDINATOR
+/// REMOVE`; failovers need a majority of the coordinators as they are now, not as `peers`
+/// listed them at the first start.
+#[test]
+fn coordinators_are_added_and_removed_while_they_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut group = Group::new();
+    let mut nodes = [
+        group.node(dir.path(), 0, None),
+        group.node(dir.path(), 1, Some(0)),
+        group.node(dir.path(), 2, Some(0)),
+    ];
+    let mut coordinators: Vec<Process> = (0..3)
+        .map(|index| group.coordinator(dir.path(), index))
+        .collect();
+
+    wait_until("the coordinators to agree on the primary", || {
+        (0..3).all(|index| group.primary_by(index) == Some(0))
+    });
+
+    // A fourth coordinator (id 4) starts with `join = true` and is added.
+    group.coordinators.push(group.spare);
+    coordinators.push(group.coordinator_with(dir.path(), 3, "join = true", &group.resp, None));
+    let spare = group.spare.to_string();
+
+    wait_until("the leader to add coordinator 4", || {
+        group
+            .on_leader(&["COORDINATOR", "ADD", "4", &spare])
+            .as_deref()
+            == Some("OK")
+    });
+    wait_until(
+        "every coordinator to count four and the new one to know the primary",
+        || {
+            group.primary_by(3) == Some(0)
+                && group.coordinators.iter().all(|coordinator| {
+                    call_with_secret(&coordinator.to_string(), &["INFO"]).is_some_and(|info| {
+                        info.lines()
+                            .find_map(|line| line.strip_prefix("coordinators:"))
+                            .is_some_and(|list| list.split(',').count() == 4)
+                    })
+                })
+        },
+    );
+
+    // Two of four are no majority: with coordinators 2 and 3 down, a dead primary stays.
+    coordinators[1].kill();
+    coordinators[2].kill();
+    nodes[0].kill();
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(group.primary_by(0), Some(0));
+    assert_eq!(group.primary_by(3), Some(0));
+
+    // Three of four are: coordinator 2 returns and the group fails over.
+    coordinators[1] = group.coordinator(dir.path(), 1);
+    wait_until("a failover with three of four coordinators", || {
+        group.primary_by(0).is_some_and(|node| node != 0)
+    });
+    let first = group.primary_by(0).unwrap();
+
+    wait_until("every live coordinator to name the new primary", || {
+        [0, 1, 3]
+            .iter()
+            .all(|&index| group.primary_by(index) == Some(first))
+    });
+
+    // Coordinator 3, still down, is removed: three vote, so two of them are a majority.
+    wait_until("the leader to remove coordinator 3", || {
+        group.on_leader(&["COORDINATOR", "REMOVE", "3"]).as_deref() == Some("OK")
+    });
+    coordinators[0].kill();
+    nodes[first].kill();
+    wait_until("a failover with two of three coordinators", || {
+        group
+            .primary_by(3)
+            .is_some_and(|node| node != 0 && node != first)
+    });
 }
 
 /// A test CA and one certificate it signed for 127.0.0.1, used by every process of a group.

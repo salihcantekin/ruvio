@@ -278,6 +278,61 @@ public class FollowFailoverTests
     }
 
     [Fact(Timeout = 30000)]
+    public async Task TheRefusingReplicaIsTakenOnceItIsPromoted()
+    {
+        using var node = new FailoverNode(Master);
+        using var other = new FailoverNode(Replica());
+        (RuvioConnection connection, RuvioClient client) = await OpenAsync(Options(node.Port, other.Port));
+
+        await using RuvioConnection owner = connection;
+
+        node.BecomeMode(new NodeMode(NodeKind.Promoted));
+
+        // The first round finds it a replica and no other primary; the next round finds it promoted and the write
+        // is sent there again.
+        await client.SetAsync("k", "v");
+        Assert.Equal((2, 0), (node.Seen("SET"), other.Seen("SET")));
+        Assert.Equal(2, node.Seen("ROLE"));
+    }
+
+    [Fact(Timeout = 30000)]
+    public async Task ARefusingNodeThatStillSaysMasterIsNeverTaken()
+    {
+        using var liar = new FailoverNode(Master);
+        using var other = new FailoverNode(Replica());
+        (RuvioConnection connection, RuvioClient client) = await OpenAsync(Options(liar.Port, other.Port));
+
+        await using RuvioConnection owner = connection;
+
+        liar.BecomeMode(new NodeMode(NodeKind.Liar));
+
+        await ReadOnlyAsync(async () => await client.SetAsync("k", "v"));
+
+        // Every round (MaxReconnectAttempts) asked it and passed it over.
+        Assert.Equal((1, 3), (liar.Seen("SET"), liar.Seen("ROLE")));
+    }
+
+    [Fact(Timeout = 30000)]
+    public async Task ACoordinatorNamingTheRefusingReplicaIsFollowedOnceItIsPromoted()
+    {
+        using var coordinator = new FailoverNode(new NodeMode(NodeKind.Names));
+        using var node = new FailoverNode(Master);
+        RuvioClientOptions options = Options(coordinator.Port);
+
+        coordinator.BecomeMode(new NodeMode(NodeKind.Names, node.Port));
+        options.SentinelMaster = "main";
+
+        (RuvioConnection connection, RuvioClient client) = await OpenAsync(options);
+
+        await using RuvioConnection owner = connection;
+
+        node.BecomeMode(new NodeMode(NodeKind.Promoted));
+
+        await client.SetAsync("k", "v");
+        Assert.Equal(2, node.Seen("SET"));
+    }
+
+    [Fact(Timeout = 30000)]
     public async Task AWriteRefusedInsideATransactionFollowsButIsNotSentAgain()
     {
         using var old = new FailoverNode(Master);

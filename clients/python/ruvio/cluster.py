@@ -100,7 +100,7 @@ class ClusterRuvio(Ruvio):
       (``pipeline(transaction=True)``) must use one slot; ``watch`` pins the node.
     * ``MOVED`` and ``ASK`` replies are followed up to 3 times per command in all (a Ruvio server forwards
       instead of sending ``MOVED`` for keys, so this matters for other topologies); ``ASK`` sends ``ASKING`` first
-      and does not change the slot table. ``TRYAGAIN`` is retried up to 3 times after short sleeps (single commands; a pipeline gets it as that
+      and does not change the slot table. ``TRYAGAIN`` is retried up to 7 times after sleeps doubling from 5 ms to 320 ms (single commands; a pipeline gets it as that
       command's error).
     * A node socket that fails is closed and reopened by the next command for that node. A command that
       hit a transport failure is never sent again.

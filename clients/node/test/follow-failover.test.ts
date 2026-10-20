@@ -17,7 +17,9 @@ type Mode =
   /** Says master but refuses writes anyway. */
   | { kind: 'liar' }
   /** A coordinator that names this primary. */
-  | { kind: 'names'; port: number };
+  | { kind: 'names'; port: number }
+  /** A replica promoted right after it answers its first ROLE. */
+  | { kind: 'promoted' };
 
 const MASTER: Mode = { kind: 'master' };
 const REPLICA: Mode = { kind: 'replica' };
@@ -57,11 +59,15 @@ async function start(initial: Mode): Promise<Node> {
     if (name === 'CLUSTER') return err('ERR This instance has cluster support disabled');
     if (name === 'ROLE') {
       if (mode.kind === 'master' || mode.kind === 'liar') return arr(bulk('master'), int(0), arr());
+      if (mode.kind === 'promoted') {
+        mode = MASTER;
+        return arr(bulk('slave'), bulk('127.0.0.1'), int(0), bulk('connected'), int(0));
+      }
       if (mode.kind === 'replica') return arr(bulk('slave'), bulk('127.0.0.1'), int(mode.primary ?? 0), bulk('connected'), int(0));
       return err('ERR unknown command');
     }
     if (name === 'SENTINEL') return mode.kind === 'names' ? arr(bulk('127.0.0.1'), bulk(String(mode.port))) : '*-1\r\n';
-    if ((mode.kind === 'replica' || mode.kind === 'liar') && WRITES.has(name)) return err(READONLY);
+    if ((mode.kind === 'replica' || mode.kind === 'liar' || mode.kind === 'promoted') && WRITES.has(name)) return err(READONLY);
     if (name === 'PING') return '+PONG\r\n';
     if (name === 'GET') return '$-1\r\n';
     if (name === 'INCR') return int(1);
@@ -276,6 +282,43 @@ test('a write refused twice is not sent a third time', () =>
     assert.deepEqual([old.count('SET'), liar.count('SET')], [1, 1]);
     // No round for the retry: only the one for the first refusal asked ROLE.
     assert.equal(liar.count('ROLE'), 1);
+  }));
+
+test('the refusing replica is taken once it is promoted', () =>
+  scenario(async () => {
+    const node = await start(MASTER);
+    const other = await start(REPLICA);
+    const c = connect([node.port, other.port]);
+    await c.ping();
+    node.become({ kind: 'promoted' });
+    // The first round finds it a replica and no other primary; the next round finds it promoted
+    // and sends the write there again.
+    assert.equal(await c.set('k', 'v'), 'OK');
+    assert.deepEqual([node.count('SET'), other.count('SET')], [2, 0]);
+    assert.deepEqual([node.count('ROLE'), other.count('ROLE')], [2, 2]);
+  }));
+
+test('a refusing node that still says master is not taken again', () =>
+  scenario(async () => {
+    const liar = await start(MASTER);
+    const other = await start(REPLICA);
+    const c = connect([liar.port, other.port], { reconnect: false });
+    await c.ping();
+    liar.become({ kind: 'liar' });
+    await readonly(c.set('k', 'v'));
+    assert.deepEqual([liar.count('SET'), liar.count('ROLE')], [1, 1]);
+  }));
+
+test('a coordinator naming the refusing replica is followed once it is promoted', () =>
+  scenario(async () => {
+    const coordinator = await start({ kind: 'names', port: 0 });
+    const node = await start(MASTER);
+    coordinator.become({ kind: 'names', port: node.port });
+    const c = connect([coordinator.port], { sentinelMaster: 'main' });
+    await c.ping();
+    node.become({ kind: 'promoted' });
+    assert.equal(await c.set('k', 'v'), 'OK');
+    assert.equal(node.count('SET'), 2);
   }));
 
 test('a write refused inside a transaction follows but is not sent again', () =>

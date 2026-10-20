@@ -23,6 +23,9 @@ from test_failover_live import IO_TIMEOUT, Address, Raw, is_master
 
 # The coordinators notice the kill after down_after_ms (1 s) and promote within a few ticks.
 PATIENCE = 15.0
+# Each client's first write after the kill comes within this, the seeds client included: the replica that
+# refused is taken once it is promoted, not after the rounds run out (about 7 s).
+FOLLOW_BOUND = 5.0
 
 
 def addresses(name: str) -> List[Address]:
@@ -99,6 +102,8 @@ async def test_clients_reach_the_new_primary_after_the_coordinators_fail_over():
             *(write_async(name) for name in asynchronous),
         )
         print("first write after the kill:", {name: f"{s:.2f} s" for name, s in zip([*sync, *asynchronous], took)})
+        for name, s in zip([*sync, *asynchronous], took):
+            assert s < FOLLOW_BOUND, f"{name}: the first write took {s:.2f} s"
 
         assert on_new.send("ROLE")[0] == "master"
         for key in keys.values():
