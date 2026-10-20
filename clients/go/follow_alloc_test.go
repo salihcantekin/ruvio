@@ -13,7 +13,8 @@ import (
 // A client that follows a failover (two Seeds, following on) allocates exactly what a
 // single-seed client allocates per command while the connection is healthy, and keeps no
 // state that grows with the number of commands. Runs against the failover pair that
-// scripts/run_with_servers.sh starts (RUVIO_FAILOVER_ADDRS, primary first); skipped without it.
+// scripts/run_with_servers.sh starts (RUVIO_FAILOVER_ADDRS); skipped without it. The live failover
+// test swaps the pair's roles, so the primary is the node that answers ROLE with master now.
 
 func TestFollowAllocsMatchSingleSeed(t *testing.T) {
 	pair, _ := followPair(t)
@@ -28,7 +29,10 @@ func TestFollowAllocsMatchSingleSeed(t *testing.T) {
 		t.Cleanup(func() { c.Close() })
 		return c
 	}
-	// The first seed is the primary; both clients talk to it.
+	// The primary first; both clients talk to it.
+	if !rawIsMaster(rawCmd(t, pair[0], "ROLE")) {
+		pair[0], pair[1] = pair[1], pair[0]
+	}
 	single := connect(pair[:1])
 	following := connect(pair[:])
 	if single.follow || !following.follow {

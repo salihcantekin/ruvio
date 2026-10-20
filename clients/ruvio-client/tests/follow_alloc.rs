@@ -1,7 +1,8 @@
 //! A client that follows a failover (two seeds, `follow_primary` on) allocates exactly what a
 //! single-seed client allocates per command while the connection is healthy, and keeps no state
 //! that grows with the number of commands. Runs against the failover pair that
-//! `scripts/run_with_servers.sh` starts (`RUVIO_FAILOVER_ADDRS`, primary first); skipped without it.
+//! `scripts/run_with_servers.sh` starts (`RUVIO_FAILOVER_ADDRS`); skipped without it. `failover_live`
+//! swaps the pair's roles, so the primary is the node that answers `ROLE` with `master` now.
 //!
 //! This binary has its own counting global allocator. Everything lives in one test so no other
 //! test thread allocates while a loop is measured.
@@ -10,7 +11,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
-use ruvio_client::{Client, ClientOptions};
+use ruvio_client::{Client, ClientOptions, RespValue};
 
 struct Counting;
 
@@ -108,6 +109,24 @@ fn seeds() -> Option<Vec<(String, u16)>> {
     Some(seeds)
 }
 
+/// Moves the node that answers `ROLE` with `master` to the front.
+fn primary_first(mut seeds: Vec<(String, u16)>) -> Vec<(String, u16)> {
+    let is_master = |seed: &(String, u16)| {
+        let role = connect(std::slice::from_ref(seed)).role().expect("ROLE");
+
+        matches!(
+            role.as_array().and_then(|items| items.first()),
+            Some(RespValue::Bulk(kind)) if kind == b"master"
+        )
+    };
+
+    if let Some(at) = seeds.iter().position(is_master) {
+        seeds.swap(0, at);
+    }
+
+    seeds
+}
+
 #[test]
 fn following_client_allocates_like_a_single_seed_client() {
     let Some(seeds) = seeds() else {
@@ -116,7 +135,8 @@ fn following_client_allocates_like_a_single_seed_client() {
         return;
     };
 
-    // The first seed is the primary; both clients talk to it.
+    // The primary first; both clients talk to it.
+    let seeds = primary_first(seeds);
     let mut single = connect(&seeds[..1]);
     let mut following = connect(&seeds);
     let value = "v".repeat(32);

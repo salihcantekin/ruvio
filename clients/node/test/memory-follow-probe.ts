@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Measurements for memory-follow.test.ts. It runs as its own process (node --expose-gc with a large young
 // generation) so that a garbage collection can be forced and does not fall inside a measured loop; it prints
-// one JSON object on stdout. Modes: `alloc` and `retain` need live servers (RUVIO_FAILOVER_ADDRS, primary
-// first), `failover` uses scripted nodes.
+// one JSON object on stdout. Modes: `alloc` and `retain` need live servers (RUVIO_FAILOVER_ADDRS, either
+// node the primary), `failover` uses scripted nodes.
 
 import * as net from 'node:net';
 import { performance, PerformanceObserver } from 'node:perf_hooks';
@@ -52,8 +52,19 @@ function addrs(): string[] {
   return list.split(',');
 }
 
-function open(following: boolean): RuvioClient {
+/** The pair, the primary first: the live failover test swaps the roles on these servers and may have run before. */
+async function primaryFirst(): Promise<string[]> {
   const all = addrs();
+  const probe = new RuvioClient({ seeds: [all[0]!], commandTimeoutMs: 5000, connectTimeoutMs: 2000 });
+  try {
+    const [role] = await probe.role();
+    return role === 'master' ? all : [all[1]!, all[0]!];
+  } finally {
+    probe.disconnect();
+  }
+}
+
+function open(all: string[], following: boolean): RuvioClient {
   return new RuvioClient({ seeds: following ? all : [all[0]!], commandTimeoutMs: 5000, connectTimeoutMs: 2000 });
 }
 
@@ -89,9 +100,10 @@ async function workload(c: RuvioClient, rounds: number): Promise<void> {
 async function alloc(): Promise<unknown> {
   const out: Record<string, number[]> = { seqSingle: [], seqFollow: [], batchSingle: [], batchFollow: [] };
   const keys = Array.from({ length: 50 }, (_, i) => 'mem:k' + i);
+  const all = await primaryFirst();
   for (let round = 0; round < 4; round++) {
     for (const following of [false, true]) {
-      const c = open(following);
+      const c = open(all, following);
       await c.set('mem:a', 'value-12345');
       for (let i = 0; i < 60; i++) await c.get('mem:a'), await Promise.all(keys.map((k) => c.get(k)));
       const seq = await perOp(500, 2, async () => {
@@ -112,8 +124,9 @@ async function alloc(): Promise<unknown> {
 
 async function retain(): Promise<unknown> {
   const result: Record<string, unknown> = {};
+  const all = await primaryFirst();
   for (const following of [false, true]) {
-    const c = open(following);
+    const c = open(all, following);
     await workload(c, 60);
     const marks: number[] = [await settled()];
     for (let step = 0; step < 3; step++) {
