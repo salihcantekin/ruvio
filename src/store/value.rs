@@ -395,12 +395,6 @@ impl SemaphoreValue {
     }
 }
 
-/// First token of a new semaphore. Later tokens count up from it. Starting from the clock keeps
-/// a token issued before the key expired from matching a holder after it is created again.
-pub(crate) fn first_semaphore_token(now: u64) -> u64 {
-    (now << 20).max(1)
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseValue {
     pub(crate) token: u64,

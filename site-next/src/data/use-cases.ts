@@ -29,7 +29,7 @@ LIMIT api:key-7 10 1000 TOKENS COST 2 WITHRETRY
     title: "Locks, leader election and fencing",
     problem: "One worker at a time holds a named resource; others get a null reply until it frees or expires.",
     code: `LEASE job:nightly-report 30000
-# 17    -> you hold it, token 17
+# token -> you hold it
 # (nil) -> someone else holds it
 RENEW job:nightly-report 17 30000
 # 1     -> deadline moved to now + 30 s (0 if the token no longer holds it)

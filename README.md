@@ -113,14 +113,14 @@ These commands run on the shard that owns the key. A key that never uses them st
 
 | Command | What it replaces a second system for |
 | --- | --- |
-| `LEASE` / `RELEASE` | A fencing token for one key. The shard is the holder. Expiry and `RELEASE` keep the token, so the next grant continues the sequence. The grant is a WAL record. `GET` of a lease is `WRONGTYPE`. |
+| `LEASE` / `RELEASE` | A fencing token for one key. The shard is the holder. Tokens only grow: after expiry, `RELEASE`, `DEL`, a restart, a failover or a slot move, the next grant is larger. The grant is a WAL record. `GET` of a lease is `WRONGTYPE`. |
 | `SEMAPHORE` / `RELEASE` | At most N holders at once, each with its own TTL. A crashed holder frees its slot when its TTL passes. The first holder stays in the object; each further holder is 16 bytes. The key goes away with the last one. |
 | `INCRBY ... MAX` | A counter that never passes a capacity. A refused call returns nil and changes nothing, so no compensating `DECR`. |
 | `SETV` | A conditional string write. The call succeeds only when the caller still has the current version, so two clients cannot both turn 12 into 11. The version exists only on keys written with `SETV`. |
 | `CHANGES` | `CHANGES START` arms an in-memory feed of later `SET`, `SETV`, `LEASE`, and `RELEASE` notes on that shard. Nothing is recorded before `START`. The feed is not the WAL, and it is empty after restart. |
 | `XADD DELAY` | The stream entry is stored now. `XREADGROUP` skips it until the delay passes. `XREAD` can still see it. The hold is a WAL record and a snapshot trailer, and it is written only when a delay is set. |
 
-`DEL` of a lease starts the next token at 1. `SET` replaces a versioned string with a plain string. `INCR` does not accept a versioned string.
+`SET` replaces a versioned string with a plain string. `INCR` does not accept a versioned string.
 
 ## Performance
 

@@ -23,6 +23,7 @@ mod arena_table;
 mod bloom;
 mod evict;
 mod expire;
+mod fence;
 mod fill;
 mod hash;
 mod intset;
@@ -379,6 +380,13 @@ pub struct KvShard<C = SystemClock, I = AHashIndex> {
     /// `None` until `CHANGES START`. Mutations do not record while this is absent.
     change_log: Option<std::collections::VecDeque<ChangeNote>>,
     change_next: u64,
+    /// Generation in the high bits of new `LEASE` and `SEMAPHORE` tokens.
+    fence_generation: u64,
+    /// Highest token of `fence_generation` this shard granted or applied.
+    fence_last: u64,
+    /// Highest token of a later generation applied before this shard learned it (a log
+    /// replayed before the epoch was read); taken over when that generation is set.
+    fence_ahead: u64,
     /// Log drain round in progress; `None` while every log is dense enough.
     reclaim: Option<Box<ReclaimWalk>>,
 }
@@ -440,6 +448,9 @@ impl Default for KvShard<SystemClock, AHashIndex> {
             notify: crate::notify::NotifyState::default(),
             change_log: None,
             change_next: 0,
+            fence_generation: 0,
+            fence_last: 0,
+            fence_ahead: 0,
             reclaim: None,
         }
     }
@@ -500,6 +511,9 @@ impl KvShard<SystemClock, AHashIndex> {
             notify: crate::notify::NotifyState::default(),
             change_log: None,
             change_next: 0,
+            fence_generation: 0,
+            fence_last: 0,
+            fence_ahead: 0,
             reclaim: None,
         };
 
@@ -561,6 +575,9 @@ impl<C: Clock> KvShard<C, AHashIndex> {
             notify: crate::notify::NotifyState::default(),
             change_log: None,
             change_next: 0,
+            fence_generation: 0,
+            fence_last: 0,
+            fence_ahead: 0,
             reclaim: None,
         };
 
@@ -632,6 +649,9 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
             notify: crate::notify::NotifyState::default(),
             change_log: None,
             change_next: 0,
+            fence_generation: 0,
+            fence_last: 0,
+            fence_ahead: 0,
             reclaim: None,
         };
 

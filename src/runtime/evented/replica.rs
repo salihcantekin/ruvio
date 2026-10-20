@@ -25,6 +25,7 @@ pub(super) fn attach_replication(
             let lineage = writer_lineage(state, shard_id)?;
 
             state.epoch.set(lineage.origin.epoch);
+            raise_fence(state);
             spawn_shipper(state, shard_id, lineage)
         }
 
@@ -402,6 +403,7 @@ pub(super) fn promote(state: &ShardState, shard_id: u32, force: bool) -> io::Res
     }
 
     state.epoch.set(lineage.origin.epoch);
+    raise_fence(state);
     let shipper = spawn_shipper(state, shard_id, lineage)?;
     state.role.set(if shipper.is_some() {
         crate::config::ReplicationRole::Primary
@@ -481,6 +483,22 @@ pub(super) fn demote(
 /// 65535 is an error; wrapping around would bind or dial a port nobody configured.
 /// Stops a primary shard taking writes once a replica has shown it a newer epoch: another
 /// primary replaced this one. It stays fenced until the process restarts or changes role.
+/// Raises the generation of new `LEASE` and `SEMAPHORE` tokens to this shard's epoch or the
+/// cluster map's version, whichever is higher. A coordinator's map version grows with every
+/// failover and every committed move, so tokens keep growing when a range changes groups.
+pub(super) fn raise_fence(state: &ShardState) {
+    let map = state
+        .forwarding
+        .as_ref()
+        .and_then(|forwarding| forwarding.fabric.topology())
+        .map_or(0, |shared| shared.get().version);
+
+    state
+        .store
+        .borrow_mut()
+        .set_fence_generation(state.epoch.get().max(map));
+}
+
 pub(super) fn fence_if_replaced(state: &ShardState) {
     if state.write_gate.get() == crate::replication::WriteGate::Open
         && state.newer_epoch.load(Ordering::Acquire) > state.epoch.get()
