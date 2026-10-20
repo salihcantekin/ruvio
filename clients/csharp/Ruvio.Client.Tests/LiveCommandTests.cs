@@ -628,9 +628,10 @@ public sealed class LiveCommandTests(ITestOutputHelper output)
         Assert.Equal("128", (await db.GetConfigAsync("slowlog-max-len")).Items![1].AsString());
         await Assert.ThrowsAsync<RuvioException>(async () => await db.SetConfigAsync([("shards", "2")]));
         Assert.Equal("master", (await db.GetRoleAsync()).Items![0].AsString());
-        // The live server keeps no WAL, so it cannot replicate: both forms are refused unchanged.
+        // The live server keeps no WAL, so it cannot replicate: these are refused unchanged.
         await Assert.ThrowsAsync<RuvioException>(async () => await db.ReplicaOfAsync("127.0.0.1", 1));
         await Assert.ThrowsAsync<RuvioException>(async () => await db.ReplicaOfNoOneAsync());
+        await Assert.ThrowsAsync<RuvioException>(async () => await db.SetDurabilityAsync(1));
 
         // Only on a throwaway server: CONFIG REWRITE rewrites the server's config file.
         if (RewritesConfig)

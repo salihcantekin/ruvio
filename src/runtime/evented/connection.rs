@@ -615,8 +615,13 @@ pub(super) async fn handle_client(
                 )
                 .await?;
                 if session.durability.is_some() {
-                    super::durable::hold_until_durable(&state, &mut session, &mut output, &shutdown)
-                        .await?;
+                    super::durable::hold_until_durable(
+                        &state,
+                        &mut session,
+                        &mut output,
+                        &shutdown,
+                    )
+                    .await?;
                 }
                 flush_output(&mut stream, &mut output, timeouts.write, &state).await?;
                 batch_commands = 0;
@@ -635,8 +640,13 @@ pub(super) async fn handle_client(
                 )
                 .await?;
                 if session.durability.is_some() {
-                    super::durable::hold_until_durable(&state, &mut session, &mut output, &shutdown)
-                        .await?;
+                    super::durable::hold_until_durable(
+                        &state,
+                        &mut session,
+                        &mut output,
+                        &shutdown,
+                    )
+                    .await?;
                 }
                 let unsent = flush_ready(&mut stream, &mut output, timeouts.write, &state).await?;
 
@@ -1318,7 +1328,8 @@ pub(super) async fn handle_client(
         }
 
         if session.durability.is_some() {
-            super::durable::hold_until_durable(&state, &mut session, &mut output, &shutdown).await?;
+            super::durable::hold_until_durable(&state, &mut session, &mut output, &shutdown)
+                .await?;
         }
         flush_output(&mut stream, &mut output, timeouts.write, &state).await?;
         input.release_idle();
