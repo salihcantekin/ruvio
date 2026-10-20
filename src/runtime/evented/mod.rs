@@ -193,6 +193,9 @@ struct ShardState {
     durable_acks: Arc<crate::replication::DurableAcks>,
     /// Committed sequence and waiting durable replies, shipped to replicas.
     durable_replies: Arc<crate::replication::DurableReplies>,
+    /// The primary lease from the coordinators (`primary-lease`): shared by every shard of
+    /// the process, read on the maintenance tick only.
+    primary_lease: Arc<crate::primary_lease::LeaseTable>,
 }
 
 impl ShardState {
@@ -1219,13 +1222,14 @@ async fn serve_async(
         role: Cell::new(config.replication.role),
         followed: RefCell::new(None),
         replication: RefCell::new(None),
-        write_gate: Cell::new(
-            if config.replication.role == crate::config::ReplicationRole::Replica {
-                crate::replication::WriteGate::Replica
-            } else {
-                crate::replication::WriteGate::Open
-            },
-        ),
+        write_gate: Cell::new(match config.replication.role {
+            crate::config::ReplicationRole::Replica => crate::replication::WriteGate::Replica,
+            // Closed until a majority of the coordinators grant the lease.
+            crate::config::ReplicationRole::Primary if config.replication.primary_lease => {
+                crate::replication::WriteGate::NoLease
+            }
+            _ => crate::replication::WriteGate::Open,
+        }),
         epoch: Cell::new(0),
         newer_epoch: Arc::new(AtomicU64::new(0)),
         replica_resync_sequence: Arc::new(AtomicU64::new(if incomplete && !force {
@@ -1275,6 +1279,9 @@ async fn serve_async(
         peak_pubsub_queue_bytes: Rc::new(Cell::new(0)),
         tls,
         single_port: std_listener.is_none() && fabric.is_some(),
+        primary_lease: fabric
+            .as_ref()
+            .map_or_else(Arc::default, |fabric| Arc::clone(&fabric.lease)),
         forwarding: fabric.map(|fabric| Forwarding::new(fabric, shard_id as usize)),
         route,
         cluster,

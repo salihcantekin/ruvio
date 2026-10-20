@@ -576,6 +576,12 @@ pub enum RpcRequest {
     Observe {
         group: String,
     },
+    /// [`RpcRequest::Observe`] and, per member, how long ago this coordinator may last have
+    /// granted it the primary lease, in milliseconds. Sent only with `primary_lease_ms`;
+    /// coordinators before it cannot decode it.
+    Leases {
+        group: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -584,6 +590,10 @@ pub enum RpcResponse {
     Vote(Result<VoteResponse<NodeId>, RaftError<NodeId>>),
     Snapshot(Result<InstallSnapshotResponse<NodeId>, RaftError<NodeId, InstallSnapshotError>>),
     Observe(Vec<Option<u64>>),
+    Leases {
+        heard: Vec<Option<u64>>,
+        granted: Vec<u64>,
+    },
 }
 
 /// What a coordinator sends on a call: the shared secret, then the request.

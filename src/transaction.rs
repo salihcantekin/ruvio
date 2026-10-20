@@ -295,6 +295,7 @@ fn queueable(command: &Command<'_>) -> bool {
             | Command::ReplicaOf { .. }
             | Command::MoveSlots(_)
             | Command::Topology(_)
+            | Command::PrimaryLease(_)
             | Command::Migrate(_)
             | Command::Role
             | Command::Bgsave

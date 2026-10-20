@@ -42,6 +42,7 @@ mod notices;
 mod notify;
 mod output;
 pub mod persistence;
+mod primary_lease;
 pub mod protocol;
 mod pubsub;
 mod replication;

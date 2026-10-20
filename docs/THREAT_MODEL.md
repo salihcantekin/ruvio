@@ -262,7 +262,11 @@ the default quota).
    topology and take part in failover decisions; with it set, calls without the
    secret are refused and clients must `AUTH`. The secret is sent in clear text:
    keep coordinators on a private network. The coordinators' data-node user
-   (`auth`) needs only `ROLE`, `INFO`, `CONFIG GET` and `REPLICAOF`.
+   (`auth`) needs only `ROLE`, `INFO`, `CONFIG GET` and `REPLICAOF` (and `RUVIO`
+   for a multi-node cluster or `primary_lease_ms`).
+9. Anyone allowed `ruvio|lease` (`@admin`) can renew a primary's lease with
+   `primary-lease` on, keeping an old primary taking writes after the
+   coordinators replaced it. Allow it only to the coordinators' user.
 
 ## Operator checklist
 

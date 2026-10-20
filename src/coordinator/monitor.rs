@@ -45,11 +45,16 @@ pub enum Role {
     Replica(Option<String>),
 }
 
-/// Every member's latest sighting, by group and member index.
+/// Every member's latest sighting, by group and member index, and this coordinator's lease
+/// grants.
 #[derive(Clone, Default)]
-pub struct Sightings(Arc<Mutex<HashMap<(String, usize), Sighting>>>);
+pub struct Sightings(Arc<Mutex<HashMap<(String, usize), Sighting>>>, Grants);
 
 impl Sightings {
+    pub fn grants(&self) -> &Grants {
+        &self.1
+    }
+
     pub fn get(&self, group: &str, member: usize) -> Sighting {
         self.0
             .lock()
@@ -79,6 +84,221 @@ impl Sightings {
     }
 }
 
+/// What this coordinator granted for the primary lease (`primary_lease_ms`): when it last
+/// granted each member, so a failover can wait until the old primary's lease ended.
+#[derive(Clone)]
+pub struct Grants(Arc<GrantBook>);
+
+struct GrantBook {
+    /// A coordinator that just started may have granted before it stopped: it reports every
+    /// lease as granted at its start, and grants nothing for `hold` after it.
+    started: Instant,
+    state: Mutex<GrantState>,
+}
+
+#[derive(Default)]
+struct GrantState {
+    members: HashMap<(String, usize), Granting>,
+    /// Per group, the highest epoch this coordinator granted a lease for.
+    epochs: HashMap<String, u64>,
+}
+
+/// One member's grants from this coordinator.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Granting {
+    /// Taken just before the last `RUVIO LEASE GRANT` was sent, so after the node's BEGIN
+    /// instant the lease counts from.
+    pub last: Option<Instant>,
+    /// After a gap, when granting may resume.
+    pub resume_at: Option<Instant>,
+}
+
+impl Default for Grants {
+    fn default() -> Self {
+        Self(Arc::new(GrantBook {
+            started: Instant::now(),
+            state: Mutex::default(),
+        }))
+    }
+}
+
+/// Whether a coordinator grants a lease for `epoch` to a member it last granted as
+/// `granting` records. It grants on while its grants have no gap longer than `safe` (the
+/// lease counted as ended), and at once for an epoch newer than any it granted in the group.
+/// After a gap it waits `hold` first: it may have told the leader the lease ended, and a
+/// failover recorded meanwhile must reach it before it renews the old primary.
+pub fn may_grant(
+    granting: &mut Granting,
+    newer_epoch: bool,
+    now: Instant,
+    safe: Duration,
+    hold: Duration,
+) -> bool {
+    if newer_epoch
+        || granting
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) <= safe)
+    {
+        granting.resume_at = None;
+        return true;
+    }
+    match granting.resume_at {
+        Some(at) => now >= at,
+        None => {
+            granting.resume_at = Some(now + hold);
+            false
+        }
+    }
+}
+
+/// How long ago a coordinator that started at `started` may last have granted a lease.
+pub fn grant_age(last: Option<Instant>, started: Instant, now: Instant) -> Duration {
+    now.saturating_duration_since(last.map_or(started, |last| last.max(started)))
+}
+
+/// Whether a majority of coordinators report a member's lease ended: its grant age above
+/// `safe`. A coordinator that did not answer counts as one that may still grant it.
+pub fn lease_ended(ages: &[Option<Duration>], safe: Duration, quorum: usize) -> bool {
+    ages.iter()
+        .filter(|age| age.is_some_and(|age| age > safe))
+        .count()
+        >= quorum
+}
+
+impl Grants {
+    /// Decides whether to grant `member` of `group` at `epoch` now; see [`may_grant`].
+    fn decide(
+        &self,
+        group: &str,
+        member: usize,
+        epoch: u64,
+        safe: Duration,
+        hold: Duration,
+    ) -> bool {
+        let now = Instant::now();
+
+        if now < self.0.started + hold {
+            return false;
+        }
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let newer = state
+            .epochs
+            .get(group)
+            .is_none_or(|&granted| epoch > granted);
+        let granting = state.members.entry((group.to_owned(), member)).or_default();
+
+        may_grant(granting, newer, now, safe, hold)
+    }
+
+    /// Records a grant about to be sent.
+    fn record(&self, group: &str, member: usize, epoch: u64) {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let granting = state.members.entry((group.to_owned(), member)).or_default();
+
+        granting.last = Some(Instant::now());
+        granting.resume_at = None;
+        let granted = state.epochs.entry(group.to_owned()).or_default();
+        *granted = (*granted).max(epoch);
+    }
+
+    /// Milliseconds since this coordinator may last have granted each member of `group` a
+    /// lease, as [`RpcRequest::Leases`] reports it.
+    pub fn ages(&self, group: &Group) -> Vec<u64> {
+        let now = Instant::now();
+        let state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
+        (0..group.members.len())
+            .map(|member| {
+                let last = state
+                    .members
+                    .get(&(group.name.clone(), member))
+                    .and_then(|granting| granting.last);
+
+                grant_age(last, self.0.started, now).as_millis() as u64
+            })
+            .collect()
+    }
+}
+
+/// What a ping needs to renew the lease of the agreed primary.
+#[derive(Clone)]
+struct Renewal {
+    grants: Grants,
+    coordinator: u64,
+    voters: u32,
+    epoch: u64,
+    group: String,
+    member: usize,
+    lease: Duration,
+    safe: Duration,
+    hold: Duration,
+}
+
+/// `RUVIO LEASE BEGIN`, then `RUVIO LEASE GRANT` on the same connection. The grant is
+/// recorded before it is sent: once sent it may arrive.
+async fn renew(client: &mut NodeClient, renewal: &Renewal) {
+    let Renewal {
+        grants,
+        group,
+        member,
+        epoch,
+        ..
+    } = renewal;
+
+    if !grants.decide(group, *member, *epoch, renewal.safe, renewal.hold) {
+        return;
+    }
+    let Ok(Value::Integer(token)) = client
+        .call(&[b"RUVIO", b"LEASE", b"BEGIN"], CALL_TIMEOUT)
+        .await
+    else {
+        return;
+    };
+    let words = [
+        token.to_string(),
+        renewal.coordinator.to_string(),
+        renewal.voters.to_string(),
+        epoch.to_string(),
+        renewal.lease.as_millis().to_string(),
+    ];
+
+    grants.record(group, *member, *epoch);
+    match client
+        .call(
+            &[
+                b"RUVIO",
+                b"LEASE",
+                b"GRANT",
+                words[0].as_bytes(),
+                words[1].as_bytes(),
+                words[2].as_bytes(),
+                words[3].as_bytes(),
+                words[4].as_bytes(),
+            ],
+            CALL_TIMEOUT,
+        )
+        .await
+    {
+        Ok(Value::Simple(_)) => {}
+        Ok(Value::Error(error)) => {
+            tracing::debug!(%group, member, %error, "the primary refused a lease grant")
+        }
+        _ => {}
+    }
+}
+
 /// A failover announcement for `+switch-master` subscribers:
 /// `group old-ip old-port new-ip new-port`.
 pub type Switches = broadcast::Sender<String>;
@@ -86,11 +306,24 @@ pub type Switches = broadcast::Sender<String>;
 const CALL_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// Pings one member and reads its role and synced sequence.
-async fn look(member: &Member, auth: Option<&str>, cluster: bool) -> Option<Sighting> {
+async fn look(
+    member: &Member,
+    auth: Option<&str>,
+    cluster: bool,
+    renewal: Option<Renewal>,
+) -> Option<Sighting> {
     let mut client = NodeClient::connect(&member.address, auth, CALL_TIMEOUT)
         .await
         .ok()?;
     let role = client.call(&[b"ROLE"], CALL_TIMEOUT).await.ok()?;
+
+    // The agreed primary's lease, renewed first so the reads below never delay it.
+    if let Some(renewal) = renewal
+        && let Value::Array(Some(items)) = &role
+        && items.first().and_then(Value::text).as_deref() == Some("master")
+    {
+        renew(&mut client, &renewal).await;
+    }
     let mut sighting = Sighting {
         last_ok: Some(Instant::now()),
         ..Sighting::default()
@@ -395,8 +628,11 @@ fn missing(sighting: &Sighting, committed: &[u64]) -> String {
         .join(", ")
 }
 
-/// Pings every member of every group, every `ping_interval`.
-pub async fn watch(config: Arc<CoordinatorConfig>, sightings: Sightings) {
+/// Pings every member of every group, every `ping_interval`, and with `primary_lease_ms`
+/// renews the lease of the member this coordinator's record names as the primary. Each
+/// coordinator grants on its own: the lease holds only while a majority of them do.
+pub async fn watch(config: Arc<CoordinatorConfig>, sightings: Sightings, machine: StateMachine) {
+    let grants = sightings.grants().clone();
     let mut tick = tokio::time::interval(config.ping_interval);
 
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -404,15 +640,35 @@ pub async fn watch(config: Arc<CoordinatorConfig>, sightings: Sightings) {
         tick.tick().await;
         let mut looks = Vec::new();
         let cluster = config.groups.iter().any(|group| group.shards.is_some());
+        let primaries = machine.primaries();
 
         for group in &config.groups {
             for (index, member) in group.members.iter().enumerate() {
                 let auth = config.auth.clone();
                 let member = member.clone();
                 let name = group.name.clone();
+                let renewal = config.primary_lease.and_then(|(lease, safe)| {
+                    let primary = primaries.get(&group.name)?;
+
+                    (primary.member == index).then(|| Renewal {
+                        grants: grants.clone(),
+                        coordinator: config.id,
+                        voters: u32::try_from(config.peers.len()).unwrap_or(u32::MAX),
+                        epoch: primary.epoch,
+                        group: group.name.clone(),
+                        member: index,
+                        lease,
+                        safe,
+                        hold: config.down_after,
+                    })
+                });
 
                 looks.push(tokio::spawn(async move {
-                    (name, index, look(&member, auth.as_deref(), cluster).await)
+                    (
+                        name,
+                        index,
+                        look(&member, auth.as_deref(), cluster, renewal).await,
+                    )
                 }));
             }
         }
@@ -425,43 +681,64 @@ pub async fn watch(config: Arc<CoordinatorConfig>, sightings: Sightings) {
 }
 
 /// Asks every other coordinator how long ago it heard from `primary`; true when a majority
-/// (this one included) has not heard from it within `down_after`.
+/// (this one included) has not heard from it within `down_after`. With `primary_lease_ms` a
+/// majority must also report that its lease ended (see [`lease_ended`]).
 async fn objectively_down(
     config: &CoordinatorConfig,
     sightings: &Sightings,
     group: &Group,
     primary: usize,
 ) -> bool {
+    let grants = sightings.grants();
     let down_after = config.down_after.as_millis() as u64;
     let local = sightings.ages(group)[primary];
     let mut down = usize::from(local.is_none_or(|age| age > down_after));
+    let mut lease_ages = vec![Some(Duration::from_millis(grants.ages(group)[primary]))];
 
     for (id, address) in &config.peers {
         if *id == config.id {
             continue;
         }
-        let request = RpcRequest::Observe {
-            group: group.name.clone(),
+        let group_name = group.name.clone();
+        // A lease needs the newer call, which reports the grants too; coordinators that do
+        // not know it (an older version) answer nothing and count as granting.
+        let request = if config.primary_lease.is_some() {
+            RpcRequest::Leases { group: group_name }
+        } else {
+            RpcRequest::Observe { group: group_name }
         };
-
-        if let Ok(RpcResponse::Observe(ages)) = super::raft::call(
+        let (heard, granted) = match super::raft::call(
             &address.to_string(),
             config.secret.as_deref().unwrap_or(""),
             request,
             CALL_TIMEOUT,
         )
         .await
-            && ages
-                .get(primary)
+        {
+            Ok(RpcResponse::Observe(heard)) => (Some(heard), None),
+            Ok(RpcResponse::Leases { heard, granted }) => (Some(heard), Some(granted)),
+            _ => (None, None),
+        };
+
+        if heard.is_some_and(|ages| {
+            ages.get(primary)
                 .copied()
                 .flatten()
                 .is_none_or(|age| age > down_after)
-        {
+        }) {
             down += 1;
         }
+        lease_ages.push(
+            granted
+                .and_then(|ages| ages.get(primary).copied())
+                .map(Duration::from_millis),
+        );
     }
 
     down >= config.quorum()
+        && config
+            .primary_lease
+            .is_none_or(|(_, safe)| lease_ended(&lease_ages, safe, config.quorum()))
 }
 
 /// The leader's loop: start each group from its configured primary, fail over a primary a
@@ -791,6 +1068,16 @@ pub async fn force_failover(force: Force<'_>, group: &Group) -> Result<String, S
             group.name
         ));
     }
+    // FORCE overrides the wait for committed records, never the lease: promoting while the
+    // old primary may still hold it would let both take writes.
+    if force.config.primary_lease.is_some()
+        && !objectively_down(force.config, force.sightings, group, primary.member).await
+    {
+        return Err(format!(
+            "ERR the primary of {} may still hold its lease; try again once a majority of coordinators saw it end",
+            group.name
+        ));
+    }
     let committed = force
         .commits
         .learn(group, primary, &seen, force.config.down_after);
@@ -918,6 +1205,113 @@ mod tests {
 
     fn following(group: &Group, member: usize) -> Role {
         Role::Replica(Some(group.members[member].replication.to_string()))
+    }
+
+    #[test]
+    fn a_coordinator_grants_on_without_gaps_and_waits_after_one() {
+        let start = Instant::now();
+        let safe = Duration::from_millis(2400);
+        let hold = Duration::from_millis(3000);
+        let ms = Duration::from_millis;
+        let mut granting = Granting::default();
+
+        // Never granted this member at this epoch: wait out the hold first.
+        assert!(!may_grant(&mut granting, false, start, safe, hold));
+        assert!(!may_grant(
+            &mut granting,
+            false,
+            start + ms(2999),
+            safe,
+            hold
+        ));
+        assert!(may_grant(
+            &mut granting,
+            false,
+            start + ms(3000),
+            safe,
+            hold
+        ));
+        granting = Granting {
+            last: Some(start + ms(3000)),
+            resume_at: None,
+        };
+        // Grants follow each other within the safe interval: no wait.
+        assert!(may_grant(
+            &mut granting,
+            false,
+            start + ms(5400),
+            safe,
+            hold
+        ));
+        // A gap longer than it: this coordinator may have reported the lease ended, so it
+        // waits the hold before renewing the same primary.
+        assert!(!may_grant(
+            &mut granting,
+            false,
+            start + ms(5401),
+            safe,
+            hold
+        ));
+        assert_eq!(granting.resume_at, Some(start + ms(8401)));
+        assert!(!may_grant(
+            &mut granting,
+            false,
+            start + ms(8400),
+            safe,
+            hold
+        ));
+        assert!(may_grant(
+            &mut granting,
+            false,
+            start + ms(8401),
+            safe,
+            hold
+        ));
+        // A newer epoch is granted at once: this coordinator learned of the failover.
+        let mut fresh = Granting::default();
+        assert!(may_grant(&mut fresh, true, start, safe, hold));
+        assert_eq!(fresh.resume_at, None);
+    }
+
+    #[test]
+    fn a_failover_waits_for_a_majority_to_see_the_lease_end() {
+        let start = Instant::now();
+        let ms = Duration::from_millis;
+        let safe = ms(2400);
+
+        // Ages count from the last grant, but never from before this coordinator started.
+        assert_eq!(grant_age(None, start, start + ms(500)), ms(500));
+        assert_eq!(
+            grant_age(Some(start + ms(100)), start, start + ms(500)),
+            ms(400)
+        );
+        assert_eq!(
+            grant_age(Some(start - ms(9000)), start, start + ms(500)),
+            ms(500)
+        );
+        assert_eq!(
+            grant_age(Some(start + ms(900)), start, start + ms(500)),
+            ms(0)
+        );
+
+        // Two of three past the safe interval: ended. Exactly at it, or a peer that did not
+        // answer, counts as still granting.
+        assert!(lease_ended(
+            &[Some(ms(2401)), Some(ms(9000)), Some(ms(0))],
+            safe,
+            2
+        ));
+        assert!(!lease_ended(
+            &[Some(ms(2400)), Some(ms(9000)), Some(ms(0))],
+            safe,
+            2
+        ));
+        assert!(!lease_ended(&[Some(ms(2401)), None, None], safe, 2));
+        assert!(lease_ended(
+            &[Some(ms(2401)), None, Some(ms(3000)), Some(ms(5000)), None],
+            safe,
+            3
+        ));
     }
 
     #[test]

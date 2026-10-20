@@ -411,7 +411,15 @@ pub(super) fn promote(state: &ShardState, shard_id: u32, force: bool) -> io::Res
         crate::config::ReplicationRole::Off
     });
     *state.replication.borrow_mut() = shipper;
-    state.write_gate.set(crate::replication::WriteGate::Open);
+    // With `primary-lease` a new primary waits for a majority of the coordinators' grants;
+    // the next maintenance tick opens the gate once they run.
+    state
+        .write_gate
+        .set(if state.live.with(|live| live.replication.primary_lease) {
+            crate::replication::WriteGate::NoLease
+        } else {
+            crate::replication::WriteGate::Open
+        });
     warn!(
         shard_id,
         epoch = lineage.origin.epoch,
@@ -443,6 +451,10 @@ pub(super) fn demote(
     primary_name: Option<(String, u16)>,
 ) -> io::Result<()> {
     state.write_gate.set(crate::replication::WriteGate::Replica);
+    // Grants were for this node as a primary; promoted again, it waits for new ones.
+    state
+        .primary_lease
+        .with(crate::primary_lease::Leases::clear);
     drop(state.replication.borrow_mut().take());
     *state.replica_reader.borrow_mut() = None;
     *state.replica_frames.borrow_mut() = None;
@@ -502,8 +514,14 @@ pub(super) fn raise_fence(state: &ShardState) {
 }
 
 pub(super) fn fence_if_replaced(state: &ShardState) {
-    if state.write_gate.get() == crate::replication::WriteGate::Open
-        && state.newer_epoch.load(Ordering::Acquire) > state.epoch.get()
+    use crate::replication::WriteGate;
+
+    // A primary refusing writes for another reason is fenced too, so it cannot take writes
+    // for one tick when that reason clears.
+    if matches!(
+        state.write_gate.get(),
+        WriteGate::Open | WriteGate::NoReplicas | WriteGate::NoLease
+    ) && state.newer_epoch.load(Ordering::Acquire) > state.epoch.get()
     {
         warn!(
             epoch = state.epoch.get(),
@@ -515,44 +533,107 @@ pub(super) fn fence_if_replaced(state: &ShardState) {
 }
 
 /// `min-replicas-to-write`: a primary shard refuses writes while fewer replicas than that
-/// acknowledged within `min-replicas-max-lag`, and takes them again once enough do. Checked
-/// on the maintenance tick, so the write path reads only the gate.
+/// acknowledged within `min-replicas-max-lag`, and takes them again once enough do. With
+/// `primary-lease` it also refuses them while grants from a majority of the coordinators do
+/// not run. Checked on the maintenance tick, so the write path reads only the gate; with
+/// `primary-lease` off the lease costs one flag read here.
 pub(super) fn gate_on_replicas(state: &ShardState) {
     use crate::replication::WriteGate;
 
     let gate = state.write_gate.get();
 
-    if !matches!(gate, WriteGate::Open | WriteGate::NoReplicas)
-        || state.role.get() != crate::config::ReplicationRole::Primary
+    if !matches!(
+        gate,
+        WriteGate::Open | WriteGate::NoReplicas | WriteGate::NoLease
+    ) || state.role.get() != crate::config::ReplicationRole::Primary
     {
         return;
     }
 
-    let (wanted, max_lag) = state.live.with(|live| {
+    let (wanted, max_lag, lease) = state.live.with(|live| {
         (
             live.replication.min_replicas_to_write,
             live.replication.min_replicas_max_lag,
+            live.replication.primary_lease,
         )
     });
-    let next = if wanted == 0 || state.durable_acks.fresh(max_lag) >= wanted {
+    let next = if lease
+        && !state
+            .primary_lease
+            .with(|leases| leases.holds(Instant::now()))
+    {
+        WriteGate::NoLease
+    } else if wanted == 0 || state.durable_acks.fresh(max_lag) >= wanted {
         WriteGate::Open
     } else {
         WriteGate::NoReplicas
     };
 
     if next != gate {
-        warn!(
-            wanted,
-            max_lag_secs = max_lag.as_secs(),
-            "{}",
-            if next == WriteGate::Open {
-                "enough replicas acknowledge again; taking writes"
-            } else {
+        match next {
+            WriteGate::NoLease => warn!(
+                "the primary lease from the coordinators is not running; refusing writes (primary-lease)"
+            ),
+            WriteGate::NoReplicas => warn!(
+                wanted,
+                max_lag_secs = max_lag.as_secs(),
                 "too few replicas acknowledge; refusing writes (min-replicas-to-write)"
+            ),
+            _ if gate == WriteGate::NoLease => {
+                warn!("a majority of the coordinators renewed the primary lease; taking writes")
             }
-        );
+            _ => warn!(
+                wanted,
+                max_lag_secs = max_lag.as_secs(),
+                "enough replicas acknowledge again; taking writes"
+            ),
+        }
         state.write_gate.set(next);
     }
+}
+
+/// `RUVIO LEASE BEGIN` (`grant` is `None`) and `RUVIO LEASE GRANT ...`, sent by every
+/// coordinator to the primary it agreed on, on every ping. Taken whatever `primary-lease`
+/// says, so the coordinators can renew leases before the nodes start to require them.
+pub(super) fn lease_command(
+    state: &ShardState,
+    grant: Option<&crate::protocol::LeaseGrant>,
+) -> crate::engine::Response<'static> {
+    use crate::engine::Response;
+
+    let now = Instant::now();
+
+    match grant {
+        None => Response::Integer(state.primary_lease.with(|leases| leases.begin(now)) as i64),
+        Some(grant) => match state.primary_lease.with(|leases| {
+            leases.grant(
+                grant.token,
+                grant.coordinator,
+                grant.voters,
+                grant.epoch,
+                Duration::from_millis(grant.lease_ms),
+                now,
+            )
+        }) {
+            Ok(()) => Response::Simple(b"OK"),
+            Err(refused) => Response::Error(refused.message()),
+        },
+    }
+}
+
+/// `INFO replication`'s lease fields: whether `primary-lease` is on, how many coordinators'
+/// grants run, and how long the majority keeps holding.
+pub(super) fn lease_report(state: &ShardState) -> (bool, usize, u128) {
+    let now = Instant::now();
+    let (running, remaining) = state
+        .primary_lease
+        .with(|leases| (leases.count(now).0, leases.remaining(now)));
+
+    (
+        state.live.with(|live| live.replication.primary_lease),
+        running,
+        remaining.as_millis(),
+    )
 }
 
 /// The lineage this shard writes as a writer, settled before it accepts its first write: a

@@ -1513,6 +1513,7 @@ fn plain_command(command: &Command<'_>) -> bool {
                 | Command::ReplicaOf { .. }
                 | Command::MoveSlots(_)
                 | Command::Topology(_)
+                | Command::PrimaryLease(_)
                 | Command::Migrate(_)
                 | Command::Role
                 | Command::Bgsave
@@ -1866,6 +1867,15 @@ async fn dispatch_inner<'s>(
 
             Command::Topology(map) => {
                 super::topology::command(state, map.as_deref(), output)?;
+
+                return Ok(());
+            }
+
+            Command::PrimaryLease(grant) => {
+                write_response(
+                    output,
+                    super::replica::lease_command(state, grant.as_deref()),
+                )?;
 
                 return Ok(());
             }

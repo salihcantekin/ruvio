@@ -125,23 +125,88 @@ How long the window lasts depends on which replicas the old primary still reache
   losing any one replica stops writes in the group.
 
 Writes the old primary took in the window are lost in both shapes. Use `min-replicas-to-write 1` (or
-higher) in every group a coordinator manages, and the number of replicas where a split must stay
-bounded.
+higher) in every group a coordinator manages, and the number of replicas or the primary lease where a
+split must stay bounded.
+
+### Primary lease
+
+With `primary_lease_ms` set on the coordinators and `primary-lease yes` on the data nodes, an old
+primary stops taking writes before a replica is promoted, whatever replicas it still reaches. Both
+are off by default.
+
+- On every ping, each coordinator renews the lease of the member its own record names as the
+  primary, on the connection it pings with: `RUVIO LEASE BEGIN` (the node notes the instant on its
+  own monotonic clock and answers a token), then `RUVIO LEASE GRANT token coordinator voters epoch
+  lease_ms`. The lease runs `lease_ms` from the BEGIN instant, so a grant that arrives late only
+  shortens it. A grant for an older epoch than one the node already holds is refused, and a newer
+  epoch drops the older grants.
+- A primary takes writes only while grants from a majority of the coordinators run. It checks this
+  on the same 100 ms tick as `min-replicas-to-write`, so nothing is added to the commands
+  themselves; otherwise writes get `NOREPLICAS Primary lease expired: too few coordinators renewed
+  it.` (the code clients already handle as `NOREPLICAS`). A primary starts refusing, and so does a
+  promoted replica, until the first grants arrive (one ping after its promotion).
+- A failover waits until a majority of coordinators report that their last grant to the primary is
+  older than the lease stretched by `primary_lease_drift_percent` (default 10) plus 200 ms (two of
+  the node's checks): 2400 ms for a 2000 ms lease. Any majority that granted and any majority that
+  reports the lease ended share a coordinator, so the two cannot overlap. `COORDINATOR FAILOVER group
+  FORCE` waits for this too.
+- A coordinator that went longer than that without granting the primary (it could not reach it, or
+  it just started) waits `down_after_ms` before granting it again, so a failover the leader recorded
+  meanwhile reaches it first. A primary of a newer epoch is granted at once.
+- `primary_lease_ms` must be at least three times `ping_interval_ms` and at most 60000, and the
+  stretched lease plus 200 ms must fit in `down_after_ms`, so detection is not delayed: with the
+  defaults (`ping_interval_ms` 500, `down_after_ms` 3000), `primary_lease_ms = 2000`.
+
+What it assumes and what it does not cover:
+
+- The clocks of the coordinators and data nodes run at rates that differ by less than
+  `primary_lease_drift_percent`. They need not agree on the time.
+- Writes the old primary takes between the cut and the end of its lease (at most `primary_lease_ms`
+  + 0.1 s) are still lost when it rejoins. The lease bounds the window; only `CLIENT DURABILITY
+  REPLICAS` equal to the number of replicas keeps acknowledged writes in every shape below.
+- A primary whose process or VM is paused longer than the lease may, when it resumes, apply the
+  writes it reads before its next check (up to about 100 ms of requests).
+- When a majority of the coordinators are down or cannot reach the primary, every primary stops
+  taking writes after its lease: a coordinator outage becomes a write outage.
+- A coordinator whose Raft log lags behind a failover by longer than `down_after_ms` after it last
+  saw the old primary could renew it.
+
+Turning it on:
+
+1. Upgrade the data nodes (they accept `RUVIO LEASE` and ignore grants while `primary-lease` is off).
+   The coordinators' data-node user needs `RUVIO` (`ruvio|lease`).
+2. Upgrade every coordinator together and set `primary_lease_ms` on all of them. A coordinator of an
+   older version neither grants nor answers the new lease query: a failover then waits for a
+   majority that does (it never promotes on a missing answer), and its missing grants count
+   against the majority.
+3. Check `INFO replication` on the primary: `primary_lease_grants` should equal the number of
+   coordinators and `primary_lease_remaining_ms` stay above 0. Then `CONFIG SET primary-lease yes`
+   on every data node (and `primary_lease = true` in their files, or `RUVIO_PRIMARY_LEASE=yes`).
+
+Done the other way round, the primaries refuse writes until the coordinators grant them.
+
+Checked with Docker (debug build, `ping_interval_ms` 500, `down_after_ms` 3000, `primary_lease_ms`
+2000, `min-replicas-to-write 1` on every node), the old primary and one replica on one network, the
+other replica and the coordinators on another, a client writing to the old primary throughout. Without
+the lease the old primary took writes for the whole partition and about 520 acknowledged writes were
+lost when it rejoined. With it, the old primary refused writes 1.5 seconds after the second
+coordinator lost it, the replica was promoted 1 second after that, and the writes taken before the
+refusal (about 180, including the two seconds the cut took to set up) were lost.
 
 ### What can still lose data
 
 `k` is the `CLIENT DURABILITY REPLICAS` value of the writing connection, `r` the number of replicas in
-the group.
+the group, `L` the `primary_lease_ms`.
 
-| Failure | Writes without `CLIENT DURABILITY` | Writes with `CLIENT DURABILITY REPLICAS k` | What the operator can do |
-| --- | --- | --- | --- |
-| Primary process or machine dies | The last writes it had not shipped are lost (0–1 of about 225 in the test above) | None lost while a replica holding them answers: the coordinators learn the committed value from the primary or from the replicas, and promote only a replica holding it; otherwise the group waits | Use `k` ≥ 1 where a lost write matters; leave `unclean_failover` off |
-| Primary cut off from the coordinators only, its replicas still reach the coordinators | Writes the old primary takes until it learns it was replaced are lost: within `min-replicas-max-lag` + 0.1 s with `min-replicas-to-write` ≥ 1, until the partition heals with 0 | None lost with `k = r`. With smaller `k`, a write acknowledged between the promotion and the moment the replicas are pointed at the new primary can be lost | `min-replicas-to-write 1` or more; `k = r` for writes that must not be lost |
-| Primary and one replica cut off together from the other replicas and the coordinators | The old primary takes writes for the whole partition unless `min-replicas-to-write` = `r`; with `r` it stops within `min-replicas-max-lag` + 0.1 s. Everything it took is lost | With `k < r` acknowledged writes can be lost: the replica that stayed acknowledges them, the coordinators never learn the committed value, and the promoted replica lacks them. With `k = r` none: the old primary cannot get a reply released without the cut-off replica | `min-replicas-to-write` = `r` with `min-replicas-max-lag` well below `down_after_ms` (for example 2 with `down_after_ms` 4000); `k = r` |
-| Every coordinator down | Nothing is lost by it; data nodes keep serving, but a primary that fails meanwhile is not replaced | Same | Run three or five coordinators on different machines; promote by hand with `REPLICAOF NO ONE` while none runs |
-| The primary's process or VM paused longer than `down_after_ms` | A replica is promoted; when the old primary resumes it may take writes until it learns it was replaced (as in the rows above), and they are lost | None lost with `k = r`: the replicas follow the new primary and do not acknowledge the old one | `min-replicas-to-write` ≥ 1 |
-| Clocks running at different rates | Timeouts are measured with each process's own monotonic clock, so a rate difference only shifts when a failover starts | Same | Keep clocks synchronized for the wall-clock deadlines of `IDEM`, `ONCE`, `LIMIT`, `LEASE` and `SEMAPHORE` |
-| Coordinators of different versions | The messages between coordinators carry no version | Same | Upgrade every coordinator of a deployment together |
+| Failure | Without the lease | With the primary lease | Writes with `CLIENT DURABILITY REPLICAS k` | What the operator can do |
+| --- | --- | --- | --- | --- |
+| Primary process or machine dies | The last writes it had not shipped are lost (0–1 of about 225 in the test above) | Same; the failover also waits until the lease counts as ended, which fits in `down_after_ms` | None lost while a replica holding them answers: the coordinators learn the committed value from the primary or from the replicas, and promote only a replica holding it; otherwise the group waits | Use `k` ≥ 1 where a lost write matters; leave `unclean_failover` off |
+| Primary cut off from the coordinators only, its replicas still reach the coordinators | Writes the old primary takes until it learns it was replaced are lost: within `min-replicas-max-lag` + 0.1 s with `min-replicas-to-write` ≥ 1, until the partition heals with 0 | It stops at most `L` + 0.1 s after its last grant, before the promotion; the writes it took until then are lost | None lost with `k = r`. With smaller `k`, a write acknowledged between the promotion and the moment the replicas are pointed at the new primary can be lost (with the lease the old primary has stopped by then) | `min-replicas-to-write 1` or more, or the lease; `k = r` for writes that must not be lost |
+| Primary and one replica cut off together from the other replicas and the coordinators | The old primary takes writes for the whole partition unless `min-replicas-to-write` = `r`; with `r` it stops within `min-replicas-max-lag` + 0.1 s. Everything it took is lost | It stops at most `L` + 0.1 s after its last grant, before the promotion; the writes it took until then are lost | With `k < r` acknowledged writes can be lost (with the lease, only those taken before it stopped): the replica that stayed acknowledges them, the coordinators never learn the committed value, and the promoted replica lacks them. With `k = r` none: the old primary cannot get a reply released without the cut-off replica | The lease; or `min-replicas-to-write` = `r` with `min-replicas-max-lag` well below `down_after_ms` (for example 2 with `down_after_ms` 4000); `k = r` |
+| A majority of coordinators down, or cut off from the primary | Nothing is lost by it; data nodes keep serving, but a primary that fails meanwhile is not replaced | Every primary they cannot renew stops taking writes after `L`; nothing is lost | Same as without the lease | Run three or five coordinators on different machines; without the lease, promote by hand with `REPLICAOF NO ONE` while none runs; with it, `CONFIG SET primary-lease no` on the primary to write without coordinators |
+| The primary's process or VM paused longer than `down_after_ms` | A replica is promoted; when the old primary resumes it may take writes until it learns it was replaced (as in the rows above), and they are lost | The promotion waits for the lease; on resuming, the old primary may apply what it reads before its next check (about 100 ms), and those writes are lost | None lost with `k = r`: the replicas follow the new primary and do not acknowledge the old one | `min-replicas-to-write` ≥ 1, or the lease |
+| Clocks running at different rates | Timeouts are measured with each process's own monotonic clock, so a rate difference only shifts when a failover starts | The lease is safe while the rates differ by less than `primary_lease_drift_percent`; beyond it both primaries can take writes for a moment | Same as without the lease | Keep clocks synchronized (NTP), also for the wall-clock deadlines of `IDEM`, `ONCE`, `LIMIT`, `LEASE` and `SEMAPHORE` |
+| Coordinators of different versions | The messages between coordinators carry no version | Older coordinators neither grant nor report grants: failovers wait for a majority of the new version, and writes stop if fewer than a majority grant | Same as without the lease | Upgrade every coordinator of a deployment together, before turning the lease on |
 
 A `CHANGES SUBSCRIBE` consumer may already have seen records a failover takes back. Its cursor
 carries the generation (the replication epoch) of the log it read, so when it resumes on the new
@@ -175,6 +240,8 @@ secret = "change-me"                    # shared by every coordinator; RUVIO_COO
 ping_interval_ms = 500                  # default 500
 down_after_ms = 3000                    # default 3000
 unclean_failover = false                # default false: wait for a replica with every committed write
+primary_lease_ms = 0                    # default 0 (off); 2000 with the defaults above, see "Primary lease"
+primary_lease_drift_percent = 10        # default 10: how much faster one clock may run than another
 auth = "password"                       # how coordinators log in to data nodes; "user password" works too
 
 [[groups]]
@@ -201,7 +268,8 @@ image; there is nothing extra to download. For a binary install,
   connection, so container names work.
 - On the first start the coordinators record as primary the member that answers `ROLE` as `master`; while
   none or several do, they wait and change nothing.
-- The data-node user in `auth` needs `ROLE`, `INFO`, `CONFIG` (`GET`) and `REPLICAOF`.
+- The data-node user in `auth` needs `ROLE`, `INFO`, `CONFIG` (`GET`) and `REPLICAOF`, and `RUVIO` with
+  `primary_lease_ms`.
 - Put the coordinators on different machines, usually next to the data nodes. Three coordinators survive
   the loss of one; five survive two. A single coordinator works for tests but cannot fail over when it is
   the one that fails.
@@ -313,9 +381,6 @@ is never slowed down. Nodes need durability `memory`, `everysec` or `always` (no
 - Groups are declared in the file; replicas are not discovered from the primary yet.
 - The coordinators do not change membership at run time (adding a coordinator means restarting all of
   them with the new `peers`).
-- No primary leases: an old primary is stopped by `min-replicas-to-write` and the epoch, not by the
-  coordinators, so one cut off together with one of its replicas keeps taking writes unless every
-  replica is required (see *An old primary that keeps taking writes*).
 - Ranges move only when an operator asks (`COORDINATOR MOVE`); nothing rebalances by load yet.
 - The committed sequences a failover must keep live in the coordinators' memory, not in Raft.
 
@@ -326,7 +391,9 @@ is never slowed down. Nodes need durability `memory`, `everysec` or `always` (no
   coordinator, a leader cut off from the other coordinators that neither fails over nor
   corrects a member while it still reaches the data nodes, and the secret; and two groups of a multi-node cluster,
   where a failover in one changes the other's `MOVED` answers, and a range moves from one to the other
-  while a client keeps writing a key of it (every acknowledged write is on the new owner).
+  while a client keeps writing a key of it (every acknowledged write is on the new owner). A primary
+  cut off from the coordinators by a proxy while a client keeps writing to it: with the lease it
+  refuses writes before a replica is promoted, without it it keeps taking them.
 - `tests/multi_node_live.rs`: the node side of a move driven by hand, and a prepared move kept across
   restarts of both nodes until it is cancelled.
 - `scripts/coordinator_faults.py target/debug/ruvio [scenario ...]`: a TCP proxy between the coordinators

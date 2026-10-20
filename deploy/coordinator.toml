@@ -13,6 +13,10 @@ down_after_ms = 3000
 # best one anyway and lose those writes. false (default): wait (COORDINATOR FAILOVER group FORCE
 # overrides once).
 unclean_failover = false
+# Lease each coordinator grants the primary (ms); 0 = off. With the data nodes' primary-lease on, an
+# old primary stops taking writes before a replica is promoted. 2000 fits down_after_ms = 3000; see
+# "Primary lease" in docs/COORDINATOR.md for the order to turn it on.
+primary_lease_ms = 0
 # How coordinators log in to the data nodes (requirepass, or "user password").
 auth = "data-node-password"
 

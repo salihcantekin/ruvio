@@ -101,6 +101,13 @@ struct FileConfig {
     /// reply was released for; those records are lost.
     #[serde(default)]
     unclean_failover: bool,
+    /// Lease each coordinator grants the agreed primary on every ping (`RUVIO LEASE`); 0, the
+    /// default, grants none. Nodes with `primary-lease` on take writes only under it.
+    #[serde(default)]
+    primary_lease_ms: u64,
+    /// How much faster or slower, in percent, a clock may run than another's.
+    #[serde(default = "default_lease_drift_percent")]
+    primary_lease_drift_percent: u64,
     /// Password (or `username password`) the coordinator logs in to data nodes with.
     #[serde(default)]
     auth: Option<String>,
@@ -121,6 +128,22 @@ fn default_down_after_ms() -> u64 {
     3000
 }
 
+fn default_lease_drift_percent() -> u64 {
+    10
+}
+
+/// How often a data node checks its lease (its maintenance tick).
+const NODE_TICK: Duration = Duration::from_millis(100);
+
+/// How long after its last grant a coordinator counts a primary's lease as ended: the lease
+/// stretched by the clock drift, plus the node's check interval and as much again as margin.
+/// A failover waits until a majority of coordinators passed this.
+pub fn lease_safe_interval(lease: Duration, drift_percent: u64) -> Duration {
+    let stretched = lease.as_millis() as u64 * (100 + drift_percent);
+
+    Duration::from_millis(stretched.div_ceil(100)) + NODE_TICK * 2
+}
+
 #[derive(Clone, Debug)]
 pub struct CoordinatorConfig {
     pub id: u64,
@@ -130,6 +153,9 @@ pub struct CoordinatorConfig {
     pub ping_interval: Duration,
     pub down_after: Duration,
     pub unclean_failover: bool,
+    /// The lease granted to primaries, and how long after a grant it is counted as ended
+    /// ([`lease_safe_interval`]); `None` when off.
+    pub primary_lease: Option<(Duration, Duration)>,
     pub auth: Option<String>,
     pub secret: Option<String>,
     pub groups: Vec<Group>,
@@ -164,6 +190,32 @@ impl CoordinatorConfig {
         if file.ping_interval_ms == 0 || file.down_after_ms < file.ping_interval_ms {
             return Err("down_after_ms must be at least ping_interval_ms, which is above 0".into());
         }
+        let primary_lease = if file.primary_lease_ms == 0 {
+            None
+        } else {
+            let lease = Duration::from_millis(file.primary_lease_ms);
+            let safe = lease_safe_interval(lease, file.primary_lease_drift_percent);
+
+            if file.primary_lease_ms < 3 * file.ping_interval_ms {
+                return Err(
+                    "primary_lease_ms must be at least three times ping_interval_ms".into(),
+                );
+            }
+            if file.primary_lease_drift_percent > 100 {
+                return Err("primary_lease_drift_percent must be at most 100".into());
+            }
+            if lease > crate::primary_lease::MAX_LEASE {
+                return Err("primary_lease_ms must be at most 60000".into());
+            }
+            if safe.as_millis() as u64 > file.down_after_ms {
+                return Err(format!(
+                    "down_after_ms must be at least {} with this primary_lease_ms: the lease plus {}% drift and 200 ms",
+                    safe.as_millis(),
+                    file.primary_lease_drift_percent
+                ));
+            }
+            Some((lease, safe))
+        };
         for group in &file.groups {
             if group.members.len() < 2 {
                 return Err(format!(
@@ -217,6 +269,7 @@ impl CoordinatorConfig {
             ping_interval: Duration::from_millis(file.ping_interval_ms),
             down_after: Duration::from_millis(file.down_after_ms),
             unclean_failover: file.unclean_failover,
+            primary_lease,
             auth: file.auth.filter(|auth| !auth.is_empty()),
             secret: std::env::var("RUVIO_COORDINATOR_SECRET")
                 .ok()
@@ -399,6 +452,7 @@ members = [
         assert_eq!(config.ping_interval, Duration::from_millis(500));
         assert_eq!(config.down_after, Duration::from_millis(1000));
         assert!(!config.unclean_failover);
+        assert_eq!(config.primary_lease, None);
         assert_eq!(config.group("main").unwrap().members.len(), 2);
         assert!(config.group("other").is_none());
     }
@@ -537,6 +591,50 @@ members = [
                 .unwrap_err()
                 .contains("slot 16001")
         );
+    }
+
+    #[test]
+    fn a_primary_lease_must_end_before_a_failover_starts() {
+        // 2000 ms stretched by 10% is 2200, plus two node ticks.
+        assert_eq!(
+            lease_safe_interval(Duration::from_millis(2000), 10),
+            Duration::from_millis(2400)
+        );
+        assert_eq!(
+            lease_safe_interval(Duration::from_millis(1001), 10),
+            Duration::from_millis(1302)
+        );
+        let lease = |text: &str| {
+            CoordinatorConfig::parse(&SAMPLE.replace("down_after_ms = 1000", text))
+                .map(|config| config.primary_lease)
+        };
+
+        assert_eq!(
+            lease("down_after_ms = 3000\nprimary_lease_ms = 2000").unwrap(),
+            Some((Duration::from_millis(2000), Duration::from_millis(2400)))
+        );
+        for (text, reason) in [
+            (
+                "down_after_ms = 2000\nprimary_lease_ms = 2000",
+                "at least 2400",
+            ),
+            (
+                "down_after_ms = 3000\nprimary_lease_ms = 1000",
+                "three times ping_interval_ms",
+            ),
+            (
+                "down_after_ms = 3000\nprimary_lease_ms = 2000\nprimary_lease_drift_percent = 101",
+                "at most 100",
+            ),
+            (
+                "down_after_ms = 90000\nprimary_lease_ms = 61000",
+                "at most 60000",
+            ),
+        ] {
+            let error = lease(text).unwrap_err();
+
+            assert!(error.contains(reason), "{text}: {error}");
+        }
     }
 
     #[test]

@@ -78,7 +78,11 @@ async fn serve(
     let (switches, _) = tokio::sync::broadcast::channel(64);
 
     info!(id = config.id, listen = %config.listen, groups = config.groups.len(), "coordinator listening");
-    let watcher = tokio::spawn(monitor::watch(Arc::clone(&config), sightings.clone()));
+    let watcher = tokio::spawn(monitor::watch(
+        Arc::clone(&config),
+        sightings.clone(),
+        machine.clone(),
+    ));
     let moves = migrate::Context {
         config: Arc::clone(&config),
         raft: raft.clone(),
@@ -242,6 +246,16 @@ impl Api {
                     .map(|group| self.sightings.ages(group))
                     .unwrap_or_default(),
             ),
+            RpcRequest::Leases { group } => match self.config.group(&group) {
+                Some(group) => RpcResponse::Leases {
+                    heard: self.sightings.ages(group),
+                    granted: self.sightings.grants().ages(group),
+                },
+                None => RpcResponse::Leases {
+                    heard: Vec::new(),
+                    granted: Vec::new(),
+                },
+            },
         }
     }
 
