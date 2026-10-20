@@ -414,7 +414,8 @@ client = Ruvio(seeds=["10.0.0.9:26379"], sentinel_master="main")             # a
 - **Cost.** A healthy connection sends nothing extra; the error text of a reply is looked at only where error
   replies are already inspected. The only extra sockets are short probes (`AUTH` as configured, one command, one
   reply, bounded by the smaller of `connect_timeout` and `socket_timeout`). While following is active the asyncio
-  client returns a coroutine from each command method instead of a future.
+  client keeps each command's encoded frame on its pending entry (a reference, no copy); command methods still
+  return the connection's future, and a `READONLY` reply is answered from the reader by one shared task.
 - `follow_primary=False` restores the plain seed behavior: `READONLY` is returned as an error and no `ROLE` is
   sent. The Python clients have no connection-lost or connection-restored hooks, so nothing is reported.
 

@@ -576,3 +576,56 @@ def test_role_and_sentinel_replies_are_read_as_documented():
     assert is_readonly(ruvio.ResponseError("READONLY You can't write against a read only replica."))
     assert not is_readonly(ruvio.ResponseError("READONLYX nope"))
     assert not is_readonly(ruvio.ResponseError("LOADING"))
+
+
+async def test_a_following_asyncio_client_returns_the_same_future_as_a_plain_one():
+    import asyncio
+
+    live, other = node("master"), node("replica")
+    try:
+        following = ruvio.asyncio.Ruvio(seeds=seeds(live, other), connect_timeout=1.0)
+        plain = ruvio.asyncio.Ruvio(seeds=seeds(live, other), connect_timeout=1.0, follow_primary=False)
+        try:
+            assert following._st.follow and not plain._st.follow
+            await following.connect()
+            await plain.connect()
+            f1, f2 = following.get("k"), plain.get("k")
+            assert type(f1) is type(f2) and isinstance(f1, asyncio.Future)
+            assert not asyncio.iscoroutine(f1)
+            await asyncio.wait_for(asyncio.gather(f1, f2), DEADLINE)
+        finally:
+            await following.aclose()
+            await plain.aclose()
+    finally:
+        live.close()
+        other.close()
+
+
+async def test_refused_futures_are_completed_in_place_after_one_shared_search():
+    import asyncio
+
+    old, new = node("master"), node("replica")
+    try:
+        c = ruvio.asyncio.Ruvio(seeds=seeds(old, new), connect_timeout=1.0)
+        try:
+            assert await c.ping()
+            become(old, "replica", new)
+            become(new, "master")
+            futs = [c.set("k%d" % i, "v") for i in range(5)]  # pipelined: none awaited yet
+            assert all(type(f) is asyncio.Future for f in futs)
+            done = []
+            futs[0].add_done_callback(lambda f: done.append(f.result()))
+            cancelled = futs[1]
+            cancelled.cancel()
+            res = await asyncio.wait_for(asyncio.gather(*futs[2:]), DEADLINE)
+            assert res == [True, True, True]
+            await asyncio.wait_for(futs[0], DEADLINE)
+            assert done == [True]
+            assert cancelled.cancelled()
+            assert seen(old, "SET") == 5 and seen(new, "SET") == 4
+            assert seen(new, "ROLE") == 1  # one search served every refusal
+        finally:
+            await c.aclose()
+    finally:
+        old.close()
+        new.close()

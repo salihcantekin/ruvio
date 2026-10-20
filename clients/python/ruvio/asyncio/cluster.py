@@ -164,7 +164,7 @@ class ClusterRuvio(Ruvio):
         if proto is None or proto.closed:
             proto = await self._open_node(node)
         fut = proto.loop.create_future()
-        proto.pending.append((fut, conv, dec))
+        proto.pending.append((fut, conv, dec, None))
         proto.send(data)
         return await fut
 
@@ -172,7 +172,7 @@ class ClusterRuvio(Ruvio):
         proto = await _open(node.opts, None)
         try:
             fut = proto.loop.create_future()
-            proto.pending.append((fut, conv, dec))
+            proto.pending.append((fut, conv, dec, None))
             proto.transport.write(data)
             return await fut
         finally:
@@ -190,7 +190,7 @@ class ClusterRuvio(Ruvio):
         fut = proto.loop.create_future()
         n = len(frames)
         idle = not proto.pending and proto.wbuf is None
-        entry = (_Batch(fut, n), None, dec)
+        entry = (_Batch(fut, n), None, dec, None)
         proto.pending.extend([entry] * n)
         data = frames[0] if n == 1 else b"".join(frames)
         if idle:
@@ -430,7 +430,7 @@ class ClusterRuvio(Ruvio):
                     fut.data = data
                     fut.conv = conv
                     fut.dec = dec
-                    proto.pending.append((fut, conv, dec))
+                    proto.pending.append((fut, conv, dec, None))
                     proto.send(data)
                     return fut
         return self._route(conv, data, decode)
@@ -470,7 +470,7 @@ class ClusterRuvio(Ruvio):
         if proto is None or proto.closed:
             proto = await self._open_target(ni, data)
         fut = proto.loop.create_future()
-        proto.pending.append((fut, conv, dec))
+        proto.pending.append((fut, conv, dec, None))
         proto.send(data)
         try:
             return await fut
@@ -648,8 +648,8 @@ class ClusterRuvio(Ruvio):
         try:
             afut = proto.loop.create_future()
             fut = proto.loop.create_future()
-            proto.pending.append((afut, None, dec))
-            proto.pending.append((fut, conv, dec))
+            proto.pending.append((afut, None, dec, None))
+            proto.pending.append((fut, conv, dec, None))
             if blocking:
                 proto.transport.write(cl.ASKING + data)
             else:

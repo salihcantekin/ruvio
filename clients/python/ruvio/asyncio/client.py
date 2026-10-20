@@ -75,13 +75,18 @@ class _Proto(asyncio.BufferedProtocol):
     def __init__(self, parser: Any, loop: asyncio.AbstractEventLoop, on_push: Optional[Callable[[Any], None]]) -> None:
         self.parser = parser
         self.loop = loop
-        self.pending: Deque[Tuple[Any, Conv, bool]] = deque()
+        #: One entry per expected reply: ``(target, conv, decode, frame)``. ``frame`` is the encoded command, kept
+        #: only while following a failover is active so a ``READONLY`` reply can be answered by sending it again.
+        self.pending: Deque[Tuple[Any, Conv, bool, Optional[bytes]]] = deque()
         self.transport: Optional[asyncio.Transport] = None
         self.wbuf: Optional[List[bytes]] = None
         self.wsize = 0
         self.on_push = on_push
         self.closed = False
         self.on_lost: Optional[Callable[["_Proto"], None]] = None
+        #: Following only: called with ``(proto, future, conv, decode, frame, error)`` for a ``READONLY`` reply
+        #: to a command that kept its frame; the future is left pending for the callback to complete.
+        self.on_refused: Optional[Callable[..., None]] = None
         self.lost_exc: Optional[BaseException] = None
 
     # -- transport callbacks -------------------------------------------------
@@ -113,14 +118,17 @@ class _Proto(asyncio.BufferedProtocol):
                 if self.on_push is not None:
                     self.on_push(v)
                 continue
-            target, conv, _ = pending.popleft()
+            target, conv, dec, frame = pending.popleft()
             if target.__class__ is _Batch:
                 target.add(v)
                 continue
             if target.done():  # cancelled by the caller; the reply is dropped
                 continue
             if isinstance(v, ResponseError):
-                target.set_exception(v)
+                if frame is not None and v.code == "READONLY" and self.on_refused is not None:
+                    self.on_refused(self, target, conv, dec, frame, v)
+                else:
+                    target.set_exception(v)
             elif conv is None:
                 target.set_result(v)
             else:
@@ -221,7 +229,7 @@ class _Cursor:
 class _State:
     """Connection state shared by a client and its ``raw`` view."""
 
-    __slots__ = ("opts", "proto", "lock", "loop", "cur", "follow", "mover")
+    __slots__ = ("opts", "proto", "lock", "loop", "cur", "follow", "mover", "refusals", "task")
 
     def __init__(self, opts: _Options) -> None:
         self.cur = _Cursor(opts)
@@ -230,6 +238,9 @@ class _State:
         self.follow = self.cur.following(opts)
         #: Serializes the moves to a primary, so many refused commands run one search.
         self.mover: Optional[asyncio.Lock] = None
+        #: ``READONLY`` replies waiting for the move to a primary, and the one task that serves them.
+        self.refusals: List[Tuple[Any, ...]] = []
+        self.task: Optional["asyncio.Task[None]"] = None
         self.proto: Optional[_Proto] = None
         self.lock: Optional[asyncio.Lock] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -295,7 +306,7 @@ async def _probe(address: Address, opts: _Options, command: str, args: Tuple[Any
         return None
     try:
         fut = proto.loop.create_future()
-        proto.pending.append((fut, None, True))
+        proto.pending.append((fut, None, True, None))
         proto.send(encode(command, args))
         return await asyncio.wait_for(fut, wait)
     except (RuvioError, OSError, ValueError, asyncio.TimeoutError):
@@ -399,7 +410,7 @@ async def _handshake(proto: _Proto, opts: _Options) -> _Proto:
         futs = []
         for conv, data in hs:
             fut = loop.create_future()
-            proto.pending.append((fut, conv, True))
+            proto.pending.append((fut, conv, True, None))
             futs.append(fut)
         proto.transport.write(b"".join(d for _, d in hs))  # type: ignore[union-attr]
         try:
@@ -453,8 +464,7 @@ class Ruvio(Commands):
             the primary, move to it and send the refused command once more (not inside a transaction opened with
             ``multi()``, and never again after a second refusal). Pipelines are not resent. ``False`` keeps the plain
             seed order and returns ``READONLY`` as an error. With one seed and no ``sentinel_master`` nothing changes.
-            A cluster client does not use it. While following is active a command method returns a coroutine
-            instead of a future; await it as usual.
+            A cluster client does not use it.
         sentinel_master: Name of the master to ask coordinators for. The ``seeds`` (or ``host``/``port``) are then
             coordinators: the client asks each with ``SENTINEL get-master-addr-by-name`` and confirms the answer with
             ``ROLE``; the first connect fails with :class:`ruvio.ProtocolError` when none names a primary.
@@ -587,39 +597,72 @@ class Ruvio(Commands):
         if proto is None:
             return self._connect_then(conv, data, decode)
         fut = proto.loop.create_future()
-        proto.pending.append((fut, conv, self._decode if decode is None else decode))
+        # the frame stays on the pending entry only while following; a READONLY reply then resends it
+        proto.pending.append((fut, conv, self._decode if decode is None else decode, data if self._st.follow else None))
         proto.send(data)
-        if self._st.follow:
-            return self._guarded(fut, conv, data, decode, proto)
         return fut
 
-    async def _guarded(self, fut: "asyncio.Future[Any]", conv: Conv, data: bytes, decode: Optional[bool], proto: _Proto) -> Any:
-        """Awaits the reply; a ``READONLY`` error moves the connection to the primary and sends the command once more."""
-        try:
-            return await fut
-        except ResponseError as exc:
-            if exc.code != "READONLY":
-                raise
-            refused = exc
+    def _refused(self, proto: _Proto, fut: "asyncio.Future[Any]", conv: Conv, dec: bool, frame: bytes, exc: ResponseError) -> None:
+        """Reader side of a ``READONLY`` reply: queues the command for the one shared task that finds the
+        primary, moves to it and sends each refused command once more on the original future."""
         st = self._st
-        retry = not st.cur.multi
+        st.refusals.append((proto, fut, conv, dec, frame, exc, not st.cur.multi))
+        if st.task is None:
+            st.task = asyncio.ensure_future(self._follow(), loop=proto.loop)
+
+    async def _follow(self) -> None:
+        st = self._st
+        failed: List[_Proto] = []
+        try:
+            while st.refusals:
+                batch, st.refusals = st.refusals, []
+                failed = []
+                try:
+                    while batch:
+                        item = batch[0]
+                        try:
+                            await self._retry(item, failed)
+                        except Exception as exc:  # noqa: BLE001 - delivered to the caller
+                            if not item[1].done():
+                                item[1].set_exception(exc)
+                        batch.pop(0)
+                finally:
+                    # cancelled or failed mid-way: nobody is left hanging on a future
+                    for item in batch:
+                        if not item[1].done():
+                            item[1].set_exception(item[5])
+        finally:
+            for item in st.refusals:
+                if not item[1].done():
+                    item[1].set_exception(item[5])
+            st.refusals = []
+            st.task = None
+
+    async def _retry(self, item: Tuple[Any, ...], failed: List[_Proto]) -> None:
+        proto, fut, conv, dec, frame, refused, retry = item
+        st = self._st
+        if fut.done():  # cancelled by the caller
+            return
         if st.proto is proto:
-            if not await self._move(proto):
-                raise refused
+            if proto in failed or not await self._move(proto):
+                failed.append(proto)
+                fut.set_exception(refused)
+                return
         elif st.proto is None:
             try:
                 await self.connect()
             except RuvioError:
-                raise refused from None
-        if not retry:
-            raise refused
+                if not fut.done():
+                    fut.set_exception(refused)
+                return
         now = st.proto
-        if now is None:
-            raise refused
-        again = now.loop.create_future()
-        now.pending.append((again, conv, self._decode if decode is None else decode))
-        now.send(data)
-        return await again
+        if fut.done():
+            return
+        if not retry or now is None:
+            fut.set_exception(refused)
+            return
+        now.pending.append((fut, conv, dec, None))  # a second refusal is returned as it is
+        now.send(frame)
 
     async def _move(self, proto: _Proto) -> bool:
         """After a ``READONLY`` reply: rounds that avoid the address that answered, with the backoff between
@@ -662,6 +705,8 @@ class Ruvio(Commands):
                 st.proto = None
 
         proto.on_lost = lost
+        if st.follow:
+            proto.on_refused = self._refused
         st.proto = proto
 
     async def _connect_then(self, conv: Conv, data: bytes, decode: Optional[bool]) -> Any:
@@ -697,7 +742,7 @@ class Ruvio(Commands):
         fut = proto.loop.create_future()
         idle = not proto.pending and proto.wbuf is None
         # one deque slot per expected reply, all feeding the same collector
-        entry = (_Batch(fut, len(payload)), None, self._decode)
+        entry = (_Batch(fut, len(payload)), None, self._decode, None)
         proto.pending.extend([entry] * len(payload))
         data = b"".join(payload)
         if idle:
