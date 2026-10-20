@@ -316,6 +316,10 @@ primary_lease_ms = 0                    # default 0 (off); 2000 with the default
 primary_lease_drift_percent = 10        # default 10: how much faster or slower than real time a clock may run; below 100
 auth = "password"                       # how coordinators log in to data nodes; "user password" works too
 join = false                            # true only when adding a coordinator to running ones
+tls_cert = ""                           # default empty: the coordinator port in clear text; see "Security"
+tls_key = ""
+tls_ca = ""                             # CA of the other coordinators' and the data nodes' certificates
+node_tls = false                        # default false: dial the data nodes with TLS
 
 [[groups]]
 name = "main"
@@ -382,7 +386,26 @@ primary under three coordinators, and the first write through the coordinators l
 The coordinator port carries the Raft traffic and the Sentinel API. With `secret` set, a coordinator
 refuses calls from coordinators that do not send it, and clients must `AUTH` with it. Without `secret`
 anyone who reaches the port can read the topology and send votes: always set it, and keep the port on a
-private network. The secret travels in clear text; use a private network or a tunnel between machines.
+private network. Without TLS the secret travels in clear text.
+
+TLS is off by default; with everything off nothing changes. Three settings turn it on:
+
+- `tls_cert` and `tls_key` (PEM, set together) put the coordinator port on TLS: the Raft calls between
+  coordinators and the Sentinel API. The port then takes no clear text, and a coordinator calls the
+  others with TLS, so set them on every coordinator at once. Sentinel clients must connect with TLS
+  too (not tried with a Sentinel library yet).
+- `tls_ca` (PEM) is the CA that vouches for the other coordinators' certificates and, with
+  `node_tls`, the data nodes'. A certificate must name the host the coordinator dials (the host of the
+  `peers` entry or of the member `address`, a DNS name or an IP address). It is required with either
+  of the others.
+- `node_tls = true` dials the data nodes with TLS (their `tls_cert`), for nodes that take nothing else.
+  When a node asks for a client certificate (`tls_client_ca`, `tls_client_auth`), the coordinator shows
+  its own `tls_cert`; without one set it cannot connect to such a node.
+
+The files are read again on the next connection after their modification time changes, as on data nodes;
+a file that does not load keeps the previous certificate. The secret is still checked: TLS hides it and
+the traffic, it does not replace it. The replication link between data nodes has its own setting
+(`replication.tls`, see [CONFIGURATION.md](CONFIGURATION.md)).
 
 ## A multi-node cluster
 
@@ -602,7 +625,8 @@ releases side by side, so the refused handshake itself was not part of the run. 
   while a client keeps writing a key of it (every acknowledged write is on the new owner). A primary
   cut off from the coordinators by a proxy while a client keeps writing to it: with the lease it
   takes no write once a replica is promoted, without it it keeps taking them; and a member that
-  accepts connections but never answers does not hold up the primary's lease.
+  accepts connections but never answers does not hold up the primary's lease. With TLS on the coordinator
+  port, between coordinators and to data nodes that take only TLS: agreement and a failover.
 - `tests/multi_node_live.rs`: the node side of a move driven by hand, and a prepared move kept across
   restarts of both nodes until it is cancelled.
 - `scripts/coordinator_faults.py target/debug/ruvio [scenario ...]`: a TCP proxy between the coordinators

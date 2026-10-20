@@ -9,11 +9,12 @@ mod migrate;
 mod monitor;
 mod raft;
 mod resp;
+mod tls;
 
 use std::{collections::BTreeMap, io, sync::Arc, time::Duration};
 
 use tokio::{
-    io::{AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
 };
 use tracing::{info, warn};
@@ -42,6 +43,7 @@ async fn serve(
     config: Arc<CoordinatorConfig>,
     shutdown: crate::shutdown::ShutdownToken,
 ) -> io::Result<()> {
+    tls::install(&config.tls)?;
     let listener = TcpListener::bind(config.listen).await?;
     let raft_config = Arc::new(
         openraft::Config {
@@ -189,19 +191,17 @@ struct Api {
 }
 
 impl Api {
-    async fn connection(&self, mut stream: TcpStream) -> io::Result<()> {
+    async fn connection(&self, stream: TcpStream) -> io::Result<()> {
         stream.set_nodelay(true)?;
-        let mut first = [0; 1];
+        let mut reader = BufReader::new(tls::get().accept(stream).await?);
+        let first = match reader.fill_buf().await?.first() {
+            Some(&first) => first,
+            None => return Ok(()),
+        };
 
-        if stream.peek(&mut first).await? == 0 {
-            return Ok(());
-        }
-        if first[0] == raft::RPC_MAGIC {
-            stream.readable().await?;
-            let mut magic = [0; 1];
-
-            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut magic).await?;
-            let envelope: raft::Envelope = raft::read_frame(&mut stream).await?;
+        if first == raft::RPC_MAGIC {
+            reader.consume(1);
+            let envelope: raft::Envelope = raft::read_frame(&mut reader).await?;
             let secret = self.config.secret.as_deref().unwrap_or("");
 
             if !crate::security::constant_time_eq(envelope.secret.as_bytes(), secret.as_bytes()) {
@@ -210,11 +210,9 @@ impl Api {
             }
             let response = self.rpc(envelope.request).await;
 
-            return raft::write_frame(&mut stream, &response).await;
+            return raft::write_frame(reader.get_mut(), &response).await;
         }
 
-        let (read, mut write) = stream.into_split();
-        let mut reader = BufReader::new(read);
         let mut authenticated = self.config.secret.is_none();
 
         while let Some(args) = resp::read_command(&mut reader).await? {
@@ -238,11 +236,12 @@ impl Api {
                 let mut out = Vec::new();
 
                 reply.encode(&mut out);
-                write.write_all(&out).await?;
+                reader.get_mut().write_all(&out).await?;
                 continue;
             }
             if !authenticated {
-                write
+                reader
+                    .get_mut()
                     .write_all(b"-NOAUTH Authentication required.\r\n")
                     .await?;
                 continue;
@@ -252,7 +251,7 @@ impl Api {
                 words.first().map(String::as_str),
                 Some("subscribe" | "psubscribe")
             ) {
-                return self.subscribe(&words, &mut write).await;
+                return self.subscribe(&words, reader.get_mut()).await;
             }
             let mut out = Vec::new();
             let reply = if words.first().map(String::as_str) == Some("coordinator") {
@@ -262,7 +261,7 @@ impl Api {
             };
 
             reply.encode(&mut out);
-            write.write_all(&out).await?;
+            reader.get_mut().write_all(&out).await?;
         }
 
         Ok(())
@@ -766,7 +765,7 @@ impl Api {
     async fn subscribe(
         &self,
         words: &[String],
-        write: &mut tokio::net::tcp::OwnedWriteHalf,
+        write: &mut (impl AsyncWrite + Unpin),
     ) -> io::Result<()> {
         let mut receiver = self.switches.subscribe();
         let kind = words[0].clone();

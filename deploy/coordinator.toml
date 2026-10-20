@@ -22,6 +22,13 @@ unclean_failover = false
 primary_lease_ms = 0
 # How coordinators log in to the data nodes (requirepass, or "user password").
 auth = "data-node-password"
+# TLS (all off by default): tls_cert/tls_key put the coordinator port (Raft and the Sentinel API) on
+# TLS, and then every coordinator must have them; node_tls dials the data nodes with TLS. tls_ca is
+# the CA that vouches for the other coordinators' and the data nodes' certificates.
+# tls_cert = "/etc/ruvio/coordinator.pem"
+# tls_key = "/etc/ruvio/coordinator.key"
+# tls_ca = "/etc/ruvio/ca.pem"
+# node_tls = true
 
 [[groups]]
 name = "main"

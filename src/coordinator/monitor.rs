@@ -2792,6 +2792,7 @@ mod tests {
             primary_lease: None,
             auth: None,
             secret: None,
+            tls: Default::default(),
             groups: Vec::new(),
             join: false,
         }
