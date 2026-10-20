@@ -1,0 +1,94 @@
+name: Nightly faults
+
+# Coordinator fault scenarios on real processes and real Docker network partitions.
+# Every night (GitHub runs schedules from the default branch only) and by manual dispatch;
+# the only automatic workflow besides the PR gate.
+# Secrets: none. On failure it opens one issue labelled nightly-failure, or comments on the
+# open one, so repeated failures do not pile up.
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: How many times each scenario runs
+        type: string
+        default: "3"
+  schedule:
+    - cron: "17 2 * * *"
+
+permissions:
+  contents: read
+
+env:
+  RUNS: ${{ inputs.runs || '3' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --profile release-fast --bin ruvio
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ruvio
+          path: target/release-fast/ruvio
+          retention-days: 3
+
+  faults:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: ruvio
+      - run: sudo apt-get update && sudo apt-get install -y redis-tools
+      - name: Coordinator fault scenarios
+        run: |
+          chmod +x ruvio
+          list=""
+          for s in partition leader minority restart loss durable stall coord-partition; do
+            for _ in $(seq "$RUNS"); do list="$list $s"; done
+          done
+          python3 scripts/coordinator_faults.py ./ruvio $list
+
+  docker:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: ruvio
+      - run: sudo apt-get update && sudo apt-get install -y redis-tools
+      - run: docker pull ubuntu:24.04
+      - name: Docker network partitions
+        run: |
+          chmod +x ruvio
+          list=""
+          for _ in $(seq "$RUNS"); do list="$list leader lease-off lease-on"; done
+          scripts/docker_partition.sh ./ruvio $list
+
+  report:
+    needs: [faults, docker]
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create nightly-failure --color B60205 --description "Nightly fault run failed" 2>/dev/null || true
+          open=$(gh issue list --label nightly-failure --state open --json number --jq '.[0].number')
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body "Failed again: $RUN_URL"
+          else
+            gh issue create --label nightly-failure --title "Nightly fault scenarios failed" --body "Run: $RUN_URL"
+          fi
