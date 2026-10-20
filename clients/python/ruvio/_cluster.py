@@ -29,8 +29,9 @@ SLOT_COUNT = 16384
 #: ``-MOVED`` / ``-ASK`` redirects followed per command (one budget) before the error is returned
 MAX_REDIRECTS = 3
 
-#: sleeps in seconds before the 1st, 2nd and 3rd re-send of a command answered ``-TRYAGAIN``
-TRYAGAIN_DELAYS = (0.005, 0.010, 0.020)
+#: sleeps in seconds before each re-send of a command answered ``-TRYAGAIN``, doubling from 5 ms (635 ms in
+#: all): a slot range moving between nodes is frozen for a few hundred milliseconds
+TRYAGAIN_DELAYS = (0.005, 0.010, 0.020, 0.040, 0.080, 0.160, 0.320)
 
 #: ``ASKING`` as a frame, sent in front of the command an ``-ASK`` redirect names
 ASKING = b"*1\r\n$6\r\nASKING\r\n"

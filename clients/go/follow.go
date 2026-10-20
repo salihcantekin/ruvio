@@ -70,7 +70,7 @@ func (c *Client) dialShared(ctx context.Context, start int, reconnect bool) (*co
 // dialFound runs one round and opens a connection to the primary it finds. (nil, nil) means
 // the caller falls back to the seed order.
 func (c *Client) dialFound(ctx context.Context, start int) (*conn, error) {
-	addr, ok, err := c.findPrimary(ctx, start, "")
+	addr, ok, err := c.findPrimary(ctx, start, new(string))
 	if err != nil {
 		return nil, err
 	}
@@ -86,7 +86,7 @@ func (c *Client) dialFound(ctx context.Context, start int) (*conn, error) {
 
 // dialPrimary is the first connect in sentinel mode: one round, no waiting.
 func (c *Client) dialPrimary(ctx context.Context, onPush func(Value)) (*conn, error) {
-	addr, ok, err := c.findPrimary(ctx, 0, "")
+	addr, ok, err := c.findPrimary(ctx, 0, new(string))
 	if err != nil {
 		return nil, err
 	}
@@ -97,23 +97,28 @@ func (c *Client) dialPrimary(ctx context.Context, onPush func(Value)) (*conn, er
 }
 
 // findPrimary is one round: the address that answered master, or none. start is the first
-// index of the node list to ask; avoid is an address that must not be taken (the one that
-// just answered READONLY). A refused AUTH is returned as the error.
-func (c *Client) findPrimary(ctx context.Context, start int, avoid string) (string, bool, error) {
+// index of the node list to ask; *avoid is an address that must not be taken (the one that
+// just answered READONLY) while it still says master: a replaced primary does. Once it answers
+// ROLE as a replica *avoid is cleared, so a later round takes it when it is promoted. A refused
+// AUTH is returned as the error.
+func (c *Client) findPrimary(ctx context.Context, start int, avoid *string) (string, bool, error) {
 	if c.sentinel {
 		for _, seed := range c.addrs {
 			addr, ok, err := c.askSentinel(ctx, seed)
 			if err != nil {
 				return "", false, err
 			}
-			if !ok || addr == avoid {
+			if !ok {
 				continue
 			}
 			role, ok, err := c.askRole(ctx, addr)
 			if err != nil {
 				return "", false, err
 			}
-			if ok && role.master {
+			if ok && addr == *avoid && !role.master {
+				*avoid = ""
+			}
+			if ok && role.master && addr != *avoid {
 				return addr, true, nil
 			}
 		}
@@ -137,10 +142,13 @@ func (c *Client) findPrimary(ctx context.Context, start int, avoid string) (stri
 		if ctx.Err() != nil {
 			return "", false, nil
 		}
+		if ok && addr == *avoid && !role.master {
+			*avoid = ""
+		}
 		switch {
 		case !ok:
 		case role.master:
-			if addr != avoid {
+			if addr != *avoid {
 				return addr, true, nil
 			}
 		case role.hint != "":
@@ -340,6 +348,8 @@ func (c *Client) followPrimary(ctx context.Context, from *conn) (cn *conn, moved
 	if cur := c.cur.Load(); cur != from && cur != nil && !cur.dead.Load() {
 		return cur, true, nil
 	}
+	// Kept across rounds: cleared once the refusing node says it is a replica, so its promotion
+	// a moment later is taken instead of waiting out every round.
 	refused := ""
 	if nodes := c.nodeList(); int(from.addr) < len(nodes) {
 		refused = nodes[from.addr]
@@ -365,7 +375,7 @@ func (c *Client) followPrimary(ctx context.Context, from *conn) (cn *conn, moved
 				delay = c.followMaxDelay
 			}
 		}
-		addr, ok, err := c.findPrimary(ctx, start, refused)
+		addr, ok, err := c.findPrimary(ctx, start, &refused)
 		if err != nil {
 			return nil, false, err
 		}

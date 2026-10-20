@@ -4,6 +4,8 @@ Issues and pull requests are in English.
 
 A pull request is one change that you can explain. Say what behavior changes, how you checked it, and which test covers it. A drive-by that rewrites an unrelated file, restyles a module, or stacks several ideas is closed.
 
+Pull requests target `dev`. A pull request merges once the required checks pass; it does not have to be updated with `dev` first. The same checks run again on `dev` after each merge, so a break between two pull requests shows up there.
+
 ## License
 
 By opening a pull request you agree that your contribution is licensed under the license of the part you change: AGPL-3.0 for the server and the operator UI (`clients/ruvio-ui/`), MIT for the SDKs in `clients/` and for `integrations/`. The maintainer may also offer the server under other terms, including a commercial license; if you are not comfortable with that, say so in the pull request before it is merged.

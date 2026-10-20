@@ -1113,6 +1113,10 @@ fn a_slot_range_moves_between_groups_while_a_client_keeps_writing() {
 
         std::thread::spawn(move || {
             let (mut acked, mut retried) = (0u64, 0u64);
+            // From the first `TRYAGAIN` of a write to its `OK`: how long a caller waits
+            // while the range is frozen.
+            let mut frozen: Option<std::time::Instant> = None;
+            let mut longest = Duration::ZERO;
 
             for value in 1u64.. {
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
@@ -1122,17 +1126,25 @@ fn a_slot_range_moves_between_groups_while_a_client_keeps_writing() {
                     match call(&address, &["SET", &busy, &value.to_string()]).as_deref() {
                         Some("OK") => {
                             acked = value;
+                            if let Some(since) = frozen.take() {
+                                longest = longest.max(since.elapsed());
+                            }
                             break;
                         }
                         Some(reply) if reply.starts_with("MOVED") => address = b.clone(),
                         Some(reply) if reply.starts_with("TRYAGAIN") => {
                             retried += 1;
+                            frozen.get_or_insert_with(std::time::Instant::now);
                             std::thread::sleep(Duration::from_millis(5));
                         }
                         other => panic!("unexpected reply {other:?}"),
                     }
                 }
             }
+            eprintln!(
+                "move freeze seen by a writer: {:.1} ms over {retried} TRYAGAIN replies",
+                longest.as_secs_f64() * 1000.0
+            );
             (acked, retried, address)
         })
     };

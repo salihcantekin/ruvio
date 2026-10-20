@@ -1407,21 +1407,21 @@ fn a_tryagain_is_retried_after_a_short_sleep() {
 }
 
 #[test]
-fn the_fourth_tryagain_in_a_row_is_returned() {
+fn the_eighth_tryagain_in_a_row_is_returned() {
     let cluster = Cluster::start(2);
     let mut client = cluster.client();
     let key = cluster.key_on(1, "giveup");
 
-    cluster.script("GET", b"-TRYAGAIN slot is being handed over\r\n", 4);
+    cluster.script("GET", b"-TRYAGAIN slot is being handed over\r\n", 8);
     cluster.clear_log();
 
     let started = Instant::now();
     let message = server_error(client.execute(&["GET", &key]));
 
     assert!(message.starts_with("TRYAGAIN"), "{message}");
-    // Sleeps of 5, 10 and 20 ms came before the three retries.
-    assert!(started.elapsed() >= Duration::from_millis(35));
-    assert_eq!(cluster.seen("GET").len(), 4);
+    // Sleeps of 5, 10, 20, 40, 80, 160 and 320 ms came before the seven retries.
+    assert!(started.elapsed() >= Duration::from_millis(635));
+    assert_eq!(cluster.seen("GET").len(), 8);
 }
 
 #[test]

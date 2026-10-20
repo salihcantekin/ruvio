@@ -4,8 +4,9 @@ name: PR gate
 # remains manually dispatched for Docker, cross-platform, fuzz, and fault tests.
 on:
   workflow_dispatch:
+  # On dev a pull request may merge without first being updated with dev, so the merged result is checked here.
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
 
 permissions:

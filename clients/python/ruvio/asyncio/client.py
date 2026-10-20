@@ -315,20 +315,27 @@ async def _probe(address: Address, opts: _Options, command: str, args: Tuple[Any
         proto.transport.close()  # type: ignore[union-attr]
 
 
-async def _find_primary(nodes: List[Address], start: int, avoid: Optional[Address], opts: _Options) -> Optional[Address]:
+async def _find_primary(nodes: List[Address], start: int, avoid: List[Optional[Address]], opts: _Options) -> Optional[Address]:
     """One round: the address of a node that answered ``master``, asking ``nodes`` in order from ``start``
     (a replica's reported primary is asked once, after them), or ``None``. With ``sentinel_master`` the nodes
-    are coordinators, each asked for the master's address, which ``ROLE`` must confirm. ``avoid`` is the
-    address that just answered ``READONLY``. Raises only when ``AUTH`` is refused."""
+    are coordinators, each asked for the master's address, which ``ROLE`` must confirm. ``avoid[0]`` is the
+    address that just answered ``READONLY``; it is not taken while it still says ``master`` (a replaced primary
+    does) and is cleared once it answers ``ROLE`` as a replica, so a later round takes it when it is promoted.
+    Raises only when ``AUTH`` is refused."""
     n = len(nodes)
     queue = [nodes[(start + k) % n] for k in range(n)]
     name = opts.sentinel_master
     if name is not None:
         for coordinator in queue:
             named = parse_master_addr(await _probe(coordinator, opts, "SENTINEL", ("get-master-addr-by-name", name)))
-            if named is not None and named != avoid:
+            if named is not None:
                 role = parse_role(await _probe(named, opts, "ROLE", ()))
-                if role is not None and role[0] == MASTER:
+                if role is None:
+                    continue
+                if role[0] != MASTER:
+                    if named == avoid[0]:
+                        avoid[0] = None
+                elif named != avoid[0]:
                     return named
         return None
     seen = set(queue)
@@ -340,9 +347,12 @@ async def _find_primary(nodes: List[Address], start: int, avoid: Optional[Addres
         if role is None:
             continue
         if role[0] == MASTER:
-            if address != avoid:
+            if address != avoid[0]:
                 return address
-        elif role[1] is not None and role[1] not in seen:
+            continue
+        if address == avoid[0]:
+            avoid[0] = None
+        if role[1] is not None and role[1] not in seen:
             seen.add(role[1])
             queue.append(role[1])
     return None
@@ -355,7 +365,7 @@ async def _connect(opts: _Options, on_push: Optional[Callable[[Any], None]], cur
     sentinel = opts.sentinel_master is not None and cur is not None
     if cur is not None and cur.following(opts):
         if sentinel or cur.at >= 0:
-            found = await _find_primary(cur.coord if sentinel else cur.addrs, cur.pos, None, opts)  # type: ignore[arg-type]
+            found = await _find_primary(cur.coord if sentinel else cur.addrs, cur.pos, [None], opts)  # type: ignore[arg-type]
             if found is not None:
                 try:
                     return await _take(opts, cur, found, on_push)
@@ -679,7 +689,8 @@ class Ruvio(Commands):
             if st.proto is not proto:  # another command already moved it
                 return True
             opts, cur = st.opts, st.cur
-            refused = cur.address()
+            # kept across rounds: cleared once the refusing node says it is a replica, so its promotion is taken
+            refused: List[Optional[Address]] = [cur.address()]
             sentinel = opts.sentinel_master is not None
             nodes = cur.coord if sentinel else cur.addrs
             for attempt in range(ROUNDS):
