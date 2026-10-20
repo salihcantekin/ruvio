@@ -9,12 +9,13 @@ namespace Ruvio.Client;
 /// Routes commands to the shard that owns their slot. Built from <c>CLUSTER SLOTS</c>;
 /// a <c>MOVED</c> reply points that slot at the named node and retries, and an <c>ASK</c> reply sends the command once
 /// (after <c>ASKING</c>) to the named node without changing the map; both count against one budget of three redirects.
-/// <c>TRYAGAIN</c> sends the command again after a short wait, at most three times.
+/// <c>TRYAGAIN</c> sends the command again after a wait doubling from 5 ms, at most seven times (635 ms in all: a slot
+/// range moving between nodes is frozen for a few hundred milliseconds).
 /// </summary>
 internal sealed class ClusterRouter : IDisposable
 {
     private const int MaxRedirects = 3;
-    private const int MaxTryAgains = 3;
+    private const int MaxTryAgains = 7;
     private const int FirstTryAgainDelayMs = 5;
 
     private static readonly string[] AskingCommand = ["ASKING"];

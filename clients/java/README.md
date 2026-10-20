@@ -189,8 +189,9 @@ pipelined commands; use `{hashtag}` keys to keep related keys in one slot.
 * **ASK**: `ASKING` and the command are sent to the named node in one write (an unknown node is opened first), the
   `+OK` is dropped and the command's reply is returned; the slot table is not changed, so the next command for the
   slot still goes to its owner. ASK and MOVED share the 3-redirect budget.
-* **TRYAGAIN**: the command is sent again, routed by the current slot table, at most 3 times after waits of 5, 10
-  and 20 ms (scheduled on the background thread, never a sleep); the error is returned after the 3rd retry.
+* **TRYAGAIN**: the command is sent again, routed by the current slot table, at most 7 times after waits of 5, 10,
+  20, 40, 80, 160 and 320 ms (635 ms in all; scheduled on the background thread, never a sleep); the error is
+  returned after the 7th retry.
 * **Connection loss**: only commands in flight on that node fail (`RuvioConnectionException`); nothing is
   replayed, the other nodes keep working, and the node's connection reopens with its next command.
 * **Pipelines** (`pipeline()`): commands are routed when queued and grouped per node; `flush()` sends one write

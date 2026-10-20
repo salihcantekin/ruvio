@@ -416,7 +416,7 @@ public class ClusterTests
     }
 
     [Fact(Timeout = 15000)]
-    public async Task TryAgainIsReturnedAfterThreeRetries()
+    public async Task TryAgainIsReturnedAfterSevenRetries()
     {
         using var first = Listen();
         using var second = Listen();
@@ -430,7 +430,7 @@ public class ClusterTests
         using TcpClient owner = await second.AcceptTcpClientAsync();
         NetworkStream ownerStream = owner.GetStream();
 
-        for (int send = 0; send < 4; send++)
+        for (int send = 0; send < 8; send++)
         {
             await ExpectAsync(ownerStream, "GET", "somekey");
             await ReplyAsync(ownerStream, "-TRYAGAIN slot is being moved\r\n");
@@ -440,7 +440,7 @@ public class ClusterTests
 
         Assert.StartsWith("TRYAGAIN", error.Message);
 
-        // The command was sent four times and not again.
+        // The command was sent eight times and not again.
         ValueTask<string> ping = client.PingAsync();
 
         await ExpectAsync(seedStream, "PING");

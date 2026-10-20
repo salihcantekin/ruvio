@@ -103,7 +103,7 @@ class ClusterRuvio(Ruvio):
     * ``dbsize`` adds up all shards, ``keys`` joins them, ``flushdb``/``flushall`` run on every shard,
       ``auth``/``select``/``client_setname`` apply to every node, ``scan`` walks shards in turn (opaque cursor).
     * Pipelines are grouped per node; transactions must use one slot.
-    * ``MOVED`` and ``ASK`` are followed up to 3 times per command in all, ``TRYAGAIN`` is retried up to 3 times. Failed node connections are reopened by the next
+    * ``MOVED`` and ``ASK`` are followed up to 3 times per command in all, ``TRYAGAIN`` is retried up to 7 times (sleeps doubling from 5 ms to 320 ms). Failed node connections are reopened by the next
       command; a failed command is never re-sent.
     * With ``read_policy=ReadPolicy.PREFER_REPLICA`` or ``REPLICA`` (default ``PRIMARY``), commands the server
       flags read-only and not blocking go to one replica of the key's shard, picked at random whenever the slot

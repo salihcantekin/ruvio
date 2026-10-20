@@ -1104,7 +1104,7 @@ func TestFakeTryAgainThenSuccess(t *testing.T) {
 	}
 }
 
-func TestFakeTryAgainGivesUpAfterThreeRetries(t *testing.T) {
+func TestFakeTryAgainGivesUpAfterSevenRetries(t *testing.T) {
 	k := keyFor(true, 0)
 	a, _ := twoNodes(t, func(f *fakeNode, args []string) string {
 		if strings.ToUpper(args[0]) == "GET" {
@@ -1115,13 +1115,18 @@ func TestFakeTryAgainGivesUpAfterThreeRetries(t *testing.T) {
 	c := newClusterClient(t, a.addr)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	start := time.Now()
 	_, err := getS(c, ctx, k)
 	var se *Error
 	if !errors.As(err, &se) || se.Prefix() != "TRYAGAIN" {
 		t.Fatalf("want the TRYAGAIN error, got %v", err)
 	}
-	if n := a.count("GET"); n != 4 {
-		t.Fatalf("GET sent %d times, want 4", n)
+	if n := a.count("GET"); n != 8 {
+		t.Fatalf("GET sent %d times, want 8", n)
+	}
+	// Waits of 5, 10, 20, 40, 80, 160 and 320 ms came before the seven retries.
+	if elapsed := time.Since(start); elapsed < 635*time.Millisecond {
+		t.Fatalf("gave up after %v, want at least 635ms", elapsed)
 	}
 }
 

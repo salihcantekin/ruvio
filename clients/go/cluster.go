@@ -374,9 +374,10 @@ func parseSlotAddr(rest []byte) (slot int, addr string, ok bool) {
 const maxRedirects = 3
 
 // maxTryAgain is how many times one command is sent again after -TRYAGAIN; the wait before
-// retry n is tryAgainWait << (n-1).
+// retry n is tryAgainWait << (n-1), 635 ms in all: a slot range moving between nodes is
+// frozen for a few hundred milliseconds.
 const (
-	maxTryAgain  = 3
+	maxTryAgain  = 7
 	tryAgainWait = 5 * time.Millisecond
 )
 
