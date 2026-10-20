@@ -20,6 +20,8 @@ enum Mode {
     Replica(Option<u16>),
     /// Says `master` but refuses writes anyway.
     Liar,
+    /// A replica that is promoted right after it answers its first `ROLE`.
+    Promoted,
     /// A coordinator that names this primary.
     Names(u16),
 }
@@ -119,8 +121,16 @@ fn serve(socket: TcpStream, mode: &Mutex<Mode>, commands: &Mutex<Vec<Vec<String>
                 String::from_utf8_lossy(&item.into_bytes().unwrap_or_default()).into_owned()
             })
             .collect();
-        let mode = mode.lock().unwrap().clone();
-        let reply = answer(&command, &mode);
+        let reply = {
+            let mut mode = mode.lock().unwrap();
+            let reply = answer(&command, &mode);
+
+            if matches!(*mode, Mode::Promoted) && command[0].eq_ignore_ascii_case("ROLE") {
+                *mode = Mode::Master;
+            }
+
+            reply
+        };
 
         commands.lock().unwrap().push(command);
 
@@ -136,6 +146,9 @@ fn answer(command: &[String], mode: &Mode) -> Vec<u8> {
 
     match (name.as_str(), mode) {
         ("ROLE", Mode::Master | Mode::Liar) => b"*3\r\n$6\r\nmaster\r\n:0\r\n*0\r\n".to_vec(),
+        ("ROLE", Mode::Promoted) => {
+            b"*5\r\n$5\r\nslave\r\n$9\r\n127.0.0.1\r\n:0\r\n$9\r\nconnected\r\n:0\r\n".to_vec()
+        }
         ("ROLE", Mode::Replica(primary)) => format!(
             "*5\r\n$5\r\nslave\r\n$9\r\n127.0.0.1\r\n:{}\r\n$9\r\nconnected\r\n:0\r\n",
             primary.unwrap_or(0)
@@ -146,7 +159,7 @@ fn answer(command: &[String], mode: &Mode) -> Vec<u8> {
 
             format!("*2\r\n$9\r\n127.0.0.1\r\n${}\r\n{port}\r\n", port.len()).into_bytes()
         }
-        (_, Mode::Replica(_) | Mode::Liar) if writes => {
+        (_, Mode::Replica(_) | Mode::Liar | Mode::Promoted) if writes => {
             b"-READONLY You can't write against a read only replica.\r\n".to_vec()
         }
         ("PING", _) => b"+PONG\r\n".to_vec(),
@@ -314,6 +327,53 @@ fn a_write_refused_twice_is_not_sent_a_third_time() {
 
     readonly(client.set("k", "v"));
     assert_eq!((old.seen("SET"), liar.seen("SET")), (1, 1));
+}
+
+#[test]
+fn the_refusing_replica_is_taken_once_it_is_promoted() {
+    let replica = Node::start(Mode::Promoted);
+    let dead = Node::dead();
+    let mut client = Client::connect_with(options(&[replica.port, dead])).unwrap();
+
+    // The first round finds it a replica and no other primary; the next round finds it
+    // promoted and sends the write there again.
+    client.set("k", "v").unwrap();
+
+    assert_eq!(replica.seen("SET"), 2);
+    assert_eq!(replica.seen("ROLE"), 2);
+}
+
+#[test]
+fn a_coordinator_naming_the_refusing_replica_is_followed_once_it_is_promoted() {
+    let coordinator = Node::start(Mode::Names(0));
+    let node = Node::start(Mode::Master);
+
+    coordinator.become_mode(Mode::Names(node.port));
+
+    let mut client = Client::connect_with(ClientOptions {
+        sentinel_master: Some("main".to_owned()),
+        ..options(&[coordinator.port])
+    })
+    .unwrap();
+
+    node.become_mode(Mode::Promoted);
+
+    client.set("k", "v").unwrap();
+    assert_eq!(node.seen("SET"), 2);
+}
+
+#[test]
+fn a_refusing_node_that_still_says_master_is_not_taken_again() {
+    let liar = Node::start(Mode::Liar);
+    let other = Node::start(Mode::Replica(None));
+    let mut client = Client::connect_with(ClientOptions {
+        max_reconnect_attempts: 3,
+        ..options(&[liar.port, other.port])
+    })
+    .unwrap();
+
+    readonly(client.set("k", "v"));
+    assert_eq!((liar.seen("SET"), liar.seen("ROLE")), (1, 3));
 }
 
 #[test]

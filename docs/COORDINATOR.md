@@ -63,8 +63,9 @@ new primary. In a test that wrote continuously while the primary was killed, 0â€
 acknowledged writes were missing afterwards, always the last ones. A client that cannot lose a write
 turns on `CLIENT DURABILITY REPLICAS 1` for its connection: every reply then waits until a replica
 holds the writes before it on disk, and becomes `NOREPLICAS` if none does within the timeout (default
-5000 ms; the writes stay applied). The client libraries have a connect option that sends it on every
-connection. `WAIT 1 timeout_ms` after a write does the same for one write at a time.
+5000 ms; the writes stay applied). After a timeout, the connection's next batch waits only if the shard
+logged a new record in between, so a read sent right after can return a write no replica holds yet. The client libraries
+have a connect option that sends it on every connection. `WAIT 1 timeout_ms` after a write does the same for one write at a time.
 
 A failover keeps such writes as long as the coordinators learned that they were committed (see
 *What can still lose data* below for the shapes where they cannot). The primary records, per shard, the highest sequence it released a
@@ -189,6 +190,12 @@ are off by default.
   detection is not delayed: with the defaults (`ping_interval_ms` 500, `down_after_ms` 3000),
   `primary_lease_ms = 2000`. `primary_lease_drift_percent` must be below 100, and at most 255
   coordinators can grant a lease.
+- Each coordinator waits at most 1 s for a node's answer while renewing. A primary that answers later
+  (a slow disk, a long pause) misses that coordinator's grant for the round, and once its running
+  grants fall below a majority with 300 ms left it refuses writes with `NOREPLICAS Primary lease
+  expired` until the next grants arrive; with the defaults a stall of about 1.7 s is enough. On nodes
+  that stall like this choose `primary_lease_ms` 3000 to 4000 and raise `down_after_ms` to fit the
+  rule above.
 
 What it assumes and what it does not cover:
 
@@ -363,8 +370,10 @@ support connects to the coordinators with the group name as the service name:
 
 Checked with redis-py's `Sentinel` (5.2): it discovers the primary, writes through it, and writes to
 the new primary about 1.2 seconds after the old one is killed (`scripts/coordinator_faults.py client`).
-Other libraries were not tried. Ruvio's own clients do not speak Sentinel yet; after a failover they reach the new primary through their
-seed addresses (see [CLIENT_BEHAVIOR.md](CLIENT_BEHAVIOR.md)) and `ROLE`.
+Other libraries were not tried. Ruvio's own six clients ask the coordinators through their coordinator
+option (`sentinel_master`, see [CLIENT_BEHAVIOR.md](CLIENT_BEHAVIOR.md#following-a-failover)); their live tests kill a
+primary under three coordinators, and the first write through the coordinators lands on the new primary about
+0.9-1.6 seconds later (Mac, debug server).
 
 ## Security
 
@@ -416,15 +425,17 @@ receive ranges this way. One move runs at a time.
 
 1. The leader records the move (Raft), then tells the target group's primary to expect the range on that
    shard (`RUVIO MIGRATE IMPORT`) and the source group's primary to send it (`RUVIO MIGRATE EXPORT`).
-2. The source copies the range to the target shard over its client port, in batches, then the keys
-   written meanwhile, until few are left. Clients keep using the source.
+2. The source copies the range to the target shard over its client port, in batches. It then waits
+   until the target's connected replicas hold what was copied (`RUVIO MIGRATE REPLICAS`, at most 10 s),
+   and sends the keys written meanwhile, until few are left. Clients keep using the source.
 3. The source freezes the range: its commands get `TRYAGAIN`, which every Ruvio client retries after 5,
    10 and 20 ms. It sends the last changes and the target syncs them to its log. The source then keeps
    the frozen range on disk (`MIGRATE_OUT`), so a restart cannot serve it again on its own.
-4. The leader waits until the target's connected replicas hold the prepared copy (at most 10 s, or the
-   move is cancelled and started again), commits the move only if neither group failed over since it
-   began, and sends the new map to the target's primary, then the source's, then
-   every other member. The target serves the range; the source answers `MOVED` naming the target and
+4. The leader, asking every 10 ms, waits until the target's connected replicas hold the prepared copy
+   (at most 10 s, or the move is cancelled and started again), commits the move only if neither group
+   failed over since it began, and sends the new map to the target's primary, then the source's, then
+   every other member. The target gets it first because until then it redirects the range back to
+   the source. The target serves the range; the source answers `MOVED` naming the target and
    drops its copy in bounded steps. Each range of the new map names its shard (`"100-199@0"`), so the
    other ranges stay on the shards that hold their data.
 
@@ -440,7 +451,20 @@ move the range back with another `COORDINATOR MOVE`. The copy rate of a source i
 `migration_max_bytes_per_sec` in its configuration (0, the default, means no cap); the frozen hand-over
 is never slowed down. Nodes need durability `memory`, `everysec` or `always` (not `snapshot`).
 
+The range is frozen from step 3 until the source gets the new map. Measured locally (debug build, one
+Mac running other builds, two groups of a primary and a replica with durability `always`, 303 keys,
+one client writing the range throughout, 5 runs): the writer saw `TRYAGAIN` for 168-237 ms (median
+170 ms). Before the source waited for the target's replicas the same test froze for 1.30-1.73 s, most
+of it the target's replica syncing the copy record by record. The time grows with the keys written
+during the freeze, not with the size of the range. Not measured on release builds or real machines.
+
 ## Upgrading
+
+Upgrade the coordinators first, then the data nodes group by group. Clients need no change for
+either; the client libraries follow a failover by default (see
+[CLIENT_BEHAVIOR.md](CLIENT_BEHAVIOR.md)), which the data-node steps below rely on.
+
+### Coordinators
 
 Upgrade all coordinators together: stop every one, replace the binary, start them again. A release
 that records committed sequences in Raft writes log entries older coordinators cannot read; an older
@@ -460,6 +484,60 @@ while every group has exactly one member answering as primary. The coordinators 
 first start: they record that member at epoch 1 and lose the committed sequences (they learn them again
 from the members). With a cluster map do not do this: the map's version and the moved ranges are in
 the same state, and starting it over sends nodes an older map than they hold.
+
+### Data nodes
+
+A primary and its replicas must run the same release when the replication handshake changed
+between the two (the release notes say so): a replica of the newer release cannot follow a primary
+of the older one, and the other way round. There is no rolling upgrade inside a group in that case.
+A replica that cannot connect still answers `ROLE`, so the coordinators do not see it as down; the
+primary just loses it. With `min-replicas-to-write` at 1 or more the primary then answers
+`NOREPLICAS`, and every `CLIENT DURABILITY` reply waits out its timeout and becomes `NOREPLICAS`.
+Each data node's own files are read by the newer release as in a single-server upgrade (see
+[RECOVERY.md](RECOVERY.md#upgrade)).
+
+Two ways, per group. Neither loses an acknowledged write.
+
+**Way A: switch over to an upgraded replica.** Reads go on throughout. Writes pause from step 1
+until the promoted replica takes them: the replicas' restarts, then about `down_after_ms` plus one
+`ping_interval_ms` after step 4.
+
+1. Stop writes on the primary: `CONFIG SET min-replicas-to-write N` with `N` larger than its number
+   of replicas (on any port; it applies to every shard), or stop the writing applications. Writes get
+   `NOREPLICAS` from the next 100 ms check. Do not `CONFIG REWRITE`: the restarted node must not keep
+   it.
+2. Wait until every replica holds what the primary has: on every shard port, the primary's
+   `wal_last_sequence` in `INFO` equals its `wal_durable_sequence`, and each replica's
+   `wal_durable_sequence` equals that number (as in *Promote a replica by hand* in
+   [RECOVERY.md](RECOVERY.md#promote-a-replica-by-hand)). Writes the primary took after
+   the replicas stopped hearing it would be lost at the switch, which is why step 1 comes first.
+3. Restart each replica with the new binary. They cannot follow the old primary; that is expected.
+4. Stop the old primary (`COORDINATOR FAILOVER group FORCE` is refused while it answers). After
+   `down_after_ms` the coordinators promote the replica holding the most history and point the
+   others at it. With `primary-lease yes` on the nodes the promoted replica refuses writes until the
+   first grants, one `ping_interval_ms` later. Its `min-replicas-to-write` is its own: a group with a
+   single replica and `min-replicas-to-write 1` gets writes back only after step 5.
+5. Start the old primary with the new binary, preferably as a replica of the new primary
+   (`replication.role = "replica"`, `replication.primary` its replication address). Started as a
+   primary it takes writes until the coordinators make it a replica on their next ping, and loses
+   them then. It catches up from its own log.
+
+Clients with more than one seed or a coordinator name (`sentinel_master` and its equivalents) find
+the new primary on their next reconnect; writes they sent during the pause got `NOREPLICAS` or a
+connection error and are not retried by the client.
+
+**Way B: stop the group.** The simplest: stop the replicas, then the primary; replace the binary;
+start the primary, then the replicas. Reads and writes stop for the restart, including each node's
+recovery (snapshot load and WAL replay; see *Recovery-Time Objective* in [RECOVERY.md](RECOVERY.md)).
+Keep this order: the coordinators promote a replica when the primary is down for `down_after_ms`
+while a replica answers, and with no replica up they change nothing.
+
+Checked with one binary (3 data nodes, 3 coordinators as local processes, `ping_interval_ms` 200,
+`down_after_ms` 1000, debug build): Way A in the order above kept all 200 writes taken before step 1,
+the promoted replica took writes 1.2 seconds after the primary stopped (2.1 seconds of paused writes in
+all, the replica restarts included), and the old primary came back as a replica holding every write,
+without the runtime `min-replicas-to-write`. Not run with `primary-lease yes`, nor with two different
+releases side by side, so the refused handshake itself was not part of the run. Way B was not run.
 
 ## Limits of this version
 
@@ -487,4 +565,17 @@ the same state, and starting it over sends nodes an older map than they hold.
   and each data node; `partition` (primary cut from the coordinators only), `leader` (the coordinator
   leader killed, then the primary), `minority`, `restart`, `loss` (acknowledged writes lost under load),
   `durable` (the same writer with `CLIENT DURABILITY REPLICAS 1`, batches of 32: none may be lost),
-  `client` (redis-py's Sentinel client; skipped when redis-py is not installed).
+  `client` (redis-py's Sentinel client; skipped when redis-py is not installed), `stall` (a replica
+  frozen with `SIGSTOP`: for 30 s the coordinators keep the healthy primary and it takes every write;
+  the thawed replica catches up) and `coord-partition` (the coordinator leader cut from the other two
+  while it still reaches the data nodes, then the primary killed: the majority fails over, the epoch
+  goes up exactly once and the new primary stays primary for 30 s). `RUVIO_FAULTS_HOLD_SECS` shortens
+  the 30 s.
+- `scripts/docker_partition.sh path/to/ruvio [leader|lease-off|lease-on]`: real network partitions with
+  Docker networks. `leader`: the coordinator leader leaves the coordinators' network only, the primary
+  is killed, the new primary stays primary and the old leader agrees after the heal. `lease-off` and
+  `lease-on`: {old primary + one replica} | {other replica + coordinators} while a client writes to the
+  old primary; without the lease it keeps acknowledging writes the heal throws away, with it the old
+  primary refuses writes before the other replica is promoted and acknowledges none after its first
+  refusal.
+- `.github/workflows/nightly.yml` runs both scripts, every scenario three times.
