@@ -55,6 +55,25 @@ re-run of the principal Rust suite is:
 cargo test --lib --bins --tests
 ```
 
+## Nightly fault scenarios
+
+`.github/workflows/nightly.yml` (every night at 02:17 UTC from `main`, and by manual dispatch) runs the coordinator fault scenarios on real
+processes and real network partitions, each scenario three times by default (`runs` input):
+
+- `scripts/coordinator_faults.py ./ruvio partition leader minority restart loss durable stall coord-partition`:
+  three data nodes, three coordinators and TCP proxies on one machine. `durable` expects no
+  acknowledged write lost; `loss` allows only the last writes before the crash to be lost.
+- `scripts/docker_partition.sh ./ruvio leader lease-off lease-on`: Docker networks cut with
+  `docker network disconnect`. `lease-on` asserts that the old primary refuses writes before the
+  other side promotes a replica and acknowledges none after its first refusal; `lease-off` prints the
+  same numbers without asserting them.
+
+Each job has a 25-minute limit and builds nothing but `--profile release-fast --bin ruvio`. A
+failed scheduled run opens one issue labelled `nightly-failure` (later failures comment on it).
+Both scripts run locally with the same arguments; the Docker one needs `docker`, `redis-cli` and
+`python3`, and runs the binary in `ubuntu:24.04` (`RUVIO_DOCKER_IMAGE`), so build it on a glibc no
+newer than that image's.
+
 ## Test rules
 
 A test that fails or hangs once in a thousand runs is a broken test. There is no list of
