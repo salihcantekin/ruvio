@@ -138,6 +138,7 @@ pub fn execute_in_database<'a, C: Clock, I: StorageIndex, S: MutationSink, W: Li
         | Command::LatencyLatest
         | Command::ClientSetName(_)
         | Command::ClientTracking(_)
+        | Command::ClientDurability { .. }
         | Command::Select(_) => Ok(Response::Error(b"ERR command is handled by the connection")),
 
         Command::ShardPublish { .. }

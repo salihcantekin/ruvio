@@ -2273,6 +2273,17 @@
       ]
     },
     {
+      "name": "CLIENT DURABILITY",
+      "family": "connection",
+      "status": "supported",
+      "same_slot": false,
+      "limitations": "Ruvio extension. CLIENT DURABILITY REPLICAS n [TIMEOUT ms] (default 5000 ms; n 0 turns it off): this connection's replies leave once n replicas hold on disk every record its shard wrote before them, checked once per batch of replies. On timeout every reply of the batch is -NOREPLICAS; the writes are applied and stay, as with WAIT. Refused inside MULTI and on a server without replication.",
+      "coverage": [
+        "src/runtime/session.rs",
+        "src/runtime/evented/durable.rs"
+      ]
+    },
+    {
       "name": "CLIENT TRACKING",
       "family": "connection",
       "status": "supported",

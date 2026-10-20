@@ -38,6 +38,7 @@
     "CLIENT LIST": {"rust": "client_list", "csharp": "GetClientListAsync", "go": "ClientList", "java": "clientList", "node": "clientList", "python": "client_list"},
     "CLIENT SETNAME": {"rust": "client_setname", "csharp": "SetConnectionNameAsync", "go": "ClientSetName", "java": "clientSetname", "node": "clientSetname", "python": "client_setname"},
     "CLIENT TRACKING": {"rust": "client_tracking", "csharp": "SetTrackingAsync", "go": "ClientTracking", "java": "clientTracking", "node": "clientTracking", "python": "client_tracking"},
+    "CLIENT DURABILITY": {"rust": "client_durability", "csharp": "SetDurabilityAsync", "go": "ClientDurability", "java": "clientDurability", "node": "clientDurability", "python": "client_durability"},
     "CLUSTER INFO": {"rust": "cluster_info", "csharp": "GetClusterInfoAsync", "go": "ClusterInfo", "java": "clusterInfo", "node": "clusterInfo", "python": "cluster_info"},
     "CLUSTER KEYSLOT": {"rust": "cluster_keyslot", "csharp": "GetClusterKeySlotAsync", "go": "ClusterKeySlot", "java": "clusterKeyslot", "node": "clusterKeyslot", "python": "cluster_keyslot"},
     "CLUSTER MYID": {"rust": "cluster_myid", "csharp": "GetClusterMyIdAsync", "go": "ClusterMyID", "java": "clusterMyid", "node": "clusterMyid", "python": "cluster_myid"},

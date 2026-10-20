@@ -29,7 +29,7 @@ Import path `github.com/salihcantekin/ruvio/clients/go` (package `ruvio`).
 - One `Client` multiplexes all concurrent callers over **one TCP connection**: frames that
   queue up while a write is in flight are coalesced into a single write, and replies are
   matched to callers through a FIFO.
-- A typed method for **every command in `docs/compatibility-matrix.json` (298/298)** plus the
+- A typed method for **every command in `docs/compatibility-matrix.json` (299/299)** plus the
   options that change what Ruvio does (`SET ... IFEQ`, `INCRBY ... MAX`, `FILLGET ... WAIT`,
   `FILLSET ... SWR`, `GETEX` ms, `DELEX key IFEQ`, `LPUSHCAP/RPUSHCAP`, `BF.*`, `JSON.*` incl.
   `JSON.INDEX`/`JSON.FIND`, `IDEM BEGIN/COMPLETE`, `LEASE/RELEASE`, `SEMAPHORE`, `ONCE`, `TAKE`, `TRANSFER/HTRANSFER`,

@@ -93,6 +93,7 @@ fn spawn_shipper(
         snapshot_requests: Arc::clone(&state.snapshot_requests),
         announce: client_endpoint(&state.published_config, shard_id),
         tls: replication_acceptor(state)?,
+        durable_replies: Arc::clone(&state.durable_replies),
     })
     .map(Some)
 }
@@ -793,6 +794,18 @@ const REPLICA_DRAIN_BUDGET: usize = 256;
 fn drain_replicated_frames(state: &ShardState) {
     let taken = drain_replicated_budget(state, REPLICA_DRAIN_BUDGET);
 
+    // A durable reply waits on the primary: make this batch durable now, not on the next
+    // `everysec` tick, so the acknowledgement goes out at once.
+    if state.replica_link.ack_each()
+        && let Err(error) = state
+            .persistence
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .flush()
+    {
+        warn!(%error, "replica log sync for a durable reply failed");
+    }
+
     if taken == 0 {
         return;
     }
@@ -1078,41 +1091,60 @@ pub(super) async fn wait_for_durable_replicas(
         return 0;
     }
 
-    // In single-port mode a client's writes may sit on any shard: wait for each shard's
-    // replicas to reach that shard's last sequence, and count the replicas all of them reached.
-    // In per-shard mode a cluster client sends WAIT to the shard it wrote on, as with Redis
-    // Cluster, so that shard's replicas count, plus those of every shard this connection had
-    // commands forwarded to (a client that is not cluster-aware writes through one port).
-    let shards = match state.forwarding.as_ref() {
+    let targets: Vec<(Arc<crate::replication::DurableAcks>, u64)> =
+        durable_shards(state, forwarded_shards)
+            .into_iter()
+            .map(|shard| {
+                let target = shard
+                    .wal
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .last_sequence();
+
+                (shard.acks, target)
+            })
+            .collect();
+
+    wait_for_targets(state, &targets, replicas, timeout_ms, shutdown).await
+}
+
+/// The shards whose replicas a connection's writes wait for.
+///
+/// In single-port mode a client's writes may sit on any shard: wait for each shard's
+/// replicas to reach that shard's last sequence, and count the replicas all of them reached.
+/// In per-shard mode a cluster client sends WAIT to the shard it wrote on, as with Redis
+/// Cluster, so that shard's replicas count, plus those of every shard this connection had
+/// commands forwarded to (a client that is not cluster-aware writes through one port).
+pub(super) fn durable_shards(state: &ShardState, forwarded_shards: u64) -> Vec<ShardDurability> {
+    let own = || ShardDurability {
+        wal: Arc::clone(&state.persistence),
+        acks: Arc::clone(&state.durable_acks),
+        replies: Arc::clone(&state.durable_replies),
+    };
+
+    match state.forwarding.as_ref() {
         Some(forwarding) if state.single_port => forwarding.fabric.durability(),
         Some(forwarding) if forwarded_shards != 0 => {
             let mut shards = forwarding
                 .fabric
                 .durability_of(forwarded_shards & !(1 << forwarding.me));
 
-            shards.push(ShardDurability {
-                wal: Arc::clone(&state.persistence),
-                acks: Arc::clone(&state.durable_acks),
-            });
+            shards.push(own());
             shards
         }
-        _ => vec![ShardDurability {
-            wal: Arc::clone(&state.persistence),
-            acks: Arc::clone(&state.durable_acks),
-        }],
-    };
-    let targets: Vec<(Arc<crate::replication::DurableAcks>, u64)> = shards
-        .into_iter()
-        .map(|shard| {
-            let target = shard
-                .wal
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .last_sequence();
+        _ => vec![own()],
+    }
+}
 
-            (shard.acks, target)
-        })
-        .collect();
+/// Waits until `replicas` replicas reached every target, or the timeout; returns how many
+/// replicas reached all of them.
+pub(super) async fn wait_for_targets(
+    state: &ShardState,
+    targets: &[(Arc<crate::replication::DurableAcks>, u64)],
+    replicas: u64,
+    timeout_ms: u64,
+    shutdown: &ShutdownToken,
+) -> u64 {
     let reached = || {
         targets
             .iter()

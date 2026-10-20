@@ -37,6 +37,17 @@ pub struct TxSession {
     /// process (forwarded there in per-shard mode), so its `WAIT` also waits for that shard's
     /// replicas.
     pub forwarded_shards: u64,
+    /// `CLIENT DURABILITY`: replies wait until this many replicas hold the writes on disk.
+    pub durability: Option<Durability>,
+    /// This shard's last record when the previous replies left under `durability`: a later
+    /// flush with no record past it has nothing new to wait for.
+    pub durable_mark: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Durability {
+    pub replicas: u64,
+    pub timeout_ms: u64,
 }
 
 #[derive(Debug)]
@@ -67,6 +78,8 @@ impl TxSession {
             watched_count: 0,
             served_after_park: None,
             forwarded_shards: 0,
+            durability: None,
+            durable_mark: 0,
         }
     }
 
@@ -289,6 +302,7 @@ fn queueable(command: &Command<'_>) -> bool {
             | Command::ClientGetName
             | Command::ClientSetName(_)
             | Command::ClientTracking(_)
+            | Command::ClientDurability { .. }
             | Command::Select(_)
             | Command::ShardPublish { .. }
             | Command::ShardSubscribe(_)

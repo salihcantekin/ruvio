@@ -221,6 +221,7 @@ pub(crate) struct Fabric {
 pub(super) struct ShardDurability {
     pub(super) wal: Arc<Mutex<crate::persistence::WalSink>>,
     pub(super) acks: Arc<crate::replication::DurableAcks>,
+    pub(super) replies: Arc<crate::replication::DurableReplies>,
 }
 
 impl Fabric {
@@ -2242,6 +2243,7 @@ mod tests {
         "ClientList",
         "ClientSetName",
         "ClientTracking",
+        "ClientDurability",
         "ClusterInfo",
         "ClusterKeySlot",
         "ClusterMyId",

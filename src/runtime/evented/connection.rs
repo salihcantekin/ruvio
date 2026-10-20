@@ -614,6 +614,10 @@ pub(super) async fn handle_client(
                     &mut output,
                 )
                 .await?;
+                if session.durability.is_some() {
+                    super::durable::hold_until_durable(&state, &mut session, &mut output, &shutdown)
+                        .await?;
+                }
                 flush_output(&mut stream, &mut output, timeouts.write, &state).await?;
                 batch_commands = 0;
             } else if output.len() >= flush_at {
@@ -630,6 +634,10 @@ pub(super) async fn handle_client(
                     &mut output,
                 )
                 .await?;
+                if session.durability.is_some() {
+                    super::durable::hold_until_durable(&state, &mut session, &mut output, &shutdown)
+                        .await?;
+                }
                 let unsent = flush_ready(&mut stream, &mut output, timeouts.write, &state).await?;
 
                 // A client that is not reading is retried at doubling sizes, so the unsent
@@ -965,6 +973,15 @@ pub(super) async fn handle_client(
                                         && !output.is_empty()
                                     {
                                         wal_group.commit().await?;
+                                        if session.durability.is_some() {
+                                            super::durable::hold_until_durable(
+                                                &state,
+                                                &mut session,
+                                                &mut output,
+                                                &shutdown,
+                                            )
+                                            .await?;
+                                        }
                                         flush_output(
                                             &mut stream,
                                             &mut output,
@@ -1138,6 +1155,15 @@ pub(super) async fn handle_client(
                                     .await?;
                                     // Forwarded replies may have added records.
                                     wal_group.commit().await?;
+                                    if session.durability.is_some() {
+                                        super::durable::hold_until_durable(
+                                            &state,
+                                            &mut session,
+                                            &mut output,
+                                            &shutdown,
+                                        )
+                                        .await?;
+                                    }
                                     flush_output(&mut stream, &mut output, timeouts.write, &state)
                                         .await?;
                                 }
@@ -1291,6 +1317,9 @@ pub(super) async fn handle_client(
             durability.wait(&state).await?;
         }
 
+        if session.durability.is_some() {
+            super::durable::hold_until_durable(&state, &mut session, &mut output, &shutdown).await?;
+        }
         flush_output(&mut stream, &mut output, timeouts.write, &state).await?;
         input.release_idle();
         output.release_oversized(IDLE_SHRINK_ABOVE_BYTES, IDLE_KEEP_BYTES);
@@ -1446,6 +1475,7 @@ fn plain_command(command: &Command<'_>) -> bool {
                 | Command::ClientKill { .. }
                 | Command::ClientSetName(_)
                 | Command::ClientTracking(_)
+                | Command::ClientDurability { .. }
                 | Command::Slowlog(_)
                 | Command::LatencyLatest
                 | Command::ShardPublish { .. }

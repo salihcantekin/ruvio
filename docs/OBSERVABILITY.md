@@ -80,6 +80,7 @@ fails when one is added without a row:
 | Replication | `replication_epoch` | Epoch of the history this primary writes; grows with each promotion (0 on a replica and on a server that never replicated) |
 | Replication | `slave<n>` | Primary only, one line per replica that announced a client address, finished copying and acknowledged within the last 10 seconds: `ip=…,port=…,state=online,offset=<acknowledged sequence>,lag=<seconds since its last acknowledgement>`; the replica's client port for this shard. `replication_replicas` also counts replicas that are still copying or announce nothing |
 | Replication | `replication_fenced` | 1 when a replica showed this primary a newer epoch: another primary replaced it and writes are refused |
+| Replication | `replication_committed_sequence` | Highest sequence a `CLIENT DURABILITY` reply was released for: on a primary its own, on a replica what its primary last sent. A failover should promote only a replica whose synced sequence reaches it |
 | Replication | `master_link_status` | Replica only: `up` or `down` |
 | Replication | `master_last_io_seconds_ago` | Replica only: seconds since the last frame, `-1` before the first |
 | Replication | `slave_repl_offset` | Replica only: last applied WAL sequence |

@@ -1072,3 +1072,124 @@ fn a_replication_port_past_65535_is_refused_instead_of_wrapping() {
         20_003
     );
 }
+
+#[test]
+fn a_durable_connection_waits_for_its_replica_and_is_refused_without_one() {
+    let primary_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let ports = crate::test_ports::reserve();
+    let replication = ports.address_at(0);
+    let persistence = |directory: &std::path::Path| PersistenceConfig {
+        profile: crate::DurabilityProfile::Everysec,
+        data_dir: directory.to_path_buf(),
+        ..PersistenceConfig::default()
+    };
+    let (primary_address, primary_stop, primary) = serve_with(|config| {
+        config.persistence = persistence(primary_dir.path());
+        config.replication = crate::config::ReplicationConfig {
+            role: crate::config::ReplicationRole::Primary,
+            listen: Some(replication),
+            ..Default::default()
+        };
+    });
+    let (replica_address, replica_stop, replica) = serve_with(|config| {
+        config.persistence = persistence(replica_dir.path());
+        config.replication = crate::config::ReplicationConfig {
+            role: crate::config::ReplicationRole::Replica,
+            primary: Some(replication),
+            ..Default::default()
+        };
+    });
+
+    wait_for_info(primary_address, "replication_replicas", |count| count == 1);
+    let started = Instant::now();
+
+    assert_eq!(
+        request(
+            primary_address,
+            &resp(&[
+                &[
+                    b"CLIENT",
+                    b"DURABILITY",
+                    b"REPLICAS",
+                    b"1",
+                    b"TIMEOUT",
+                    b"10000"
+                ],
+                &[b"SET", b"kept", b"1"],
+            ]),
+        ),
+        b"+OK\r\n+OK\r\n"
+    );
+    eprintln!("durable SET answered in {:?}", started.elapsed());
+    // The replica holds it on disk, and both sides know it was committed.
+    let committed = wait_for_info(primary_address, "replication_committed_sequence", |seq| {
+        seq > 0
+    });
+
+    wait_for_info(replica_address, "replication_committed_sequence", |seq| {
+        seq >= committed
+    });
+    assert!(
+        info_field(replica_address, "wal_durable_sequence").unwrap() >= committed,
+        "the replica acknowledged a record it had not synced"
+    );
+
+    let mut client = connect_bounded(primary_address);
+    let mut line = |payload: &[u8]| {
+        client.write_all(payload).unwrap();
+        let mut reply = Vec::new();
+        let mut byte = [0u8; 1];
+
+        while !reply.ends_with(b"\r\n") {
+            client.read_exact(&mut byte).unwrap();
+            reply.push(byte[0]);
+        }
+        reply
+    };
+
+    assert_eq!(
+        line(&resp(&[&[
+            b"CLIENT",
+            b"DURABILITY",
+            b"REPLICAS",
+            b"1",
+            b"TIMEOUT",
+            b"100"
+        ]])),
+        b"+OK\r\n"
+    );
+    // Without a replica the write is applied and its reply refused.
+    replica_stop.request();
+    join_within(replica, PATIENCE).unwrap();
+    wait_for_info(primary_address, "replication_replicas", |count| count == 0);
+
+    assert_eq!(
+        line(&resp(&[&[b"SET", b"lost", b"1"]])),
+        b"-NOREPLICAS Not enough good replicas to write.\r\n"
+    );
+    // Nothing was written since: a read is not held back.
+    assert_eq!(line(&resp(&[&[b"EXISTS", b"lost"]])), b":1\r\n");
+
+    primary_stop.request();
+    join_within(primary, PATIENCE).unwrap();
+}
+
+#[test]
+fn client_durability_needs_replication() {
+    let (address, stop, server) = serve_on_ephemeral();
+
+    assert_eq!(
+        request(
+            address,
+            &resp(&[
+                &[b"CLIENT", b"DURABILITY", b"REPLICAS", b"1"],
+                &[b"CLIENT", b"DURABILITY", b"REPLICAS", b"0"],
+            ]),
+        ),
+        b"-ERR CLIENT DURABILITY needs replication on this server\r\n+OK\r\n"
+    );
+
+    stop.request();
+    join_within(server, PATIENCE).unwrap();
+}

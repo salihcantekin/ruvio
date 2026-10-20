@@ -76,6 +76,13 @@ impl<'a> Command<'a> {
             Self::MemoryUsage(key) => Command::MemoryUsage(owned(key)),
             Self::ClientSetName(name) => Command::ClientSetName(owned(name)),
             Self::ClientTracking(on) => Command::ClientTracking(on),
+            Self::ClientDurability {
+                replicas,
+                timeout_ms,
+            } => Command::ClientDurability {
+                replicas,
+                timeout_ms,
+            },
             Self::ShardPublish { channel, message } => Command::ShardPublish {
                 channel: owned(channel),
                 message: owned(message),
@@ -1240,6 +1247,7 @@ pub(crate) fn command_mutates_store(command: &Command<'_>) -> bool {
             | Command::ClientGetName
             | Command::ClientSetName(_)
             | Command::ClientTracking(_)
+            | Command::ClientDurability { .. }
             | Command::ShardPublish { .. }
             | Command::ShardSubscribe(_)
             | Command::ShardUnsubscribe(_)

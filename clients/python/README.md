@@ -27,7 +27,7 @@ dependencies and needs Python 3.9 or newer. It ships type information (`py.typed
 - `ruvio.Ruvio` is the synchronous client. It uses one socket and a reusable `recv_into` buffer.
 - `ruvio.asyncio.Ruvio` is the asyncio client. It keeps one multiplexed, pipelined connection
   that all coroutines share.
-- There is a typed method for each of the **298** commands in `docs/compatibility-matrix.json`.
+- There is a typed method for each of the **299** commands in `docs/compatibility-matrix.json`.
   The methods also cover the options that change Ruvio's behaviour: `SET … IFEQ`,
   `INCRBY … MAX`, `FILLGET … WAIT`, `FILLSET … SWR`, `GETEX` in milliseconds,
   `DELEX key IFEQ v`, `LPUSHCAP`/`RPUSHCAP`, `BF.*`, `JSON.*` (including `JSON.INDEX` and
@@ -393,7 +393,7 @@ RUVIO_TEST_FLUSHALL=1 ...                                               # also r
   has no typed method on the sync or the async client. It also fails when a typed method is
   never called by a live test.
 - `tests/test_cluster_unit.py` needs no Ruvio server: slot vectors and hashtags, key
-  extraction through the typed methods, a check that **all 298 matrix commands have a routing
+  extraction through the typed methods, a check that **all 299 matrix commands have a routing
   rule**, topology / `MOVED` / scan-cursor parsing, and the router against scripted fake servers
   (`tests/fakecluster.py`) on both clients: owner-only routing, fail-fast `CROSSSLOT` (no byte
   sent), split reassembly order, `MOVED` patch / refresh / unknown node / at most 3 redirects, no

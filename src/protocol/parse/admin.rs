@@ -130,9 +130,53 @@ pub(in crate::protocol) fn parse_client<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
         ));
     }
 
+    if subcommand.eq_ignore_ascii_case(b"DURABILITY") {
+        return parse_client_durability(args);
+    }
+
     Err(ProtocolError::Invalid(
         "CLIENT expects GETNAME, SETNAME, or TRACKING",
     ))
+}
+
+/// Replies wait this long for replicas by default.
+pub(crate) const DURABILITY_TIMEOUT_MS: u64 = 5_000;
+
+/// `CLIENT DURABILITY REPLICAS n [TIMEOUT ms]`.
+fn parse_client_durability<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
+    const USAGE: &str = "CLIENT DURABILITY expects REPLICAS n [TIMEOUT ms]";
+
+    if !(args.len() == 3 || args.len() == 5) || !args.bytes(1).eq_ignore_ascii_case(b"REPLICAS") {
+        return Err(ProtocolError::Invalid(USAGE));
+    }
+
+    let number = |index: usize| {
+        std::str::from_utf8(args.bytes(index))
+            .ok()
+            .and_then(|text| text.parse::<u64>().ok())
+            .ok_or(ProtocolError::Invalid(USAGE))
+    };
+    let replicas = number(2)?;
+    let timeout_ms = if args.len() == 5 {
+        if !args.bytes(3).eq_ignore_ascii_case(b"TIMEOUT") {
+            return Err(ProtocolError::Invalid(USAGE));
+        }
+
+        number(4)?
+    } else {
+        DURABILITY_TIMEOUT_MS
+    };
+
+    if replicas > crate::replication::MAX_REPLICAS as u64 {
+        return Err(ProtocolError::Invalid(
+            "CLIENT DURABILITY asks for more replicas than a primary can have",
+        ));
+    }
+
+    Ok(Command::ClientDurability {
+        replicas,
+        timeout_ms,
+    })
 }
 
 /// `ACL LOAD` and `ACL SAVE` read and write `security.acl_file` only.

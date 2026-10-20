@@ -151,8 +151,13 @@ pub(super) fn evented_info(state: &ShardState, section: Option<&[u8]>) -> io::Re
 
     write!(
         info,
-        "# Replication\r\nreplication_role:{role}\r\nwal_durable_sequence:{durable_sequence}\r\nreplication_replicas:{replica_count}\r\nreplication_replica_sequence:{replica_sequence}\r\nreplication_send_lag:{send_lag}\r\nreplica_retain_dropped:{dropped}\r\nreplication_epoch:{epoch}\r\nreplication_fenced:{fenced}\r\n",
+        "# Replication\r\nreplication_role:{role}\r\nwal_durable_sequence:{durable_sequence}\r\nreplication_replicas:{replica_count}\r\nreplication_replica_sequence:{replica_sequence}\r\nreplication_send_lag:{send_lag}\r\nreplica_retain_dropped:{dropped}\r\nreplication_epoch:{epoch}\r\nreplication_fenced:{fenced}\r\nreplication_committed_sequence:{committed}\r\n",
         epoch = state.epoch.get(),
+        committed = if state.role.get() == crate::config::ReplicationRole::Replica {
+            state.replica_link.committed()
+        } else {
+            state.durable_replies.committed()
+        },
         fenced = u8::from(state.write_gate.get() == crate::replication::WriteGate::Fenced),
     )?;
     // Redis's lines for each replica that announced where clients reach it; replicas that

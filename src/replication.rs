@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc::{Receiver, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
@@ -27,11 +27,14 @@ use crate::{
 pub const HANDSHAKE_MAGIC: &[u8; 8] = b"RUVREP01";
 /// Handshake versions this build speaks; the version also names the request: resume from the
 /// replica's log, resync from a snapshot at a sequence, or resync an incomplete image.
-pub const VERSION_RESUME: u16 = 12;
-pub const VERSION_RESYNC: u16 = 13;
-pub const VERSION_RESYNC_INCOMPLETE: u16 = 14;
+pub const VERSION_RESUME: u16 = 15;
+pub const VERSION_RESYNC: u16 = 16;
+pub const VERSION_RESYNC_INCOMPLETE: u16 = 17;
 const SUPPORTED_VERSIONS: std::ops::RangeInclusive<u16> =
     VERSION_RESUME..=VERSION_RESYNC_INCOMPLETE;
+/// Versions of builds whose handshake and reply are this build's, but whose stream has no
+/// control frames. Read in full, then refused in this build's reply format.
+const NO_CONTROL_VERSIONS: std::ops::RangeInclusive<u16> = 12..=14;
 /// Versions of builds whose handshake ended after the password and whose reply carried no
 /// history id. They are refused in their own reply format so they log the refusal.
 const LEGACY_VERSIONS: std::ops::RangeInclusive<u16> = 1..=5;
@@ -1055,6 +1058,7 @@ pub fn apply_frame(
 
 pub const PUBLISH_MAGIC: &[u8; 8] = b"RUVPUB01";
 pub const ACK_MAGIC: &[u8; 8] = b"RUVACK01";
+pub const CONTROL_MAGIC: &[u8; 8] = b"RUVCTL01";
 const ACK_LEN: usize = 16;
 
 pub fn encode_ack(sequence: u64) -> [u8; ACK_LEN] {
@@ -1256,6 +1260,70 @@ pub fn encode_copied_publish(sharded: bool, channel: &[u8], message: &[u8]) -> V
     frame
 }
 
+/// What a primary shard tells its replicas besides its log: the highest sequence a durable
+/// reply was released for, and whether a durable reply is waiting now.
+#[derive(Debug, Default)]
+pub struct DurableReplies {
+    committed: AtomicU64,
+    waiting: AtomicU32,
+}
+
+impl DurableReplies {
+    pub fn committed(&self) -> u64 {
+        self.committed.load(Ordering::Acquire)
+    }
+
+    pub fn commit(&self, sequence: u64) {
+        self.committed.fetch_max(sequence, Ordering::AcqRel);
+    }
+
+    /// While at least one durable reply waits, replicas sync and acknowledge every batch.
+    pub fn begin_wait(&self) {
+        self.waiting.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn end_wait(&self) {
+        self.waiting.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn state(&self) -> (u64, bool) {
+        (
+            self.committed.load(Ordering::Acquire),
+            self.waiting.load(Ordering::Acquire) != 0,
+        )
+    }
+}
+
+pub fn encode_control(committed: u64, ack_each: bool) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(32);
+
+    frame.extend_from_slice(&32u32.to_le_bytes());
+    frame.extend_from_slice(CONTROL_MAGIC);
+    frame.extend_from_slice(&committed.to_le_bytes());
+    frame.push(u8::from(ack_each));
+    frame.resize(28, 0);
+    let checksum = crc32c::crc32c(&frame);
+
+    frame.extend_from_slice(&checksum.to_le_bytes());
+    frame
+}
+
+/// `(committed, ack_each)` of a control frame; `None` for any other frame.
+pub fn decode_control(frame: &[u8]) -> Option<(u64, bool)> {
+    if frame.len() != 32 || &frame[4..12] != CONTROL_MAGIC {
+        return None;
+    }
+
+    if crc32c::crc32c(&frame[..28]) != u32::from_le_bytes(frame[28..].try_into().ok()?) {
+        return None;
+    }
+
+    Some((
+        u64::from_le_bytes(frame[12..20].try_into().ok()?),
+        frame[20] == 1,
+    ))
+}
+
 pub fn decode_copied_publish(frame: &[u8]) -> Option<(bool, Vec<u8>, Vec<u8>)> {
     if frame.len() < 32 || u32::from_le_bytes(frame[..4].try_into().ok()?) as usize != frame.len() {
         return None;
@@ -1424,6 +1492,8 @@ pub struct Shipment {
     pub announce: Option<Endpoint>,
     /// Wraps each accepted replica connection in TLS; none leaves the link in cleartext.
     pub tls: Option<Arc<crate::tls::TlsAcceptor>>,
+    /// Sent to every replica in control frames when it changes.
+    pub durable_replies: Arc<DurableReplies>,
 }
 
 struct ReplicaProgress {
@@ -1601,6 +1671,10 @@ pub struct LinkStatus {
     /// caught up: the replica then sends no acknowledgement, so its primary neither lists
     /// it for reads nor counts it for `WAIT` and `min-replicas-to-write`.
     copying: AtomicBool,
+    /// Highest sequence the primary released a durable reply for.
+    committed: AtomicU64,
+    /// The primary has a durable reply waiting: sync and acknowledge every batch.
+    ack_each: AtomicBool,
 }
 
 impl LinkStatus {
@@ -1610,6 +1684,19 @@ impl LinkStatus {
 
     pub fn is_copying(&self) -> bool {
         self.copying.load(Ordering::Acquire)
+    }
+
+    fn note_control(&self, committed: u64, ack_each: bool) {
+        self.committed.fetch_max(committed, Ordering::AcqRel);
+        self.ack_each.store(ack_each, Ordering::Release);
+    }
+
+    pub fn committed(&self) -> u64 {
+        self.committed.load(Ordering::Acquire)
+    }
+
+    pub fn ack_each(&self) -> bool {
+        self.ack_each.load(Ordering::Acquire)
     }
 
     fn mark_up(&self) {
@@ -2288,6 +2375,8 @@ fn stream_new_frames(
     mut last_sent: u64,
 ) -> io::Result<()> {
     let mut ack_bytes = Vec::new();
+    // What this replica was last told; a new connection starts from nothing committed.
+    let mut control = (0, false);
 
     loop {
         if stop.load(Ordering::Acquire) {
@@ -2296,6 +2385,17 @@ fn stream_new_frames(
 
         if !poll_acks(stream, hold, &mut ack_bytes) {
             return Ok(());
+        }
+
+        let current = shipment.durable_replies.state();
+
+        if current != control {
+            if !write_live(stream, &encode_control(current.0, current.1), stop)? {
+                return Ok(());
+            }
+
+            control = current;
+            let _ = stream.flush();
         }
 
         while let Ok(frame) = copied_publishes.try_recv() {
@@ -2660,6 +2760,8 @@ fn read_primary(
     };
 
     acks.poll(stream, &link.wal);
+    // The primary repeats what a durable reply needs after every handshake.
+    link.status.note_control(0, false);
     link.status.mark_up();
     // Frames carry records written under the primary's limits, not this replica's; but
     // none larger than this replica's own log segment can be stored, so a declared length
@@ -2695,6 +2797,16 @@ fn read_primary(
             };
 
         link.status.touch();
+
+        if let Some((committed, ack_each)) = decode_control(&frame) {
+            link.status.note_control(committed, ack_each);
+            if ack_each {
+                link.wake_shard.notify_one();
+            }
+            acks.poll(stream, &link.wal);
+
+            continue;
+        }
 
         let sequence = if decode_copied_publish(&frame).is_some() {
             None
@@ -2901,7 +3013,7 @@ fn read_handshake(stream: &mut dyn Wire) -> io::Result<Incoming> {
 
     // Decided before the rest is read: other builds send a different tail, and waiting for
     // bytes that never come would stall both sides until the read timeout.
-    if !SUPPORTED_VERSIONS.contains(&version) {
+    if !SUPPORTED_VERSIONS.contains(&version) && !NO_CONTROL_VERSIONS.contains(&version) {
         // Consume what older builds send after the prefix so the peer reads the refusal
         // instead of a reset: the legacy ones end with the password, the history-only ones
         // add a history id and shard count.
@@ -2933,6 +3045,11 @@ fn read_handshake(stream: &mut dyn Wire) -> io::Result<Incoming> {
 
     bytes.resize(read + host_len + CHECKSUM_LEN, 0);
     stream.read_exact(&mut bytes[read..])?;
+
+    if NO_CONTROL_VERSIONS.contains(&version) {
+        return Ok(Incoming::Unsupported(version));
+    }
+
     decode_handshake(&bytes)
         .map(Incoming::Handshake)
         .map_err(|reason| io::Error::new(io::ErrorKind::InvalidData, reason))

@@ -97,7 +97,7 @@ Anything without a typed method: `c.async().execute("COMMAND", arg, ...)`.
 
 ## Coverage
 
-All 298 commands of `docs/compatibility-matrix.json` have a typed method (`CoverageTest` maps every
+All 299 commands of `docs/compatibility-matrix.json` have a typed method (`CoverageTest` maps every
 matrix name to a method and fails otherwise), including the Ruvio options: `SET ... IFEQ`, `SET ... IFGT/IFLT` (`setIfGreater`, `setIfLess`),
 `INCRBY ... MAX`, `FILLGET ... WAIT`, `FILLSET ... SWR`, `GETEX`, `DELEX key IFEQ v`, `LPUSHCAP/RPUSHCAP`,
 `BF.*`, `JSON.*` incl. `JSON.INDEX/FIND`, `IDEM BEGIN/COMPLETE`, `LEASE/RELEASE`, `SEMAPHORE`, `ONCE`,
@@ -167,7 +167,7 @@ client, including `database(n)`. In cluster mode the database option is ignored 
 database 0). Every node gets its own lazily opened multiplexed connection with the same fast path as
 the standalone one; the standalone path itself only pays one `router == null` check per command.
 
-How it routes (the key table covers all 298 matrix commands, `CoverageTest` fails when one has no rule):
+How it routes (the key table covers all 299 matrix commands, `CoverageTest` fails when one has no rule):
 
 | Command shape | Routing |
 | --- | --- |
