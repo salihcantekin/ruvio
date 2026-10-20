@@ -1,4 +1,7 @@
 /target
+# Nix build output links
+/result
+/result-*
 # Written by a server started in the repository; the tracked template is ruvio.example.toml
 /ruvio.toml
 .DS_Store

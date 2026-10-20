@@ -66,6 +66,35 @@ The sections below build Ruvio from source.
 - Install the Rust toolchain with `rustup`.
 - The portable core and examples support Linux, macOS, and Windows.
 
+## Nix (Linux and macOS)
+
+Enable Nix's `nix-command` and `flakes` experimental features, then run:
+
+```bash
+nix develop
+cargo build --locked --bin ruvio --bin ruvio-ctl
+scripts/check.sh
+cargo nextest run --locked --profile ci --lib --bins --tests
+```
+
+The shell supplies the pinned Rust toolchain, editor components, native build
+dependencies, Python, Nextest and Redis tools.
+
+```bash
+nix build                         # result/bin/{ruvio,ruvio-ctl}
+nix flake check                   # package tests and Rust formatting
+nix fmt -- --check flake.nix
+```
+
+The package includes the template in `share/ruvio/` and notices in
+`share/licenses/ruvio/`. Use writable configuration and data paths, not the Nix
+store. Package tests cover library/binary tests, layout and zero-allocation
+guards; run the full suite in the shell as above.
+
+Outputs target x86_64/aarch64 Linux and aarch64 macOS. On x86_64 Linux, Nix's
+explicit linker skips optional symbol ordering in `build.rs`; Rust stays pinned
+in `rust-toolchain.toml`.
+
 ## macOS
 
 macOS builds and runs the same server as Linux and Windows. I/O uses kqueue.
