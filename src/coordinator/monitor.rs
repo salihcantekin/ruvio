@@ -84,23 +84,26 @@ impl Sightings {
     }
 }
 
-/// What this coordinator granted for the primary lease (`primary_lease_ms`): when it last
-/// granted each member, so a failover can wait until the old primary's lease ended.
+/// What this coordinator granted for the primary lease (`primary_lease_ms`), and the promises
+/// it made to the leader about it.
+///
+/// When the leader asks whether a primary's lease ended ([`RpcRequest::Leases`]) and this
+/// coordinator answers yes, it promises not to grant that member again until the leader
+/// confirms, after any failover it was deciding, that the record still names it
+/// ([`confirm_locally`]). The leader decides each failover under [`Grants::decision`], and a
+/// confirmation waits for it and reads the record after a majority confirmed the leader. So
+/// a majority that reported the lease ended cannot renew the old primary once the failover is
+/// recorded, and any majority that granted it shares a coordinator with that one.
 #[derive(Clone)]
 pub struct Grants(Arc<GrantBook>);
 
 struct GrantBook {
     /// A coordinator that just started may have granted before it stopped: it reports every
-    /// lease as granted at its start, and grants nothing for `hold` after it.
+    /// lease as granted at its start.
     started: Instant,
-    state: Mutex<GrantState>,
-}
-
-#[derive(Default)]
-struct GrantState {
-    members: HashMap<(String, usize), Granting>,
-    /// Per group, the highest epoch this coordinator granted a lease for.
-    epochs: HashMap<String, u64>,
+    members: Mutex<HashMap<(String, usize), Granting>>,
+    /// Held by the leader while it decides whether to fail a group over.
+    decision: tokio::sync::Mutex<()>,
 }
 
 /// One member's grants from this coordinator.
@@ -109,45 +112,21 @@ pub struct Granting {
     /// Taken just before the last `RUVIO LEASE GRANT` was sent, so after the node's BEGIN
     /// instant the lease counts from.
     pub last: Option<Instant>,
-    /// After a gap, when granting may resume.
-    pub resume_at: Option<Instant>,
+    /// The epoch the leader confirmed for this member since this coordinator last reported
+    /// its lease ended; it grants only at that epoch. `None` at start.
+    pub cleared: Option<u64>,
+    /// How many times this coordinator reported the lease ended: a confirmation asked
+    /// before the latest report does not count.
+    pub reports: u64,
 }
 
 impl Default for Grants {
     fn default() -> Self {
         Self(Arc::new(GrantBook {
             started: Instant::now(),
-            state: Mutex::default(),
+            members: Mutex::default(),
+            decision: tokio::sync::Mutex::new(()),
         }))
-    }
-}
-
-/// Whether a coordinator grants a lease for `epoch` to a member it last granted as
-/// `granting` records. It grants on while its grants have no gap longer than `safe` (the
-/// lease counted as ended), and at once for an epoch newer than any it granted in the group.
-/// After a gap it waits `hold` first: it may have told the leader the lease ended, and a
-/// failover recorded meanwhile must reach it before it renews the old primary.
-pub fn may_grant(
-    granting: &mut Granting,
-    newer_epoch: bool,
-    now: Instant,
-    safe: Duration,
-    hold: Duration,
-) -> bool {
-    if newer_epoch
-        || granting
-            .last
-            .is_some_and(|last| now.saturating_duration_since(last) <= safe)
-    {
-        granting.resume_at = None;
-        return true;
-    }
-    match granting.resume_at {
-        Some(at) => now >= at,
-        None => {
-            granting.resume_at = Some(now + hold);
-            false
-        }
     }
 }
 
@@ -156,110 +135,147 @@ pub fn grant_age(last: Option<Instant>, started: Instant, now: Instant) -> Durat
     now.saturating_duration_since(last.map_or(started, |last| last.max(started)))
 }
 
-/// Whether a majority of coordinators report a member's lease ended: its grant age above
-/// `safe`. A coordinator that did not answer counts as one that may still grant it.
-pub fn lease_ended(ages: &[Option<Duration>], safe: Duration, quorum: usize) -> bool {
-    ages.iter()
-        .filter(|age| age.is_some_and(|age| age > safe))
-        .count()
-        >= quorum
+impl Granting {
+    /// Answers the leader: whether the lease ended, its grant age past `safe`. A yes is a
+    /// promise: no grant until the leader confirms the member again.
+    pub fn report(&mut self, started: Instant, now: Instant, safe: Duration) -> bool {
+        let ended = grant_age(self.last, started, now) > safe;
+
+        if ended {
+            self.cleared = None;
+            self.reports += 1;
+        }
+        ended
+    }
+
+    /// The leader confirmed the record names this member at `epoch`, in answer to a request
+    /// sent when [`Granting::reports`] was `asked_at`.
+    pub fn confirm(&mut self, asked_at: u64, epoch: u64) {
+        if self.reports == asked_at {
+            self.cleared = Some(epoch);
+        }
+    }
+
+    /// Records a grant at `epoch` about to be sent, when the member is cleared for it.
+    pub fn record(&mut self, epoch: u64, now: Instant) -> bool {
+        let cleared = self.cleared == Some(epoch);
+
+        if cleared {
+            self.last = Some(now);
+        }
+        cleared
+    }
 }
 
 impl Grants {
-    /// Decides whether to grant `member` of `group` at `epoch` now; see [`may_grant`].
-    fn decide(
-        &self,
-        group: &str,
-        member: usize,
-        epoch: u64,
-        safe: Duration,
-        hold: Duration,
-    ) -> bool {
-        let now = Instant::now();
-
-        if now < self.0.started + hold {
-            return false;
-        }
-        let mut state = self
+    fn with<R>(&self, group: &str, member: usize, act: impl FnOnce(&mut Granting) -> R) -> R {
+        let mut members = self
             .0
-            .state
+            .members
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let newer = state
-            .epochs
-            .get(group)
-            .is_none_or(|&granted| epoch > granted);
-        let granting = state.members.entry((group.to_owned(), member)).or_default();
 
-        may_grant(granting, newer, now, safe, hold)
+        act(members.entry((group.to_owned(), member)).or_default())
     }
 
-    /// Records a grant about to be sent.
-    fn record(&self, group: &str, member: usize, epoch: u64) {
-        let mut state = self
-            .0
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let granting = state.members.entry((group.to_owned(), member)).or_default();
+    /// [`Granting::report`] for `member` of `group`.
+    pub fn report(&self, group: &str, member: usize, safe: Duration) -> bool {
+        let started = self.0.started;
 
-        granting.last = Some(Instant::now());
-        granting.resume_at = None;
-        let granted = state.epochs.entry(group.to_owned()).or_default();
-        *granted = (*granted).max(epoch);
+        self.with(group, member, |granting| {
+            granting.report(started, Instant::now(), safe)
+        })
     }
 
-    /// Milliseconds since this coordinator may last have granted each member of `group` a
-    /// lease, as [`RpcRequest::Leases`] reports it.
-    pub fn ages(&self, group: &Group) -> Vec<u64> {
-        let now = Instant::now();
-        let state = self
-            .0
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-
-        (0..group.members.len())
-            .map(|member| {
-                let last = state
-                    .members
-                    .get(&(group.name.clone(), member))
-                    .and_then(|granting| granting.last);
-
-                grant_age(last, self.0.started, now).as_millis() as u64
-            })
-            .collect()
+    /// Held by the leader while it decides a failover; [`confirm_locally`] waits for it.
+    pub async fn decision(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.0.decision.lock().await
     }
 }
 
-/// What a ping needs to renew the lease of the agreed primary.
-#[derive(Clone)]
-struct Renewal {
-    grants: Grants,
-    coordinator: u64,
-    voters: u32,
-    epoch: u64,
-    group: String,
-    member: usize,
-    lease: Duration,
-    safe: Duration,
-    hold: Duration,
+/// [`RpcRequest::Confirm`] on the leader: after any failover decision in progress, and once a
+/// majority confirmed this coordinator still leads (so its record is current), the group's
+/// primary. `None` when it cannot confirm.
+pub async fn confirm_locally(
+    raft: &Raft,
+    machine: &StateMachine,
+    grants: &Grants,
+    group: &str,
+) -> Option<Primary> {
+    let _decided = grants.decision().await;
+
+    match tokio::time::timeout(CALL_TIMEOUT, raft.ensure_linearizable()).await {
+        Ok(Ok(_)) => machine.primaries().get(group).copied(),
+        _ => None,
+    }
 }
 
-/// `RUVIO LEASE BEGIN`, then `RUVIO LEASE GRANT` on the same connection. The grant is
-/// recorded before it is sent: once sent it may arrive.
-async fn renew(client: &mut NodeClient, renewal: &Renewal) {
-    let Renewal {
-        grants,
-        group,
-        member,
-        epoch,
-        ..
-    } = renewal;
+/// The group's primary as the current leader confirms it ([`confirm_locally`]).
+async fn confirm(
+    config: &CoordinatorConfig,
+    raft: &Raft,
+    machine: &StateMachine,
+    grants: &Grants,
+    group: &str,
+) -> Option<Primary> {
+    let leader = raft.metrics().borrow().current_leader?;
 
-    if !grants.decide(group, *member, *epoch, renewal.safe, renewal.hold) {
+    if leader == config.id {
+        return confirm_locally(raft, machine, grants, group).await;
+    }
+    let (_, address) = config.peers.iter().find(|(id, _)| *id == leader)?;
+
+    match super::raft::call(
+        &address.to_string(),
+        config.secret.as_deref().unwrap_or(""),
+        RpcRequest::Confirm {
+            group: group.to_owned(),
+        },
+        CALL_TIMEOUT,
+    )
+    .await
+    {
+        Ok(RpcResponse::Confirmed(primary)) => primary,
+        _ => None,
+    }
+}
+
+/// Renews the lease of the primary this coordinator's record names in `group`: confirms it
+/// with the leader first when needed, then `RUVIO LEASE BEGIN` and `RUVIO LEASE GRANT` on
+/// one connection. The grant is recorded before it is sent: once sent it may arrive.
+async fn renew(
+    config: &CoordinatorConfig,
+    raft: &Raft,
+    machine: &StateMachine,
+    grants: &Grants,
+    group: &Group,
+    primary: Primary,
+) {
+    let Some((lease, _)) = config.primary_lease else {
         return;
+    };
+    let name = group.name.as_str();
+    let member = primary.member;
+    let asked_at = grants.with(name, member, |granting| {
+        (granting.cleared != Some(primary.epoch)).then_some(granting.reports)
+    });
+
+    if let Some(asked_at) = asked_at {
+        if confirm(config, raft, machine, grants, name).await != Some(primary) {
+            return;
+        }
+        grants.with(name, member, |granting| {
+            granting.confirm(asked_at, primary.epoch)
+        });
     }
+    let Some(target) = group.members.get(member) else {
+        return;
+    };
+    let Ok(mut client) =
+        NodeClient::connect(&target.address, config.auth.as_deref(), CALL_TIMEOUT).await
+    else {
+        return;
+    };
     let Ok(Value::Integer(token)) = client
         .call(&[b"RUVIO", b"LEASE", b"BEGIN"], CALL_TIMEOUT)
         .await
@@ -268,14 +284,18 @@ async fn renew(client: &mut NodeClient, renewal: &Renewal) {
     };
     let words = [
         token.to_string(),
-        renewal.coordinator.to_string(),
-        renewal.voters.to_string(),
-        epoch.to_string(),
-        renewal.lease.as_millis().to_string(),
+        config.id.to_string(),
+        config.peers.len().to_string(),
+        primary.epoch.to_string(),
+        lease.as_millis().to_string(),
     ];
 
-    grants.record(group, *member, *epoch);
-    match client
+    if !grants.with(name, member, |granting| {
+        granting.record(primary.epoch, Instant::now())
+    }) {
+        return;
+    }
+    if let Ok(Value::Error(error)) = client
         .call(
             &[
                 b"RUVIO",
@@ -291,11 +311,61 @@ async fn renew(client: &mut NodeClient, renewal: &Renewal) {
         )
         .await
     {
-        Ok(Value::Simple(_)) => {}
-        Ok(Value::Error(error)) => {
-            tracing::debug!(%group, member, %error, "the primary refused a lease grant")
+        tracing::debug!(group = name, member, %error, "the primary refused a lease grant");
+    }
+}
+
+/// With `primary_lease_ms`, renews every group's primary lease every `ping_interval`, each
+/// group on its own task: a slow or silent member elsewhere never delays a renewal, and a
+/// renewal still running is not started twice. Each coordinator grants on its own: the lease
+/// holds only while a majority of them do.
+pub async fn renew_leases(
+    config: Arc<CoordinatorConfig>,
+    raft: Raft,
+    machine: StateMachine,
+    sightings: Sightings,
+) {
+    if config.primary_lease.is_none() {
+        return;
+    }
+    let grants = sightings.grants().clone();
+    let running: Arc<Mutex<Vec<String>>> = Arc::default();
+    let mut tick = tokio::time::interval(config.ping_interval);
+
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let primaries = machine.primaries();
+
+        for group in &config.groups {
+            let Some(primary) = primaries.get(&group.name).copied() else {
+                continue;
+            };
+            {
+                let mut running = running.lock().unwrap_or_else(|error| error.into_inner());
+
+                if running.contains(&group.name) {
+                    continue;
+                }
+                running.push(group.name.clone());
+            }
+            let (config, raft, machine, grants, running, group) = (
+                Arc::clone(&config),
+                raft.clone(),
+                machine.clone(),
+                grants.clone(),
+                Arc::clone(&running),
+                group.clone(),
+            );
+
+            tokio::spawn(async move {
+                renew(&config, &raft, &machine, &grants, &group, primary).await;
+                running
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .retain(|name| *name != group.name);
+            });
         }
-        _ => {}
     }
 }
 
@@ -306,24 +376,11 @@ pub type Switches = broadcast::Sender<String>;
 const CALL_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// Pings one member and reads its role and synced sequence.
-async fn look(
-    member: &Member,
-    auth: Option<&str>,
-    cluster: bool,
-    renewal: Option<Renewal>,
-) -> Option<Sighting> {
+async fn look(member: &Member, auth: Option<&str>, cluster: bool) -> Option<Sighting> {
     let mut client = NodeClient::connect(&member.address, auth, CALL_TIMEOUT)
         .await
         .ok()?;
     let role = client.call(&[b"ROLE"], CALL_TIMEOUT).await.ok()?;
-
-    // The agreed primary's lease, renewed first so the reads below never delay it.
-    if let Some(renewal) = renewal
-        && let Value::Array(Some(items)) = &role
-        && items.first().and_then(Value::text).as_deref() == Some("master")
-    {
-        renew(&mut client, &renewal).await;
-    }
     let mut sighting = Sighting {
         last_ok: Some(Instant::now()),
         ..Sighting::default()
@@ -628,11 +685,8 @@ fn missing(sighting: &Sighting, committed: &[u64]) -> String {
         .join(", ")
 }
 
-/// Pings every member of every group, every `ping_interval`, and with `primary_lease_ms`
-/// renews the lease of the member this coordinator's record names as the primary. Each
-/// coordinator grants on its own: the lease holds only while a majority of them do.
-pub async fn watch(config: Arc<CoordinatorConfig>, sightings: Sightings, machine: StateMachine) {
-    let grants = sightings.grants().clone();
+/// Pings every member of every group, every `ping_interval`.
+pub async fn watch(config: Arc<CoordinatorConfig>, sightings: Sightings) {
     let mut tick = tokio::time::interval(config.ping_interval);
 
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -640,35 +694,15 @@ pub async fn watch(config: Arc<CoordinatorConfig>, sightings: Sightings, machine
         tick.tick().await;
         let mut looks = Vec::new();
         let cluster = config.groups.iter().any(|group| group.shards.is_some());
-        let primaries = machine.primaries();
 
         for group in &config.groups {
             for (index, member) in group.members.iter().enumerate() {
                 let auth = config.auth.clone();
                 let member = member.clone();
                 let name = group.name.clone();
-                let renewal = config.primary_lease.and_then(|(lease, safe)| {
-                    let primary = primaries.get(&group.name)?;
-
-                    (primary.member == index).then(|| Renewal {
-                        grants: grants.clone(),
-                        coordinator: config.id,
-                        voters: u32::try_from(config.peers.len()).unwrap_or(u32::MAX),
-                        epoch: primary.epoch,
-                        group: group.name.clone(),
-                        member: index,
-                        lease,
-                        safe,
-                        hold: config.down_after,
-                    })
-                });
 
                 looks.push(tokio::spawn(async move {
-                    (
-                        name,
-                        index,
-                        look(&member, auth.as_deref(), cluster, renewal).await,
-                    )
+                    (name, index, look(&member, auth.as_deref(), cluster).await)
                 }));
             }
         }
@@ -680,65 +714,106 @@ pub async fn watch(config: Arc<CoordinatorConfig>, sightings: Sightings, machine
     }
 }
 
-/// Asks every other coordinator how long ago it heard from `primary`; true when a majority
-/// (this one included) has not heard from it within `down_after`. With `primary_lease_ms` a
-/// majority must also report that its lease ended (see [`lease_ended`]).
+/// What the coordinators say about a primary the leader no longer hears from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// Fewer than a majority lost it.
+    Up,
+    /// A majority lost it, but fewer than a majority saw its lease end.
+    LeaseRunning,
+    /// Down, and its lease (if any coordinator grants one) ended.
+    Down,
+}
+
+/// Counts the coordinators' answers: how many no longer hear the primary, how many report
+/// its lease ended, and whether any of them grants leases.
+pub fn verdict(heard_down: usize, lease_ended: usize, lease_on: bool, quorum: usize) -> Verdict {
+    if heard_down < quorum {
+        Verdict::Up
+    } else if lease_on && lease_ended < quorum {
+        Verdict::LeaseRunning
+    } else {
+        Verdict::Down
+    }
+}
+
+/// Asks every coordinator (this one included, the others at once) how long ago it heard from
+/// `primary` and whether that member's lease ended, each by its own lease settings. A
+/// coordinator that reports the lease ended promises not to renew it until the leader
+/// confirms the member again (see [`Grants`]). One that does not answer the lease question (it
+/// is down, or of an older version) counts as still granting; its `Observe` answer still
+/// counts for hearing. Also whether any coordinator grants leases.
 async fn objectively_down(
     config: &CoordinatorConfig,
     sightings: &Sightings,
     group: &Group,
     primary: usize,
-) -> bool {
-    let grants = sightings.grants();
+) -> (Verdict, bool) {
     let down_after = config.down_after.as_millis() as u64;
-    let local = sightings.ages(group)[primary];
-    let mut down = usize::from(local.is_none_or(|age| age > down_after));
-    let mut lease_ages = vec![Some(Duration::from_millis(grants.ages(group)[primary]))];
+    let is_down = |ages: &[Option<u64>]| {
+        ages.get(primary)
+            .copied()
+            .flatten()
+            .is_none_or(|age| age > down_after)
+    };
+    let mut heard_down = usize::from(is_down(&sightings.ages(group)));
+    let mut lease_on = config.primary_lease.is_some();
+    let mut ended = usize::from(match config.primary_lease {
+        Some((_, safe)) => sightings.grants().report(&group.name, primary, safe),
+        None => true,
+    });
+    let mut calls = tokio::task::JoinSet::new();
 
     for (id, address) in &config.peers {
         if *id == config.id {
             continue;
         }
-        let group_name = group.name.clone();
-        // A lease needs the newer call, which reports the grants too; coordinators that do
-        // not know it (an older version) answer nothing and count as granting.
-        let request = if config.primary_lease.is_some() {
-            RpcRequest::Leases { group: group_name }
-        } else {
-            RpcRequest::Observe { group: group_name }
-        };
-        let (heard, granted) = match super::raft::call(
-            &address.to_string(),
-            config.secret.as_deref().unwrap_or(""),
-            request,
-            CALL_TIMEOUT,
-        )
-        .await
-        {
-            Ok(RpcResponse::Observe(heard)) => (Some(heard), None),
-            Ok(RpcResponse::Leases { heard, granted }) => (Some(heard), Some(granted)),
-            _ => (None, None),
+        let (address, secret, name) = (
+            address.to_string(),
+            config.secret.clone().unwrap_or_default(),
+            group.name.clone(),
+        );
+
+        calls.spawn(async move {
+            let leases = RpcRequest::Leases {
+                group: name.clone(),
+                member: primary,
+            };
+
+            match super::raft::call(&address, &secret, leases, CALL_TIMEOUT).await {
+                Ok(RpcResponse::Leases {
+                    heard,
+                    ended,
+                    lease_on,
+                }) => (Some(heard), ended, lease_on),
+                _ => match super::raft::call(
+                    &address,
+                    &secret,
+                    RpcRequest::Observe { group: name },
+                    CALL_TIMEOUT,
+                )
+                .await
+                {
+                    Ok(RpcResponse::Observe(heard)) => (Some(heard), false, false),
+                    _ => (None, false, false),
+                },
+            }
+        });
+    }
+    while let Some(answer) = calls.join_next().await {
+        let Ok((heard, peer_ended, peer_lease_on)) = answer else {
+            continue;
         };
 
-        if heard.is_some_and(|ages| {
-            ages.get(primary)
-                .copied()
-                .flatten()
-                .is_none_or(|age| age > down_after)
-        }) {
-            down += 1;
-        }
-        lease_ages.push(
-            granted
-                .and_then(|ages| ages.get(primary).copied())
-                .map(Duration::from_millis),
-        );
+        heard_down += usize::from(heard.is_some_and(|ages| is_down(&ages)));
+        ended += usize::from(peer_ended);
+        lease_on |= peer_lease_on;
     }
 
-    down >= config.quorum()
-        && config
-            .primary_lease
-            .is_none_or(|(_, safe)| lease_ended(&lease_ages, safe, config.quorum()))
+    (
+        verdict(heard_down, ended, lease_on, config.quorum()),
+        lease_on,
+    )
 }
 
 /// The leader's loop: start each group from its configured primary, fail over a primary a
@@ -801,8 +876,18 @@ pub async fn lead(
             let committed = commits.learn(group, primary, &seen, config.down_after);
             let primary_age = seen[primary.member].last_ok.map(|at| at.elapsed());
 
-            if primary_age.is_none_or(|age| age > config.down_after)
-                && objectively_down(&config, &sightings, group, primary.member).await
+            // Held through the failover, so no coordinator is confirmed this primary between
+            // reporting its lease ended and the record naming another member.
+            let decided = match primary_age.is_none_or(|age| age > config.down_after) {
+                true => Some(sightings.grants().decision().await),
+                false => None,
+            };
+
+            if decided.is_some()
+                && objectively_down(&config, &sightings, group, primary.member)
+                    .await
+                    .0
+                    == Verdict::Down
             {
                 let failing = Failing {
                     group,
@@ -813,6 +898,7 @@ pub async fn lead(
                 let _ = failover(&config, &raft, &machine, &switches, failing, false).await;
                 continue;
             }
+            drop(decided);
 
             reconcile(&config, group, primary, &seen).await;
         }
@@ -1069,14 +1155,24 @@ pub async fn force_failover(force: Force<'_>, group: &Group) -> Result<String, S
         ));
     }
     // FORCE overrides the wait for committed records, never the lease: promoting while the
-    // old primary may still hold it would let both take writes.
-    if force.config.primary_lease.is_some()
-        && !objectively_down(force.config, force.sightings, group, primary.member).await
-    {
-        return Err(format!(
-            "ERR the primary of {} may still hold its lease; try again once a majority of coordinators saw it end",
-            group.name
-        ));
+    // old primary may still hold it would let both take writes. Asked even when this
+    // coordinator grants no lease, since the others may.
+    let _decided = force.sightings.grants().decision().await;
+
+    match objectively_down(force.config, force.sightings, group, primary.member).await {
+        (Verdict::LeaseRunning, _) => {
+            return Err(format!(
+                "ERR the primary of {} may still hold its lease; try again once a majority of coordinators saw it end",
+                group.name
+            ));
+        }
+        (Verdict::Up, true) => {
+            return Err(format!(
+                "ERR a majority of coordinators still hear the primary of {}, so its lease may be renewed",
+                group.name
+            ));
+        }
+        _ => {}
     }
     let committed = force
         .commits
@@ -1208,78 +1304,59 @@ mod tests {
     }
 
     #[test]
-    fn a_coordinator_grants_on_without_gaps_and_waits_after_one() {
-        let start = Instant::now();
-        let safe = Duration::from_millis(2400);
-        let hold = Duration::from_millis(3000);
-        let ms = Duration::from_millis;
-        let mut granting = Granting::default();
-
-        // Never granted this member at this epoch: wait out the hold first.
-        assert!(!may_grant(&mut granting, false, start, safe, hold));
-        assert!(!may_grant(
-            &mut granting,
-            false,
-            start + ms(2999),
-            safe,
-            hold
-        ));
-        assert!(may_grant(
-            &mut granting,
-            false,
-            start + ms(3000),
-            safe,
-            hold
-        ));
-        granting = Granting {
-            last: Some(start + ms(3000)),
-            resume_at: None,
-        };
-        // Grants follow each other within the safe interval: no wait.
-        assert!(may_grant(
-            &mut granting,
-            false,
-            start + ms(5400),
-            safe,
-            hold
-        ));
-        // A gap longer than it: this coordinator may have reported the lease ended, so it
-        // waits the hold before renewing the same primary.
-        assert!(!may_grant(
-            &mut granting,
-            false,
-            start + ms(5401),
-            safe,
-            hold
-        ));
-        assert_eq!(granting.resume_at, Some(start + ms(8401)));
-        assert!(!may_grant(
-            &mut granting,
-            false,
-            start + ms(8400),
-            safe,
-            hold
-        ));
-        assert!(may_grant(
-            &mut granting,
-            false,
-            start + ms(8401),
-            safe,
-            hold
-        ));
-        // A newer epoch is granted at once: this coordinator learned of the failover.
-        let mut fresh = Granting::default();
-        assert!(may_grant(&mut fresh, true, start, safe, hold));
-        assert_eq!(fresh.resume_at, None);
-    }
-
-    #[test]
-    fn a_failover_waits_for_a_majority_to_see_the_lease_end() {
+    fn a_coordinator_grants_only_after_the_leader_confirms_the_primary() {
         let start = Instant::now();
         let ms = Duration::from_millis;
         let safe = ms(2400);
+        let mut granting = Granting::default();
 
-        // Ages count from the last grant, but never from before this coordinator started.
+        // Just started: nothing confirmed, so no grant at any epoch.
+        assert!(!granting.record(1, start));
+        granting.confirm(0, 1);
+        assert!(!granting.record(2, start + ms(10)));
+        assert!(granting.record(1, start + ms(10)));
+        assert_eq!(granting.last, Some(start + ms(10)));
+
+        // Grants within the safe interval: the lease has not ended, nothing is promised.
+        assert!(!granting.report(start, start + ms(2410), safe));
+        assert!(granting.record(1, start + ms(2410)));
+
+        // A gap past it: the report promises no grant until the leader confirms again, and
+        // that promise holds however much later the renewal comes.
+        assert!(granting.report(start, start + ms(4811), safe));
+        assert_eq!(granting.cleared, None);
+        assert!(!granting.record(1, start + ms(4900)));
+        assert!(!granting.record(1, start + ms(60_000)));
+        assert_eq!(granting.last, Some(start + ms(2410)));
+    }
+
+    #[test]
+    fn a_confirmation_asked_before_a_report_does_not_clear_the_member() {
+        let start = Instant::now();
+        let safe = Duration::from_millis(2400);
+        let mut granting = Granting::default();
+        let asked_at = granting.reports;
+
+        // The leader asks for the lease while this coordinator waits for a confirmation that
+        // read the record before the failover.
+        assert!(granting.report(start, start + safe * 2, safe));
+        granting.confirm(asked_at, 1);
+        assert!(!granting.record(1, start + safe * 2));
+
+        // A confirmation asked after the report counts.
+        granting.confirm(granting.reports, 1);
+        assert!(granting.record(1, start + safe * 2));
+        // The record moved on: the old epoch is never granted again.
+        granting.confirm(granting.reports, 2);
+        assert!(!granting.record(1, start + safe * 3));
+        assert!(granting.record(2, start + safe * 3));
+    }
+
+    #[test]
+    fn grant_ages_never_count_from_before_the_coordinator_started() {
+        let start = Instant::now();
+        let ms = Duration::from_millis;
+
         assert_eq!(grant_age(None, start, start + ms(500)), ms(500));
         assert_eq!(
             grant_age(Some(start + ms(100)), start, start + ms(500)),
@@ -1293,25 +1370,16 @@ mod tests {
             grant_age(Some(start + ms(900)), start, start + ms(500)),
             ms(0)
         );
+    }
 
-        // Two of three past the safe interval: ended. Exactly at it, or a peer that did not
-        // answer, counts as still granting.
-        assert!(lease_ended(
-            &[Some(ms(2401)), Some(ms(9000)), Some(ms(0))],
-            safe,
-            2
-        ));
-        assert!(!lease_ended(
-            &[Some(ms(2400)), Some(ms(9000)), Some(ms(0))],
-            safe,
-            2
-        ));
-        assert!(!lease_ended(&[Some(ms(2401)), None, None], safe, 2));
-        assert!(lease_ended(
-            &[Some(ms(2401)), None, Some(ms(3000)), Some(ms(5000)), None],
-            safe,
-            3
-        ));
+    #[test]
+    fn a_failover_waits_for_a_majority_to_hear_the_primary_down_and_see_its_lease_end() {
+        assert_eq!(verdict(1, 3, true, 2), Verdict::Up);
+        assert_eq!(verdict(2, 1, true, 2), Verdict::LeaseRunning);
+        assert_eq!(verdict(2, 2, true, 2), Verdict::Down);
+        // No coordinator grants leases: hearing alone decides.
+        assert_eq!(verdict(2, 0, false, 2), Verdict::Down);
+        assert_eq!(verdict(3, 2, true, 3), Verdict::LeaseRunning);
     }
 
     #[test]

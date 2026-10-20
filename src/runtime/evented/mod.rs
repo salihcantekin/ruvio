@@ -1225,9 +1225,7 @@ async fn serve_async(
         write_gate: Cell::new(match config.replication.role {
             crate::config::ReplicationRole::Replica => crate::replication::WriteGate::Replica,
             // Closed until a majority of the coordinators grant the lease.
-            crate::config::ReplicationRole::Primary if config.replication.primary_lease => {
-                crate::replication::WriteGate::NoLease
-            }
+            _ if config.replication.primary_lease => crate::replication::WriteGate::NoLease,
             _ => crate::replication::WriteGate::Open,
         }),
         epoch: Cell::new(0),

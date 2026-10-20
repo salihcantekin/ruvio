@@ -194,19 +194,30 @@ impl CoordinatorConfig {
             None
         } else {
             let lease = Duration::from_millis(file.primary_lease_ms);
-            let safe = lease_safe_interval(lease, file.primary_lease_drift_percent);
 
-            if file.primary_lease_ms < 3 * file.ping_interval_ms {
-                return Err(
-                    "primary_lease_ms must be at least three times ping_interval_ms".into(),
-                );
+            // Checked before the safe interval is worked out, which they keep from overflowing.
+            if lease > crate::primary_lease::MAX_LEASE {
+                return Err("primary_lease_ms must be at most 60000".into());
             }
             if file.primary_lease_drift_percent > 100 {
                 return Err("primary_lease_drift_percent must be at most 100".into());
             }
-            if lease > crate::primary_lease::MAX_LEASE {
-                return Err("primary_lease_ms must be at most 60000".into());
+            // A node closes its gate `GATE_MARGIN` before the lease ends, so a renewal every
+            // ping must leave more than that, with room for the round trip.
+            let floor =
+                file.ping_interval_ms
+                    .saturating_mul(3)
+                    .max(file.ping_interval_ms.saturating_add(
+                        crate::primary_lease::GATE_MARGIN.as_millis() as u64 + 200,
+                    ));
+
+            if file.primary_lease_ms < floor {
+                return Err(format!(
+                    "primary_lease_ms must be at least {floor}: three times ping_interval_ms, and ping_interval_ms plus 500"
+                ));
             }
+            let safe = lease_safe_interval(lease, file.primary_lease_drift_percent);
+
             if safe.as_millis() as u64 > file.down_after_ms {
                 return Err(format!(
                     "down_after_ms must be at least {} with this primary_lease_ms: the lease plus {}% drift and 200 ms",
@@ -620,7 +631,7 @@ members = [
             ),
             (
                 "down_after_ms = 3000\nprimary_lease_ms = 1000",
-                "three times ping_interval_ms",
+                "at least 1500",
             ),
             (
                 "down_after_ms = 3000\nprimary_lease_ms = 2000\nprimary_lease_drift_percent = 101",
@@ -629,6 +640,15 @@ members = [
             (
                 "down_after_ms = 90000\nprimary_lease_ms = 61000",
                 "at most 60000",
+            ),
+            // Out-of-range values are refused, never overflowed.
+            (
+                "down_after_ms = 3000\nprimary_lease_ms = 9223372036854775807",
+                "at most 60000",
+            ),
+            (
+                "down_after_ms = 3000\nprimary_lease_ms = 2000\nprimary_lease_drift_percent = 9223372036854775807",
+                "at most 100",
             ),
         ] {
             let error = lease(text).unwrap_err();

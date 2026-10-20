@@ -3,20 +3,17 @@
 //! Each coordinator renews it on every ping, in two steps on one connection:
 //! `RUVIO LEASE BEGIN` records the node's own instant and answers a token, then
 //! `RUVIO LEASE GRANT token coordinator voters epoch lease_ms` grants the lease from that
-//! instant. The lease runs on the node's monotonic clock from the BEGIN instant, which comes
-//! before the coordinator sent the grant: a grant that arrives late only shortens it, and the
-//! coordinator, which counts from when it sent the grant, never believes a lease ended that
-//! the node still holds (as long as the two clocks run at nearly the same rate).
+//! instant. The lease runs on the node's clock from the BEGIN instant, which comes before the
+//! coordinator sent the grant: a grant that arrives late only shortens it, and the coordinator,
+//! which counts from when it sent the grant, never believes a lease ended that the node still
+//! holds (as long as the two clocks run at nearly the same rate).
 //!
-//! A primary takes writes while grants from a majority of the coordinators are running. The
-//! shards check this on their 100 ms maintenance tick and close their write gate; the write
-//! path reads only the gate. The table is shared by every shard of the process.
+//! A primary takes writes while grants from a majority of the coordinators run for longer
+//! than [`GATE_MARGIN`]. The shards check this on their 100 ms maintenance tick and close their
+//! write gate; the write path reads only the gate. The table is shared by every shard of the
+//! process.
 
-use std::{
-    collections::VecDeque,
-    sync::Mutex,
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, sync::Mutex, time::Duration};
 
 /// BEGIN instants kept for their grant. A coordinator sends its grant right after BEGIN on
 /// the same connection, so only a few are ever pending.
@@ -25,20 +22,53 @@ const PENDING_BEGINS: usize = 64;
 /// The longest lease a grant may ask for.
 pub const MAX_LEASE: Duration = Duration::from_secs(60);
 
+/// A primary stops taking writes this long before its lease ends: one maintenance tick, plus
+/// as much again and more for a tick that runs late (a long script, a slow log sync).
+pub const GATE_MARGIN: Duration = Duration::from_millis(300);
+
+/// The lease clock: on Linux `CLOCK_BOOTTIME`, which keeps counting while the host is
+/// suspended (Rust's `Instant` uses `CLOCK_MONOTONIC`, which stops); on macOS
+/// `CLOCK_MONOTONIC`, which counts sleep there. Elsewhere `Instant`. The value is time since an
+/// arbitrary origin.
+pub fn now() -> Duration {
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        const CLOCK: libc::clockid_t = libc::CLOCK_BOOTTIME;
+        #[cfg(target_vendor = "apple")]
+        const CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC;
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+
+        // SAFETY: `now` is a valid timespec for the call to fill; the clock id is a constant
+        // this platform defines.
+        #[allow(unsafe_code)]
+        let status = unsafe { libc::clock_gettime(CLOCK, &mut now) };
+
+        if status == 0 {
+            return Duration::new(now.tv_sec as u64, now.tv_nsec as u32);
+        }
+    }
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+    ORIGIN.get_or_init(std::time::Instant::now).elapsed()
+}
+
 /// One coordinator's running grant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Grant {
     coordinator: u64,
-    /// How many coordinators there are, as that coordinator counts them.
-    voters: u32,
     epoch: u64,
-    until: Instant,
+    until: Duration,
 }
 
 /// Why a grant was not taken.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refused {
-    /// No BEGIN with this token is pending (unknown, or already used).
+    /// No BEGIN with this token is pending (unknown, already used, or pushed out by newer
+    /// BEGINs).
     UnknownToken,
     /// The lease would already have ended: the grant took longer than the lease.
     Stale,
@@ -46,6 +76,8 @@ pub enum Refused {
     OldEpoch,
     /// `voters` or `lease_ms` out of range.
     Invalid,
+    /// The node does not take writes of its own: it follows a primary.
+    NotPrimary,
 }
 
 impl Refused {
@@ -55,6 +87,7 @@ impl Refused {
             Self::Stale => b"ERR RUVIO LEASE GRANT arrived after its lease ended",
             Self::OldEpoch => b"ERR RUVIO LEASE GRANT is for an older epoch",
             Self::Invalid => b"ERR RUVIO LEASE GRANT voters or lease_ms is out of range",
+            Self::NotPrimary => b"ERR RUVIO LEASE GRANT on a replica",
         }
     }
 }
@@ -63,13 +96,16 @@ impl Refused {
 #[derive(Debug, Default)]
 pub struct Leases {
     next_token: u64,
-    begins: VecDeque<(u64, Instant)>,
+    begins: VecDeque<(u64, Duration)>,
     grants: Vec<Grant>,
+    /// The most coordinators any grant named since the node became a primary: a majority of
+    /// it is needed, so a grant naming fewer cannot lower the bar.
+    voters: u32,
 }
 
 impl Leases {
     /// `RUVIO LEASE BEGIN`: records `now` and answers the token its grant names.
-    pub fn begin(&mut self, now: Instant) -> u64 {
+    pub fn begin(&mut self, now: Duration) -> u64 {
         self.next_token += 1;
         if self.begins.len() == PENDING_BEGINS {
             self.begins.pop_front();
@@ -87,7 +123,7 @@ impl Leases {
         voters: u32,
         epoch: u64,
         lease: Duration,
-        now: Instant,
+        now: Duration,
     ) -> Result<(), Refused> {
         if voters == 0 || lease.is_zero() || lease > MAX_LEASE {
             return Err(Refused::Invalid);
@@ -110,18 +146,15 @@ impl Leases {
         }
         // A newer epoch supersedes the grants of older ones.
         self.grants.retain(|grant| grant.epoch == epoch);
+        self.voters = self.voters.max(voters);
         match self
             .grants
             .iter_mut()
             .find(|grant| grant.coordinator == coordinator)
         {
-            Some(grant) => {
-                grant.voters = voters;
-                grant.until = grant.until.max(until);
-            }
+            Some(grant) => grant.until = grant.until.max(until),
             None => self.grants.push(Grant {
                 coordinator,
-                voters,
                 epoch,
                 until,
             }),
@@ -129,37 +162,29 @@ impl Leases {
         Ok(())
     }
 
-    /// How many grants run at `now`, and how many make a majority (0 when none ran yet).
-    pub fn count(&self, now: Instant) -> (usize, usize) {
-        let running = self.grants.iter().filter(|grant| grant.until > now);
-        let voters = running
-            .clone()
-            .map(|grant| grant.voters as usize)
-            .max()
-            .unwrap_or(0);
+    /// How many grants run at `now`, and how many make a majority (0 when none came yet).
+    pub fn count(&self, now: Duration) -> (usize, usize) {
+        let running = self.grants.iter().filter(|grant| grant.until > now).count();
+        let voters = self.voters as usize;
 
-        (
-            running.count(),
-            if voters == 0 { 0 } else { voters / 2 + 1 },
-        )
+        (running, if voters == 0 { 0 } else { voters / 2 + 1 })
     }
 
-    /// Whether a majority of the coordinators' grants run at `now`.
-    pub fn holds(&self, now: Instant) -> bool {
-        let (running, needed) = self.count(now);
-
-        needed > 0 && running >= needed
+    /// Whether a majority of the coordinators' grants run past `now` + [`GATE_MARGIN`]: the
+    /// write gate is open only then.
+    pub fn holds(&self, now: Duration) -> bool {
+        self.remaining(now) > GATE_MARGIN
     }
 
     /// How long the majority keeps holding from `now`: the needed-th latest end among the
     /// running grants. Zero when it does not hold.
-    pub fn remaining(&self, now: Instant) -> Duration {
+    pub fn remaining(&self, now: Duration) -> Duration {
         let (running, needed) = self.count(now);
 
         if needed == 0 || running < needed {
             return Duration::ZERO;
         }
-        let mut ends: Vec<Instant> = self
+        let mut ends: Vec<Duration> = self
             .grants
             .iter()
             .filter(|grant| grant.until > now)
@@ -167,13 +192,14 @@ impl Leases {
             .collect();
 
         ends.sort_unstable_by(|left, right| right.cmp(left));
-        ends[needed - 1].saturating_duration_since(now)
+        ends[needed - 1].saturating_sub(now)
     }
 
     /// Forgets every grant: the node stopped being a primary.
     pub fn clear(&mut self) {
         self.grants.clear();
         self.begins.clear();
+        self.voters = 0;
     }
 }
 
@@ -199,7 +225,7 @@ mod tests {
 
     #[test]
     fn a_majority_of_running_grants_holds_the_lease_from_each_begin_instant() {
-        let start = Instant::now();
+        let start = ms(10_000);
         let mut leases = Leases::default();
 
         assert!(!leases.holds(start), "nothing granted yet");
@@ -219,23 +245,24 @@ mod tests {
         assert!(leases.holds(start + ms(510)));
         // The majority ends with the earlier of the two grants: BEGIN + lease.
         assert_eq!(leases.remaining(start + ms(1000)), ms(1000));
-        assert!(leases.holds(start + ms(1999)));
-        assert!(!leases.holds(start + ms(2000)));
+        assert_eq!(leases.remaining(start + ms(1999)), ms(1));
         assert_eq!(leases.remaining(start + ms(2000)), Duration::ZERO);
+        // The gate closes a margin before the end.
+        assert!(leases.holds(start + ms(1699)));
+        assert!(!leases.holds(start + ms(1700)));
 
         // A third coordinator keeps the majority with the second.
         let third = leases.begin(start + ms(1500));
         leases
             .grant(third, 3, 3, 1, LEASE, start + ms(1500))
             .unwrap();
-        assert!(leases.holds(start + ms(2400)));
         assert_eq!(leases.remaining(start + ms(2400)), ms(100));
-        assert!(!leases.holds(start + ms(2500)));
+        assert_eq!(leases.remaining(start + ms(2500)), Duration::ZERO);
     }
 
     #[test]
     fn a_grant_needs_its_own_pending_begin_in_time_and_a_current_epoch() {
-        let start = Instant::now();
+        let start = ms(10_000);
         let mut leases = Leases::default();
 
         assert_eq!(
@@ -285,8 +312,27 @@ mod tests {
     }
 
     #[test]
+    fn a_grant_naming_fewer_coordinators_does_not_lower_the_majority() {
+        let start = ms(10_000);
+        let mut leases = Leases::default();
+        let token = leases.begin(start);
+
+        leases.grant(token, 1, 3, 1, LEASE, start).unwrap();
+        assert!(!leases.holds(start));
+        // A stray grant that claims a single coordinator: still two of three needed.
+        let token = leases.begin(start);
+        leases.grant(token, 9, 1, 1, LEASE, start).unwrap();
+        assert_eq!(leases.count(start), (2, 2));
+        let token = leases.begin(start);
+        leases.grant(token, 2, 5, 1, LEASE, start).unwrap();
+        // Five named once: three needed from then on.
+        assert_eq!(leases.count(start), (3, 3));
+        assert!(leases.holds(start));
+    }
+
+    #[test]
     fn a_late_grant_never_extends_a_lease_and_only_the_newest_begins_are_kept() {
-        let start = Instant::now();
+        let start = ms(10_000);
         let mut leases = Leases::default();
         let early = leases.begin(start);
         let late = leases.begin(start + ms(1000));
@@ -308,5 +354,13 @@ mod tests {
             leases.grant(oldest, 1, 1, 1, LEASE, start),
             Err(Refused::UnknownToken)
         );
+    }
+
+    #[test]
+    fn the_lease_clock_moves_forward() {
+        let first = now();
+        std::thread::sleep(ms(2));
+
+        assert!(now() > first);
     }
 }

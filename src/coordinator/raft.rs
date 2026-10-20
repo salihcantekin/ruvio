@@ -576,10 +576,17 @@ pub enum RpcRequest {
     Observe {
         group: String,
     },
-    /// [`RpcRequest::Observe`] and, per member, how long ago this coordinator may last have
-    /// granted it the primary lease, in milliseconds. Sent only with `primary_lease_ms`;
-    /// coordinators before it cannot decode it.
+    /// [`RpcRequest::Observe`], and whether the primary lease of `member` ended by this
+    /// coordinator's own settings. A yes promises no grant to it until the leader confirms it
+    /// again ([`RpcRequest::Confirm`]). Coordinators before the lease cannot decode it; the
+    /// leader then falls back to `Observe`.
     Leases {
+        group: String,
+        member: usize,
+    },
+    /// To the leader: the primary of `group`, read after any failover decision in progress
+    /// and once a majority confirmed the leader.
+    Confirm {
         group: String,
     },
 }
@@ -592,8 +599,13 @@ pub enum RpcResponse {
     Observe(Vec<Option<u64>>),
     Leases {
         heard: Vec<Option<u64>>,
-        granted: Vec<u64>,
+        /// The lease ended by this coordinator's settings, or it grants none.
+        ended: bool,
+        /// This coordinator grants leases.
+        lease_on: bool,
     },
+    /// `None` when the leader could not confirm.
+    Confirmed(Option<Primary>),
 }
 
 /// What a coordinator sends on a call: the shared secret, then the request.

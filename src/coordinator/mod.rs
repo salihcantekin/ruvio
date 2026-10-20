@@ -78,10 +78,12 @@ async fn serve(
     let (switches, _) = tokio::sync::broadcast::channel(64);
 
     info!(id = config.id, listen = %config.listen, groups = config.groups.len(), "coordinator listening");
-    let watcher = tokio::spawn(monitor::watch(
+    let watcher = tokio::spawn(monitor::watch(Arc::clone(&config), sightings.clone()));
+    let renewer = tokio::spawn(monitor::renew_leases(
         Arc::clone(&config),
-        sightings.clone(),
+        raft.clone(),
         machine.clone(),
+        sightings.clone(),
     ));
     let moves = migrate::Context {
         config: Arc::clone(&config),
@@ -131,6 +133,7 @@ async fn serve(
     }
 
     watcher.abort();
+    renewer.abort();
     leader.abort();
     let _ = raft.shutdown().await;
     Ok(())
@@ -246,16 +249,29 @@ impl Api {
                     .map(|group| self.sightings.ages(group))
                     .unwrap_or_default(),
             ),
-            RpcRequest::Leases { group } => match self.config.group(&group) {
+            RpcRequest::Leases { group, member } => match self.config.group(&group) {
                 Some(group) => RpcResponse::Leases {
                     heard: self.sightings.ages(group),
-                    granted: self.sightings.grants().ages(group),
+                    ended: self.config.primary_lease.is_none_or(|(_, safe)| {
+                        self.sightings.grants().report(&group.name, member, safe)
+                    }),
+                    lease_on: self.config.primary_lease.is_some(),
                 },
                 None => RpcResponse::Leases {
                     heard: Vec::new(),
-                    granted: Vec::new(),
+                    ended: false,
+                    lease_on: self.config.primary_lease.is_some(),
                 },
             },
+            RpcRequest::Confirm { group } => RpcResponse::Confirmed(
+                monitor::confirm_locally(
+                    &self.raft,
+                    &self.machine,
+                    self.sightings.grants(),
+                    &group,
+                )
+                .await,
+            ),
         }
     }
 

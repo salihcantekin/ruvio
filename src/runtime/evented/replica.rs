@@ -534,18 +534,20 @@ pub(super) fn fence_if_replaced(state: &ShardState) {
 
 /// `min-replicas-to-write`: a primary shard refuses writes while fewer replicas than that
 /// acknowledged within `min-replicas-max-lag`, and takes them again once enough do. With
-/// `primary-lease` it also refuses them while grants from a majority of the coordinators do
-/// not run. Checked on the maintenance tick, so the write path reads only the gate; with
-/// `primary-lease` off the lease costs one flag read here.
+/// `primary-lease` any shard that writes (a primary, or one without replication) also refuses
+/// them unless grants from a majority of the coordinators run past the next checks
+/// ([`crate::primary_lease::GATE_MARGIN`]). Checked on the maintenance tick, so the write
+/// path reads only the gate; with `primary-lease` off the lease costs one flag read here.
 pub(super) fn gate_on_replicas(state: &ShardState) {
-    use crate::replication::WriteGate;
+    use crate::{config::ReplicationRole, replication::WriteGate};
 
     let gate = state.write_gate.get();
+    let role = state.role.get();
 
     if !matches!(
         gate,
         WriteGate::Open | WriteGate::NoReplicas | WriteGate::NoLease
-    ) || state.role.get() != crate::config::ReplicationRole::Primary
+    ) || role == ReplicationRole::Replica
     {
         return;
     }
@@ -560,10 +562,13 @@ pub(super) fn gate_on_replicas(state: &ShardState) {
     let next = if lease
         && !state
             .primary_lease
-            .with(|leases| leases.holds(Instant::now()))
+            .with(|leases| leases.holds(crate::primary_lease::now()))
     {
         WriteGate::NoLease
-    } else if wanted == 0 || state.durable_acks.fresh(max_lag) >= wanted {
+    } else if wanted == 0
+        || role != ReplicationRole::Primary
+        || state.durable_acks.fresh(max_lag) >= wanted
+    {
         WriteGate::Open
     } else {
         WriteGate::NoReplicas
@@ -594,17 +599,21 @@ pub(super) fn gate_on_replicas(state: &ShardState) {
 
 /// `RUVIO LEASE BEGIN` (`grant` is `None`) and `RUVIO LEASE GRANT ...`, sent by every
 /// coordinator to the primary it agreed on, on every ping. Taken whatever `primary-lease`
-/// says, so the coordinators can renew leases before the nodes start to require them.
+/// says, so the coordinators can renew leases before the nodes start to require them; a
+/// grant is refused on a replica.
 pub(super) fn lease_command(
     state: &ShardState,
     grant: Option<&crate::protocol::LeaseGrant>,
 ) -> crate::engine::Response<'static> {
     use crate::engine::Response;
 
-    let now = Instant::now();
+    let now = crate::primary_lease::now();
 
     match grant {
         None => Response::Integer(state.primary_lease.with(|leases| leases.begin(now)) as i64),
+        Some(_) if state.role.get() == crate::config::ReplicationRole::Replica => {
+            Response::Error(crate::primary_lease::Refused::NotPrimary.message())
+        }
         Some(grant) => match state.primary_lease.with(|leases| {
             leases.grant(
                 grant.token,
@@ -624,7 +633,7 @@ pub(super) fn lease_command(
 /// `INFO replication`'s lease fields: whether `primary-lease` is on, how many coordinators'
 /// grants run, and how long the majority keeps holding.
 pub(super) fn lease_report(state: &ShardState) -> (bool, usize, u128) {
-    let now = Instant::now();
+    let now = crate::primary_lease::now();
     let (running, remaining) = state
         .primary_lease
         .with(|leases| (leases.count(now).0, leases.remaining(now)));

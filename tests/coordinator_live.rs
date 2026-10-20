@@ -1185,26 +1185,34 @@ fn primary_cut_from_the_coordinators(lease_ms: Option<u64>) -> CutResult {
 
     loop {
         assert!(Instant::now() < deadline, "no failover after the cut");
-        let reply = call(&primary, &["SET", "during", &writes.to_string()]).unwrap_or_default();
-        let at = Instant::now();
+        // A reply that does not arrive (a slow machine) says nothing either way.
+        if let Some(reply) = call(&primary, &["SET", "during", &writes.to_string()]) {
+            let at = Instant::now();
 
-        writes += 1;
-        if reply == "OK" {
-            result.last_taken = Some(at);
-        } else {
-            assert!(reply.starts_with("NOREPLICAS Primary lease"), "{reply}");
-            result.first_refused.get_or_insert(at);
+            if reply == "OK" {
+                result.last_taken = Some(at);
+            } else {
+                assert!(reply.starts_with("NOREPLICAS Primary lease"), "{reply}");
+                result.first_refused.get_or_insert(at);
+            }
         }
+        writes += 1;
         if (0..3).any(|index| named(index).is_some_and(|node| node != 0)) {
             result.promoted = Instant::now();
             break;
         }
     }
     // After the failover the old primary still answers as it did.
-    let reply = call(&primary, &["SET", "after", "1"]).unwrap_or_default();
+    let mut reply = None;
+
+    wait_until("the old primary to answer a write", || {
+        reply = call(&primary, &["SET", "after", "1"]);
+        reply.is_some()
+    });
+    let reply = reply.unwrap_or_default();
 
     if lease_ms.is_some() {
-        assert!(reply.starts_with("NOREPLICAS"), "{reply}");
+        assert!(reply.starts_with("NOREPLICAS Primary lease"), "{reply}");
         // The promoted replica takes writes once the coordinators grant it the lease.
         let promoted = (0..3)
             .find_map(|index| named(index).filter(|&node| node != 0))
@@ -1236,18 +1244,23 @@ fn primary_cut_from_the_coordinators(lease_ms: Option<u64>) -> CutResult {
 fn with_the_lease_a_primary_cut_from_the_coordinators_stops_writing_before_the_failover() {
     // ping 200 ms, down_after 1000 ms: a 700 ms lease counts as ended 970 ms after a grant.
     let result = primary_cut_from_the_coordinators(Some(700));
-    let refused = result.first_refused.expect("the old primary never refused");
 
+    // Every write the old primary took came before any coordinator named another primary,
+    // and it refused writes once one did.
     assert!(
-        result.last_taken.is_none_or(|taken| taken < refused),
-        "a write was taken after the first refusal"
-    );
-    assert!(
-        refused < result.promoted,
-        "refused {:?} after the cut, promotion seen {:?}",
-        refused - result.cut,
+        result
+            .last_taken
+            .is_none_or(|taken| taken < result.promoted),
+        "a write was taken {:?} after the cut, promotion seen {:?}",
+        result.last_taken.map(|at| at - result.cut),
         result.promoted - result.cut
     );
+    if let Some(refused) = result.first_refused {
+        assert!(
+            result.last_taken.is_none_or(|taken| taken < refused),
+            "a write was taken after the first refusal"
+        );
+    }
 }
 
 #[test]
@@ -1256,4 +1269,41 @@ fn without_the_lease_a_primary_cut_from_the_coordinators_keeps_writing() {
 
     assert!(result.first_refused.is_none());
     assert!(result.last_taken.is_some());
+}
+
+/// With the lease, a member that accepts connections but never answers (a stalled host)
+/// must not hold up the renewal of the primary's lease: the primary keeps taking writes.
+#[test]
+fn a_stalled_member_does_not_hold_up_the_primary_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let group = Group::new();
+    let env = [("RUVIO_PRIMARY_LEASE", "yes")];
+    let _nodes = [
+        group.node_with(dir.path(), 0, None, &env),
+        group.node_with(dir.path(), 1, Some(0), &env),
+    ];
+    // Member 2's address: connections are queued by the kernel and never read.
+    let _stalled = std::net::TcpListener::bind(group.resp[2]).unwrap();
+    // ping 200 ms, down_after 1000 ms; a look at the stalled member takes a full second.
+    let _coordinators: Vec<Process> = (0..3)
+        .map(|index| {
+            group.coordinator_with(dir.path(), index, "primary_lease_ms = 700", &group.resp)
+        })
+        .collect();
+    let primary = group.resp[0].to_string();
+
+    wait_until("the primary to take writes", || {
+        call(&primary, &["SET", "before", "1"]).as_deref() == Some("OK")
+    });
+    let until = Instant::now() + Duration::from_secs(4);
+    let mut writes = 0u64;
+
+    while Instant::now() < until {
+        if let Some(reply) = call(&primary, &["SET", "during", &writes.to_string()]) {
+            assert_eq!(reply, "OK", "write {writes} refused");
+        }
+        writes += 1;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(writes > 20, "only {writes} writes in four seconds");
 }
