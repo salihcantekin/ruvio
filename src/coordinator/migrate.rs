@@ -41,14 +41,16 @@ pub struct Mover {
 }
 
 #[derive(Default)]
-struct MoverState {
-    driving: Option<String>,
+pub(super) struct MoverState {
+    pub(super) driving: Option<String>,
     cancel: Option<String>,
-    last: Vec<(String, String)>,
+    pub(super) last: Vec<(String, String)>,
+    /// The rebalance this leader runs, or ran last.
+    pub(super) rebalance: Option<super::rebalance::Progress>,
 }
 
 impl Mover {
-    fn lock(&self) -> std::sync::MutexGuard<'_, MoverState> {
+    pub(super) fn lock(&self) -> std::sync::MutexGuard<'_, MoverState> {
         self.inner.lock().unwrap_or_else(|error| error.into_inner())
     }
 }
@@ -154,16 +156,26 @@ pub async fn start(
     Ok(migration.id)
 }
 
-/// `COORDINATOR CANCEL`: ends the running move unless it is committed already.
+/// `COORDINATOR CANCEL`: ends the running move unless it is committed already, and the
+/// rebalance that started it.
 pub async fn cancel(context: &Context) -> Result<(), String> {
     if !context.leading().await {
         return Err(context.not_leader().await);
     }
-    let Some(current) = context.machine.moves().current else {
-        return Err("ERR no move in progress".into());
-    };
+    let current = context.machine.moves().current;
+    let mut mover = context.mover.lock();
+    let rebalance = mover
+        .rebalance
+        .as_mut()
+        .filter(|progress| progress.running())
+        .map(|progress| progress.stop = true)
+        .is_some();
 
-    context.mover.lock().cancel = Some(current.id);
+    match current {
+        Some(current) => mover.cancel = Some(current.id),
+        None if rebalance => {}
+        None => return Err("ERR no move in progress".into()),
+    }
     Ok(())
 }
 
@@ -193,6 +205,9 @@ pub fn status(context: &Context) -> Value {
     };
 
     pairs.push(("moved_ranges".into(), moves.moved.len().to_string()));
+    if let Some(progress) = &context.mover.lock().rebalance {
+        pairs.extend(progress.pairs());
+    }
     Value::array(
         pairs
             .into_iter()

@@ -970,8 +970,8 @@ fn a_failover_in_one_group_moves_the_redirects_of_the_others() {
     });
 }
 
-/// Group `a` (nodes 0 and 1) owns slots 0-8191, group `b` (nodes 2 and 3) the rest; one
-/// shard each, node 1 and 3 replicas; one coordinator.
+/// Group `a` (nodes 0 and 1) owns slots 0-8191 (or up to the split asked for), group `b`
+/// (nodes 2 and 3) the rest; one shard each, node 1 and 3 replicas; one coordinator.
 struct TwoGroups {
     resp: Vec<SocketAddr>,
     coordinator: String,
@@ -993,6 +993,17 @@ impl TwoGroups {
         env: &[(&str, &str)],
         stand_in: impl Fn(usize, SocketAddr) -> Option<StandIn>,
     ) -> Self {
+        Self::start_split(dir, env, 8192, stand_in)
+    }
+
+    /// Like [`TwoGroups::start_with`], with group `a` owning slots `0..split`.
+    fn start_split(
+        dir: &Path,
+        env: &[(&str, &str)],
+        split: u16,
+        stand_in: impl Fn(usize, SocketAddr) -> Option<StandIn>,
+    ) -> Self {
+        let (a_slots, b_slots) = (format!("0-{}", split - 1), format!("{split}-16383"));
         let data = test_ports::reserve();
         let replication = test_ports::reserve();
         let resp: Vec<SocketAddr> = (0..4).map(|index| data.address_at(index)).collect();
@@ -1003,7 +1014,7 @@ impl TwoGroups {
 
         std::fs::write(
             &topology,
-            [("a", "0-8191", 0), ("b", "8192-16383", 2)].iter().fold(
+            [("a", &a_slots, 0), ("b", &b_slots, 2)].iter().fold(
                 "version = 1\n".to_owned(),
                 |text, (name, slots, node)| {
                     format!(
@@ -1064,8 +1075,8 @@ impl TwoGroups {
             format!(
                 "id = 1\nlisten = \"{coordinator}\"\ndata_dir = \"{}\"\npeers = [\"1@{coordinator}\"]\n\
                  secret = \"{SECRET}\"\nping_interval_ms = 200\ndown_after_ms = 1000\n\n\
-                 [[groups]]\nname = \"a\"\nshards = 1\nslots = [\"0-8191\"]\nmembers = [{}]\n\n\
-                 [[groups]]\nname = \"b\"\nshards = 1\nslots = [\"8192-16383\"]\nmembers = [{}]\n",
+                 [[groups]]\nname = \"a\"\nshards = 1\nslots = [\"{a_slots}\"]\nmembers = [{}]\n\n\
+                 [[groups]]\nname = \"b\"\nshards = 1\nslots = [\"{b_slots}\"]\nmembers = [{}]\n",
                 dir.join("coordinator").display(),
                 members(0),
                 members(2),
@@ -1262,6 +1273,169 @@ fn a_slot_range_moves_between_groups_while_a_client_keeps_writing() {
         call_with_secret(&groups.coordinator, &["COORDINATOR", "STATUS"])
             .unwrap()
             .contains("moved_ranges 1")
+    );
+}
+
+#[test]
+fn a_rebalance_evens_out_the_slots_in_moves_while_a_client_keeps_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    // Group a owns 512 slots more than its share: two moves of 256 even it out.
+    let groups = TwoGroups::start_split(dir.path(), &[], 8704, |_, _| None);
+    let keys: Vec<String> = (0..)
+        .map(|n| format!("spread:{n}"))
+        .filter(|key| (8192..8704).contains(&ruvio::routing::hash_slot(key.as_bytes())))
+        .take(200)
+        .collect();
+
+    for key in &keys {
+        assert_eq!(
+            call(&groups.node(0), &["SET", key, key]).as_deref(),
+            Some("OK")
+        );
+    }
+    let coordinator = |args: &[&str]| call_with_secret(&groups.coordinator, args).unwrap();
+
+    assert_eq!(
+        coordinator(&["COORDINATOR", "REBALANCE", "DRYRUN"]),
+        "8448-8703 a/0 -> b/0 8192-8447 a/0 -> b/0"
+    );
+    // A dry run moves nothing.
+    assert!(coordinator(&["COORDINATOR", "STATUS"]).starts_with("state none moved_ranges 0"));
+
+    // A client writes one key of the moving slots throughout, following MOVED and TRYAGAIN.
+    let busy = key_in(8192..8704, "busy");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let (busy, stop) = (busy.clone(), std::sync::Arc::clone(&stop));
+        let mut address = groups.node(0);
+        let b = groups.node(2);
+
+        std::thread::spawn(move || {
+            let mut acked = 0;
+
+            for value in 1u64.. {
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                loop {
+                    match call(&address, &["SET", &busy, &value.to_string()]).as_deref() {
+                        Some("OK") => {
+                            acked = value;
+                            break;
+                        }
+                        Some(reply) if reply.starts_with("MOVED") => address = b.clone(),
+                        Some(reply) if reply.starts_with("TRYAGAIN") => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        other => panic!("unexpected reply {other:?}"),
+                    }
+                }
+            }
+            acked
+        })
+    };
+
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(coordinator(&["COORDINATOR", "REBALANCE"]), "2");
+    assert!(
+        coordinator(&["COORDINATOR", "REBALANCE"]).contains("in progress"),
+        "a second rebalance waits for the first"
+    );
+    wait_until("the rebalance to finish", || {
+        call_with_secret(&groups.coordinator, &["COORDINATOR", "STATUS"]).is_some_and(|status| {
+            status.contains("rebalance done rebalance_moves 2 rebalance_left 0")
+        })
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let acked = writer.join().unwrap();
+
+    assert!(acked > 0);
+    assert_eq!(
+        call(&groups.node(2), &["GET", &busy]),
+        Some(acked.to_string())
+    );
+    assert!(coordinator(&["COORDINATOR", "STATUS"]).contains("moved_ranges 2"));
+    // Balanced now: nothing left to plan, and a rebalance has no move to make.
+    assert_eq!(coordinator(&["COORDINATOR", "REBALANCE", "DRYRUN"]), "");
+    assert_eq!(coordinator(&["COORDINATOR", "REBALANCE"]), "0");
+
+    wait_until("every node to get the map with both moves", || {
+        (0..4).all(|index| groups.version(index).as_deref() == Some("5"))
+    });
+    let b_port = groups.resp[2].port();
+
+    for key in &keys {
+        let slot = ruvio::routing::hash_slot(key.as_bytes());
+
+        assert_eq!(
+            call(&groups.node(2), &["GET", key]).as_deref(),
+            Some(key.as_str())
+        );
+        assert_eq!(
+            call(&groups.node(0), &["GET", key]),
+            Some(format!("MOVED {slot} 127.0.0.1:{b_port}"))
+        );
+    }
+    // b's replica took both ranges, although its map may have come only after the second
+    // move began.
+    wait_until("b's replica to hold both ranges", || {
+        keys.iter()
+            .all(|key| call(&groups.node(3), &["GET", key]).as_deref() == Some(key.as_str()))
+    });
+}
+
+#[test]
+fn a_cancel_ends_a_rebalance_with_its_move() {
+    let dir = tempfile::tempdir().unwrap();
+    // Slow copies (a few KiB per second) keep the first move copying when it is cancelled.
+    let groups = TwoGroups::start_split(
+        dir.path(),
+        &[("RUVIO_MIGRATION_MAX_BYTES_PER_SEC", "4096")],
+        8704,
+        |_, _| None,
+    );
+    let keys: Vec<String> = (0..)
+        .map(|n| format!("spread:{n}"))
+        .filter(|key| (8448..8704).contains(&ruvio::routing::hash_slot(key.as_bytes())))
+        .take(200)
+        .collect();
+
+    for key in &keys {
+        assert_eq!(
+            call(&groups.node(0), &["SET", key, key]).as_deref(),
+            Some("OK")
+        );
+    }
+    let coordinator = |args: &[&str]| call_with_secret(&groups.coordinator, args).unwrap();
+
+    assert_eq!(coordinator(&["COORDINATOR", "REBALANCE"]), "2");
+    wait_until("the source to copy", || {
+        call(&groups.node(0), &["RUVIO", "MIGRATE", "STATUS"])
+            .is_some_and(|status| status.contains("state copying"))
+    });
+    assert_eq!(coordinator(&["COORDINATOR", "CANCEL"]), "OK");
+    wait_until("the rebalance to end", || {
+        call_with_secret(&groups.coordinator, &["COORDINATOR", "STATUS"])
+            .is_some_and(|status| status.contains("rebalance cancelled"))
+    });
+    let status = coordinator(&["COORDINATOR", "STATUS"]);
+
+    assert!(
+        status.contains("moved_ranges 0 rebalance cancelled rebalance_moves 0"),
+        "{status}"
+    );
+    for key in &keys {
+        assert_eq!(
+            call(&groups.node(0), &["GET", key]).as_deref(),
+            Some(key.as_str())
+        );
+    }
+    // Nothing runs any more; the plan is still there for the next rebalance.
+    assert!(coordinator(&["COORDINATOR", "CANCEL"]).contains("no move in progress"));
+    assert_eq!(
+        coordinator(&["COORDINATOR", "REBALANCE", "DRYRUN"]),
+        "8448-8703 a/0 -> b/0 8192-8447 a/0 -> b/0"
     );
 }
 

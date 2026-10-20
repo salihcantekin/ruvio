@@ -248,7 +248,7 @@ slots = ["8192-16383"]
 # on 10.0.0.5: cluster_topology = "topology.toml", cluster_group = "a"
 GET user:1      # a key of group b, sent to 10.0.0.5
 # -MOVED 10778 10.0.0.6:7001`,
-    body: "Each group (a primary and its replicas) serves the slots the map gives it, split over its own shards, and answers <code>MOVED</code> with the owning shard's address for every other slot, so cluster clients go straight to the right machine. <code>CLUSTER SLOTS</code> describes the whole map on every node. With <code>ruvio coordinator</code> managing the groups, every node gets a newer map after a failover, so <code>MOVED</code> names the new primary.",
+    body: "Each group (a primary and its replicas) serves the slots the map gives it, split over its own shards, and answers <code>MOVED</code> with the owning shard's address for every other slot, so cluster clients go straight to the right machine. <code>CLUSTER SLOTS</code> describes the whole map on every node. With <code>ruvio coordinator</code> managing the groups, every node gets a newer map after a failover, so <code>MOVED</code> names the new primary, and <code>COORDINATOR REBALANCE</code> evens out the slots after a group joins.",
     note: "The map is fixed when the cluster is created: slots do not move between machines yet, and a node that holds keys of slots the map serves elsewhere does not start. Keyless commands, <code>WAIT</code> and classic <code>PUBLISH</code> stay on the node that receives them; use <code>SPUBLISH</code> for channels the whole cluster shares.",
     refs: [{ label: "Multi-node settings", href: "/docs/configuration/" }, { label: "Coordinator", href: "/docs/coordinator/#a-multi-node-cluster" }],
   },

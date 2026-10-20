@@ -355,13 +355,27 @@ fn record_incoming(
         return Ok(());
     };
     let shard = forwarding.me as u16;
+    let replica = state.role.get() == crate::config::ReplicationRole::Replica;
+    let mut taken = None;
 
-    forwarding
+    let recorded = forwarding
         .fabric
         .mover
         .with_history(|history, data_dir| {
             let mut next = history.clone();
 
+            // The primary takes a new range only once a map gave it the one before. A replica
+            // gets maps from the coordinators, not from its primary, and may not have that
+            // map yet: it takes that range when the next one arrives.
+            if replica
+                && step != IncomingStep::Cancelled
+                && let Some(gain) = next
+                    .pending_gain()
+                    .filter(|gain| (gain.first, gain.last, gain.to) != (first, last, shard))
+            {
+                next.complete(sequence)?;
+                taken = Some(gain);
+            }
             match step {
                 IncomingStep::Begin => next.begin_gain(first, last, shard, sequence)?,
                 IncomingStep::Prepared => {
@@ -383,7 +397,21 @@ fn record_incoming(
             Ok::<(), &'static str>(())
         })
         .unwrap_or(Ok(()))
-        .map_err(|error| format!("ERR RUVIO MIGRATE {error}"))
+        .map_err(|error| format!("ERR RUVIO MIGRATE {error}"));
+
+    if let Some(gain) = taken.filter(|_| recorded.is_ok()) {
+        let table = forwarding.fabric.slot_table();
+
+        for slot in gain.first..=gain.last {
+            table.assign(slot, usize::from(gain.to));
+        }
+        info!(
+            first = gain.first,
+            last = gain.last,
+            "took a slot range the primary took before its next one arrived"
+        );
+    }
+    recorded
 }
 
 fn current_import(state: &ShardState, id: &[u8]) -> Result<Arc<Import>, String> {
