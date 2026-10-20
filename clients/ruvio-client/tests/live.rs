@@ -345,11 +345,11 @@ fn semaphores_and_capped_increments() {
     let first = db.semaphore("jobs", 2, 60_000).unwrap().unwrap();
     let second = db.semaphore("jobs", 2, 60_000).unwrap().unwrap();
 
-    assert_eq!(second, first + 1);
+    assert!(second > first, "tokens only grow");
     assert_eq!(db.semaphore("jobs", 2, 60_000).unwrap(), None);
     assert_eq!(db.key_type("jobs").unwrap(), "semaphore");
     assert_eq!(db.renew("jobs", first as u64, 120_000).unwrap(), 1);
-    assert_eq!(db.renew("jobs", first as u64 + 100, 120_000).unwrap(), 0);
+    assert_eq!(db.renew("jobs", 1, 120_000).unwrap(), 0);
     assert_eq!(
         db.semaphore("jobs", 2, 60_000).unwrap(),
         None,

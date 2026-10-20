@@ -1223,6 +1223,9 @@ pub(super) fn settle(state: &Rc<ShardState>) {
     let Some(topology) = fabric.topology().map(|shared| shared.get()) else {
         return;
     };
+
+    super::replica::raise_fence(state);
+
     let me = forwarding.me as u16;
     let count = fabric.shard_count() as u16;
     let placement = topology.placement(usize::from(count));
