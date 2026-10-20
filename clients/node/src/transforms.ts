@@ -144,8 +144,9 @@ function toFloat(v: unknown): number {
 function entry(e: unknown): StreamEntry {
   const a = e as unknown[];
   const f = a[1] as unknown[] | null;
-  const fields: Record<string, string> = {};
-  if (f !== null && f !== undefined) for (let i = 0; i + 1 < f.length; i += 2) fields[str(f[i])] = f[i + 1] as string;
+  // A list, not an object: field names may repeat and their order matters.
+  const fields: [string, string][] = [];
+  if (f !== null && f !== undefined) for (let i = 0; i + 1 < f.length; i += 2) fields.push([str(f[i]), f[i + 1] as string]);
   return { id: str(a[0]), fields };
 }
 
