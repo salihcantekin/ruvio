@@ -37,7 +37,7 @@ public final class RuvioAsync<K, V> extends RuvioCommands<K, V> {
     final Link link;
     /** Non-null in cluster mode: every command is routed by its key; {@code link} is then the seed's. */
     final ClusterRouter router;
-    /** A standalone link that follows a failover: commands keep their encoded frame so a refused one can be sent again. */
+    /** A standalone link that follows a failover: the connection keeps each write until its reply arrives so a refused one can be sent again. */
     private final boolean follow;
 
     RuvioAsync(Link link, RuvioCodec<K> keys, RuvioCodec<V> values) {
@@ -49,7 +49,7 @@ public final class RuvioAsync<K, V> extends RuvioCommands<K, V> {
         this.link = link;
         this.router = router;
         this.follow = router == null && link.follows();
-        this.routed = router != null || follow;
+        this.routed = router != null;
     }
 
     @Override
@@ -58,12 +58,12 @@ public final class RuvioAsync<K, V> extends RuvioCommands<K, V> {
         if (r != null) {
             return r.begin();
         }
-        return follow ? link.begin() : link.get().begin();
+        return link.get().begin();
     }
 
     @Override
     protected void abort(RespOut out) {
-        if (router == null && !follow) {
+        if (router == null) {
             out.owner.abort();
         }
     }
@@ -72,10 +72,12 @@ public final class RuvioAsync<K, V> extends RuvioCommands<K, V> {
     @SuppressWarnings("unchecked")
     protected <T> CompletableFuture<T> end(RespOut out, Request<T> request) {
         ClusterRouter r = router;
-        if (follow) {
-            link.send(out.frame, (RoutedRequest<T>) request);
-        } else if (r == null) {
-            out.owner.end(request);
+        if (r == null) {
+            if (follow) {
+                out.owner.endKeeping(request);
+            } else {
+                out.owner.end(request);
+            }
         } else {
             r.dispatch(out.frame, (RoutedRequest<T>) request, ClusterRouter.DIRECT);
         }

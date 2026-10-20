@@ -43,7 +43,6 @@ public final class Link implements AutoCloseable {
                 return t;
             });
     /** Scratch buffers that keep each encoded command, so a refused one can be sent again; one per calling thread. */
-    private static final ThreadLocal<Frame> FRAMES = ThreadLocal.withInitial(() -> new Frame(true));
 
     /** The settings used for every (re)connect. */
     public final RuvioOptions options;
@@ -289,6 +288,9 @@ public final class Link implements AutoCloseable {
         }
         if (remember) {
             c.setCommandTimeout(options.commandTimeoutMillis);
+            if (follow) {
+                c.keepWrites(this);
+            }
         }
         return c;
     }
@@ -323,41 +325,18 @@ public final class Link implements AutoCloseable {
         this.onMove = action;
     }
 
-    /**
-     * Returns the calling thread's scratch buffer for the next command of a following link; the command is kept
-     * (without a copy) so that a refused one can be sent again.
-     *
-     * @return the buffer to encode into
-     */
-    public RespOut begin() {
-        Frame f = FRAMES.get();
-        f.reset();
-        return f.out;
-    }
-
-    /**
-     * Sends the command encoded in {@code f} on the shared connection, reconnecting first when it dropped.
-     *
-     * @param f the scratch frame {@link #begin()} returned
-     * @param r the request awaiting the reply
-     */
-    public void send(Frame f, RoutedRequest<?> r) {
-        byte[] buf = f.out.buf;
-        int off = f.base;
-        int len = f.out.pos - off;
-        f.keep();
-        r.setFrame(buf, off, len);
-        r.link = this;
-        Connection c = get();
-        r.sentOn = c;
-        RespOut o = c.begin();
-        try {
-            o.raw(buf, off, len);
-        } catch (RuntimeException e) {
-            c.abort();
-            throw e;
+    /** Tells whether the encoded command at {@code buf[off]} is flagged readonly (and not blocking) in the command table. */
+    static boolean isRead(byte[] buf, int off) {
+        int p = off + 1;
+        while (buf[p] != '\r') {
+            p++;
         }
-        c.end(r);
+        p += 3; // CRLF and '$'
+        int n = 0;
+        while (buf[p] != '\r') {
+            n = n * 10 + (buf[p++] - '0');
+        }
+        return ClusterKeys.spec(buf, p + 2, n).read;
     }
 
     /**
@@ -380,13 +359,15 @@ public final class Link implements AutoCloseable {
      * primary is found, and with the reply of the second send otherwise (a second refusal included).
      *
      * @param r the refused request
+     * @param command the encoded command, as the connection kept it
+     * @param refusedOn the connection that refused it
      * @param error the {@code READONLY} error
      */
-    void followReadonly(RoutedRequest<?> r, Throwable error) {
+    void followReadonly(Request<?> r, byte[] command, Connection refusedOn, Throwable error) {
         try {
-            BACKGROUND.execute(() -> sendAgain(r, error));
+            BACKGROUND.execute(() -> sendAgain(r, command, refusedOn, error));
         } catch (RejectedExecutionException e) {
-            r.failFinal(error);
+            r.completeExceptionally(error);
         }
     }
 
@@ -410,34 +391,32 @@ public final class Link implements AutoCloseable {
         }
     }
 
-    private void sendAgain(RoutedRequest<?> r, Throwable error) {
+    private void sendAgain(Request<?> r, byte[] command, Connection refusedOn, Throwable error) {
         Connection target;
         try {
-            target = moveAfterReadonly(r.sentOn);
+            target = moveAfterReadonly(refusedOn);
         } catch (RuntimeException e) {
-            r.failFinal(e); // a refused AUTH, as when connecting
+            r.completeExceptionally(e); // a refused AUTH, as when connecting
             return;
         }
         if (target == null) {
-            r.failFinal(error);
+            r.completeExceptionally(error);
             return;
         }
         if (r.isDone()) {
             return;
         }
-        r.retried = true;
-        r.sentOn = target;
         try {
             RespOut o = target.begin();
             try {
-                o.raw(r.frame, r.frameOff, r.frameLen);
+                o.raw(command, 0, command.length);
             } catch (RuntimeException e) {
                 target.abort();
                 throw e;
             }
             target.end(r);
         } catch (RuntimeException e) {
-            r.failFinal(e);
+            r.completeExceptionally(e);
         }
     }
 

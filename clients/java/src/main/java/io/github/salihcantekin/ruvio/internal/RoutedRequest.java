@@ -6,7 +6,7 @@ import io.github.salihcantekin.ruvio.RuvioCodec;
 /**
  * A request sent by the cluster router. It keeps a copy of the encoded command so that a
  * {@code -MOVED} or {@code -ASK} reply can be followed (together at most {@link ClusterRouter#MAX_REDIRECTS} times) and a
- * {@code -TRYAGAIN} reply retried (at most {@link ClusterRouter#MAX_TRYAGAIN} times); on a standalone connection that follows a failover a {@code READONLY} reply sends it once more to the new primary; any other failure
+ * {@code -TRYAGAIN} reply retried (at most {@link ClusterRouter#MAX_TRYAGAIN} times); any other failure
  * (including a lost connection) completes it as is: nothing is ever replayed after a transport failure.
  *
  * @param <T> the result type
@@ -32,13 +32,6 @@ public class RoutedRequest<T> extends Request<T> {
     public boolean replicaOk;
     /** The replica this command was sent to, or null; a {@code LOADING} reply from it sends the command on to the primary. */
     public ClusterNode replica;
-    /** Set on a standalone connection that follows a failover: the link to move when this command is refused with {@code READONLY}. */
-    public Link link;
-    /** The connection this command was last sent on (a following link only). */
-    public volatile Connection sentOn;
-    /** The command was already sent again after a {@code READONLY} reply; a second refusal is its result. */
-    public volatile boolean retried;
-
     /**
      * Creates a request.
      *
@@ -88,11 +81,6 @@ public class RoutedRequest<T> extends Request<T> {
                 r.retryLater(this, error);
                 return;
             }
-        }
-        Link l = link;
-        if (l != null && frame != null && !retried && Link.isReadonly(error)) {
-            l.followReadonly(this, error);
-            return;
         }
         failFinal(error);
     }
