@@ -1,7 +1,8 @@
 name: Nightly faults
 
 # Coordinator fault scenarios on real processes and real Docker network partitions.
-# Manual for now (a schedule would be the only automatic run besides the PR gate).
+# Every night (GitHub runs schedules from the default branch only) and by manual dispatch;
+# the only automatic workflow besides the PR gate.
 # Secrets: none. On failure it opens one issue labelled nightly-failure, or comments on the
 # open one, so repeated failures do not pile up.
 on:
@@ -11,8 +12,8 @@ on:
         description: How many times each scenario runs
         type: string
         default: "3"
-  # schedule:
-  #   - cron: "17 2 * * *"
+  schedule:
+    - cron: "17 2 * * *"
 
 permissions:
   contents: read

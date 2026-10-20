@@ -54,7 +54,7 @@ cargo test --lib --bins --tests
 
 ## Nightly fault scenarios
 
-`.github/workflows/nightly.yml` (manual dispatch) runs the coordinator fault scenarios on real
+`.github/workflows/nightly.yml` (every night at 02:17 UTC from `main`, and by manual dispatch) runs the coordinator fault scenarios on real
 processes and real network partitions, each scenario three times by default (`runs` input):
 
 - `scripts/coordinator_faults.py ./ruvio partition leader minority restart loss durable stall coord-partition`:
