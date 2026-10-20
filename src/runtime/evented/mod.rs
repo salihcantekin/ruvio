@@ -602,6 +602,7 @@ fn run_cluster(config: &AppConfig, shutdown: ShutdownToken, force: bool) -> io::
             .topology()
             .map(|shared| shared.get().placement(config.shards).into());
         let moves = load_slot_moves(config, config.shards, placement.clone(), Some(pushed))?;
+        let mapped = placement.is_some();
 
         if let Some(moves) = &moves {
             moves.apply(&fabric.slot_table(), |slot| {
@@ -622,6 +623,16 @@ fn run_cluster(config: &AppConfig, shutdown: ShutdownToken, force: bool) -> io::
                         None => moves,
                     }
                 }),
+                config
+                    .persistence
+                    .profile
+                    .uses_wal()
+                    .then(|| config.persistence.data_dir.clone()),
+            );
+        }
+        if mapped {
+            migrate::restore(
+                fabric,
                 config
                     .persistence
                     .profile
@@ -989,6 +1000,12 @@ async fn serve_async(
     let mut slot_filter = slot_moves
         .as_ref()
         .and_then(|moves| moves.replay_filter(shard_id as usize, snapshot_sequence));
+    // A prepared range from another node is kept on its shard until the map decides.
+    let arriving = slot_moves
+        .as_ref()
+        .and_then(crate::slot_moves::SlotMoves::pending_gain)
+        .filter(|gain| usize::from(gain.to) == shard_id as usize)
+        .map(|gain| gain.first..=gain.last);
 
     let (mut sink, mutations, report) = WalSink::open_after(
         config.persistence.clone(),
@@ -1026,7 +1043,11 @@ async fn serve_async(
     let mut note_foreign = |key: &[u8]| {
         let slot = crate::routing::hash_slot(key);
 
-        if other_group(slot) {
+        if other_group(slot)
+            && !slot_moves
+                .as_ref()
+                .is_some_and(|moves| moves.crossed_nodes(slot))
+        {
             skipped_foreign = Some(skipped_foreign.map_or(slot, |known| known.min(slot)));
         }
     };
@@ -1136,7 +1157,14 @@ async fn serve_async(
     }
     if let Some(route) = route.as_ref().filter(|route| route.topology.is_some()) {
         let foreign: Vec<bool> = (0..crate::routing::HASH_SLOT_COUNT as u16)
-            .map(|slot| route.slots.owner(slot) != shard_id as usize)
+            .map(|slot| {
+                let owner = route.slots.owner(slot);
+
+                // A frozen range (a prepared move to another node) is still held here.
+                owner != shard_id as usize
+                    && owner != crate::routing::FROZEN_BASE + shard_id as usize
+                    && !arriving.as_ref().is_some_and(|range| range.contains(&slot))
+            })
             .collect();
 
         if let (count @ 1.., Some(slot)) = store.count_in_slots(&foreign) {

@@ -51,7 +51,15 @@ struct State {
     export: Option<Arc<Export>>,
     /// What the last finished import or export reported.
     last: Vec<(String, String)>,
+    /// Where a prepared move is kept across a restart (`None` without a log).
+    dir: Option<std::path::PathBuf>,
 }
+
+/// A prepared import, kept until the map or a cancel decides it.
+const IMPORT_FILE: &str = "MIGRATE_IN";
+/// A prepared export: after a restart its range stays frozen until the map or a cancel
+/// decides it, so the source never takes writes the target may already own.
+const EXPORT_FILE: &str = "MIGRATE_OUT";
 
 impl Migrations {
     /// Whether a range is arriving or leaving.
@@ -59,6 +67,29 @@ impl Migrations {
         let state = self.lock();
 
         state.import.is_some() || state.export.is_some()
+    }
+
+    fn save(&self, name: &str, fields: &[String]) -> Result<(), String> {
+        let Some(dir) = self.lock().dir.clone() else {
+            return Ok(());
+        };
+        let mut text = fields.join("\n");
+
+        text.push('\n');
+        crate::replication::write_durably(&dir.join(name), text.as_bytes())
+            .map_err(|error| format!("could not record the prepared move: {error}"))
+    }
+
+    fn clear(&self, name: &str) {
+        let Some(dir) = self.lock().dir.clone() else {
+            return;
+        };
+
+        match std::fs::remove_file(dir.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warn!(%error, file = name, "could not remove a finished move's file"),
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -172,6 +203,14 @@ fn number<T: std::str::FromStr>(bytes: &[u8], what: &str) -> Result<T, String> {
         .ok_or_else(|| format!("ERR RUVIO MIGRATE {what} is not a valid number"))
 }
 
+/// Move ids are kept in a text file: 1 to 64 printable ASCII characters, no spaces.
+fn move_id(id: &[u8]) -> Result<Vec<u8>, String> {
+    if id.is_empty() || id.len() > 64 || !id.iter().all(u8::is_ascii_graphic) {
+        return Err("ERR RUVIO MIGRATE id must be 1 to 64 printable characters".into());
+    }
+    Ok(id.to_vec())
+}
+
 fn slot_range(first: &[u8], last: &[u8]) -> Result<(u16, u16), String> {
     let first: u16 = number(first, "first slot")?;
     let last: u16 = number(last, "last slot")?;
@@ -224,6 +263,7 @@ fn import(state: &Rc<ShardState>, args: &[&[u8]]) -> Reply {
     let forwarding = forwarding(state)?;
     let (first, last) = slot_range(args[2], args[3])?;
     let shard: usize = number(args[4], "shard")?;
+    let id = move_id(args[1])?;
 
     if shard != forwarding.me {
         return Err(format!(
@@ -268,7 +308,7 @@ fn import(state: &Rc<ShardState>, args: &[&[u8]]) -> Reply {
     record_incoming(state, first, last, IncomingStep::Begin, since)?;
 
     migrations.lock().import = Some(Arc::new(Import {
-        id: args[1].to_vec(),
+        id,
         first,
         last,
         shard,
@@ -367,6 +407,20 @@ fn prepare(state: &Rc<ShardState>, id: &[u8]) -> Reply {
         IncomingStep::Prepared,
         position,
     )?;
+    forwarding(state)?
+        .fabric
+        .migrations
+        .save(
+            IMPORT_FILE,
+            &[
+                String::from_utf8_lossy(&import.id).into_owned(),
+                import.first.to_string(),
+                import.last.to_string(),
+                import.shard.to_string(),
+                position.to_string(),
+            ],
+        )
+        .map_err(|error| format!("ERR RUVIO MIGRATE {error}"))?;
     import.prepared.store(position, Ordering::Release);
     info!(
         first = import.first,
@@ -404,7 +458,7 @@ fn export(state: &Rc<ShardState>, args: &[&[u8]]) -> Reply {
     writable(state)?;
 
     let export = Arc::new(Export {
-        id: args[1].to_vec(),
+        id: move_id(args[1])?,
         first,
         last,
         shard,
@@ -528,6 +582,8 @@ pub(super) fn cancel_import(state: &Rc<ShardState>, import: Arc<Import>) {
             {
                 migrations.import = None;
                 migrations.last = report_import(&import, "cancelled");
+                drop(migrations);
+                forwarding.fabric.migrations.clear(IMPORT_FILE);
             }
         }
         info!(
@@ -938,6 +994,19 @@ async fn copy_and_prepare(
         }
     };
 
+    // Kept before anyone may commit the move: a restart keeps the range frozen.
+    fabric.migrations.save(
+        EXPORT_FILE,
+        &[
+            String::from_utf8_lossy(&export.id).into_owned(),
+            export.first.to_string(),
+            export.last.to_string(),
+            export.shard.to_string(),
+            position.to_string(),
+            export.host.clone(),
+            export.port.to_string(),
+        ],
+    )?;
     if !export.end(ExportState::Prepared {
         position,
         freeze: frozen_at.elapsed(),
@@ -986,6 +1055,8 @@ fn finish_export(fabric: &Fabric, export: &Arc<Export>, ended: &str) {
         }
         migrations.export = None;
         migrations.last = report;
+        drop(migrations);
+        fabric.migrations.clear(EXPORT_FILE);
     }
 }
 
@@ -1117,6 +1188,7 @@ pub(super) fn settle(state: &Rc<ShardState>) {
             migrations.last = report_import(&import, "done");
         }
         drop(migrations);
+        fabric.migrations.clear(IMPORT_FILE);
         info!(
             first,
             last, "serving a slot range that arrived from another node"
@@ -1231,5 +1303,118 @@ pub(super) fn replicated(state: &ShardState, mutation: &crate::OwnedMutation, se
             forget(first, last);
         }
         _ => {}
+    }
+}
+
+/// At start, before any shard serves: takes back the prepared moves a restart interrupted.
+/// A prepared export the map has not given away stays frozen; a prepared import the map
+/// has not completed waits for it again. Either can still be cancelled by its id.
+pub(super) fn restore(fabric: &Fabric, dir: Option<std::path::PathBuf>) {
+    let Some(dir) = dir else {
+        return;
+    };
+    let read = |name: &str| -> Option<Vec<String>> {
+        let text = std::fs::read_to_string(dir.join(name)).ok()?;
+
+        Some(text.lines().map(str::to_owned).collect())
+    };
+    let imported = read(IMPORT_FILE);
+    let exported = read(EXPORT_FILE);
+
+    fabric.migrations.lock().dir = Some(dir.clone());
+
+    if let Some(fields) = imported {
+        let restored = (|| {
+            let [id, first, last, shard, position] = fields.as_slice() else {
+                return None;
+            };
+            let (first, last, shard, position) = (
+                first.parse::<u16>().ok()?,
+                last.parse::<u16>().ok()?,
+                shard.parse::<usize>().ok()?,
+                position.parse::<u64>().ok()?,
+            );
+            let waiting = fabric
+                .mover
+                .with_history(|history, _| history.pending_gain())
+                .flatten()
+                .is_some_and(|gain| {
+                    (gain.first, gain.last, usize::from(gain.to)) == (first, last, shard)
+                });
+
+            waiting.then(|| Import {
+                id: id.clone().into_bytes(),
+                first,
+                last,
+                shard,
+                keys: AtomicU64::new(0),
+                started: Instant::now(),
+                prepared: AtomicU64::new(position),
+            })
+        })();
+
+        match restored {
+            Some(import) => {
+                info!(
+                    first = import.first,
+                    last = import.last,
+                    "a prepared slot range from another node waits for the cluster map again"
+                );
+                fabric.migrations.lock().import = Some(Arc::new(import));
+            }
+            None => fabric.migrations.clear(IMPORT_FILE),
+        }
+    }
+
+    if let Some(fields) = exported {
+        let table = fabric.slot_table();
+        let restored = (|| {
+            let [id, first, last, shard, position, host, port] = fields.as_slice() else {
+                return None;
+            };
+            let (first, last, shard, position, port) = (
+                first.parse::<u16>().ok()?,
+                last.parse::<u16>().ok()?,
+                shard.parse::<usize>().ok()?,
+                position.parse::<u64>().ok()?,
+                port.parse::<u16>().ok()?,
+            );
+            // Given away already (the map on disk is newer): nothing to wait for.
+            let held = shard < fabric.shard_count()
+                && last >= first
+                && (first..=last).all(|slot| table.owner(slot) == shard);
+
+            held.then(|| Export {
+                id: id.clone().into_bytes(),
+                first,
+                last,
+                shard,
+                host: host.clone(),
+                port,
+                auth: Vec::new(),
+                keys: AtomicU64::new(0),
+                rounds: AtomicU64::new(0),
+                started: Instant::now(),
+                outcome: Mutex::new(ExportState::Prepared {
+                    position,
+                    freeze: Duration::ZERO,
+                }),
+                cancel: tokio::sync::Notify::new(),
+            })
+        })();
+
+        match restored {
+            Some(export) => {
+                freeze(fabric, &export);
+                warn!(
+                    first = export.first,
+                    last = export.last,
+                    "a slot range prepared for another node stays frozen until the cluster \
+                     map or RUVIO MIGRATE CANCEL decides it"
+                );
+                fabric.migrations.lock().export = Some(Arc::new(export));
+            }
+            None => fabric.migrations.clear(EXPORT_FILE),
+        }
     }
 }

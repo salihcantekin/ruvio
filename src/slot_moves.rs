@@ -476,6 +476,14 @@ impl SlotMoves {
         Ok(())
     }
 
+    /// Whether `slot` ever moved between this node and another one: a log may then hold
+    /// its keys although another group serves it now.
+    pub(crate) fn crossed_nodes(&self, slot: u16) -> bool {
+        self.moves.iter().any(|entry| {
+            (entry.from == REMOTE || entry.to == REMOTE) && entry.slots().contains(&slot)
+        })
+    }
+
     /// The prepared gain the cluster map has not decided yet.
     pub(crate) fn pending_gain(&self) -> Option<SlotMove> {
         self.moves.last().copied().filter(SlotMove::pending)
@@ -546,16 +554,6 @@ impl SlotMoves {
                 },
             );
         }
-    }
-
-    /// The shard count the moves were recorded for.
-    pub(crate) fn shard_count(&self) -> usize {
-        usize::from(self.shard_count)
-    }
-
-    /// The starting table, when it is not the formula.
-    pub(crate) fn base(&self) -> Option<&std::sync::Arc<[u16]>> {
-        self.base.as_ref()
     }
 
     /// What recovery of `shard` keeps, or `None` when no move concerns it (it then owns

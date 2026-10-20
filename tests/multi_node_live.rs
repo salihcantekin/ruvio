@@ -431,3 +431,95 @@ fn a_slot_range_moves_to_another_node_and_stays_there_after_restarts() {
     b.restart();
     check(&a, &b);
 }
+
+#[test]
+fn a_prepared_move_survives_restarts_on_both_sides_until_it_is_cancelled() {
+    let env = [
+        ("RUVIO_SHARDS", "2"),
+        ("RUVIO_DURABILITY", "always"),
+        ("RUVIO_SNAPSHOT_INTERVAL_MS", "0"),
+    ];
+    let mut a = Server::start_with(&env);
+    let mut b = Server::start_with(&env);
+    let dir = tempfile::tempdir().unwrap();
+    let topology = dir.path().join("topology.toml");
+    let (a_port, b_port) = (a.ports().port_at(0), b.ports().port_at(0));
+
+    std::fs::write(
+        &topology,
+        format!(
+            "version = 1\n[[groups]]\nname = \"a\"\naddress = \"127.0.0.1:{a_port}\"\nshards = 2\nslots = [\"0-4095@0\", \"4096-8191@1\"]\n\
+             [[groups]]\nname = \"b\"\naddress = \"127.0.0.1:{b_port}\"\nshards = 2\nslots = [\"8192-12287@0\", \"12288-16383@1\"]\n"
+        ),
+    )
+    .unwrap();
+    for (server, group) in [(&mut a, "a"), (&mut b, "b")] {
+        server.set_env("RUVIO_CLUSTER_TOPOLOGY", topology.to_str().unwrap());
+        server.set_env("RUVIO_CLUSTER_GROUP", group);
+        server.restart();
+    }
+
+    let key = key_in(100..200, "kept");
+    let mut on_a = Client::connect(&a.address);
+    let mut on_b = Client::connect(&b.address);
+    let port = b_port.to_string();
+
+    assert_eq!(on_a.call(&["SET", &key, "1"]), "OK");
+    assert_eq!(
+        on_b.call(&["RUVIO", "MIGRATE", "IMPORT", "m1", "100", "199", "0"]),
+        "OK"
+    );
+    assert_eq!(
+        on_a.call(&[
+            "RUVIO",
+            "MIGRATE",
+            "EXPORT",
+            "m1",
+            "100",
+            "199",
+            "127.0.0.1",
+            &port
+        ]),
+        "OK"
+    );
+    wait_for(&mut on_a, &["RUVIO", "MIGRATE", "STATUS"], "state,prepared");
+
+    // The source comes back frozen: the target may own the range by now.
+    a.restart();
+    b.restart();
+    let mut on_a = Client::connect(&a.address);
+    let mut on_b = Client::connect(&b.address);
+
+    assert!(on_a.call(&["SET", &key, "2"]).starts_with("ERR:TRYAGAIN"));
+    assert!(
+        on_a.call(&["RUVIO", "MIGRATE", "STATUS"])
+            .contains("state,prepared")
+    );
+    assert!(
+        on_b.call(&["RUVIO", "MIGRATE", "STATUS"])
+            .contains("state,prepared")
+    );
+
+    // Cancelled on both sides: the source serves the range again, the target drops it.
+    assert_eq!(on_a.call(&["RUVIO", "MIGRATE", "CANCEL", "m1"]), "OK");
+    assert_eq!(on_b.call(&["RUVIO", "MIGRATE", "CANCEL", "m1"]), "OK");
+    wait_for(
+        &mut on_b,
+        &["RUVIO", "MIGRATE", "STATUS"],
+        "state,cancelled",
+    );
+    assert_eq!(on_a.call(&["GET", &key]), "1");
+    assert_eq!(on_a.call(&["SET", &key, "2"]), "OK");
+    assert!(on_b.call(&["GET", &key]).starts_with("ERR:MOVED"));
+    assert_eq!(on_b.call(&["DBSIZE"]), "0");
+
+    // Nothing comes back after another restart.
+    a.restart();
+    b.restart();
+    let mut on_a = Client::connect(&a.address);
+    let mut on_b = Client::connect(&b.address);
+
+    assert_eq!(on_a.call(&["GET", &key]), "2");
+    assert_eq!(on_b.call(&["DBSIZE"]), "0");
+    assert_eq!(on_b.call(&["RUVIO", "MIGRATE", "STATUS"]), "[state,none]");
+}
