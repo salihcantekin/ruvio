@@ -54,8 +54,9 @@ new primary. In a test that wrote continuously while the primary was killed, 0â€
 acknowledged writes were missing afterwards, always the last ones. A client that cannot lose a write
 turns on `CLIENT DURABILITY REPLICAS 1` for its connection: every reply then waits until a replica
 holds the writes before it on disk, and becomes `NOREPLICAS` if none does within the timeout (default
-5000 ms; the writes stay applied). The client libraries have a connect option that sends it on every
-connection. `WAIT 1 timeout_ms` after a write does the same for one write at a time.
+5000 ms; the writes stay applied). After a timeout, the connection's next batch waits only if the shard
+logged a new record in between, so a read sent right after can return a write no replica holds yet. The client libraries
+have a connect option that sends it on every connection. `WAIT 1 timeout_ms` after a write does the same for one write at a time.
 
 A failover keeps such writes as long as the coordinators learned that they were committed (see
 *What can still lose data* below for the shapes where they cannot). The primary records, per shard, the highest sequence it released a
@@ -180,6 +181,12 @@ are off by default.
   detection is not delayed: with the defaults (`ping_interval_ms` 500, `down_after_ms` 3000),
   `primary_lease_ms = 2000`. `primary_lease_drift_percent` must be below 100, and at most 255
   coordinators can grant a lease.
+- Each coordinator waits at most 1 s for a node's answer while renewing. A primary that answers later
+  (a slow disk, a long pause) misses that coordinator's grant for the round, and once its running
+  grants fall below a majority with 300 ms left it refuses writes with `NOREPLICAS Primary lease
+  expired` until the next grants arrive; with the defaults a stall of about 1.7 s is enough. On nodes
+  that stall like this choose `primary_lease_ms` 3000 to 4000 and raise `down_after_ms` to fit the
+  rule above.
 
 What it assumes and what it does not cover:
 
@@ -456,6 +463,12 @@ is never slowed down. Nodes need durability `memory`, `everysec` or `always` (no
 
 ## Upgrading
 
+Upgrade the coordinators first, then the data nodes group by group. Clients need no change for
+either; the client libraries follow a failover by default (see
+[CLIENT_BEHAVIOR.md](CLIENT_BEHAVIOR.md)), which the data-node steps below rely on.
+
+### Coordinators
+
 Upgrade all coordinators together: stop every one, replace the binary, start them again. A release
 that records committed sequences in Raft writes log entries older coordinators cannot read; an older
 coordinator that receives one cannot follow the log, and one restarted on such a log refuses to start.
@@ -474,6 +487,60 @@ while every group has exactly one member answering as primary. The coordinators 
 first start: they record that member at epoch 1 and lose the committed sequences (they learn them again
 from the members). With a cluster map do not do this: the map's version and the moved ranges are in
 the same state, and starting it over sends nodes an older map than they hold.
+
+### Data nodes
+
+A primary and its replicas must run the same release when the replication handshake changed
+between the two (the release notes say so): a replica of the newer release cannot follow a primary
+of the older one, and the other way round. There is no rolling upgrade inside a group in that case.
+A replica that cannot connect still answers `ROLE`, so the coordinators do not see it as down; the
+primary just loses it. With `min-replicas-to-write` at 1 or more the primary then answers
+`NOREPLICAS`, and every `CLIENT DURABILITY` reply waits out its timeout and becomes `NOREPLICAS`.
+Each data node's own files are read by the newer release as in a single-server upgrade (see
+[RECOVERY.md](RECOVERY.md#upgrade)).
+
+Two ways, per group. Neither loses an acknowledged write.
+
+**Way A: switch over to an upgraded replica.** Reads go on throughout. Writes pause from step 1
+until the promoted replica takes them: the replicas' restarts, then about `down_after_ms` plus one
+`ping_interval_ms` after step 4.
+
+1. Stop writes on the primary: `CONFIG SET min-replicas-to-write N` with `N` larger than its number
+   of replicas (on any port; it applies to every shard), or stop the writing applications. Writes get
+   `NOREPLICAS` from the next 100 ms check. Do not `CONFIG REWRITE`: the restarted node must not keep
+   it.
+2. Wait until every replica holds what the primary has: on every shard port, the primary's
+   `wal_last_sequence` in `INFO` equals its `wal_durable_sequence`, and each replica's
+   `wal_durable_sequence` equals that number (as in *Promote a replica by hand* in
+   [RECOVERY.md](RECOVERY.md#promote-a-replica-by-hand)). Writes the primary took after
+   the replicas stopped hearing it would be lost at the switch, which is why step 1 comes first.
+3. Restart each replica with the new binary. They cannot follow the old primary; that is expected.
+4. Stop the old primary (`COORDINATOR FAILOVER group FORCE` is refused while it answers). After
+   `down_after_ms` the coordinators promote the replica holding the most history and point the
+   others at it. With `primary-lease yes` on the nodes the promoted replica refuses writes until the
+   first grants, one `ping_interval_ms` later. Its `min-replicas-to-write` is its own: a group with a
+   single replica and `min-replicas-to-write 1` gets writes back only after step 5.
+5. Start the old primary with the new binary, preferably as a replica of the new primary
+   (`replication.role = "replica"`, `replication.primary` its replication address). Started as a
+   primary it takes writes until the coordinators make it a replica on their next ping, and loses
+   them then. It catches up from its own log.
+
+Clients with more than one seed or a coordinator name (`sentinel_master` and its equivalents) find
+the new primary on their next reconnect; writes they sent during the pause got `NOREPLICAS` or a
+connection error and are not retried by the client.
+
+**Way B: stop the group.** The simplest: stop the replicas, then the primary; replace the binary;
+start the primary, then the replicas. Reads and writes stop for the restart, including each node's
+recovery (snapshot load and WAL replay; see *Recovery-Time Objective* in [RECOVERY.md](RECOVERY.md)).
+Keep this order: the coordinators promote a replica when the primary is down for `down_after_ms`
+while a replica answers, and with no replica up they change nothing.
+
+Checked with one binary (3 data nodes, 3 coordinators as local processes, `ping_interval_ms` 200,
+`down_after_ms` 1000, debug build): Way A in the order above kept all 200 writes taken before step 1,
+the promoted replica took writes 1.2 seconds after the primary stopped (2.1 seconds of paused writes in
+all, the replica restarts included), and the old primary came back as a replica holding every write,
+without the runtime `min-replicas-to-write`. Not run with `primary-lease yes`, nor with two different
+releases side by side, so the refused handshake itself was not part of the run. Way B was not run.
 
 ## Limits of this version
 
