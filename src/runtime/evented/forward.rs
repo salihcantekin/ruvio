@@ -207,6 +207,8 @@ pub(crate) struct Fabric {
     durability: Mutex<Vec<Option<ShardDurability>>>,
     /// Which shard owns each hash slot (see [`SlotTable`]).
     slots: SlotTable,
+    /// The primary lease from the coordinators, held for the whole process.
+    pub(super) lease: Arc<crate::primary_lease::LeaseTable>,
     /// The newest `CONFIG SET` configuration and its version (see `live`).
     pub(super) config: Mutex<super::live::ConfigAuthority>,
     /// Slot moves between these shards.
@@ -245,6 +247,7 @@ impl Fabric {
             mover: super::moveslots::SlotMover::default(),
             migrations: super::migrate::Migrations::default(),
             topology: std::sync::OnceLock::new(),
+            lease: Arc::default(),
         })
     }
 

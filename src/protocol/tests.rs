@@ -443,6 +443,55 @@ fn parses_acl_commands() {
 }
 
 #[test]
+fn parses_the_primary_lease_commands() {
+    let frame = |args: &[&str]| {
+        let mut text = format!("*{}\r\n", args.len());
+
+        for arg in args {
+            text.push_str(&format!("${}\r\n{arg}\r\n", arg.len()));
+        }
+        text
+    };
+    let parse = |args: &[&str]| read_command(&mut Cursor::new(frame(args).into_bytes()));
+
+    assert_eq!(
+        parse(&["RUVIO", "lease", "begin"]).unwrap(),
+        Some(Command::PrimaryLease(None))
+    );
+    assert_eq!(
+        parse(&["RUVIO", "LEASE", "GRANT", "7", "2", "3", "4", "2000"]).unwrap(),
+        Some(Command::PrimaryLease(Some(Box::new(
+            crate::protocol::LeaseGrant {
+                token: 7,
+                coordinator: 2,
+                voters: 3,
+                epoch: 4,
+                lease_ms: 2000,
+            }
+        ))))
+    );
+    for args in [
+        &["RUVIO", "LEASE"][..],
+        &["RUVIO", "LEASE", "BEGIN", "1"],
+        &["RUVIO", "LEASE", "GRANT", "7", "2", "3", "4"],
+        &["RUVIO", "LEASE", "GRANT", "7", "2", "x", "4", "2000"],
+        &[
+            "RUVIO",
+            "LEASE",
+            "GRANT",
+            "7",
+            "2",
+            "4294967296",
+            "4",
+            "2000",
+        ],
+        &["RUVIO", "LEASE", "RENEW"],
+    ] {
+        assert!(parse(args).is_err(), "{args:?}");
+    }
+}
+
+#[test]
 fn parses_transaction_commands() {
     let input = b"*1\r\n$5\r\nMULTI\r\n*1\r\n$4\r\nEXEC\r\n*1\r\n$7\r\nDISCARD\r\n*2\r\n$5\r\nWATCH\r\n$1\r\nk\r\n*1\r\n$7\r\nUNWATCH\r\n";
     let mut reader = Cursor::new(input);

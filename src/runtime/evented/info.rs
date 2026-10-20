@@ -160,6 +160,13 @@ pub(super) fn evented_info(state: &ShardState, section: Option<&[u8]>) -> io::Re
         },
         fenced = u8::from(state.write_gate.get() == crate::replication::WriteGate::Fenced),
     )?;
+    let (lease, grants, remaining) = super::replica::lease_report(state);
+
+    write!(
+        info,
+        "primary_lease:{}\r\nprimary_lease_grants:{grants}\r\nprimary_lease_remaining_ms:{remaining}\r\n",
+        if lease { "on" } else { "off" },
+    )?;
     // Redis's lines for each replica that announced where clients reach it; replicas that
     // announced nothing, or are still copying, are counted above but not listed.
     for (index, replica) in state.durable_acks.replicas().iter().enumerate() {

@@ -58,6 +58,16 @@ impl Group {
     }
 
     fn node(&self, dir: &Path, index: usize, follow: Option<usize>) -> Process {
+        self.node_with(dir, index, follow, &[])
+    }
+
+    fn node_with(
+        &self,
+        dir: &Path,
+        index: usize,
+        follow: Option<usize>,
+        env: &[(&str, &str)],
+    ) -> Process {
         let data_dir = dir.join(format!("node{index}"));
         let config = dir.join(format!("node{index}.toml"));
 
@@ -89,6 +99,7 @@ impl Group {
             ),
             None => command.env("RUVIO_REPLICATION_ROLE", "primary"),
         };
+        command.envs(env.iter().copied());
         let process = Process(command.spawn().unwrap());
 
         wait_until("a data node to answer", || {
@@ -98,11 +109,24 @@ impl Group {
     }
 
     fn coordinator(&self, dir: &Path, index: usize) -> Process {
-        self.coordinator_logging(dir, index, None)
+        self.coordinator_with(dir, index, "", &self.resp, None)
     }
 
     /// A coordinator whose log goes to `log` when given.
     fn coordinator_logging(&self, dir: &Path, index: usize, log: Option<&Path>) -> Process {
+        self.coordinator_with(dir, index, "", &self.resp, log)
+    }
+
+    /// A coordinator with `extra` settings that dials the data nodes at `addresses`, its log
+    /// going to `log` when given.
+    fn coordinator_with(
+        &self,
+        dir: &Path,
+        index: usize,
+        extra: &str,
+        addresses: &[SocketAddr],
+        log: Option<&Path>,
+    ) -> Process {
         let output = || match log {
             Some(path) => Stdio::from(
                 std::fs::OpenOptions::new()
@@ -125,7 +149,7 @@ impl Group {
             .map(|node| {
                 format!(
                     "  {{ address = \"{}\", replication = \"{}\" }}",
-                    self.resp[node], self.replication[node]
+                    addresses[node], self.replication[node]
                 )
             })
             .collect::<Vec<_>>()
@@ -135,7 +159,7 @@ impl Group {
             &config,
             format!(
                 "id = {}\nlisten = \"{}\"\ndata_dir = \"{}\"\npeers = [{peers}]\nsecret = \"{SECRET}\"\n\
-                 ping_interval_ms = 200\ndown_after_ms = 1000\n\n[[groups]]\nname = \"main\"\n\
+                 ping_interval_ms = 200\ndown_after_ms = 1000\n{extra}\n\n[[groups]]\nname = \"main\"\n\
                  members = [\n{members}\n]\n",
                 index + 1,
                 self.coordinators[index],
@@ -1167,4 +1191,305 @@ fn a_failover_of_the_source_during_a_move_starts_it_again_with_the_new_primary()
     wait_until("a's new primary to drop its copy", || {
         call(&groups.node(1), &["DBSIZE"]).as_deref() == Some("0")
     });
+}
+
+/// A TCP proxy in front of one data node for the coordinators only: cutting it leaves the
+/// node reachable by clients and by its replicas, as a partition between it and the
+/// coordinators would.
+struct Proxy {
+    cut: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    accepter: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Proxy {
+    fn start(listen: SocketAddr, target: SocketAddr) -> Self {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let listener = std::net::TcpListener::bind(listen).unwrap();
+        let cut = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let open: Arc<Mutex<Vec<std::net::TcpStream>>> = Arc::default();
+
+        listener.set_nonblocking(true).unwrap();
+        let accepter = {
+            let (cut, stop) = (Arc::clone(&cut), Arc::clone(&stop));
+
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    if cut.load(Ordering::Acquire) {
+                        for stream in open.lock().unwrap().drain(..) {
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                        }
+                    }
+                    let Ok((client, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    if cut.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    let Ok(server) =
+                        std::net::TcpStream::connect_timeout(&target, Duration::from_secs(1))
+                    else {
+                        continue;
+                    };
+                    let _ = client.set_nonblocking(false);
+                    let mut open = open.lock().unwrap();
+
+                    for (from, to) in [(&client, &server), (&server, &client)] {
+                        let (Ok(mut from), Ok(mut to)) = (from.try_clone(), to.try_clone()) else {
+                            continue;
+                        };
+
+                        std::thread::spawn(move || {
+                            let _ = std::io::copy(&mut from, &mut to);
+                            let _ = to.shutdown(std::net::Shutdown::Both);
+                        });
+                    }
+                    open.push(client);
+                    open.push(server);
+                }
+                for stream in open.lock().unwrap().drain(..) {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                }
+            })
+        };
+
+        Self {
+            cut,
+            stop,
+            accepter: Some(accepter),
+        }
+    }
+
+    /// Drops every proxied connection and refuses new ones.
+    fn cut(&self) {
+        self.cut.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(accepter) = self.accepter.take() {
+            let _ = accepter.join();
+        }
+    }
+}
+
+/// What a primary cut off from the coordinators did while they failed over.
+struct CutResult {
+    /// The last write the old primary took, and its first refusal, after the cut.
+    last_taken: Option<Instant>,
+    first_refused: Option<Instant>,
+    /// When a coordinator was first seen naming another primary.
+    promoted: Instant,
+    cut: Instant,
+}
+
+fn info_text(address: &str, name: &str) -> Option<String> {
+    call(address, &["INFO", "replication"])?
+        .lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(':'))
+        .map(|value| value.trim().to_owned())
+}
+
+/// Three nodes and three coordinators that reach node 0 only through a proxy. Once node 0
+/// takes writes the proxy is cut; a client keeps writing to node 0 directly while the
+/// coordinators fail over. With `lease_ms`, every node runs `primary-lease` and the
+/// coordinators grant it.
+fn primary_cut_from_the_coordinators(lease_ms: Option<u64>) -> CutResult {
+    let dir = tempfile::tempdir().unwrap();
+    let group = Group::new();
+    let ports = test_ports::reserve();
+    let proxy = Proxy::start(ports.address_at(0), group.resp[0]);
+    let env = [(
+        "RUVIO_PRIMARY_LEASE",
+        if lease_ms.is_some() { "yes" } else { "no" },
+    )];
+    let _nodes = [
+        group.node_with(dir.path(), 0, None, &env),
+        group.node_with(dir.path(), 1, Some(0), &env),
+        group.node_with(dir.path(), 2, Some(0), &env),
+    ];
+    let extra = lease_ms.map_or_else(String::new, |ms| {
+        format!("primary_lease_ms = {ms}\nprimary_lease_drift_percent = 5")
+    });
+    let mut addresses = group.resp.clone();
+
+    addresses[0] = ports.address_at(0);
+    let _coordinators: Vec<Process> = (0..3)
+        .map(|index| group.coordinator_with(dir.path(), index, &extra, &addresses, None))
+        .collect();
+    let primary = group.resp[0].to_string();
+    // The coordinators name node 0 by the proxy's address.
+    let named = |index: usize| {
+        let reply = call_with_secret(
+            &group.coordinators[index].to_string(),
+            &["SENTINEL", "get-master-addr-by-name", "main"],
+        )?;
+        let port: u16 = reply.split_whitespace().nth(1)?.parse().ok()?;
+
+        addresses.iter().position(|address| address.port() == port)
+    };
+
+    wait_until("the coordinators to agree on the primary", || {
+        (0..3).all(|index| named(index) == Some(0))
+    });
+    // With the lease, the primary takes writes once a majority granted it.
+    wait_until("the primary to take writes", || {
+        call(&primary, &["SET", "before", "1"]).as_deref() == Some("OK")
+    });
+    let lease_state = info_text(&primary, "primary_lease");
+
+    assert_eq!(
+        lease_state.as_deref(),
+        Some(if lease_ms.is_some() { "on" } else { "off" })
+    );
+
+    proxy.cut();
+    let cut = Instant::now();
+    let mut result = CutResult {
+        last_taken: None,
+        first_refused: None,
+        promoted: cut,
+        cut,
+    };
+    let deadline = cut + PATIENCE;
+    let mut writes = 0u64;
+
+    loop {
+        assert!(Instant::now() < deadline, "no failover after the cut");
+        // A reply that does not arrive (a slow machine) says nothing either way.
+        if let Some(reply) = call(&primary, &["SET", "during", &writes.to_string()]) {
+            let at = Instant::now();
+
+            if reply == "OK" {
+                result.last_taken = Some(at);
+            } else {
+                assert!(reply.starts_with("NOREPLICAS Primary lease"), "{reply}");
+                result.first_refused.get_or_insert(at);
+            }
+        }
+        writes += 1;
+        if (0..3).any(|index| named(index).is_some_and(|node| node != 0)) {
+            result.promoted = Instant::now();
+            break;
+        }
+    }
+    // After the failover the old primary still answers as it did.
+    let mut reply = None;
+
+    wait_until("the old primary to answer a write", || {
+        reply = call(&primary, &["SET", "after", "1"]);
+        reply.is_some()
+    });
+    let reply = reply.unwrap_or_default();
+
+    if lease_ms.is_some() {
+        assert!(reply.starts_with("NOREPLICAS Primary lease"), "{reply}");
+        // The promoted replica takes writes once the coordinators grant it the lease.
+        let promoted = (0..3)
+            .find_map(|index| named(index).filter(|&node| node != 0))
+            .unwrap();
+
+        wait_until("the new primary to take writes", || {
+            call(&group.resp[promoted].to_string(), &["SET", "new", "1"]).as_deref() == Some("OK")
+        });
+        eprintln!(
+            "the new primary took writes {:?} after the cut",
+            cut.elapsed()
+        );
+    } else {
+        assert_eq!(
+            reply, "OK",
+            "without the lease the old primary keeps writing"
+        );
+    }
+    eprintln!(
+        "lease {lease_ms:?}: last write taken {:?}, first refused {:?}, promotion seen {:?} after the cut",
+        result.last_taken.map(|at| at - cut),
+        result.first_refused.map(|at| at - cut),
+        result.promoted - cut
+    );
+    result
+}
+
+#[test]
+fn with_the_lease_a_primary_cut_from_the_coordinators_stops_writing_before_the_failover() {
+    // ping 200 ms, down_after 1000 ms: a 700 ms lease with 5% drift counts as ended 974 ms
+    // after a grant (700 * 105 / 95, rounded up, plus 200).
+    let result = primary_cut_from_the_coordinators(Some(700));
+
+    // Every write the old primary took came before any coordinator named another primary,
+    // and it refused writes once one did.
+    assert!(
+        result
+            .last_taken
+            .is_none_or(|taken| taken < result.promoted),
+        "a write was taken {:?} after the cut, promotion seen {:?}",
+        result.last_taken.map(|at| at - result.cut),
+        result.promoted - result.cut
+    );
+    if let Some(refused) = result.first_refused {
+        assert!(
+            result.last_taken.is_none_or(|taken| taken < refused),
+            "a write was taken after the first refusal"
+        );
+    }
+}
+
+#[test]
+fn without_the_lease_a_primary_cut_from_the_coordinators_keeps_writing() {
+    let result = primary_cut_from_the_coordinators(None);
+
+    assert!(result.first_refused.is_none());
+    assert!(result.last_taken.is_some());
+}
+
+/// With the lease, a member that accepts connections but never answers (a stalled host)
+/// must not hold up the renewal of the primary's lease: the primary keeps taking writes.
+#[test]
+fn a_stalled_member_does_not_hold_up_the_primary_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let group = Group::new();
+    let env = [("RUVIO_PRIMARY_LEASE", "yes")];
+    let _nodes = [
+        group.node_with(dir.path(), 0, None, &env),
+        group.node_with(dir.path(), 1, Some(0), &env),
+    ];
+    // Member 2's address: connections are queued by the kernel and never read.
+    let _stalled = std::net::TcpListener::bind(group.resp[2]).unwrap();
+    // ping 200 ms, down_after 1000 ms; a look at the stalled member takes a full second.
+    let _coordinators: Vec<Process> = (0..3)
+        .map(|index| {
+            group.coordinator_with(
+                dir.path(),
+                index,
+                "primary_lease_ms = 700\nprimary_lease_drift_percent = 5",
+                &group.resp,
+                None,
+            )
+        })
+        .collect();
+    let primary = group.resp[0].to_string();
+
+    wait_until("the primary to take writes", || {
+        call(&primary, &["SET", "before", "1"]).as_deref() == Some("OK")
+    });
+    let until = Instant::now() + Duration::from_secs(4);
+    let mut writes = 0u64;
+
+    while Instant::now() < until {
+        if let Some(reply) = call(&primary, &["SET", "during", &writes.to_string()]) {
+            assert_eq!(reply, "OK", "write {writes} refused");
+        }
+        writes += 1;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(writes > 20, "only {writes} writes in four seconds");
 }

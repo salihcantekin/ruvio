@@ -46,6 +46,9 @@ pub struct ReplicationConfig {
     /// `min_replicas_max_lag`; 0 turns the check off.
     pub min_replicas_to_write: usize,
     pub min_replicas_max_lag: Duration,
+    /// A primary takes writes only while a majority of `ruvio coordinator`s renewed its lease
+    /// (`RUVIO LEASE`); off by default.
+    pub primary_lease: bool,
     /// A replica announces its client address to its primary, which lists it in
     /// `CLUSTER SLOTS`, `ROLE` and `INFO`; off keeps it out of the topology.
     pub announced: bool,
@@ -69,6 +72,7 @@ impl Default for ReplicationConfig {
             primary_name: None,
             min_replicas_to_write: 0,
             min_replicas_max_lag: Duration::from_secs(10),
+            primary_lease: false,
             announced: true,
             tls: false,
             tls_ca: PathBuf::new(),
@@ -553,6 +557,10 @@ impl AppConfig {
 
         apply_u64(&get, "RUVIO_MIN_REPLICAS_MAX_LAG", &mut max_lag)?;
         self.replication.min_replicas_max_lag = Duration::from_secs(max_lag);
+
+        if let Some(value) = get("RUVIO_PRIMARY_LEASE") {
+            self.replication.primary_lease = parse_bool(&value, "RUVIO_PRIMARY_LEASE")?;
+        }
 
         if let Some(value) = get("RUVIO_REPLICA_ANNOUNCED") {
             self.replication.announced = parse_bool(&value, "RUVIO_REPLICA_ANNOUNCED")?;
@@ -1119,6 +1127,10 @@ impl AppConfig {
                 self.replication.min_replicas_max_lag.as_secs().to_string(),
             ),
             (
+                "primary-lease".into(),
+                yes_no(self.replication.primary_lease),
+            ),
+            (
                 "replica-announced".into(),
                 yes_no(self.replication.announced),
             ),
@@ -1592,6 +1604,7 @@ struct ReplicationFileConfig {
     min_replicas_to_write: Option<usize>,
     /// Seconds, as Redis's `min-replicas-max-lag`.
     min_replicas_max_lag: Option<u64>,
+    primary_lease: Option<bool>,
     announced: Option<bool>,
     tls: Option<bool>,
     tls_ca: Option<PathBuf>,
@@ -1632,6 +1645,7 @@ impl ReplicationFileConfig {
             replication.min_replicas_max_lag = Duration::from_secs(seconds);
         }
 
+        assign(&mut replication.primary_lease, self.primary_lease);
         if let Some(announced) = self.announced {
             replication.announced = announced;
         }
@@ -2496,6 +2510,13 @@ fn overlay_config(table: &mut toml::Table, loaded: &AppConfig, effective: &AppCo
         loaded.replication.min_replicas_to_write,
         effective.replication.min_replicas_to_write,
     );
+    if loaded.replication.primary_lease != effective.replication.primary_lease {
+        set_toml(
+            table,
+            &["replication", "primary_lease"],
+            toml::Value::Boolean(effective.replication.primary_lease),
+        );
+    }
     if loaded.replication.announced != effective.replication.announced {
         set_toml(
             table,

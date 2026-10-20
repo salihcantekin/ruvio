@@ -69,6 +69,7 @@ listen = "127.0.0.1:26379"    # primary base address; shard i uses port + i
 primary = "127.0.0.1:26379"   # replica dials this base address; a hostname is allowed
 min_replicas_to_write = 0     # a primary refuses writes with fewer good replicas; 0 = off
 min_replicas_max_lag = 10     # seconds since a replica's last acknowledgement
+primary_lease = false         # take writes only under a lease from ruvio coordinator
 announced = true              # a replica tells its primary where clients reach it
 tls = false                   # encrypt the replication link; see Replication TLS
 
@@ -167,6 +168,7 @@ setting takes a restart.
 | `requirepass` | `security.requirepass` | next login |
 | `min-replicas-to-write` | `replication.min_replicas_to_write` | next replica check (100 ms) |
 | `min-replicas-max-lag` | `replication.min_replicas_max_lag` | next replica check (100 ms) |
+| `primary-lease` | `replication.primary_lease` | next replica check (100 ms) |
 
 - One call changes all its pairs or none. An unknown name, a name given twice,
   a restart-only name, or a value that does not parse or validate fails the
@@ -302,6 +304,7 @@ Each variable overrides one file setting, and a command-line flag, where there i
 | `RUVIO_REPLICATION_PRIMARY` | no | | `replication.primary` | |
 | `RUVIO_MIN_REPLICAS_TO_WRITE` | `min-replicas-to-write` | | `replication.min_replicas_to_write` | |
 | `RUVIO_MIN_REPLICAS_MAX_LAG` | `min-replicas-max-lag` | | `replication.min_replicas_max_lag` | Seconds, as in Redis |
+| `RUVIO_PRIMARY_LEASE` | `primary-lease` | | `replication.primary_lease` | `yes`/`no`; see [COORDINATOR.md](COORDINATOR.md#primary-lease) |
 | `RUVIO_REPLICA_ANNOUNCED` | no | | `replication.announced` | `CONFIG GET replica-announced` |
 
 Flags with no variable:
@@ -542,6 +545,16 @@ that installs a full copy acknowledges nothing until it has caught up, so with a
 single replica and `min-replicas-to-write 1` the primary refuses writes while that
 replica resyncs, as in Redis. Both change
 with `CONFIG SET`. Only role `primary` applies them.
+
+`replication.primary_lease` / `primary-lease` (default `false`) makes a primary
+(or a node with no replication role) take writes only while a majority of the
+`ruvio coordinator`s that manage it renewed its lease (their `primary_lease_ms`)
+for more than 300 ms more; otherwise writes get
+`NOREPLICAS Primary lease expired: too few coordinators renewed it.`. A primary
+starts, and a promoted replica begins, refusing writes until the first grants
+arrive. It is checked on the same 100 ms tick and changes with `CONFIG SET`;
+see [COORDINATOR.md](COORDINATOR.md#primary-lease) for the guarantee and the
+order to turn it on or off.
 
 **Replicas in the topology.** A replica sends its primary the address clients
 reach it on: `advertised_host`, and `advertised_port` (else the bind port) plus

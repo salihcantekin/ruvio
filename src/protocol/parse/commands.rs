@@ -45,6 +45,10 @@ pub(in crate::protocol) fn cmd_ruvio<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
         };
     }
 
+    if args.len() >= 1 && args.bytes(0).eq_ignore_ascii_case(b"LEASE") {
+        return parse_lease(args);
+    }
+
     if args.len() >= 2 && args.bytes(0).eq_ignore_ascii_case(b"MIGRATE") {
         return Ok(Command::Migrate(
             (1..args.len()).map(|at| args.arg(at)).collect(),
@@ -55,6 +59,33 @@ pub(in crate::protocol) fn cmd_ruvio<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
         0 => Ok(Command::Ruvio(None)),
         1 => Ok(Command::Ruvio(Some(args.arg(0)))),
         _ => Err(ProtocolError::Invalid("RUVIO expects zero or one argument")),
+    }
+}
+
+/// `RUVIO LEASE BEGIN` or `RUVIO LEASE GRANT token coordinator voters epoch lease_ms`.
+fn parse_lease<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
+    const USAGE: &str =
+        "RUVIO LEASE expects BEGIN, or GRANT token coordinator voters epoch lease_ms";
+    let is = |word: &[u8]| args.len() >= 2 && args.bytes(1).eq_ignore_ascii_case(word);
+    let number = |at: usize| {
+        std::str::from_utf8(args.bytes(at))
+            .ok()
+            .and_then(|text| text.parse::<u64>().ok())
+            .ok_or(ProtocolError::Invalid(USAGE))
+    };
+
+    match args.len() {
+        2 if is(b"BEGIN") => Ok(Command::PrimaryLease(None)),
+        7 if is(b"GRANT") => Ok(Command::PrimaryLease(Some(Box::new(
+            crate::protocol::LeaseGrant {
+                token: number(2)?,
+                coordinator: number(3)?,
+                voters: u32::try_from(number(4)?).map_err(|_| ProtocolError::Invalid(USAGE))?,
+                epoch: number(5)?,
+                lease_ms: number(6)?,
+            },
+        )))),
+        _ => Err(ProtocolError::Invalid(USAGE)),
     }
 }
 

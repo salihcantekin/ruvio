@@ -47,6 +47,7 @@ pub const LIVE_SETTINGS: &[&str] = &[
     // Replication
     "min-replicas-to-write",
     "min-replicas-max-lag",
+    "primary-lease",
 ];
 
 /// `CONFIG GET` names that only change with a restart, or only report a value. `CONFIG SET`
@@ -200,6 +201,7 @@ impl AppConfig {
             "min-replicas-max-lag" => {
                 self.replication.min_replicas_max_lag = Duration::from_secs(unsigned(value)?);
             }
+            "primary-lease" => self.replication.primary_lease = parse_bool(value, "the value")?,
             _ => return Err("not a live setting".into()),
         }
 
@@ -221,6 +223,7 @@ impl AppConfig {
         self.security.requirepass = live.security.requirepass.clone();
         self.replication.min_replicas_to_write = live.replication.min_replicas_to_write;
         self.replication.min_replicas_max_lag = live.replication.min_replicas_max_lag;
+        self.replication.primary_lease = live.replication.primary_lease;
     }
 
     /// `CONFIG REWRITE`: writes the live settings of `self` into the config file the server

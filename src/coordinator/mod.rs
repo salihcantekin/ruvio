@@ -84,6 +84,12 @@ async fn serve(
 
     info!(id = config.id, listen = %config.listen, groups = config.groups.len(), "coordinator listening");
     let watcher = tokio::spawn(monitor::watch(Arc::clone(&config), sightings.clone()));
+    let renewer = tokio::spawn(monitor::renew_leases(
+        Arc::clone(&config),
+        raft.clone(),
+        machine.clone(),
+        sightings.clone(),
+    ));
     let moves = migrate::Context {
         config: Arc::clone(&config),
         raft: raft.clone(),
@@ -132,6 +138,7 @@ async fn serve(
     }
 
     watcher.abort();
+    renewer.abort();
     leader.abort();
     let _ = raft.shutdown().await;
     Ok(())
@@ -246,6 +253,29 @@ impl Api {
                     .group(&group)
                     .map(|group| self.sightings.ages(group))
                     .unwrap_or_default(),
+            ),
+            RpcRequest::Leases { group, member } => match self.config.group(&group) {
+                Some(group) => RpcResponse::Leases {
+                    heard: self.sightings.ages(group),
+                    ended: self.config.primary_lease.is_none_or(|(_, safe)| {
+                        self.sightings.grants().report(&group.name, member, safe)
+                    }),
+                    lease_on: self.config.primary_lease.is_some(),
+                },
+                None => RpcResponse::Leases {
+                    heard: Vec::new(),
+                    ended: false,
+                    lease_on: self.config.primary_lease.is_some(),
+                },
+            },
+            RpcRequest::Confirm { group } => RpcResponse::Confirmed(
+                monitor::confirm_locally(
+                    &self.raft,
+                    &self.machine,
+                    self.sightings.grants(),
+                    &group,
+                )
+                .await,
             ),
         }
     }

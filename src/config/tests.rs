@@ -1016,6 +1016,7 @@ fn every_template_setting_answers_config_get() {
         ("replication.announced", "replica-announced"),
         ("replication.min_replicas_max_lag", "min-replicas-max-lag"),
         ("replication.min_replicas_to_write", "min-replicas-to-write"),
+        ("replication.primary_lease", "primary-lease"),
         ("replication.role", "replication-role"),
         (
             "requests.max_output_buffer_bytes",
