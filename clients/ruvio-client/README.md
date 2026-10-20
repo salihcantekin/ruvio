@@ -63,6 +63,25 @@ let mut client = Client::connect_with(ClientOptions {
 })?;
 ```
 
+### Following a failover
+
+With two or more seeds a standalone client finds the primary again after a failover. On a reconnect it asks the seeds `ROLE` and connects to the one that answers `master` (a replica's reported primary is tried too); if none does it falls back to the first seed that answers. When a command is answered `READONLY` (the node was demoted) it does the same and sends that command once more to the new primary: `READONLY` is sent before the command runs, so the retry cannot apply it twice. It is not sent again inside a transaction the client opened, or in a pipeline, and a second `READONLY` is returned. The rounds wait with the reconnect backoff (`max_reconnect_attempts`, `reconnect_base_delay`, `reconnect_max_delay`); with `reconnect: false` there is one round. Nothing is sent while the connection is healthy, and a single address behaves as before. `ClientOptions::follow_primary = false` turns it off.
+
+With `sentinel_master` set the seeds are coordinator (or Sentinel) addresses: the client asks `SENTINEL get-master-addr-by-name <name>`, checks the answer with `ROLE`, and connects there, at connect time, on reconnect and after `READONLY`. The same `AUTH` credentials go to the coordinators and the data node. The rules are the same in every client ([docs/CLIENT_BEHAVIOR.md](../../docs/CLIENT_BEHAVIOR.md#following-a-failover)).
+
+```rust
+let mut client = Client::connect_with(ClientOptions {
+    seeds: vec![("10.0.0.5".into(), 6379), ("10.0.0.6".into(), 6379)],
+    ..ClientOptions::default()
+})?;
+// Or with coordinators: seeds are their addresses.
+let mut client = Client::connect_with(ClientOptions {
+    seeds: vec![("10.0.0.9".into(), 26379)],
+    sentinel_master: Some("main".into()),
+    ..ClientOptions::default()
+})?;
+```
+
 ### Reads from replicas
 
 `ClientOptions::read_policy` decides where a cluster client sends read-only commands. `ReadPolicy::Primary` (the default) keeps every command on the slot's primary. `ReadPolicy::PreferReplica` sends reads to one replica of the slot's shard, picked at random when the slot map loads, and falls back to the primary when none is known, it cannot be opened, or it answers `LOADING`. `ReadPolicy::Replica` sends reads only to replicas and fails with `Error::Protocol` ("no replica ...") when none is usable. Reads are the commands the server flags `readonly` and not blocking (`GET`, `MGET`, `HGETALL`, `ZRANGE`, ...); writes, transactions, blocking commands, scripts and Pub/Sub stay on the primaries, and a pipeline goes to replicas only when every command in it reads. Replica connections send `READONLY` when they open. Replication is asynchronous, so a read from a replica may miss recent writes, including your own. Standalone connections ignore the policy. The rules are the same in every client ([docs/CLIENT_BEHAVIOR.md](../../docs/CLIENT_BEHAVIOR.md#reads-from-replicas)).
@@ -283,6 +302,7 @@ and vary run to run, so compare them only within one run.
 fails when a command has no typed method. `RUVIO_TEST_ADDR=127.0.0.1:16390 cargo test` also runs
 `tests/live.rs` (databases 0 to 7) and `tests/live_ext.rs` (databases 0 and 8 to 15) against a server
 on that address; they flush those databases. Without the variable the live tests return early.
+`tests/failover_live.rs` needs the pair `scripts/run_with_servers.sh` starts (`RUVIO_FAILOVER_ADDRS`, `RUVIO_FAILOVER_REPLICATION`); `tests/follow_failover.rs` uses scripted nodes and needs nothing.
 
 ## Not done / not verified
 

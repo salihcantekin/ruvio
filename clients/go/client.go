@@ -83,6 +83,21 @@ type Options struct {
 	// ReadPolicy is where a cluster client sends read-only commands; see ReadPolicy. A
 	// standalone connection ignores it. Default ReadPrimary.
 	ReadPolicy ReadPolicy
+	// DisableFollowPrimary turns off following a failover. By default a standalone client
+	// with several Seeds (or a SentinelMaster) asks ROLE to find the node that is the
+	// primary: when it reconnects, and after a command is refused with READONLY, in which
+	// case the command is sent once more on the connection to the primary. With one address
+	// and no SentinelMaster nothing changes, and a cluster client never follows. While the
+	// connection is healthy nothing extra is sent. Dedicated connections (Conn, Tx, blocking
+	// commands) and the commands of a pipeline are not moved by a READONLY reply.
+	DisableFollowPrimary bool
+	// SentinelMaster is a master name: Seeds (or Addr) are then coordinators, not data
+	// nodes. The client asks them "SENTINEL get-master-addr-by-name <name>", checks the
+	// named node with ROLE, and connects to it, on the first connect, after a reconnect and
+	// after READONLY. The first connect fails with an error that wraps ErrProtocol and names
+	// the master when no coordinator names a primary. AUTH credentials go to coordinators
+	// and data nodes alike. Ignored with Cluster or DisableFollowPrimary. Default empty.
+	SentinelMaster string
 }
 
 // ReadPolicy is where a cluster client sends read-only commands: those the server flags
@@ -135,6 +150,22 @@ type Client struct {
 	at     atomic.Int32
 	cfgErr error
 
+	// follow is set when the client runs the failover rules (see Options.DisableFollowPrimary);
+	// sentinel when addrs are coordinators and the data node comes from them. nodes is the
+	// list the dial index points into: addrs plus the primaries found by following (copy on
+	// write, guarded by nodesMu), or just the last primary in sentinel mode.
+	follow   bool
+	sentinel bool
+	nodes    atomic.Pointer[[]string]
+	nodesMu  sync.Mutex
+	inMulti  atomic.Bool // a MULTI sent with Client.Do is open on the shared connection
+	done     chan struct{}
+
+	// rounds and the wait between them after a READONLY reply (tests shorten them).
+	followRounds   int
+	followDelay    time.Duration
+	followMaxDelay time.Duration
+
 	// readOnly marks a replica chosen for reads: READONLY is sent on every connection
 	// it opens.
 	readOnly bool
@@ -166,6 +197,13 @@ func NewClient(opts Options) *Client {
 		c.opts.Seeds = c.addrs
 	} else {
 		c.addrs = []string{opts.Addr}
+	}
+	c.done = make(chan struct{})
+	c.followRounds, c.followDelay, c.followMaxDelay = followRounds, followDelay, followMaxDelay
+	c.follow = !opts.DisableFollowPrimary && (len(c.addrs) > 1 || opts.SentinelMaster != "")
+	c.sentinel = c.follow && !opts.Cluster && opts.SentinelMaster != ""
+	if !c.sentinel {
+		c.nodes.Store(&c.addrs)
 	}
 	c.db.Store(int64(opts.DB))
 	c.cmds.ex = c
@@ -231,6 +269,7 @@ func (c *Client) Close() error {
 	if c.closed.Swap(true) {
 		return nil
 	}
+	close(c.done)
 	if cn := c.cur.Swap(nil); cn != nil {
 		cn.close()
 	}
@@ -260,10 +299,11 @@ func (c *Client) shared(ctx context.Context) (*conn, error) {
 	}
 	// A dropped connection moves on to the address after the one that dropped.
 	start := int(c.at.Load())
-	if old := c.cur.Load(); old != nil {
+	old := c.cur.Load()
+	if old != nil {
 		start = int(old.addr) + 1
 	}
-	cn, err := c.dialAt(ctx, c.opts.OnPush, start)
+	cn, err := c.dialShared(ctx, start, old != nil)
 	if err != nil {
 		return nil, err
 	}
@@ -284,15 +324,22 @@ func (c *Client) dialAt(ctx context.Context, onPush func(Value), start int) (*co
 	if c.cfgErr != nil {
 		return nil, c.cfgErr
 	}
-	n := len(c.addrs)
-	if n == 1 || (c.cl != nil && !c.cl.standalone.Load()) {
+	if c.cl != nil && !c.cl.standalone.Load() {
 		return c.dialAddr(ctx, onPush, 0, c.opts.Addr)
+	}
+	nodes := c.nodeList()
+	n := len(nodes)
+	if n == 0 { // sentinel mode, no primary known yet
+		return c.dialPrimary(ctx, onPush)
+	}
+	if n == 1 {
+		return c.dialAddr(ctx, onPush, 0, nodes[0])
 	}
 	start %= n
 	var last error
 	for step := 0; step < n; step++ {
 		i := (start + step) % n
-		cn, err := c.dialAddr(ctx, onPush, i, c.addrs[i])
+		cn, err := c.dialAddr(ctx, onPush, i, nodes[i])
 		if err == nil {
 			return cn, nil
 		}
@@ -414,6 +461,9 @@ func (c *Client) execLocal(ctx context.Context, r *request) (Value, error) {
 		putReq(r)
 		return Value{}, err
 	}
+	if c.follow && c.following() {
+		return c.execFollow(ctx, cn, r)
+	}
 	return cn.exec(ctx, r)
 }
 
@@ -496,7 +546,11 @@ func (c *Client) release(cn *conn) {
 //	v, err := c.Do(ctx, "OBJECT", "ENCODING", "mykey")
 //	s := v.Str()
 func (c *Client) Do(ctx context.Context, args ...any) (Value, error) {
-	return c.cmds.Do(ctx, args...)
+	v, err := c.cmds.Do(ctx, args...)
+	if c.follow {
+		c.trackMulti(args, v, err)
+	}
+	return v, err
 }
 
 // Stats are transport counters of the shared connection. Because frames that queue up

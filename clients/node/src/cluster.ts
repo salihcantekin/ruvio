@@ -404,7 +404,9 @@ class Router {
   private readonly seeds: { host: string; port: number }[] = [];
 
   constructor(options: ClusterOptions) {
-    const { cluster, seeds, readPolicy = 'primary', ...rest } = options;
+    // A cluster client never follows a primary: it keeps its own MOVED/ASK rules.
+    const { cluster, seeds, readPolicy = 'primary', sentinelMaster: _coordinator, ...rest } = options;
+    rest.followPrimary = false;
     if (readPolicy !== 'primary' && readPolicy !== 'prefer-replica' && readPolicy !== 'replica') {
       throw new TypeError('ruvio: readPolicy must be "primary", "prefer-replica" or "replica"');
     }

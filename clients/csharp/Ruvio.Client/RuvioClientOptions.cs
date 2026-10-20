@@ -153,6 +153,27 @@ public sealed class RuvioClientOptions
     /// ignores it. Defaults to <see cref="ReadPolicy.Primary"/>.
     /// </summary>
     public ReadPolicy ReadPolicy { get; set; } = ReadPolicy.Primary;
+
+    /// <summary>
+    /// When true (the default), a standalone client finds the primary again after a failover. With two or more
+    /// <see cref="Seeds"/>, or a <see cref="SentinelMaster"/> name, a reconnect asks the seeds <c>ROLE</c> and
+    /// connects to the one that answers <c>master</c> (a replica's reported primary is followed too), and a command
+    /// answered <c>READONLY</c> does the same and is sent once more to the new primary, since <c>READONLY</c>
+    /// means it was not applied. A command inside a transaction the client opened is not sent again, and neither
+    /// is a pipeline's. Nothing is sent while the connection is healthy. A cluster client ignores it. Set it to
+    /// false to get the <c>READONLY</c> error and the plain seed order back.
+    /// </summary>
+    public bool FollowPrimary { get; set; } = true;
+
+    /// <summary>
+    /// When set, <see cref="Seeds"/> (or <see cref="Host"/> and <see cref="Port"/>) are coordinator or Sentinel
+    /// addresses, not data nodes: the primary of this master name is asked with
+    /// <c>SENTINEL get-master-addr-by-name</c>, checked with <c>ROLE</c> and connected to, at connect time, on every
+    /// reconnect and after a <c>READONLY</c> reply. The same <c>AUTH</c> credentials go to the coordinators and the
+    /// data node. Connect throws a <see cref="RuvioException"/> naming the master when no coordinator names a
+    /// primary. Null (the default) leaves it off.
+    /// </summary>
+    public string? SentinelMaster { get; set; }
 }
 
 /// <summary>Reads and checks the <c>host:port</c> entries of <see cref="RuvioClientOptions.Seeds"/>.</summary>

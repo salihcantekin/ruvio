@@ -36,6 +36,17 @@ public class Connection implements AutoCloseable {
     public final String host;
     /** The server port. */
     public final int port;
+    /** Set on the shared connection of a link that follows a failover: the link, and the writes kept until their reply. */
+    private Link followLink;
+    private static final int KEEP_BYTES = 128 * 1024;
+    /** The ring of kept bytes, per ring slot where the command sits in it ({@code -1}: in {@link #spill}) and its length (0: none kept). */
+    private byte[] kept;
+    private int[] keptOff;
+    private int[] keptLen;
+    private byte[][] spill;
+    /** Bytes ever put in the ring (padding included; lock held) and bytes released by the reader, in absolute positions. */
+    private long keptWritten;
+    private volatile long keptReleased;
     private final SocketChannel channel;
     private final ReentrantLock lock = new ReentrantLock();
     private final Thread writer;
@@ -188,6 +199,81 @@ public class Connection implements AutoCloseable {
         }
     }
 
+    /**
+     * Makes this connection keep each write sent with {@link #endKeeping} until its reply arrives, so that a
+     * {@code READONLY} refusal can be sent again by {@code link}. The bytes are copied into a fixed ring of bytes that
+     * is freed in reply order, so the healthy path allocates nothing; a write that does not fit (very many writes in
+     * flight) gets its own copy. Call before the first command.
+     *
+     * @param link the link to tell about a refusal
+     */
+    void keepWrites(Link link) {
+        kept = new byte[KEEP_BYTES];
+        keptOff = new int[ring.length];
+        keptLen = new int[ring.length];
+        followLink = link;
+    }
+
+    /**
+     * Like {@link #end}, and keeps the encoded command (unless it is a read, which a replica never refuses) for a
+     * {@code READONLY} reply.
+     *
+     * @param request the request that will receive the reply
+     */
+    public void endKeeping(Request<?> request) {
+        end(request, true);
+    }
+
+    /** Keeps the command encoded at {@code out.buf[mark, out.pos)} for ring slot {@code slot}. Lock held. */
+    private void keep(int slot) {
+        byte[] b = out.buf;
+        if (Link.isRead(b, mark)) {
+            keptLen[slot] = 0;
+            return;
+        }
+        int n = out.pos - mark;
+        byte[] arena = kept;
+        int size = arena.length;
+        long w = keptWritten;
+        int o = (int) (w % size);
+        if (o + n > size) {
+            w += size - o; // the command does not fit before the end: start again at the front
+            o = 0;
+        }
+        if (n <= size && w + n - keptReleased <= size) {
+            System.arraycopy(b, mark, arena, o, n);
+            keptWritten = w + n;
+            keptOff[slot] = o;
+        } else {
+            if (spill == null) {
+                spill = new byte[ring.length][];
+            }
+            spill[slot] = java.util.Arrays.copyOfRange(b, mark, mark + n);
+            keptOff[slot] = -1;
+        }
+        keptLen[slot] = n;
+    }
+
+    /** Reader thread: the request in ring slot {@code slot} was answered; its kept bytes may be overwritten. */
+    private void release(int slot) {
+        int n = keptLen[slot];
+        if (n == 0) {
+            return;
+        }
+        keptLen[slot] = 0;
+        int o = keptOff[slot];
+        if (o < 0) {
+            spill[slot] = null;
+            return;
+        }
+        long r = keptReleased;
+        long start = r - r % kept.length + o;
+        if (start < r) {
+            start += kept.length;
+        }
+        keptReleased = start + n;
+    }
+
     /** Drops the partly encoded frame and releases the lock. */
     public void abort() {
         out.pos = mark;
@@ -200,7 +286,18 @@ public class Connection implements AutoCloseable {
      * @param request the request that will receive the reply
      */
     public void end(Request<?> request) {
+        end(request, false);
+    }
+
+    private void end(Request<?> request, boolean keep) {
         long t = tail;
+        if (kept != null) {
+            if (keep) {
+                keep((int) (t & mask));
+            } else {
+                keptLen[(int) (t & mask)] = 0;
+            }
+        }
         boolean serial = t == head;
         long tm = timeoutMillis;
         if (tm > 0) {
@@ -232,6 +329,9 @@ public class Connection implements AutoCloseable {
                 requests[i].arm(tm);
             }
             ring[(int) ((t + i) & mask)] = requests[i];
+            if (kept != null) {
+                keptLen[(int) ((t + i) & mask)] = 0;
+            }
         }
         tail = t + count;
         submitLocked(serial);
@@ -410,7 +510,11 @@ public class Connection implements AutoCloseable {
     /** Removes the request at the head of the FIFO. Reader thread only. */
     public final void popRequest() {
         long h = head;
-        ring[(int) (h & mask)] = null;
+        int slot = (int) (h & mask);
+        ring[slot] = null;
+        if (kept != null) {
+            release(slot);
+        }
         head = h + 1;
     }
 
@@ -445,6 +549,18 @@ public class Connection implements AutoCloseable {
         }
         if (t == '-') {
             RuvioServerException err = r.readError();
+            Link l = followLink;
+            if (l != null && Link.isReadonly(err)) {
+                int slot = (int) (head & mask);
+                int n = keptLen[slot];
+                if (n > 0) {
+                    int o = keptOff[slot];
+                    byte[] command = o < 0 ? spill[slot] : java.util.Arrays.copyOfRange(kept, o, o + n);
+                    popRequest();
+                    l.followReadonly(q, command, this, err);
+                    return;
+                }
+            }
             popRequest();
             q.fail(err);
             return;

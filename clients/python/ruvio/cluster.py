@@ -213,6 +213,7 @@ class ClusterRuvio(Ruvio):
         o.host = host
         o.port = port
         o.seeds = None
+        o.stop_following()
         return _Node(host, port, _Conn(o))
 
     def _discover(self) -> None:
@@ -224,6 +225,7 @@ class ClusterRuvio(Ruvio):
             c.mode = 2  # standalone (or a one-node map): plain single-connection behavior
             return
         c.seed.conn.opts.seeds = None  # from now on this socket is the node it connected to
+        c.seed.conn.opts.stop_following()
         self._apply(topo)
         c.mode = 1
 

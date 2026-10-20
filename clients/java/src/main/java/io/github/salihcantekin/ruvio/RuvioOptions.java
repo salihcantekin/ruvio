@@ -56,6 +56,13 @@ public final class RuvioOptions {
     public final boolean cluster;
     /** Where a cluster client sends read-only commands (default {@link ReadPolicy#PRIMARY}); ignored when standalone. */
     public final ReadPolicy readPolicy;
+    /**
+     * Whether a standalone client with several seeds (or a {@link #sentinelMaster}) finds the primary again after a
+     * failover (default {@code true}).
+     */
+    public final boolean followPrimary;
+    /** The master name asked of the coordinators in {@link #seeds}, or {@code null} (default) when the seeds are data nodes. */
+    public final String sentinelMaster;
 
     private RuvioOptions(Builder b) {
         this.host = b.host;
@@ -73,6 +80,8 @@ public final class RuvioOptions {
         this.pushListener = b.pushListener;
         this.cluster = b.cluster;
         this.readPolicy = b.readPolicy;
+        this.followPrimary = b.followPrimary;
+        this.sentinelMaster = b.sentinelMaster;
     }
 
     /**
@@ -169,6 +178,8 @@ public final class RuvioOptions {
         b.pushListener = pushListener;
         b.cluster = cluster;
         b.readPolicy = readPolicy;
+        b.followPrimary = followPrimary;
+        b.sentinelMaster = sentinelMaster;
         return b;
     }
 
@@ -193,6 +204,8 @@ public final class RuvioOptions {
         private Consumer<Object> pushListener;
         private boolean cluster;
         private ReadPolicy readPolicy = ReadPolicy.PRIMARY;
+        private boolean followPrimary = true;
+        private String sentinelMaster;
 
         /**
          * Sets the server host.
@@ -391,6 +404,38 @@ public final class RuvioOptions {
          */
         public Builder readPolicy(ReadPolicy policy) {
             this.readPolicy = java.util.Objects.requireNonNull(policy, "policy");
+            return this;
+        }
+
+        /**
+         * Sets whether a standalone client finds the primary again after a failover. It applies with at least two
+         * {@link #seeds} or a {@link #sentinelMaster}: on a reconnect the client asks the seeds {@code ROLE} and connects
+         * to the node that answers {@code master} (a replica's reported primary is followed too), and when a command is
+         * answered {@code READONLY} it does the same and sends that command once more to the new primary (nothing
+         * was applied). Commands in a pipeline or a transaction are not sent again. Nothing is sent while the
+         * connection is healthy. Ignored in cluster mode and with a single address. With {@code false} the
+         * {@code READONLY} error is returned and the reconnect order is the plain seed order.
+         *
+         * @param enabled {@code false} to turn it off (default {@code true})
+         * @return this builder
+         */
+        public Builder followPrimary(boolean enabled) {
+            this.followPrimary = enabled;
+            return this;
+        }
+
+        /**
+         * Makes the {@link #seeds} (or host and port) coordinator addresses instead of data nodes: the primary of this
+         * master name is asked with {@code SENTINEL get-master-addr-by-name name}, checked with {@code ROLE}, and
+         * connected to at connect time, on every reconnect and after a {@code READONLY} reply. The same {@code AUTH}
+         * credentials go to the coordinators and the data node. Connecting fails with a {@link RuvioException} when no
+         * coordinator names a primary.
+         *
+         * @param masterName the master name, or {@code null} (default) for no coordinators
+         * @return this builder
+         */
+        public Builder sentinelMaster(String masterName) {
+            this.sentinelMaster = masterName;
             return this;
         }
 

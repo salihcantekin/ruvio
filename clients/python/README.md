@@ -387,6 +387,38 @@ client = Ruvio(seeds=["10.0.0.1:6379", ("10.0.0.2", 6379), "[::1]:6379"])
   table). Pipelines, fan-out commands and transactions do not trigger the reload on their own; they fail as
   before and the next single-key or keyless command reloads. Seeds are never asked while the known nodes answer.
 
+## Following a failover
+
+A standalone client with two or more `seeds`, or with `sentinel_master`, finds the primary again after a
+failover instead of staying on a node that is now a replica. It is on by default (`follow_primary=True`), in
+both clients, and does nothing with one seed and no `sentinel_master`. A cluster client keeps its
+`MOVED`/`ASK` rules and does not use it. The contract is in [docs/CLIENT_BEHAVIOR.md](../../docs/CLIENT_BEHAVIOR.md).
+
+```python
+client = Ruvio(seeds=["10.0.0.1:6379", "10.0.0.2:6379"])                     # asks ROLE
+client = Ruvio(seeds=["10.0.0.9:26379"], sentinel_master="main")             # asks the coordinator
+```
+
+- **Reconnect.** After a dropped connection the next connect asks the seeds (starting with the one after the one
+  that dropped) which node answers `ROLE` with `master`, following the primary address a replica reports, and
+  connects to it. When none is found, or it cannot be opened, the seed order above applies. The command that hit
+  the drop still raises. The first connect keeps the seed order; with `sentinel_master` it asks the coordinators
+  (`SENTINEL get-master-addr-by-name`, confirmed with `ROLE`) and raises `ProtocolError` when none names a primary.
+- **`READONLY`.** A command answered `READONLY` (the text is `READONLY` alone or followed by a space) makes the
+  client search for the primary, up to 8 rounds with waits of 100 ms doubling to 2 s (7.1 s in all; the asyncio
+  client waits without blocking other tasks), move to it and send the refused command once more. The retry's reply
+  goes to the caller, a second `READONLY` included; there is never a third send. When no primary is found the
+  `READONLY` error is raised and the connection stays where it was.
+- **Not resent.** A command inside a transaction opened with `multi()` (the connection still moves, so the next
+  command works), a command of a pipeline (its `READONLY` is that command's result), and any other error.
+- **Cost.** A healthy connection sends nothing extra; the error text of a reply is looked at only where error
+  replies are already inspected. The only extra sockets are short probes (`AUTH` as configured, one command, one
+  reply, bounded by the smaller of `connect_timeout` and `socket_timeout`). While following is active the asyncio
+  client keeps each command's encoded frame on its pending entry (a reference, no copy); command methods still
+  return the connection's future, and a `READONLY` reply is answered from the reader by one shared task.
+- `follow_primary=False` restores the plain seed behavior: `READONLY` is returned as an error and no `ROLE` is
+  sent. The Python clients have no connection-lost or connection-restored hooks, so nothing is reported.
+
 ## Tests
 
 ```bash
@@ -427,6 +459,10 @@ RUVIO_TEST_FLUSHALL=1 ...                                               # also r
 - `tests/test_multi_node_live.py` needs `RUVIO_MULTINODE_A_ADDR`, `RUVIO_MULTINODE_B_ADDR` and
   `RUVIO_MULTINODE_STALE_ADDR` (a two-node cluster and a node with an older map, started by
   `scripts/run_with_servers.sh`) and checks that the client follows `MOVED`. Without them it is skipped.
+- `tests/test_failover_live.py` needs `RUVIO_FAILOVER_ADDRS` and `RUVIO_FAILOVER_REPLICATION` (a primary and a replica, comma
+  separated, primary first, and their replication addresses); `scripts/run_with_servers.sh` starts them. It swaps the roles
+  with `REPLICAOF` and checks that the client follows, that `follow_primary=False` gets `READONLY`, and that a reconnect lands
+  on the primary. Without them it is skipped. `tests/test_follow_failover.py` covers the rules against scripted nodes.
 - Without `RUVIO_TEST_ADDR` the live tests are skipped. Live tests use database 11 and run
   `FLUSHDB`. `test_keys` also uses database 12. `JSON.INDEX` only works in database 0, so
   that test uses unique keys there and cleans up after itself.

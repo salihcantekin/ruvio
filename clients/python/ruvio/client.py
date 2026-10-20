@@ -29,10 +29,11 @@ from urllib.parse import unquote, urlparse
 from ._blocking import FOREVER, blocking_wait, pipeline_wait
 from ._cluster import ReadPolicy, policy_code
 from ._commands import Commands, Conv, KeyT, KeyTypeT, _s
+from ._follow import MASTER, ROUNDS, WAITS, Address, parse_master_addr, parse_role, probe_wait
 from ._models import Message
 from ._pipeline import PipelineBase
 from ._resp import NEED, Push, encode, make_parser
-from .errors import ConnectionError, LockError, ResponseError, RuvioError, TimeoutError
+from .errors import ConnectionError, LockError, ProtocolError, ResponseError, RuvioError, TimeoutError
 
 __all__ = ["Ruvio", "Pipeline", "PubSub", "Lock", "parse_url"]
 
@@ -133,6 +134,8 @@ class _Options:
         "parser",
         "on_push",
         "read_policy",
+        "follow_primary",
+        "sentinel_master",
     )
 
     def __init__(self, **kw: Any) -> None:
@@ -162,6 +165,11 @@ class _Options:
     def as_dict(self) -> Dict[str, Any]:
         return {n: getattr(self, n) for n in _Options.__slots__}
 
+    def stop_following(self) -> None:
+        """A cluster node keeps its own address: it never looks for a primary."""
+        self.follow_primary = False
+        self.sentinel_master = None
+
 
 class _ReplicaOptions(_Options):
     """Options of a replica connection of a cluster client: ``READONLY`` follows the handshake, on every open."""
@@ -180,7 +188,7 @@ class _Conn:
     first connect). A failed open leaves both alone.
     """
 
-    __slots__ = ("sock", "parser", "opts", "pos", "at")
+    __slots__ = ("sock", "parser", "opts", "pos", "at", "addrs", "coord", "multi", "once")
 
     def __init__(self, opts: _Options) -> None:
         self.opts = opts
@@ -188,29 +196,40 @@ class _Conn:
         self.parser: Any = None
         self.pos = 0
         self.at = -1
+        #: The addresses a connect tries in order: the seeds, plus any primary a replica reported; with
+        #: ``sentinel_master`` just the primary last found (empty before the first connect).
+        self.addrs: Optional[List[Address]] = [] if opts.sentinel_master is not None else (list(opts.seeds) if opts.seeds else None)
+        #: With ``sentinel_master``, the coordinators to ask.
+        self.coord: Optional[List[Address]] = (list(opts.seeds) if opts.seeds else [(opts.host, opts.port)]) if opts.sentinel_master is not None else None
+        #: True between an acknowledged ``MULTI`` and ``EXEC``/``DISCARD`` sent through the client.
+        self.multi = False
+        #: True while the command a ``READONLY`` reply refused is sent its second time.
+        self.once = False
 
     def resume(self) -> int:
         """The seed index a new connection that should join this one starts at."""
         return self.at if self.at >= 0 else self.pos
 
-    def _dial(self) -> socket.socket:
+    def _dial(self, host: Optional[str] = None, port: Optional[int] = None) -> socket.socket:
         o = self.opts
+        if host is None:
+            host, port = o.host, o.port
         try:
             if o.unix_socket_path:
                 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 sock.settimeout(o.connect_timeout)
                 sock.connect(o.unix_socket_path)
             else:
-                sock = socket.create_connection((o.host, o.port), timeout=o.connect_timeout)
+                sock = socket.create_connection((host, port), timeout=o.connect_timeout)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             sock.settimeout(o.socket_timeout)
         except socket.timeout as exc:
-            raise TimeoutError(f"connect to {o.host}:{o.port} timed out") from exc
+            raise TimeoutError(f"connect to {host}:{port} timed out") from exc
         except OSError as exc:
-            raise ConnectionError(f"cannot connect to {o.host}:{o.port}: {exc}") from exc
+            raise ConnectionError(f"cannot connect to {host}:{port}: {exc}") from exc
         return sock
 
-    def _dial_seeds(self, seeds: List[Tuple[str, int]]) -> socket.socket:
+    def _dial_seeds(self, seeds: List[Address]) -> socket.socket:
         """One connect attempt per seed, from ``pos`` round to the seed before it; the last connect
         error when none answers. ``opts.host``/``opts.port`` follow the seed that connected."""
         o = self.opts
@@ -229,10 +248,102 @@ class _Conn:
             return sock
         raise error  # type: ignore[misc]
 
-    def open(self) -> None:
+    def follows(self) -> bool:
+        """Following is active (see :meth:`_following`)."""
+        return self._following()
+
+    def move_to_primary(self, sleep: Callable[[float], None]) -> bool:
+        """After a ``READONLY`` reply: rounds that avoid the address that answered, ``sleep`` between them, until
+        a primary is found and the connection is moved to it. ``False`` when none is, the connection unchanged."""
         o = self.opts
-        seeds = o.seeds
-        sock = self._dial_seeds(seeds) if seeds else self._dial()
+        refused = self.address()
+        sentinel = o.sentinel_master is not None
+        nodes = self.coord if sentinel else self.addrs
+        for attempt in range(ROUNDS):
+            if attempt:
+                sleep(WAITS[attempt - 1])
+            found = find_primary(nodes, 0 if sentinel else self.pos, refused, o)  # type: ignore[arg-type]
+            if found is not None:
+                try:
+                    self.move(found)
+                    return True
+                except ConnectionError:
+                    pass
+        return False
+
+    def _following(self) -> bool:
+        """Following is active: the option is on and there are at least two seeds or a coordinator name."""
+        o = self.opts
+        if not o.follow_primary:
+            return False
+        if o.sentinel_master is not None:
+            return True
+        return bool(o.seeds) and len(self.addrs or ()) > 1  # type: ignore[arg-type]
+
+    def _connect(self) -> socket.socket:
+        """A socket for a new connection. The first connect keeps the seed order (a coordinator name asks the
+        coordinators instead); a reconnect first asks which node is the primary and falls back to the seed order."""
+        o = self.opts
+        if self._following():
+            sentinel = o.sentinel_master is not None
+            if sentinel or self.at >= 0:
+                found = find_primary(self.coord if sentinel else self.addrs, self.pos, None, o)  # type: ignore[arg-type]
+                if found is not None:
+                    try:
+                        return self.take(found)
+                    except ConnectionError:
+                        if sentinel and self.at < 0:
+                            raise
+                elif sentinel and self.at < 0:
+                    raise ProtocolError(f"no coordinator names a primary for {o.sentinel_master!r}")
+        if o.sentinel_master is not None:
+            if not self.addrs:
+                raise ConnectionError("no primary to connect to")
+            sock = self._dial(*self.addrs[0])  # the last primary; the coordinators are no data nodes
+            self.at = 0
+            return sock
+        if o.seeds:
+            return self._dial_seeds(self.addrs)  # type: ignore[arg-type]
+        return self._dial()
+
+    def take(self, address: Address) -> socket.socket:
+        """Connects to ``address`` (a node that answered ``master``) and makes it the seed the connection is on."""
+        o = self.opts
+        sock = self._dial(address[0], address[1])
+        if o.sentinel_master is not None:
+            self.addrs = [address]
+            self.at = 0
+            self.pos = 0
+            return sock
+        addrs = self.addrs
+        if address not in addrs:  # type: ignore[operator]
+            addrs.append(address)  # type: ignore[union-attr]
+        i = addrs.index(address)  # type: ignore[union-attr]
+        o.host, o.port = address
+        self.at = i
+        self.pos = (i + 1) % len(addrs)  # type: ignore[arg-type]
+        return sock
+
+    def address(self) -> Optional[Address]:
+        """The address the socket is on, or ``None`` before the first connect."""
+        if self.addrs is not None and self.at >= 0:
+            return self.addrs[self.at]
+        return None
+
+    def open(self) -> None:
+        self.multi = False
+        self._start(self._connect())
+
+    def move(self, address: Address) -> None:
+        """Replaces the socket by a new connection to ``address`` (a node that answered ``master``), handshake
+        included. The old socket is closed once the new one connects; ``ConnectionError`` leaves it alone."""
+        sock = self.take(address)
+        self.close()
+        self.multi = False
+        self._start(sock)
+
+    def _start(self, sock: socket.socket) -> None:
+        o = self.opts
         self.sock = sock
         self.parser = make_parser(o.parser or "auto")
         hs = o.handshake()
@@ -271,6 +382,70 @@ class _Conn:
             if not n:
                 raise ConnectionError("connection closed by server")
             p.end += n
+
+
+def _probe(address: Address, o: _Options, command: str, args: Tuple[Any, ...]) -> Any:
+    """One short-lived socket for one question. The reply, or ``None`` when the address cannot be
+    reached, times out, drops or answers an error. A refused ``AUTH`` raises, as connecting does."""
+    po = _Options(**o.as_dict())
+    po.host, po.port = address
+    po.seeds = None
+    po.db = 0
+    po.client_name = None
+    po.durability_replicas = None
+    po.durability_timeout_ms = None
+    po.on_push = None
+    po.stop_following()
+    po.socket_timeout = probe_wait(o.connect_timeout, o.socket_timeout)
+    c = _Conn(po)
+    try:
+        try:
+            c.open()
+        except ResponseError:
+            raise
+        except (RuvioError, OSError, ValueError):
+            return None
+        try:
+            c.sock.sendall(encode(command, args))  # type: ignore[union-attr]
+            reply = c.read()
+        except (RuvioError, OSError, ValueError):
+            return None
+        return None if isinstance(reply, ResponseError) else reply
+    finally:
+        c.close()
+
+
+def find_primary(nodes: List[Address], start: int, avoid: Optional[Address], o: _Options) -> Optional[Address]:
+    """One round: the address of a node that answered ``master``, asking ``nodes`` in order from ``start``
+    (a replica's reported primary is asked once, after them), or ``None``. With ``sentinel_master`` the nodes
+    are coordinators, each asked for the master's address, which ``ROLE`` must confirm. ``avoid`` is the
+    address that just answered ``READONLY``. Raises only when ``AUTH`` is refused."""
+    n = len(nodes)
+    queue = [nodes[(start + k) % n] for k in range(n)]
+    name = o.sentinel_master
+    if name is not None:
+        for coordinator in queue:
+            named = parse_master_addr(_probe(coordinator, o, "SENTINEL", ("get-master-addr-by-name", name)))
+            if named is not None and named != avoid:
+                role = parse_role(_probe(named, o, "ROLE", ()))
+                if role is not None and role[0] == MASTER:
+                    return named
+        return None
+    seen = set(queue)
+    i = 0
+    while i < len(queue):
+        address = queue[i]
+        i += 1
+        role = parse_role(_probe(address, o, "ROLE", ()))
+        if role is None:
+            continue
+        if role[0] == MASTER:
+            if address != avoid:
+                return address
+        elif role[1] is not None and role[1] not in seen:
+            seen.add(role[1])
+            queue.append(role[1])
+    return None
 
 
 class Ruvio(Commands):
@@ -319,6 +494,17 @@ class Ruvio(Commands):
         read_policy: Cluster clients only: where reads go. A :class:`ruvio.ReadPolicy` or its string value:
             ``"primary"`` (default), ``"prefer-replica"`` or ``"replica"``. See :class:`ruvio.ClusterRuvio`.
             Ignored by a standalone server and by a client without ``cluster=True``.
+        follow_primary: ``True`` (default): a standalone client with at least two ``seeds`` (or a
+            ``sentinel_master``) finds the primary again after a failover. A reconnect connects to the node whose
+            ``ROLE`` is ``master`` (falling back to the seed order), and a ``READONLY`` reply makes the client look for
+            the primary, move to it and send the refused command once more (not inside a transaction opened with
+            ``multi()``, and never again after a second refusal). Pipelines are not resent. ``False`` keeps the plain
+            seed order and returns ``READONLY`` as an error. With one seed and no ``sentinel_master`` nothing changes.
+            A cluster client does not use it.
+        sentinel_master: Name of the master to ask coordinators for. The ``seeds`` (or ``host``/``port``) are then
+            coordinators: the client asks each with ``SENTINEL get-master-addr-by-name`` and confirms the answer with
+            ``ROLE``; the first connect fails with :class:`ruvio.ProtocolError` when none names a primary.
+            Needs ``follow_primary``.
 
     Example:
         from ruvio import Ruvio
@@ -359,6 +545,8 @@ class Ruvio(Commands):
         cluster: bool = False,
         seeds: Optional[Sequence[Union[str, Tuple[str, int]]]] = None,
         read_policy: Union[None, str, ReadPolicy] = None,
+        follow_primary: bool = True,
+        sentinel_master: Optional[str] = None,
     ) -> None:
         """Creates the client. See the class docstring for the meaning of every argument.
 
@@ -383,10 +571,14 @@ class Ruvio(Commands):
             seeds: ``"host:port"`` strings or ``(host, port)`` tuples tried in order in place of
                 ``host``/``port``.
             read_policy: ``"primary"`` (default), ``"prefer-replica"`` or ``"replica"``; cluster clients only.
+            follow_primary: Find the primary again after a failover (default ``True``).
+            sentinel_master: Master name to ask coordinators for; see the class docstring.
 
         Raises:
-            ValueError: A seed has an empty host or a port outside 1-65535, or ``read_policy`` is unknown.
+            ValueError: A seed has an empty host or a port outside 1-65535, ``read_policy`` is unknown, or
+                ``sentinel_master`` is empty or combined with ``unix_socket_path``.
             ConnectionError: ``lazy=False`` and the server cannot be reached or rejects the handshake.
+            ProtocolError: ``lazy=False``, ``sentinel_master`` is set and no coordinator names a primary.
         """
         seed_list = _parse_seeds(seeds)
         if seed_list:
@@ -394,6 +586,13 @@ class Ruvio(Commands):
                 raise ValueError("seeds cannot be combined with unix_socket_path")
             host, port = seed_list[0]
         policy_code(read_policy)  # rejects an unknown value now rather than at the first command
+        if sentinel_master is not None:
+            if not isinstance(sentinel_master, str) or not sentinel_master:
+                raise ValueError("sentinel_master must be a non-empty string")
+            if unix_socket_path:
+                raise ValueError("sentinel_master cannot be combined with unix_socket_path")
+            if not follow_primary:
+                sentinel_master = None  # off restores the plain connect
         opts = _Options(
             host=host,
             port=port,
@@ -410,6 +609,8 @@ class Ruvio(Commands):
             parser=parser,
             on_push=on_push,
             read_policy=read_policy,
+            follow_primary=bool(follow_primary),
+            sentinel_master=sentinel_master,
         )
         self._conn = _Conn(opts)
         self._decode = decode_responses
@@ -469,10 +670,28 @@ class Ruvio(Commands):
             conn.close()
             raise
         if isinstance(reply, ResponseError):
+            if reply.code == "READONLY" and conn.follows() and not conn.once:
+                return self._after_readonly(conv, data, decode, reply)
             raise reply
         if conv is None:
             return reply
         return conv(reply)
+
+    def _after_readonly(self, conv: Conv, data: bytes, decode: Optional[bool], refused: ResponseError) -> Any:
+        """A write met a replica: looks for the primary (up to ``ROUNDS`` rounds with the backoff between), moves the
+        connection to it and sends the refused command once more. Inside a transaction the connection moves but the
+        command is not sent again; when no primary is found the original error is raised."""
+        conn = self._conn
+        retry = not conn.multi
+        if not conn.move_to_primary(sleep=time.sleep):
+            raise refused
+        if not retry:
+            raise refused
+        conn.once = True
+        try:
+            return Ruvio._x(self, conv, data, decode)
+        finally:
+            conn.once = False
 
     def _batch(self, payload: List[bytes], count: int) -> List[Any]:
         conn = self._conn
@@ -552,6 +771,62 @@ class Ruvio(Commands):
         self._conn.opts.password = password
         self._conn.opts.username = username
         return ok
+
+    def multi(self) -> Any:
+        """``MULTI`` - raw transaction start; remembered so a ``READONLY`` reply inside it is not resent.
+
+        Returns:
+            ``True``.
+        """
+        ok = super().multi()
+        self._conn.multi = True
+        return ok
+
+    def exec(self) -> Any:
+        """``EXEC`` - runs the queued commands of a raw ``MULTI`` and ends the transaction.
+
+        Returns:
+            A list with one reply per queued command, or ``None`` when a watched key changed.
+        """
+        try:
+            return super().exec()
+        finally:
+            self._conn.multi = False
+
+    def discard(self) -> Any:
+        """``DISCARD`` - drops the queued commands of a raw ``MULTI`` and ends the transaction.
+
+        Returns:
+            ``True``.
+        """
+        try:
+            return super().discard()
+        finally:
+            self._conn.multi = False
+
+    def execute_command(self, *args: Any) -> Any:
+        """Sends any command and returns the raw reply; see :meth:`Commands.execute_command`.
+
+        Args:
+            *args: Command name followed by its arguments.
+
+        Returns:
+            The server reply as parsed.
+        """
+        conn = self._conn
+        if args and conn.follows():
+            name = args[0]
+            name = (name.decode("ascii", "replace") if isinstance(name, bytes) else str(name)).upper()
+            if name == "MULTI":
+                reply = super().execute_command(*args)
+                conn.multi = True
+                return reply
+            if name == "EXEC" or name == "DISCARD":
+                try:
+                    return super().execute_command(*args)
+                finally:
+                    conn.multi = False
+        return super().execute_command(*args)
 
     @property
     def raw(self) -> "Ruvio":
@@ -691,6 +966,8 @@ class Ruvio(Commands):
         """
         ps = PubSub(self._conn.opts, self._decode, ignore_subscribe_messages)
         ps._conn.pos = self._conn.resume()
+        if self._conn.opts.sentinel_master is None and self._conn.addrs is not None:
+            ps._conn.addrs = list(self._conn.addrs)  # includes a primary a replica reported
         return ps
 
     # ---------------------------------------------------------------- helpers

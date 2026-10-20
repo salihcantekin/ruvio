@@ -81,6 +81,16 @@ public final class Address {
     }
 
     @Override
+    public boolean equals(Object o) {
+        return o instanceof Address && ((Address) o).port == port && ((Address) o).host.equals(host);
+    }
+
+    @Override
+    public int hashCode() {
+        return 31 * host.hashCode() + port;
+    }
+
+    @Override
     public String toString() {
         return (host.indexOf(':') >= 0 ? "[" + host + "]" : host) + ":" + port;
     }

@@ -9,9 +9,13 @@
 # A multi-node cluster: node a (<base-port>+50, +51, slots 0-8191) and node b (+60, +61,
 # slots 8192-16383), two shards each, plus a one-shard node (+70) whose older map gives every
 # slot to node a, so a client seeded with it is answered MOVED by node a for node b's keys.
+# A failover pair: two single-shard nodes, each able to be primary or replica (client ports
+# <base-port>+80, +81; replication ports +82, +83), node 1 the primary and node 2 its replica.
 # Exports RUVIO_TEST_ADDR / RUVIO_ADDR / RUVIO_CLUSTER_ADDR / RUVIO_REPLICATED_ADDR
 # (the primary) / RUVIO_REPLICA_ADDR (the replica) / RUVIO_MULTINODE_A_ADDR /
-# RUVIO_MULTINODE_B_ADDR / RUVIO_MULTINODE_STALE_ADDR, and RUVIO_TEST_CONFIG_REWRITE=1,
+# RUVIO_MULTINODE_B_ADDR / RUVIO_MULTINODE_STALE_ADDR / RUVIO_FAILOVER_ADDRS
+# (the failover pair, comma separated, primary first) / RUVIO_FAILOVER_REPLICATION (their
+# replication addresses, same order), and RUVIO_TEST_CONFIG_REWRITE=1,
 # for the command, and stops every server afterwards.
 # The repository ruvio.example.toml is copied, never edited.
 #
@@ -135,6 +139,14 @@ RUVIO_CLUSTER_TOPOLOGY="$work/stale-topology.toml" RUVIO_CLUSTER_GROUP=stale \
   "$binary" --config "$work/standalone.toml" --address "127.0.0.1:$((base + 70))" --data-dir "$work/node-stale" >"$work/node-stale.log" 2>&1 &
 pids+=("$!")
 
+# The failover pair: replication is set through the environment, as the coordinator tests do.
+RUVIO_REPLICATION_ROLE=primary RUVIO_REPLICATION_LISTEN="127.0.0.1:$((base + 82))" \
+  "$binary" --config "$work/standalone.toml" --address "127.0.0.1:$((base + 80))" --durability always --data-dir "$work/failover-1" >"$work/failover-1.log" 2>&1 &
+pids+=("$!")
+RUVIO_REPLICATION_ROLE=replica RUVIO_REPLICATION_LISTEN="127.0.0.1:$((base + 83))" RUVIO_REPLICATION_PRIMARY="127.0.0.1:$((base + 82))" \
+  "$binary" --config "$work/standalone.toml" --address "127.0.0.1:$((base + 81))" --durability always --data-dir "$work/failover-2" >"$work/failover-2.log" 2>&1 &
+pids+=("$!")
+
 ready() {
   python3 "$root/scripts/_ruvio.py" wait-ready --timeout 30 --port "$@"
 }
@@ -156,6 +168,8 @@ for port in $((base + 60)) $((base + 61)); do
   ready "$port" --pid "${pids[5]}" --data-dir "$work/node-b"
 done
 ready "$((base + 70))" --pid "${pids[6]}" --data-dir "$work/node-stale"
+ready "$((base + 80))" --pid "${pids[7]}" --data-dir "$work/failover-1"
+ready "$((base + 81))" --pid "${pids[8]}" --data-dir "$work/failover-2"
 python3 "$root/scripts/_ruvio.py" wait-replicas --timeout 30 --port "$((base + 20))" --replicas 1
 
 export RUVIO_ADDR="127.0.0.1:$base"
@@ -165,6 +179,8 @@ export RUVIO_REPLICATED_ADDR="127.0.0.1:$((base + 20))"
 export RUVIO_REPLICA_ADDR="127.0.0.1:$((base + 30))"
 export RUVIO_MULTINODE_A_ADDR="127.0.0.1:$((base + 50))"
 export RUVIO_MULTINODE_B_ADDR="127.0.0.1:$((base + 60))"
+export RUVIO_FAILOVER_REPLICATION="127.0.0.1:$((base + 82)),127.0.0.1:$((base + 83))"
+export RUVIO_FAILOVER_ADDRS="127.0.0.1:$((base + 80)),127.0.0.1:$((base + 81))"
 export RUVIO_MULTINODE_STALE_ADDR="127.0.0.1:$((base + 70))"
 # The servers run on throwaway copies of the config file, so live tests may rewrite it.
 export RUVIO_TEST_CONFIG_REWRITE=1

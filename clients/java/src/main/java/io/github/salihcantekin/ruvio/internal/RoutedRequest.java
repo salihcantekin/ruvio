@@ -32,7 +32,6 @@ public class RoutedRequest<T> extends Request<T> {
     public boolean replicaOk;
     /** The replica this command was sent to, or null; a {@code LOADING} reply from it sends the command on to the primary. */
     public ClusterNode replica;
-
     /**
      * Creates a request.
      *

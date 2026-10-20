@@ -278,6 +278,45 @@ RuvioClient<String, String> client = RuvioClient.connect(options);
   Seeds are not asked while the known nodes answer, so routing is unchanged. Pipelines are not re-routed: a
   group whose node cannot be opened fails, as before.
 
+## Following a failover
+
+A standalone client with at least two seeds, or with a coordinator name, finds the primary again after a failover
+instead of staying on a node that is now a replica (the shared contract is in `docs/CLIENT_BEHAVIOR.md`, "Following a
+failover"). A cluster client keeps its `MOVED`/`ASK` rules and does not use any of this.
+
+```java
+RuvioOptions options = RuvioOptions.builder()
+        .seeds("10.0.0.1:6379", "10.0.0.2:6379")
+        .followPrimary(true)          // the default; false returns READONLY and keeps the plain seed order
+        // .sentinelMaster("main")    // the seeds are coordinators: SENTINEL get-master-addr-by-name main
+        .build();
+```
+
+* **On reconnect**: each attempt runs one round: every seed is asked `ROLE` on a short-lived socket (connect, `AUTH`,
+  one command, one reply; bounded by the smaller of `connectTimeoutMillis` and `commandTimeoutMillis`), a replica's
+  reported primary is asked once too, and the client connects to the node that answers `master`. With none found, or
+  when opening it fails with an I/O error, the plain seed order applies. The command that hit the drop still fails.
+* **On `READONLY`** (the error text is `READONLY` alone or followed by a space): the client runs up to 8 rounds
+  (waits of 100 ms doubling to 2 s, on a background thread, never on a reader thread), avoiding the address that
+  answered, moves the shared connection to the primary it finds, and sends the refused command once more. The second
+  reply, a second `READONLY` included, is the result; there is never a third send. With no primary the original
+  `READONLY` error is returned and the connection stays. Other errors (`LOADING`, `MASTERDOWN`, `NOREPLICAS`) and I/O
+  errors are never retried.
+* **Not retried**: commands of a `pipeline()` (the `READONLY` reply is returned at its index and nothing follows) and
+  of a `multi()` transaction (its queued commands are lost with the socket, so the error is returned; the shared
+  connection still moves to the primary, so the next command works). Transactions run on their own sockets here, so
+  a `MULTI` sent by hand with `execute` on the shared connection is not tracked.
+* **Coordinator name**: with `sentinelMaster(name)` the first connect and every round ask each seed in order
+  `SENTINEL get-master-addr-by-name name`, confirm the named address with `ROLE`, and fail the connect with a
+  `RuvioException` naming the master when no coordinator names a primary. The same `AUTH` credentials go to
+  coordinators and data nodes.
+* **Cost**: while the connection is healthy nothing is sent and nothing is checked on the success path. A client that
+  follows keeps each command's encoded bytes in a per-thread scratch array (the way the cluster path does, no copy
+  per command) and uses a request object that can hold them; a client with one address does not.
+
+`FollowFailoverFakeTest` runs scripted nodes; `FailoverLiveTest` runs on the pair `scripts/run_with_servers.sh` starts
+(`RUVIO_FAILOVER_ADDRS` and `RUVIO_FAILOVER_REPLICATION`, comma separated, primary first) and skips without them.
+
 ## Tests and benchmark
 
 ```

@@ -248,6 +248,7 @@ public final class Transaction<K, V> extends RuvioCommands<K, V> implements Auto
         }
         // Commands the server refused at queue time never run; EXEC only returns the accepted ones.
         List<Request<?>> accepted = new ArrayList<>(queued.size());
+        Connection used = connection;
         for (Request<?> q : queued) {
             if (!q.isDone()) {
                 accepted.add(q);
@@ -256,7 +257,14 @@ public final class Transaction<K, V> extends RuvioCommands<K, V> implements Auto
         ExecRequest exec = new ExecRequest(accepted.toArray(new Request<?>[0]));
         sendFrame(EXEC_FRAME, exec);
         finished = true;
-        exec.whenComplete((ok, err) -> release(err == null));
+        exec.whenComplete((ok, err) -> {
+            // EXEC answers after every queued command, so a refusal (a replica) is known here. Nothing is sent
+            // again: the transaction is lost with its socket; the link moves on so the next one runs on the primary.
+            if (pool != null && refusedByReplica(err)) {
+                pool.refused(used);
+            }
+            release(err == null);
+        });
         return exec;
     }
 
@@ -311,6 +319,18 @@ public final class Transaction<K, V> extends RuvioCommands<K, V> implements Auto
             }
         }
         release(healthy);
+    }
+
+    private boolean refusedByReplica(Throwable execError) {
+        if (Link.isReadonly(execError)) {
+            return true;
+        }
+        for (Request<?> q : queued) {
+            if (q.isCompletedExceptionally() && q.handle((value, error) -> Link.isReadonly(error)).getNow(false)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void release(boolean healthy) {
