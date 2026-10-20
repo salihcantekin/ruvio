@@ -89,7 +89,7 @@ public readonly record struct ScanPage(long Cursor, IReadOnlyList<string> Keys);
 /// <summary>One <c>HSCAN</c> page.</summary>
 public readonly record struct HashScanPage(long Cursor, IReadOnlyDictionary<string, string> Fields);
 
-/// <summary>One stream entry.</summary>
+/// <summary>One stream entry. Fields retain their order and may contain repeated names.</summary>
 public readonly record struct StreamEntry(string Id, IReadOnlyList<KeyValuePair<string, string>> Fields);
 
 /// <summary>Entries read from one stream key.</summary>

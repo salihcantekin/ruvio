@@ -1,0 +1,81 @@
+# Effective settings. Ruvio reads this file once, at process start.
+# Editing it while the process is running does not change the live server.
+# Restart to pick up edits.
+# RUVIO_* environment variables and CLI flags override this file; they are
+# written back here only when the server starts with --write-config.
+
+address = "127.0.0.1:6379"
+advertised_host = "127.0.0.1"
+hot_keys = []
+notify_keyspace_events = ""
+shards = 1
+shutdown_grace_ms = 30000
+
+[connections]
+max_commands_per_second = 0
+max_global = 10000
+max_per_ip = 256
+max_per_user = 0
+
+[memory]
+active_expire_keys = 16
+active_expire_maintenance_keys = 16
+hash_max_compact_entries = 64
+hash_max_compact_value_bytes = 64
+list_max_compact_entries = 128
+list_max_compact_value_bytes = 64
+max_process_bytes = 0
+max_shard_bytes = 0
+maxmemory_policy = "noeviction"
+maxmemory_samples = 16
+reserved_headroom_bytes = 16777216
+set_max_intset_entries = 512
+
+[persistence]
+data_dir = "./data"
+profile = "memory"
+snapshot_interval_ms = 60000
+snapshot_journal_bytes = 67108864
+snapshot_max_bytes = 17179869184
+snapshot_min_mutations = 0
+sync_interval_ms = 1000
+wal_segment_bytes = 268435456
+
+[protocol]
+databases = 16
+max_arguments = 1048576
+max_command_bytes = 67108864
+max_connection_buffer_bytes = 67108864
+max_key_bytes = 1048576
+max_pipeline_commands = 1024
+max_value_bytes = 16777216
+
+[replication]
+announced = true
+min_replicas_max_lag = 10
+min_replicas_to_write = 0
+role = "off"
+
+[requests]
+max_output_buffer_bytes = 67108864
+max_queued_requests = 1024
+
+[scripts]
+max_bytes = 16384
+max_cached = 1024
+max_calls = 1024
+max_instructions = 1000000
+
+[security]
+allow_unauthenticated_public = false
+metrics_token = ""
+protected_mode = true
+replication_password = ""
+requirepass = ""
+tls_cert = ""
+tls_key = ""
+
+[timeouts]
+idle_ms = 300000
+read_ms = 30000
+write_ms = 30000

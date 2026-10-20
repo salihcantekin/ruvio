@@ -2716,9 +2716,9 @@ public sealed partial class RuvioClient
             }
 
             string id = item.Items[0].AsString() ?? "";
-            IReadOnlyDictionary<string, string> fields = Pairs(item.Items[1].Items);
+            IReadOnlyList<KeyValuePair<string, string>> fields = RespRead.Pairs(item.Items[1], "stream entry");
 
-            entries.Add(new StreamEntry(id, [.. fields]));
+            entries.Add(new StreamEntry(id, fields));
         }
 
         return entries;

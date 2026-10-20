@@ -287,8 +287,8 @@ export interface BfInsertOptions {
 export interface StreamEntry {
   /** Entry id, `<ms>-<seq>`. */
   id: string;
-  /** Field names and values. */
-  fields: Record<string, string>;
+  /** `[name, value]` pairs in stored order; a name may repeat. */
+  fields: [string, string][];
 }
 
 /** Entries read from one stream by `XREAD` or `XREADGROUP`. */

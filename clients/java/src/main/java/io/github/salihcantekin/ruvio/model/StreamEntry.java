@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: MIT
 package io.github.salihcantekin.ruvio.model;
 
-import java.util.Map;
+import java.util.List;
 
 /**
- * One stream entry: its id and its field/value pairs in stored order.
+ * One stream entry: its id and its field/value pairs in stored order. A field name may repeat.
  *
  * @param <K> the field name type
  * @param <V> the field value type
  */
 public final class StreamEntry<K, V> {
     private final String id;
-    private final Map<K, V> fields;
+    private final List<KeyValue<K, V>> fields;
 
     /**
      * Creates an entry.
@@ -19,7 +19,7 @@ public final class StreamEntry<K, V> {
      * @param id the entry id
      * @param fields the field/value pairs
      */
-    public StreamEntry(String id, Map<K, V> fields) {
+    public StreamEntry(String id, List<KeyValue<K, V>> fields) {
         this.id = id;
         this.fields = fields;
     }
@@ -34,11 +34,11 @@ public final class StreamEntry<K, V> {
     }
 
     /**
-     * Returns the field/value pairs in stored order.
+     * Returns the field/value pairs in stored order, repeated names included.
      *
      * @return the fields
      */
-    public Map<K, V> fields() {
+    public List<KeyValue<K, V>> fields() {
         return fields;
     }
 
