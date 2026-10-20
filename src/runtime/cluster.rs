@@ -478,6 +478,10 @@ struct ClusterCheckpointState {
     covers: Vec<u64>,
     /// Shutdown began: only final checkpoints may complete a round.
     final_round: bool,
+    /// A round of final files was published: every shard's part of the shutdown is saved,
+    /// and no round opens after it (no shard would submit to it, so its directory would be
+    /// left behind).
+    final_published: bool,
     /// Shards whose carried copy (see `carry_published_file`) is being written into the
     /// open round: it writes the shard's file path, so no other file of that shard may
     /// start meanwhile.
@@ -576,6 +580,7 @@ impl ClusterCheckpointCoordinator {
                 shards: (0..shard_count).map(|_| None).collect(),
                 covers: vec![0; shard_count],
                 final_round: false,
+                final_published: false,
                 carrying: vec![false; shard_count],
                 hot_tried_at: None,
                 hot_blocked: false,
@@ -678,6 +683,12 @@ impl ClusterCheckpointCoordinator {
             return Ok(generation);
         }
 
+        if state.final_published {
+            return Err(PersistenceError::Failed(
+                "the final checkpoint round is already published".into(),
+            ));
+        }
+
         // Past every round ever started: one that failed after CURRENT may be published.
         let generation = manager.allocate_generation(state.generation)?;
 
@@ -710,7 +721,9 @@ impl ClusterCheckpointCoordinator {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-            if state.open.is_none() && !state.final_round {
+            // No round needs a copy, or the final round already holds this shard's part: a
+            // shard with a failed log can still tick after its copy completed that round.
+            if (state.open.is_none() && !state.final_round) || state.final_published {
                 return Ok(None);
             }
 
@@ -1036,6 +1049,7 @@ impl ClusterCheckpointCoordinator {
         state.open = None;
         self.manager.commit_round(generation, &complete)?;
         state.generation = generation;
+        state.final_published |= state.final_round;
         self.published_requests
             .fetch_max(answered, Ordering::AcqRel);
         self.published_generation
@@ -1404,6 +1418,50 @@ mod tests {
         assert_eq!(coordinator.published_generation(), 0);
         covering_file(&coordinator, 1, 3, u64::MAX);
         assert_eq!(coordinator.published_generation(), 1);
+    }
+
+    /// A shard with a failed log hands the final round a copy of its last published file,
+    /// possibly from a tick before its own shutdown, and again at its shutdown. Once that
+    /// round is published the other shards have stopped: a second copy must not open a
+    /// round no one completes, which would leave its directory (a whole shard file) behind.
+    #[test]
+    fn no_round_opens_after_the_final_round_is_published() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = CheckpointManager::new(
+            snapshot_config(directory.path()),
+            crate::protocol::ProtocolLimits::default(),
+        );
+        let coordinator = ClusterCheckpointCoordinator::new(manager, 2, 0, None);
+
+        covering_file(&coordinator, 0, 1, 1);
+        covering_file(&coordinator, 1, 1, 1);
+        assert_eq!(coordinator.published_generation(), 1);
+
+        coordinator.require_final_round();
+        assert_eq!(
+            coordinator
+                .carry_published_file(1, UnixMillis::new(1), false)
+                .unwrap(),
+            Some((2, 1))
+        );
+        covering_file(&coordinator, 0, 2, u64::MAX);
+        assert_eq!(coordinator.published_generation(), 2);
+
+        assert_eq!(
+            coordinator
+                .carry_published_file(1, UnixMillis::new(1), false)
+                .unwrap(),
+            None
+        );
+        assert!(coordinator.begin_round(0).is_err());
+        assert!(!coordinator.round_open());
+        let rounds: Vec<_> = std::fs::read_dir(directory.path().join("checkpoints"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.parse::<u64>().is_ok_and(|generation| generation > 2))
+            .collect();
+
+        assert!(rounds.is_empty(), "rounds {rounds:?} after the final one");
     }
 
     fn hot_store_with(value: &[u8]) -> crate::hot_store::SharedMemoryStore {

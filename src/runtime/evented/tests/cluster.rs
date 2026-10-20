@@ -1679,12 +1679,6 @@ fn rounds_still_publish_after_one_shard_wal_sync_failed() {
         snapshot_interval: Duration::from_millis(50),
         ..PersistenceConfig::default()
     };
-    let generation = || {
-        CheckpointManager::new(persistence.clone(), ProtocolLimits::default())
-            .load()
-            .unwrap()
-            .map_or(0, |checkpoint| checkpoint.generation)
-    };
     let (left_addr, right_addr, stop, left_server, right_server) =
         serve_two_shards_with(|config| config.persistence = persistence.clone());
     let left = key_on_shard(0, "left");
@@ -1711,20 +1705,20 @@ fn rounds_still_publish_after_one_shard_wal_sync_failed() {
         .retain(|(dir, _)| dir != directory.path());
     assert!(!refused.starts_with(b"+"), "{refused:?}");
 
-    let failed_at = generation();
+    let failed_at = published_generation(&persistence);
     let deadline = Instant::now() + PATIENCE;
     let mut last = String::new();
 
     for n in 0.. {
         last = format!("b{n}");
         assert_eq!(set(left_addr, &left, &last), b"+OK\r\n");
-        if generation() > failed_at + 2 || Instant::now() > deadline {
+        if published_generation(&persistence) > failed_at + 2 || Instant::now() > deadline {
             break;
         }
         thread::sleep(Duration::from_millis(50));
     }
     assert!(
-        generation() > failed_at + 2,
+        published_generation(&persistence) > failed_at + 2,
         "no round published after shard 1's WAL failed (generation {failed_at})"
     );
     let killed = tempfile::tempdir().unwrap();
@@ -2372,17 +2366,21 @@ fn checkpoint_failed_round_commit_does_not_compact_the_log_past_a_later_carried_
     wait_for_idle_checkpoints(&[left_addr, right_addr]);
     let published = published_generation(&persistence);
 
-    stop_failing_writes(directory.path());
     // The log resumes; the right shard's next file goes into a round that fails again.
-    let deadline = Instant::now() + PATIENCE;
-    let mut accepted = false;
-
-    while !accepted && Instant::now() < deadline {
-        accepted = request(right_addr, &resp(&[&[b"SET", after.as_bytes(), b"y"]])) == b"+OK\r\n";
-        thread::sleep(Duration::from_millis(50));
-    }
-    assert!(accepted, "the right shard's log did not resume");
+    // Commits fail from before the log resumes: the right shard still owes the snapshot
+    // requests the wait's BGSAVEs raised (its carried copies answer none), and starts a
+    // round for them on its own within a second of resuming, which must not publish.
     let failing = fail_commits(directory.path(), || {
+        stop_failing_writes(directory.path());
+        let deadline = Instant::now() + PATIENCE;
+        let mut accepted = false;
+
+        while !accepted && Instant::now() < deadline {
+            accepted =
+                request(right_addr, &resp(&[&[b"SET", after.as_bytes(), b"y"]])) == b"+OK\r\n";
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(accepted, "the right shard's log did not resume");
         start_bgsave(right_addr);
     });
     assert_eq!(published_generation(&persistence), published);
