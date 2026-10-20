@@ -237,7 +237,7 @@ The differences are about ownership, the durability contract, and how much of th
 | Durability | RDB, AOF, combinations | Snapshots | Tsavorite on disk | `memory`, `snapshot`, `everysec`, `always` |
 | Keep the other when | You need modules, the full Sentinel feature set, or a command Ruvio does not list | You want that single-node scale claim | You want a .NET stack and Tsavorite as the store | The written subset and the shard contract are enough |
 
-Not claimed: a cluster bus, slot migration between machines (slots move only between the shards of one process, with `RUVIO MOVESLOTS`), failover across a multi-node cluster (failover covers one primary and its replicas, through `ruvio coordinator`), or a hardware latency number. Replication copies a WAL tail to a bounded set of replicas. Classic `PUBLISH` reaches subscribers on every shard of one process, not other processes.
+Not claimed: a cluster bus, automatic rebalancing (slot ranges move between the shards of one process with `RUVIO MOVESLOTS`, and between machines when an operator asks `ruvio coordinator`), failover across a multi-node cluster (failover covers one primary and its replicas, through `ruvio coordinator`), or a hardware latency number. Replication copies a WAL tail to a bounded set of replicas. Classic `PUBLISH` reaches subscribers on every shard of one process, not other processes.
 
 ### Docker Desktop and memory density
 

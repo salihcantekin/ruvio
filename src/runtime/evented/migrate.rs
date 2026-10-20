@@ -21,6 +21,7 @@
 
 use super::*;
 use crate::slot_moves::IncomingStep;
+use std::sync::atomic::AtomicBool;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 use super::moveslots::{CopyBatch, apply_batch, drop_slots, release_clients};
@@ -107,6 +108,8 @@ pub(super) struct Import {
     started: Instant,
     /// The target's last sequence once prepared; 0 before.
     prepared: AtomicU64,
+    /// Set by a cancel before anything else: later copies and a late prepare are refused.
+    cancelled: AtomicBool,
 }
 
 /// A range leaving one shard of this node.
@@ -121,6 +124,8 @@ pub(super) struct Export {
     keys: AtomicU64,
     rounds: AtomicU64,
     started: Instant,
+    /// Set once the range is frozen: the copy rate no longer applies.
+    frozen: AtomicBool,
     outcome: Mutex<ExportState>,
     cancel: tokio::sync::Notify,
 }
@@ -274,16 +279,23 @@ fn import(state: &Rc<ShardState>, args: &[&[u8]]) -> Reply {
     writable(state)?;
 
     let migrations = &forwarding.fabric.migrations;
-    {
-        let current = migrations.lock();
+    let running = forwarding
+        .fabric
+        .mover
+        .unless_moving(|| migrations.lock().import.clone())
+        .ok_or("ERR RUVIO MIGRATE a move between shards is in progress")?;
 
-        if let Some(import) = &current.import {
-            return if import.id == args[1] && (import.first, import.last) == (first, last) {
-                Ok(Response::Simple(b"OK"))
-            } else {
-                Err("ERR RUVIO MIGRATE another range is arriving on this node".into())
-            };
+    if let Some(import) = running {
+        if import.id == args[1] && (import.first, import.last) == (first, last) {
+            return Ok(Response::Simple(b"OK"));
         }
+        // The coordinators run one move at a time: another id is a move they ended while
+        // this node could not hear it.
+        cancel(state, &import.id)?;
+        return Err(
+            "ERR RUVIO MIGRATE another range is arriving on this node; it is being cancelled"
+                .into(),
+        );
     }
     // The history is checked before anything is logged, then recorded at the sequence of
     // the begin record: copies follow it.
@@ -315,6 +327,7 @@ fn import(state: &Rc<ShardState>, args: &[&[u8]]) -> Reply {
         keys: AtomicU64::new(0),
         started: Instant::now(),
         prepared: AtomicU64::new(0),
+        cancelled: AtomicBool::new(false),
     }));
     info!(
         first,
@@ -345,7 +358,17 @@ fn record_incoming(
 
             match step {
                 IncomingStep::Begin => next.begin_gain(first, last, shard, sequence)?,
-                IncomingStep::Prepared => next.prepare(sequence)?,
+                IncomingStep::Prepared => {
+                    // A replica that missed the begin (a crash before it saved it) still
+                    // keeps the range's records from the start of its log.
+                    if next.unfinished_gain().is_none_or(|gain| {
+                        (gain.first, gain.last, gain.to) != (first, last, shard)
+                    }) {
+                        warn!(first, last, "the start of an arriving range was not recorded here; keeping the range's whole log");
+                        next.begin_gain(first, last, shard, 1)?;
+                    }
+                    next.prepare(sequence)?
+                }
                 IncomingStep::Cancelled => next.cancel(),
             }
             super::moveslots::save(&next, data_dir)
@@ -373,6 +396,9 @@ fn current_import(state: &ShardState, id: &[u8]) -> Result<Arc<Import>, String> 
 fn copy(state: &Rc<ShardState>, id: &[u8], batch: &[u8]) -> Reply {
     let import = current_import(state, id)?;
 
+    if import.cancelled.load(Ordering::Acquire) {
+        return Err("ERR RUVIO MIGRATE the move was cancelled".into());
+    }
     if import.prepared.load(Ordering::Acquire) != 0 {
         return Err("ERR RUVIO MIGRATE the move is already prepared".into());
     }
@@ -386,6 +412,10 @@ fn copy(state: &Rc<ShardState>, id: &[u8], batch: &[u8]) -> Reply {
 /// `PREPARE id`, on the target shard: the copy is complete and durable here.
 fn prepare(state: &Rc<ShardState>, id: &[u8]) -> Reply {
     let import = current_import(state, id)?;
+
+    if import.cancelled.load(Ordering::Acquire) {
+        return Err("ERR RUVIO MIGRATE the move was cancelled".into());
+    }
     let done = import.prepared.load(Ordering::Acquire);
 
     if done != 0 {
@@ -468,23 +498,35 @@ fn export(state: &Rc<ShardState>, args: &[&[u8]]) -> Reply {
         keys: AtomicU64::new(0),
         rounds: AtomicU64::new(0),
         started: Instant::now(),
+        frozen: AtomicBool::new(false),
         outcome: Mutex::new(ExportState::Copying),
         cancel: tokio::sync::Notify::new(),
     });
-    {
-        let mut migrations = fabric.migrations.lock();
+    let running = fabric
+        .mover
+        .unless_moving(|| {
+            let mut migrations = fabric.migrations.lock();
 
-        if let Some(running) = &migrations.export {
-            return if running.id == args[1] && (running.first, running.last) == (first, last) {
-                Ok(Response::Simple(b"OK"))
-            } else {
-                Err("ERR RUVIO MIGRATE another range is leaving this node".into())
-            };
+            match &migrations.export {
+                Some(running) => Some(Arc::clone(running)),
+                None => {
+                    migrations.export = Some(Arc::clone(&export));
+                    None
+                }
+            }
+        })
+        .ok_or("ERR RUVIO MIGRATE a move between shards is in progress")?;
+
+    if let Some(running) = running {
+        if running.id == args[1] && (running.first, running.last) == (first, last) {
+            return Ok(Response::Simple(b"OK"));
         }
-        if fabric.mover.has_current() {
-            return Err("ERR RUVIO MIGRATE a move between shards is in progress".into());
-        }
-        migrations.export = Some(Arc::clone(&export));
+        // A move the coordinators ended while this node could not hear it. They send the
+        // current map before a new move, so a range still frozen here was not given away.
+        cancel(state, &running.id)?;
+        return Err(
+            "ERR RUVIO MIGRATE another range is leaving this node; it is being cancelled".into(),
+        );
     }
 
     if shard == forwarding.me {
@@ -572,11 +614,16 @@ fn orphan_import(state: &ShardState, id: &[u8]) -> Option<Arc<Import>> {
         keys: AtomicU64::new(0),
         started: Instant::now(),
         prepared: AtomicU64::new(gain.prepared),
+        cancelled: AtomicBool::new(false),
     }))
 }
 
 /// Target shard: drops an import that will not complete.
 pub(super) fn cancel_import(state: &Rc<ShardState>, import: Arc<Import>) {
+    // Runs on the import's shard, as copies and the prepare do: none applies after this.
+    if import.cancelled.swap(true, Ordering::AcqRel) {
+        return;
+    }
     let logged = log_step(
         state,
         crate::mutation::Mutation::SlotsIncoming {
@@ -757,10 +804,14 @@ struct Link {
     reader: BufReader<tokio::net::TcpStream>,
     /// Replies still to read, in order.
     pending: usize,
+    /// `migration_max_bytes_per_sec` (0: no limit), and the bytes sent since `since`.
+    rate: u64,
+    sent: u64,
+    since: Instant,
 }
 
 impl Link {
-    async fn open(export: &Export) -> Result<Self, String> {
+    async fn open(export: &Export, rate: u64) -> Result<Self, String> {
         let stream = tokio::time::timeout(
             REPLY_LIMIT,
             tokio::net::TcpStream::connect((export.host.as_str(), export.port)),
@@ -775,6 +826,9 @@ impl Link {
         let mut link = Self {
             reader: BufReader::new(stream),
             pending: 0,
+            rate,
+            sent: 0,
+            since: Instant::now(),
         };
 
         if !export.auth.is_empty() {
@@ -853,6 +907,18 @@ impl Link {
         while self.pending >= IN_FLIGHT {
             self.reply().await?;
         }
+        if self.rate != 0 {
+            // Waits until the bytes sent so far fit the rate. Never while frozen: the
+            // hand-over sends few keys and must not hold the range longer.
+            self.sent += batch.as_bytes().len() as u64;
+            let due = Duration::from_secs_f64(self.sent as f64 / self.rate as f64);
+
+            if let Some(wait) = due.checked_sub(self.since.elapsed())
+                && !export.frozen.load(Ordering::Acquire)
+            {
+                tokio::time::sleep(wait).await;
+            }
+        }
         self.send(&[b"RUVIO", b"MIGRATE", b"COPY", &export.id, batch.as_bytes()])
             .await?;
         export
@@ -917,7 +983,7 @@ async fn copy_and_prepare(
     fabric: &Arc<Fabric>,
     export: &Arc<Export>,
 ) -> Result<(), String> {
-    let mut link = Link::open(export).await?;
+    let mut link = Link::open(export, state.published_config.migration_max_bytes_per_sec).await?;
     let databases = state.store.borrow().database_ids();
     let mut batch = CopyBatch::default();
 
@@ -1024,7 +1090,13 @@ async fn copy_and_prepare(
         }
     };
 
-    // Kept before anyone may commit the move: a restart keeps the range frozen.
+    // Kept before anyone may commit the move: a restart keeps the range frozen, and the
+    // slot history exists so a restart after the map gave the range away records the loss.
+    fabric
+        .mover
+        .with_history(|history, data_dir| super::moveslots::save(history, data_dir))
+        .unwrap_or(Ok(()))
+        .map_err(|error| format!("could not record the slot history: {error}"))?;
     fabric.migrations.save(
         EXPORT_FILE,
         &[
@@ -1052,6 +1124,7 @@ fn freeze(fabric: &Fabric, export: &Export) {
     let table = fabric.slot_table();
     let frozen = crate::routing::FROZEN_BASE + export.shard;
 
+    export.frozen.store(true, Ordering::Release);
     fabric.mover.mark_moved();
     for slot in export.first..=export.last {
         table.assign(slot, frozen);
@@ -1339,10 +1412,19 @@ pub(super) fn replicated(state: &ShardState, mutation: &crate::OwnedMutation, se
 /// At start, before any shard serves: takes back the prepared moves a restart interrupted.
 /// A prepared export the map has not given away stays frozen; a prepared import the map
 /// has not completed waits for it again. Either can still be cancelled by its id.
-pub(super) fn restore(fabric: &Fabric, dir: Option<std::path::PathBuf>) {
+pub(super) fn restore(fabric: &Fabric, dir: Option<std::path::PathBuf>, primary: bool) {
     let Some(dir) = dir else {
         return;
     };
+    // A node restarted as a replica follows its primary; the coordinators cancel the move
+    // or the map completes it there.
+    if !primary {
+        for name in [IMPORT_FILE, EXPORT_FILE] {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+        fabric.migrations.lock().dir = Some(dir);
+        return;
+    }
     let read = |name: &str| -> Option<Vec<String>> {
         let text = std::fs::read_to_string(dir.join(name)).ok()?;
 
@@ -1380,6 +1462,7 @@ pub(super) fn restore(fabric: &Fabric, dir: Option<std::path::PathBuf>) {
                 keys: AtomicU64::new(0),
                 started: Instant::now(),
                 prepared: AtomicU64::new(position),
+                cancelled: AtomicBool::new(false),
             })
         })();
 
@@ -1425,6 +1508,7 @@ pub(super) fn restore(fabric: &Fabric, dir: Option<std::path::PathBuf>) {
                 keys: AtomicU64::new(0),
                 rounds: AtomicU64::new(0),
                 started: Instant::now(),
+                frozen: AtomicBool::new(true),
                 outcome: Mutex::new(ExportState::Prepared {
                     position,
                     freeze: Duration::ZERO,

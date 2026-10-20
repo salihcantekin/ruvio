@@ -77,6 +77,7 @@ pub const RESTART_ONLY_SETTINGS: &[&str] = &[
     "max-value-bytes",
     "metrics-address",
     "metrics-token",
+    "migration-max-bytes-per-sec",
     "port-mode",
     "protected-mode",
     "replica-announced",

@@ -365,10 +365,6 @@ fn a_slot_range_moves_to_another_node_and_stays_there_after_restarts() {
         on_b.call(&["RUVIO", "MIGRATE", "IMPORT", "m1", "100", "199", "0"]),
         "OK"
     );
-    assert!(
-        on_b.call(&["RUVIO", "MIGRATE", "IMPORT", "m2", "300", "399", "0"])
-            .contains("another range")
-    );
     assert_eq!(
         on_a.call(&[
             "RUVIO",

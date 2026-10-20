@@ -79,9 +79,13 @@ impl SlotMover {
             .map(|(history, data_dir)| step(history, data_dir.as_deref()))
     }
 
-    /// Whether a move between this process's shards is running.
-    pub(super) fn has_current(&self) -> bool {
-        self.lock().current.is_some()
+    /// Runs `step` unless a move between this process's shards is running, holding the
+    /// mover's lock so none starts meanwhile. Locks are taken mover first, then the moves
+    /// between nodes (as `RUVIO MOVESLOTS` does), never the other way round.
+    pub(super) fn unless_moving<T>(&self, step: impl FnOnce() -> T) -> Option<T> {
+        let state = self.lock();
+
+        state.current.is_none().then(step)
     }
 
     /// From now on shards check forwarded requests and commands that waited.

@@ -478,12 +478,13 @@ fn a_failover_in_one_group_moves_the_redirects_of_the_others() {
 struct TwoGroups {
     resp: Vec<SocketAddr>,
     coordinator: String,
-    _processes: Vec<Process>,
+    processes: Vec<Process>,
     _ports: (test_ports::PortBlock, test_ports::PortBlock),
 }
 
 impl TwoGroups {
-    fn start(dir: &Path) -> Self {
+    /// `env`: extra settings of every data node.
+    fn start(dir: &Path, env: &[(&str, &str)]) -> Self {
         let data = test_ports::reserve();
         let replication = test_ports::reserve();
         let resp: Vec<SocketAddr> = (0..4).map(|index| data.address_at(index)).collect();
@@ -516,6 +517,7 @@ impl TwoGroups {
                     .env("RUVIO_REPLICATION_LISTEN", repl[index].to_string())
                     .env("RUVIO_CLUSTER_TOPOLOGY", &topology)
                     .env("RUVIO_CLUSTER_GROUP", group)
+                    .envs(env.iter().copied())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null());
                 if index % 2 == 1 {
@@ -571,7 +573,7 @@ impl TwoGroups {
         let groups = Self {
             resp,
             coordinator: coordinator.to_string(),
-            _processes: processes,
+            processes,
             _ports: (data, replication),
         };
 
@@ -601,7 +603,7 @@ fn key_in(range: std::ops::Range<u16>, label: &str) -> String {
 #[test]
 fn a_slot_range_moves_between_groups_while_a_client_keeps_writing() {
     let dir = tempfile::tempdir().unwrap();
-    let groups = TwoGroups::start(dir.path());
+    let groups = TwoGroups::start(dir.path(), &[]);
     let keys: Vec<String> = (0..)
         .map(|n| format!("moving:{n}"))
         .filter(|key| (100..200).contains(&ruvio::routing::hash_slot(key.as_bytes())))
@@ -713,4 +715,56 @@ fn a_slot_range_moves_between_groups_while_a_client_keeps_writing() {
             .unwrap()
             .contains("moved_ranges 1")
     );
+}
+
+#[test]
+fn a_failover_of_the_source_during_a_move_starts_it_again_with_the_new_primary() {
+    let dir = tempfile::tempdir().unwrap();
+    // Slow copies (a few KiB per second) keep the first attempt copying when its source dies.
+    let mut groups = TwoGroups::start(dir.path(), &[("RUVIO_MIGRATION_MAX_BYTES_PER_SEC", "4096")]);
+    let keys: Vec<String> = (0..)
+        .map(|n| format!("moving:{n}"))
+        .filter(|key| (100..200).contains(&ruvio::routing::hash_slot(key.as_bytes())))
+        .take(200)
+        .collect();
+
+    for key in &keys {
+        assert_eq!(
+            call(&groups.node(0), &["SET", key, key]).as_deref(),
+            Some("OK")
+        );
+    }
+    wait_until("a's replica to copy the keys", || {
+        keys.iter()
+            .all(|key| call(&groups.node(1), &["GET", key]).as_deref() == Some(key.as_str()))
+    });
+    let id = call_with_secret(
+        &groups.coordinator,
+        &["COORDINATOR", "MOVE", "100", "199", "b", "0"],
+    )
+    .unwrap();
+
+    assert!(id.starts_with('m'), "{id}");
+    wait_until("the source to copy", || {
+        call(&groups.node(0), &["RUVIO", "MIGRATE", "STATUS"])
+            .is_some_and(|status| status.contains("state copying"))
+    });
+    groups.processes[0].kill();
+
+    wait_until("the move to finish with a's new primary", || {
+        call_with_secret(&groups.coordinator, &["COORDINATOR", "STATUS"])
+            .is_some_and(|status| status.starts_with("state done"))
+    });
+    let status = call_with_secret(&groups.coordinator, &["COORDINATOR", "STATUS"]).unwrap();
+
+    assert!(status.contains(&format!("id {id}-2")), "{status}");
+    for key in &keys {
+        assert_eq!(
+            call(&groups.node(2), &["GET", key]).as_deref(),
+            Some(key.as_str())
+        );
+    }
+    wait_until("a's new primary to drop its copy", || {
+        call(&groups.node(1), &["DBSIZE"]).as_deref() == Some("0")
+    });
 }

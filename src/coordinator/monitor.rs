@@ -333,7 +333,7 @@ pub async fn lead(
             if primary_age.is_none_or(|age| age > config.down_after)
                 && objectively_down(&config, &sightings, group, primary.member).await
             {
-                failover(&config, &raft, group, primary, &seen, &switches).await;
+                failover(&config, &raft, &machine, group, primary, &seen, &switches).await;
                 continue;
             }
 
@@ -448,6 +448,7 @@ async fn propose(raft: &Raft, group: &Group, member: usize, epoch: u64) -> bool 
 async fn failover(
     config: &CoordinatorConfig,
     raft: &Raft,
+    machine: &StateMachine,
     group: &Group,
     primary: Primary,
     seen: &[Sighting],
@@ -470,6 +471,18 @@ async fn failover(
 
     let promoted = &group.members[candidate];
 
+    // The newest map first: a range the group gave away is then answered with `MOVED`
+    // before the promoted member takes writes.
+    if let Some((_, map)) = config.cluster_map(&machine.primaries(), &machine.moves().moved)
+        && let Err(error) = command(
+            promoted,
+            config.auth.as_deref(),
+            &[b"RUVIO", b"TOPOLOGY", b"SET", map.as_bytes()],
+        )
+        .await
+    {
+        warn!(group = %group.name, %error, "the chosen replica refused the cluster map before its promotion");
+    }
     if let Err(error) = command(
         promoted,
         config.auth.as_deref(),

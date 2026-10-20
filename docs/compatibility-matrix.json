@@ -40,7 +40,7 @@
       "family": "connection",
       "status": "supported",
       "same_slot": false,
-      "limitations": "No arguments replies PONG is taken. OWNER names the shard rule. RUVIO TOPOLOGY VERSION returns the cluster map version the node serves (0 without cluster_topology); RUVIO TOPOLOGY SET map installs a newer map (sent by ruvio coordinator; @admin @dangerous; the node's own slots may not change). Any other argument is an error.",
+      "limitations": "No arguments replies PONG is taken. OWNER names the shard rule. RUVIO TOPOLOGY VERSION returns the cluster map version the node serves (0 without cluster_topology); RUVIO TOPOLOGY SET map installs a newer map (sent by ruvio coordinator; @admin @dangerous; a slot may join the node's group only once RUVIO MIGRATE prepared its data there). RUVIO MIGRATE IMPORT, EXPORT, COPY, PREPARE, CANCEL and STATUS move a slot range between groups for ruvio coordinator (COORDINATOR MOVE; @admin @dangerous; AUTH arguments redacted in SLOWLOG); see docs/COMPATIBILITY.md. Any other argument is an error.",
       "coverage": [
         "src/protocol/",
         "src/engine/"

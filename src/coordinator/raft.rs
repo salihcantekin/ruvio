@@ -350,8 +350,9 @@ impl StateMachine {
     }
 }
 
-/// Applies a move request; returns whether it changed anything.
-pub fn apply_move(moves: &mut Moves, request: &Request) -> bool {
+/// Applies a move request; returns whether it changed anything. A commit applies only
+/// while both groups still have the primaries the move began with.
+pub fn apply_move(moves: &mut Moves, primaries: &Primaries, request: &Request) -> bool {
     match request {
         Request::BeginMove(migration) => {
             if moves.current.is_some() {
@@ -361,7 +362,16 @@ pub fn apply_move(moves: &mut Moves, request: &Request) -> bool {
             true
         }
         Request::CommitMove { id } => {
-            let Some(migration) = moves.current.take_if(|current| current.id == *id) else {
+            let unchanged = |group: &String, epoch: u64| {
+                primaries
+                    .get(group)
+                    .is_some_and(|primary| primary.epoch == epoch)
+            };
+            let Some(migration) = moves.current.take_if(|current| {
+                current.id == *id
+                    && unchanged(&current.from, current.from_epoch)
+                    && unchanged(&current.to, current.to_epoch)
+            }) else {
                 return false;
             };
 
@@ -481,7 +491,7 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
                     let state = &mut *state;
 
                     apply_request(&mut state.primaries, &request)
-                        || apply_move(&mut state.moves, &request)
+                        || apply_move(&mut state.moves, &state.primaries, &request)
                 }
                 EntryPayload::Membership(membership) => {
                     state.membership = StoredMembership::new(Some(entry.log_id), membership);
@@ -744,6 +754,17 @@ mod tests {
     #[test]
     fn one_move_runs_at_a_time_and_only_its_own_id_ends_it() {
         let mut moves = Moves::default();
+        let mut primaries = Primaries::new();
+
+        for group in ["a", "b"] {
+            primaries.insert(
+                group.into(),
+                Primary {
+                    member: 0,
+                    epoch: 1,
+                },
+            );
+        }
         let begin = |id: &str| {
             Request::BeginMove(Migration {
                 id: id.into(),
@@ -757,23 +778,27 @@ mod tests {
             })
         };
 
-        assert!(apply_move(&mut moves, &begin("m1")));
-        assert!(!apply_move(&mut moves, &begin("m2")));
+        assert!(apply_move(&mut moves, &primaries, &begin("m1")));
+        assert!(!apply_move(&mut moves, &primaries, &begin("m2")));
         assert!(!apply_move(
             &mut moves,
+            &primaries,
             &Request::CommitMove { id: "m2".into() }
         ));
         assert!(apply_move(
             &mut moves,
+            &primaries,
             &Request::CommitMove { id: "m1".into() }
         ));
         // A retried commit or a late end changes nothing.
         assert!(!apply_move(
             &mut moves,
+            &primaries,
             &Request::CommitMove { id: "m1".into() }
         ));
         assert!(!apply_move(
             &mut moves,
+            &primaries,
             &Request::EndMove { id: "m1".into() }
         ));
         assert_eq!(
@@ -785,12 +810,23 @@ mod tests {
                 shard: 0
             }]
         );
-        assert!(apply_move(&mut moves, &begin("m2")));
+        assert!(apply_move(&mut moves, &primaries, &begin("m2")));
         assert!(apply_move(
             &mut moves,
+            &primaries,
             &Request::EndMove { id: "m2".into() }
         ));
         assert_eq!(moves.current, None);
+        assert_eq!(moves.moved.len(), 1);
+
+        // A failover of either group after the move began keeps it from committing.
+        assert!(apply_move(&mut moves, &primaries, &begin("m3")));
+        primaries.get_mut("b").unwrap().epoch = 2;
+        assert!(!apply_move(
+            &mut moves,
+            &primaries,
+            &Request::CommitMove { id: "m3".into() }
+        ));
         assert_eq!(moves.moved.len(), 1);
     }
 

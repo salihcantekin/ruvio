@@ -638,6 +638,7 @@ fn run_cluster(config: &AppConfig, shutdown: ShutdownToken, force: bool) -> io::
                     .profile
                     .uses_wal()
                     .then(|| config.persistence.data_dir.clone()),
+                config.replication.role != crate::config::ReplicationRole::Replica,
             );
         }
     }
@@ -1330,6 +1331,15 @@ async fn serve_async(
     let shutdown_grace = config.shutdown_grace;
 
     *state.replication.borrow_mut() = attach_replication(&state, shard_id)?;
+    // A map installed just before a stop may have given ranges away before the loss was
+    // recorded: record it now, before this shard serves.
+    if state
+        .route
+        .as_ref()
+        .is_some_and(|route| route.topology.is_some())
+    {
+        migrate::settle(&state);
+    }
     let mut maintenance = tokio::time::interval(Duration::from_millis(100));
     maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     maintenance.tick().await;

@@ -124,7 +124,13 @@ next slot map load. During the hand-over the old shard pauses for a moment (well
 millisecond without a log, around 15 ms with one on a Mac, mostly the log sync). One move runs at a time, every slot of the range must be on one
 shard, and it is refused while replication is on. With `everysec` or `always` the move
 survives a crash at any step; the moved ranges are kept in the `SLOTS` file of the data
-directory. Moving slots to another machine is not supported.
+directory.
+
+Between machines, with a multi-node cluster run by `ruvio coordinator`:
+`COORDINATOR MOVE 0 1000 b 0` moves slots 0 to 1000 to shard 0 of group `b`, and
+`COORDINATOR STATUS` follows it. Clients keep working there too: during the short hand-over
+the old owner answers `TRYAGAIN`, which the Ruvio clients retry, and afterwards `MOVED`. See
+`docs/COORDINATOR.md`.
 
 ### How do I list the keys of one slot?
 

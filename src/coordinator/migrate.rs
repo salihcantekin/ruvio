@@ -27,6 +27,8 @@ const POLL: Duration = Duration::from_millis(50);
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Starts of one move (the first and the ones a failover forces).
 const ATTEMPTS: usize = 3;
+/// Polls the leader waits for the target's replicas to hold a prepared copy (10 s).
+const REPLICA_WAIT_POLLS: usize = 200;
 
 /// The leader's side of the moves: which one it drives, a cancel asked for, and how the
 /// last one ended.
@@ -232,14 +234,15 @@ async fn drive(context: &Context, mut migration: Migration) {
         match outcome {
             Ended::Committed => {
                 info!(id = %migration.id, "slot range moved; sending the new map");
-                send_map(context, &migration).await;
+                send_map(context, &[&migration.to, &migration.from]).await;
                 report(context, &migration, "done", None);
                 return;
             }
             Ended::Handed => return,
             Ended::Aborted { reason, again } => {
                 warn!(id = %migration.id, %reason, "the slot range move ended before its commit");
-                cancel_on_nodes(context, &migration).await;
+                // Ended in the Raft state first: once that holds, no leader can commit the
+                // move, so cancelling it on the nodes cannot undo a committed move.
                 if propose(
                     context,
                     Request::EndMove {
@@ -247,10 +250,11 @@ async fn drive(context: &Context, mut migration: Migration) {
                     },
                 )
                 .await
-                .is_err()
+                    != Ok(true)
                 {
                     return;
                 }
+                cancel_on_nodes(context, &migration).await;
                 if !again || attempt == ATTEMPTS {
                     report(context, &migration, "failed", Some(reason));
                     return;
@@ -299,6 +303,9 @@ async fn attempt_move(context: &Context, migration: &Migration) -> Ended {
         .map(|auth| auth.split_whitespace().map(str::as_bytes).collect())
         .unwrap_or_default();
 
+    // The current map first: a range a node still holds frozen from a committed move is
+    // given away before anything else happens there.
+    send_map(context, &[&migration.to, &migration.from]).await;
     let import: [&[u8]; 7] = [
         b"RUVIO",
         b"MIGRATE",
@@ -340,11 +347,21 @@ async fn attempt_move(context: &Context, migration: &Migration) -> Ended {
         export.push(b"AUTH");
         export.extend(&auth);
     }
-    if let Err(error) = expect_ok(call(config, &source, &export).await) {
-        return Ended::Aborted {
-            reason: format!("the source refused the range: {error}"),
-            again: false,
-        };
+    let mut tries = 0;
+
+    // A move the source missed the end of is cancelled there first.
+    while let Err(error) = expect_ok(call(config, &source, &export).await) {
+        tries += 1;
+        if !error.contains("another range is leaving") || tries >= 200 {
+            return Ended::Aborted {
+                reason: format!("the source refused the range: {error}"),
+                again: false,
+            };
+        }
+        tokio::time::sleep(POLL).await;
+        if let Some(ended) = interrupted(context, migration).await {
+            return ended;
+        }
     }
 
     // The source reports `prepared` once the target holds the whole range and the source
@@ -388,8 +405,46 @@ async fn attempt_move(context: &Context, migration: &Migration) -> Ended {
         }
     }
 
-    if let Some(ended) = interrupted(context, migration).await {
-        return ended;
+    // The target's replicas must hold the copy too: a failover of the target right after
+    // the commit would otherwise promote a replica without the range.
+    let mut waited = 0;
+
+    loop {
+        if let Some(ended) = interrupted(context, migration).await {
+            return ended;
+        }
+        let behind = call(config, &target, &[b"RUVIO", b"MIGRATE", b"STATUS"])
+            .await
+            .ok()
+            .map(|reply| pairs(&reply))
+            .and_then(|pairs| {
+                let field = |name: &str| {
+                    pairs
+                        .iter()
+                        .find(|(known, _)| known == name)
+                        .map(|(_, value)| value.clone())
+                };
+
+                (field("id").as_deref() == Some(migration.id.as_str())
+                    && field("state").as_deref() == Some("prepared"))
+                .then(|| field("replicas_behind"))
+                .flatten()
+            });
+
+        if behind.as_deref() == Some("0") {
+            break;
+        }
+        waited += 1;
+        if waited >= REPLICA_WAIT_POLLS {
+            return Ended::Aborted {
+                reason: format!(
+                    "the target's replicas did not get the copy in time ({} behind)",
+                    behind.as_deref().unwrap_or("unknown")
+                ),
+                again: true,
+            };
+        }
+        tokio::time::sleep(POLL).await;
     }
     match propose(
         context,
@@ -467,6 +522,9 @@ async fn cancel_on_nodes(context: &Context, migration: &Migration) {
         }
     }
     for target in targets {
+        if !context.leading().await {
+            return;
+        }
         if let Err(error) = call(
             &context.config,
             &target,
@@ -479,9 +537,9 @@ async fn cancel_on_nodes(context: &Context, migration: &Migration) {
     }
 }
 
-/// Sends the map with the committed move to the target's primary, then the source's;
-/// the leader's loop brings every other member up to date.
-async fn send_map(context: &Context, migration: &Migration) {
+/// Sends the current map to the primaries of `groups`, in that order; the leader's loop
+/// brings every other member up to date.
+async fn send_map(context: &Context, groups: &[&String]) {
     let Some((version, map)) = context
         .config
         .cluster_map(&context.machine.primaries(), &context.machine.moves().moved)
@@ -489,7 +547,7 @@ async fn send_map(context: &Context, migration: &Migration) {
         return;
     };
 
-    for group in [&migration.to, &migration.from] {
+    for group in groups {
         let Some(primary) = primary_address(context, group, 0) else {
             continue;
         };

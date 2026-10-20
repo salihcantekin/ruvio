@@ -230,6 +230,7 @@ Each variable overrides one file setting, and a command-line flag, where there i
 | `RUVIO_ADVERTISE_PORT` | no | `--advertised-port` | `advertised_port` | |
 | `RUVIO_CLUSTER_TOPOLOGY` | no | | `cluster_topology` | Path of the cluster map; empty = none |
 | `RUVIO_CLUSTER_GROUP` | no | | `cluster_group` | This node's group in the map |
+| `RUVIO_MIGRATION_MAX_BYTES_PER_SEC` | no | | `migration_max_bytes_per_sec` | Copy rate of a range moving to another node; 0 = no limit |
 | `RUVIO_CPUSET` | no | `--cpu-set` | `cpu_set` | |
 | `RUVIO_CORE` | no | | `cpu_set` | Older name; read only when `RUVIO_CPUSET` is unset |
 | `RUVIO_SHUTDOWN_GRACE_MS` | no | `--shutdown-grace-ms` | `shutdown_grace_ms` | |
@@ -833,9 +834,12 @@ shards as before. `CLUSTER SLOTS`, `CLUSTER SHARDS` and `CLUSTER NODES` describe
 the whole map, other groups by their primary only. Keyless commands (`DBSIZE`,
 `KEYS`, `SCAN`, `FLUSHALL`), `WAIT` and classic `PUBLISH`/`SUBSCRIBE` stay on the
 node that receives them; use `SPUBLISH`/`SSUBSCRIBE` for channels the whole
-cluster shares. The map is fixed: start a group with its slots empty, or as the
-only group of a node that already holds data; data is not moved between groups
-yet. A node that holds keys in slots the map serves elsewhere (or on another of its
+cluster shares. Start a group with its slots empty, or as the only group of a
+node that already holds data; `ruvio coordinator` moves ranges between groups
+later (`COORDINATOR MOVE`, see `docs/COORDINATOR.md`), and a node refuses a map
+that gives its group a slot whose data is not there. `migration_max_bytes_per_sec`
+(`RUVIO_MIGRATION_MAX_BYTES_PER_SEC`, default 0: no cap) caps how fast a node copies
+a range it sends to another group. A node that holds keys in slots the map serves elsewhere (or on another of its
 own shards) refuses to start and names the first such slot; the check walks the
 keys once at startup, only when a map is set. With `ruvio coordinator` managing the
 groups, the coordinators send each node a newer map after every failover (`RUVIO
