@@ -550,6 +550,14 @@ single replica and `min-replicas-to-write 1` the primary refuses writes while th
 replica resyncs, as in Redis. Both change
 with `CONFIG SET`. Only role `primary` applies them.
 
+For a synchronous write per connection, `CLIENT DURABILITY REPLICAS n [TIMEOUT ms]`
+holds the connection's replies until `n` replicas hold the records written before
+them on disk (default timeout 5000 ms); on timeout the batch's replies become
+`NOREPLICAS` and the writes stay applied. After a timeout, the connection's next
+batch waits only if the shard logged a new record in between, so a read sent right
+after can return a write no replica holds yet. See
+[COORDINATOR.md](COORDINATOR.md#what-can-be-lost-and-split-brain).
+
 `replication.primary_lease` / `primary-lease` (default `false`) makes a primary
 (or a node with no replication role) take writes only while a majority of the
 `ruvio coordinator`s that manage it renewed its lease (their `primary_lease_ms`)
