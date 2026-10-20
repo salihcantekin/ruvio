@@ -880,3 +880,16 @@ fn a_blocking_command_waits_its_own_timeout_on_top_of_the_read_timeout() {
         Some("ok")
     );
 }
+
+#[test]
+fn client_durability_is_refused_without_replication() {
+    let Some(mut db) = connect(7) else {
+        return;
+    };
+    let error = db.client_durability(1, Some(5000)).unwrap_err();
+
+    assert!(
+        matches!(&error, ruvio_client::Error::Server(m) if m.contains("needs replication")),
+        "{error:?}"
+    );
+}

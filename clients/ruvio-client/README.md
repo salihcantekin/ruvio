@@ -98,6 +98,8 @@ let mut secured = Client::connect_with(ClientOptions {
 
 `select` switches the same connection, and `into_database` does the same and returns the client. `flushdb`, `flushall`, `swapdb`, and `move_key` send `FLUSHDB`, `FLUSHALL`, `SWAPDB`, and `MOVE`.
 
+`ClientOptions::durability` (`Some(Durability { replicas, timeout_ms })`) makes every connection the client opens, including reconnects and the per-shard sockets of a cluster client, send `CLIENT DURABILITY REPLICAS n [TIMEOUT ms]` right after `AUTH`. The server then holds that connection's replies until `n` replicas have the writes on disk, and answers `-NOREPLICAS` after the timeout (writes stay applied). A refusal, such as on a server without replication, fails the connect with `Error::Server`. The default `None` sends nothing. `client_durability(replicas, timeout_ms)` sets it on one connection; 0 turns it off.
+
 A password is sent as `AUTH` only when `ClientOptions::password` is set. A server error reply leaves the connection usable. A broken read or write does not.
 
 ## Commands

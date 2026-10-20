@@ -3389,6 +3389,19 @@ public partial interface IRuvioClient
     /// </example>
     ValueTask SetTrackingAsync(bool enabled, CancellationToken cancellationToken = default);
 
+    /// <summary>Sends <c>CLIENT DURABILITY REPLICAS n [TIMEOUT ms]</c>: holds this connection's replies until <paramref name="replicas"/> replicas have the writes on disk.</summary>
+    /// <param name="replicas">How many replicas must have the writes; zero turns the wait off.</param>
+    /// <param name="timeout">How long to wait before the replies become <c>NOREPLICAS</c> errors (the writes stay applied); null keeps the server's default of 5 seconds.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
+    /// <exception cref="RuvioException">The server has no replication, or the connection is inside <c>MULTI</c>.</exception>
+    /// <remarks>The setting belongs to the connection. <see cref="RuvioClientOptions.DurabilityReplicas"/> sets it on every connection the client opens.</remarks>
+    /// <example>
+    /// <code>
+    /// await db.SetDurabilityAsync(1, TimeSpan.FromSeconds(5));
+    /// </code>
+    /// </example>
+    ValueTask SetDurabilityAsync(int replicas, TimeSpan? timeout = null, CancellationToken cancellationToken = default);
+
     /// <summary>Sends <c>CONFIG GET</c>.</summary>
     /// <param name="parameter">A setting name or glob, for example <c>databases</c> or <c>*</c>.</param>
     /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>

@@ -248,6 +248,29 @@ public abstract class RuvioCommands<K, V> extends ScriptingCommands<K, V> {
     }
 
     /**
+     * Sends {@code CLIENT DURABILITY REPLICAS n}. While set, the server holds this connection's replies until {@code replicas} replicas have every earlier write on disk. After the default 5000 ms the replies of the batch become {@code NOREPLICAS} errors and the writes stay applied. The options' {@code durability} sets it on every (re)connect.
+     *
+     * @param replicas the replicas that must hold each write; 0 turns it off
+     * @throws RuvioServerException {@code ERR} on a server without replication or inside {@code MULTI}
+     * @return a future that completes with no value once the server has acknowledged the command
+     */
+    public CompletableFuture<Void> clientDurability(long replicas) {
+        return send(args().w(Cmd.CLIENT).s("DURABILITY").s("REPLICAS").l(replicas), Reply.OK);
+    }
+
+    /**
+     * Sends {@code CLIENT DURABILITY REPLICAS n TIMEOUT ms}. Same as {@link #clientDurability(long)} with a longest wait.
+     *
+     * @param replicas the replicas that must hold each write; 0 turns it off
+     * @param timeoutMillis the longest wait in milliseconds
+     * @throws RuvioServerException {@code ERR} on a server without replication or inside {@code MULTI}
+     * @return a future that completes with no value once the server has acknowledged the command
+     */
+    public CompletableFuture<Void> clientDurability(long replicas, long timeoutMillis) {
+        return send(args().w(Cmd.CLIENT).s("DURABILITY").s("REPLICAS").l(replicas).s("TIMEOUT").l(timeoutMillis), Reply.OK);
+    }
+
+    /**
      * Sends {@code CLIENT ID}.
      *
      * @return the id the server gave this connection

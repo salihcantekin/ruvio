@@ -211,6 +211,14 @@ pipelined commands; use `{hashtag}` keys to keep related keys in one slot.
   only issue single-key commands, so they work unchanged; `ClusterLiveTest` runs them on the cluster.
 * `ASK` redirects and `CLUSTERDOWN` handling: not implemented. Reads from replicas: see below.
 
+## Durable replies
+
+`RuvioOptions.Builder.durability(replicas)` or `durability(replicas, timeoutMillis)` makes the server hold every reply of a connection until that many replicas have the earlier writes on disk. Every connection the client opens (reconnects, Pub/Sub, and the per-node connections of a cluster client) sends `CLIENT DURABILITY REPLICAS n [TIMEOUT ms]` after its other connect commands, and the connect fails if the server refuses (for example without replication). Nothing is sent by default. After the timeout (5000 ms unless set) the replies of the batch become `NOREPLICAS` errors and the writes stay applied. `clientDurability(n)` / `clientDurability(n, timeoutMillis)` set it on one connection; `0` turns it off.
+
+```java
+RuvioOptions options = RuvioOptions.builder().host("10.0.0.1").durability(1, 5000).build();
+```
+
 ## Reads from replicas
 
 `RuvioOptions.Builder.readPolicy(ReadPolicy)` sets where a cluster client sends read-only commands. A standalone

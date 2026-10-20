@@ -365,3 +365,14 @@ test('multiplexing, ordering, binary view, errors, reconnect', { skip: SKIP }, a
     await c.quit();
   }
 });
+
+test('CLIENT DURABILITY needs replication on a standalone server', { skip: SKIP }, async () => {
+  const c = await live(7);
+  try {
+    const e = await rejects(c.clientDurability(1, 1000));
+    assert.ok(e instanceof RuvioError);
+    assert.match(e.message, /needs replication/);
+  } finally {
+    c.disconnect();
+  }
+});

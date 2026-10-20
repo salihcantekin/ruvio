@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use ruvio_client::{Client, ClientOptions, ReadPolicy, hash_slot};
+use ruvio_client::{Client, ClientOptions, Durability, ReadPolicy, hash_slot};
 
 // Each test counts the GETs one replica shard has served, so they take turns.
 static TURN: Mutex<()> = Mutex::new(());
@@ -114,4 +114,28 @@ fn primary_policy_keeps_reads_on_the_primary() {
 
     assert_eq!(db.get_string(key).unwrap().as_deref(), Some("v3"));
     assert_eq!(get_commands(&mut on_replica), before);
+}
+
+#[test]
+fn durability_option_writes_and_reads_back_on_the_replicated_primary() {
+    let Some((primary, _)) = addresses() else {
+        return;
+    };
+    let mut db = Client::connect_with(ClientOptions {
+        host: primary.ip().to_string(),
+        port: primary.port(),
+        durability: Some(Durability {
+            replicas: 1,
+            timeout_ms: Some(5000),
+        }),
+        ..ClientOptions::default()
+    })
+    .unwrap();
+
+    db.set("durability-live", "v").unwrap();
+    assert_eq!(
+        db.get("durability-live").unwrap().as_deref(),
+        Some(&b"v"[..])
+    );
+    db.del(&["durability-live"]).unwrap();
 }

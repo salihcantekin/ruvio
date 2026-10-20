@@ -26,6 +26,17 @@ class ReplicaReadsLiveTest {
                 .readPolicy(policy).commandTimeoutMillis(10_000).build());
     }
 
+    @Test
+    void durabilityOptionHoldsRepliesUntilAReplicaHasTheWrite() {
+        assumeTrue(PRIMARY != null && !PRIMARY.isEmpty(), "RUVIO_REPLICATED_ADDR not set; durability test skipped");
+        RuvioOptions base = RuvioOptions.of(PRIMARY);
+        try (RuvioClient<String, String> db = RuvioClient.connect(RuvioOptions.builder().host(base.host()).port(base.port())
+                .cluster(true).durability(1, 5000).commandTimeoutMillis(10_000).build())) {
+            db.set("java:durability", "v");
+            assertEquals("v", db.get("java:durability"));
+        }
+    }
+
     /** One shard of the replica, without cluster routing. */
     private static RuvioClient<String, String> shard(String key) {
         RuvioOptions base = RuvioOptions.of(REPLICA);

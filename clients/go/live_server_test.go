@@ -77,6 +77,10 @@ func TestLiveConnectionAndServer(t *testing.T) {
 	if err := c.ReplicaOfNoOne(ctx, false); err == nil {
 		t.Fatal("REPLICAOF NO ONE should be refused without a WAL")
 	}
+	// Without replication the server refuses CLIENT DURABILITY.
+	if err := c.ClientDurability(ctx, 1, 0); err == nil || !strings.Contains(err.Error(), "needs replication") {
+		t.Fatalf("CLIENT DURABILITY answered %v, want the needs-replication error", err)
+	}
 	okOrServerErr(t, "SAVE", c.Save(ctx))
 	okOrServerErr(t, "BGSAVE", func() error { _, err := c.BgSave(ctx); return err }())
 	cmd := must[Value](t)(c.Command(ctx))

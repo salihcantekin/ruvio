@@ -415,6 +415,32 @@ class Commands:
         """
         return self._c(_ok, "CLIENT SETNAME", name)
 
+    def client_durability(self, replicas: int, timeout: Optional[int] = None) -> Any:
+        """``CLIENT DURABILITY REPLICAS n [TIMEOUT ms]`` - holds this connection's replies until replicas have the writes on disk.
+
+        While set, the server answers a batch of replies only when ``replicas`` replicas have every
+        record written before them on disk. On a timeout every reply of that batch becomes a
+        ``NOREPLICAS`` error and the writes stay applied. The setting is per connection, is not sent
+        again after a reconnect by this method (use the ``durability_replicas`` constructor argument for
+        that), and is refused inside ``MULTI``. The cluster client sends it to every node.
+
+        Args:
+            replicas: Replicas that must have the writes; ``0`` turns it off.
+            timeout: Milliseconds to wait for them; omitted keeps the server default (5000).
+
+        Returns:
+            ``True``.
+
+        Raises:
+            ResponseError: The server has no replication.
+
+        Example:
+            client.client_durability(1, 5000)
+        """
+        if timeout is None:
+            return self._c(_ok, "CLIENT DURABILITY", "REPLICAS", replicas)
+        return self._c(_ok, "CLIENT DURABILITY", "REPLICAS", replicas, "TIMEOUT", timeout)
+
     def client_tracking(self, on: bool) -> Any:
         """``CLIENT TRACKING ON|OFF`` - turns client-side-caching invalidation on or off.
 

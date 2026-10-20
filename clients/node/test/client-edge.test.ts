@@ -93,6 +93,29 @@ test('handshake: AUTH with username, RESP3 HELLO with AUTH, SELECT and SETNAME i
   });
 });
 
+test('durability: the method and the connect option send CLIENT DURABILITY', async () => {
+  await withClient(() => ok, {}, async (c, s) => {
+    assert.equal(await c.clientDurability(1), 'OK');
+    assert.equal(await c.clientDurability(2, 750), 'OK');
+    assert.deepEqual(s.seen, [['CLIENT', 'DURABILITY', 'REPLICAS', '1'], ['CLIENT', 'DURABILITY', 'REPLICAS', '2', 'TIMEOUT', '750']]);
+  });
+  await withClient(() => ok, { db: 2, name: 'nm', durability: { replicas: 1, timeoutMs: 5000 } }, async (c, s) => {
+    await c.ping();
+    assert.deepEqual(s.seen.slice(0, 4), [['SELECT', '2'], ['CLIENT', 'SETNAME', 'nm'], ['CLIENT', 'DURABILITY', 'REPLICAS', '1', 'TIMEOUT', '5000'], ['PING']]);
+  });
+  await withClient(() => ok, { durability: { replicas: 3 } }, async (c, s) => {
+    await c.ping();
+    assert.deepEqual(s.seen.slice(0, 2), [['CLIENT', 'DURABILITY', 'REPLICAS', '3'], ['PING']]);
+  });
+  await withClient(() => ok, {}, async (c, s) => {
+    await c.ping();
+    assert.deepEqual(s.seen, [['PING']], 'nothing is sent by default');
+  });
+  await withClient((a) => (a[0] === 'CLIENT' ? err('ERR CLIENT DURABILITY needs replication on this server') : ok), { durability: { replicas: 1 } }, async (c) => {
+    await assert.rejects(c.ping());
+  });
+});
+
 test('handshake: a rejected AUTH fails the waiting command and the next command retries it', async () => {
   let bad = true;
   await withClient(

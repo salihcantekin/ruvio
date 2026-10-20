@@ -350,6 +350,19 @@ client.get("user:1")          # a replica; may not have the write yet
   `REPLICA` raises (`ConnectionError`, or the `LOADING` `ResponseError`), and a `RuvioError` saying "no replica"
   when none is known. A socket that drops after a command was sent fails the command, as for every node.
 
+## Durable replies
+
+`durability_replicas=n` (and optionally `durability_timeout_ms=`) on `Ruvio`, `asyncio.Ruvio` and the cluster
+clients sends `CLIENT DURABILITY REPLICAS n [TIMEOUT ms]` right after the handshake of every connection,
+reconnects included. The server then holds each reply until `n` replicas have the writes on disk; on a timeout
+(default 5000 ms) the replies of that batch are `-NOREPLICAS` errors and the writes stay applied. A server
+without replication refuses it and the connect fails. Without the option nothing is sent.
+`client.client_durability(n, timeout_ms=None)` sets it on the current connection only (`0` turns it off).
+
+```python
+r = Ruvio("127.0.0.1", 6379, durability_replicas=1, durability_timeout_ms=5000)
+```
+
 ## Seed addresses
 
 `seeds=` takes the place of `host`/`port` (both clients, plain and `cluster=True`): `"host:port"` strings

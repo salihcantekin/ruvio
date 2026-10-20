@@ -60,6 +60,11 @@ export interface ConnectionOptions {
   db?: number;
   /** Connection name set with `CLIENT SETNAME` on every (re)connect. */
   name?: string;
+  /**
+   * Sends `CLIENT DURABILITY REPLICAS replicas [TIMEOUT timeoutMs]` on every (re)connect, so each reply waits until that
+   * many replicas have the data on disk. A server without replication refuses it and the connect fails. Default: not set, nothing is sent.
+   */
+  durability?: { replicas: number; timeoutMs?: number };
   /** RESP protocol version: 2 (default) or 3 (sends `HELLO 3` on connect; enables push messages such as client-side-cache invalidation). */
   protocol?: 2 | 3;
   /** Abort a connection attempt after this many milliseconds with a {@link ConnectionError}. Default 5000; `0` for no limit. */
@@ -182,6 +187,7 @@ class Dial {
 const C_AUTH = cmd('AUTH');
 const C_SELECT = cmd('SELECT');
 const C_SETNAME = cmd('CLIENT', 'SETNAME');
+const C_DURABILITY = cmd('CLIENT', 'DURABILITY');
 const C_HELLO = cmd('HELLO');
 const C_READONLY = cmd('READONLY');
 
@@ -651,6 +657,10 @@ export class Connection extends EventEmitter {
     }
     if (this.db !== 0) send(C_SELECT, [this.db]);
     if (o.name !== undefined) send(C_SETNAME, [o.name]);
+    if (o.durability !== undefined) {
+      const d = o.durability;
+      send(C_DURABILITY, d.timeoutMs === undefined ? ['REPLICAS', d.replicas] : ['REPLICAS', d.replicas, 'TIMEOUT', d.timeoutMs]);
+    }
     if (this.replica) {
       // Redis replicas serve reads only after READONLY; Ruvio replicas serve them anyway and answer OK.
       e.begin(C_READONLY, 0);

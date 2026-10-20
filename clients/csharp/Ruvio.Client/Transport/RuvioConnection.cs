@@ -333,6 +333,8 @@ public sealed class RuvioConnection : IRuvioConnection
         Username = options.Username,
         Password = options.Password,
         Database = database,
+        DurabilityReplicas = options.DurabilityReplicas,
+        DurabilityTimeout = options.DurabilityTimeout,
         ConnectTimeout = options.ConnectTimeout,
         CommandTimeout = options.CommandTimeout,
         MaxInFlightRequests = options.MaxInFlightRequests,

@@ -2100,6 +2100,16 @@ public sealed partial class RuvioClient
     }
 
     /// <inheritdoc />
+    public ValueTask SetDurabilityAsync(int replicas, TimeSpan? timeout = null, CancellationToken cancellationToken = default)
+    {
+        string count = replicas.ToString(CultureInfo.InvariantCulture);
+
+        return timeout is { } limit
+            ? Ok(new RespCommand("CLIENT", "DURABILITY", "REPLICAS", count, "TIMEOUT", ((long)limit.TotalMilliseconds).ToString(CultureInfo.InvariantCulture)), cancellationToken)
+            : Ok(new RespCommand("CLIENT", "DURABILITY", "REPLICAS", count), cancellationToken);
+    }
+
+    /// <inheritdoc />
     public ValueTask<RespValue> GetConfigAsync(string parameter, CancellationToken cancellationToken = default)
     {
         return ExecuteCommandAsync(new RespCommand("CONFIG", "GET", parameter), cancellationToken);

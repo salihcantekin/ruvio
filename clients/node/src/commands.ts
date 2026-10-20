@@ -76,7 +76,7 @@ const W = {
   GROUP: w('GROUP'), NOACK: w('NOACK'), GTID: w('>'), IDLE: w('IDLE'), JUSTID: w('JUSTID'), TIME: w('TIME'),
   RETRYCOUNT: w('RETRYCOUNT'), FORCE: w('FORCE'), LASTID: w('LASTID'), ON: w('ON'), OFF: w('OFF'), ID: w('ID'),
   ADDR: w('ADDR'), SKIPME: w('SKIPME'), YES: w('yes'), NO: w('no'), SETNAME: w('SETNAME'), AUTH: w('AUTH'),
-  OWNER: w('OWNER'), OVERFLOW: w('OVERFLOW'), MIN: w('MIN'),
+  REPLICAS: w('REPLICAS'), TIMEOUT: w('TIMEOUT'), OWNER: w('OWNER'), OVERFLOW: w('OVERFLOW'), MIN: w('MIN'),
 } as const;
 
 type R<T> = Promise<T>;
@@ -625,6 +625,25 @@ export abstract class Commands {
    */
   clientTracking(on: boolean): R<'OK'> {
     return this._1(null, C.CLIENT_TRACKING, on ? W.ON : W.OFF);
+  }
+  /**
+   * Holds this connection's replies until `replicas` replicas have every record written before them on disk (`CLIENT DURABILITY REPLICAS n [TIMEOUT ms]`).
+   * It is per connection and not re-applied after a reconnect; set the `durability` connection option for that. On timeout every reply of the batch becomes `-NOREPLICAS` and the writes stay applied. Refused inside `MULTI` and on a server without replication.
+   *
+   * @param replicas Replicas that must have the data on disk; `0` turns it off.
+   * @param timeoutMs Longest wait in milliseconds (the server default is 5000 when omitted).
+   * @returns `'OK'`.
+   * @throws {@link RuvioError} `ERR` on a server without replication.
+   *
+   * @example
+   * ```ts
+   * await client.clientDurability(1, 2000);
+   * ```
+   */
+  clientDurability(replicas: number, timeoutMs?: number): R<'OK'> {
+    return timeoutMs === undefined
+      ? this._2(null, C.CLIENT_DURABILITY, W.REPLICAS, replicas)
+      : this._4(null, C.CLIENT_DURABILITY, W.REPLICAS, replicas, W.TIMEOUT, timeoutMs);
   }
   /**
    * Returns this connection's id (`CLIENT ID`). Ids are per shard, so on a multi-shard server two connections can share an id.

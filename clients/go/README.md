@@ -45,7 +45,12 @@ Import path `github.com/salihcantekin/ruvio/clients/go` (package `ruvio`).
   split and re-assembled. A standalone server is detected and handled as before. See
   [Cluster](#cluster).
 
-Connecting sends nothing unless configured (`AUTH`, `SELECT`, `CLIENT SETNAME`, `HELLO 3`).
+Connecting sends nothing unless configured (`AUTH`, `SELECT`, `CLIENT SETNAME`, `HELLO 3`, `CLIENT DURABILITY`).
+
+`Options.DurabilityReplicas` (with an optional `DurabilityTimeout`) sends `CLIENT DURABILITY REPLICAS n [TIMEOUT ms]`
+on every connection the client opens, cluster nodes and reconnects included, so a reply is held until `n` replicas have
+the writes on disk; a late replica turns the replies into `-NOREPLICAS`, and a server without replication refuses the
+connect. `ClientDurability(ctx, replicas, timeout)` sets it on one connection (timeout 0 sends no `TIMEOUT`).
 
 ## Install
 

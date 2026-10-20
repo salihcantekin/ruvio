@@ -516,6 +516,8 @@ On a cluster, `CLUSTER SLOTS` comes from the first reachable seed. A slot map re
 
 ### Reads from replicas
 
+`RuvioClientOptions.DurabilityReplicas` (with an optional `DurabilityTimeout`) makes every connection the client opens send `CLIENT DURABILITY REPLICAS n [TIMEOUT ms]` right after `AUTH`, so the server holds that connection's replies until `n` replicas have the writes on disk; a write the replicas do not confirm in time fails with `NOREPLICAS` and stays applied. A server without replication refuses it and the connect fails. The default sends nothing. `SetDurabilityAsync(replicas, timeout)` sets or clears it on one connection.
+
 `RuvioClientOptions.ReadPolicy` (`ReadPolicy.Primary`, `PreferReplica` or `Replica`) chooses where a cluster client sends reads. A standalone connection ignores it. `CLUSTER SLOTS` lists each shard's replicas after its primary; when the slot map is loaded, the client picks one replica per shard at random and keeps it until the next load. Each replica socket sends `READONLY` once, right after it is opened.
 
 ```csharp

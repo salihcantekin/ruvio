@@ -1059,6 +1059,23 @@ fn simple_admin_commands_send_their_words() {
 }
 
 #[test]
+fn client_durability_sends_replicas_and_optional_timeout() {
+    let (reply, request) = probe("+OK\r\n", |c| c.client_durability(2, None));
+    reply.unwrap();
+    assert_eq!(request, words(&["CLIENT", "DURABILITY", "REPLICAS", "2"]));
+
+    let (reply, request) = probe("+OK\r\n", |c| c.client_durability(1, Some(250)));
+    reply.unwrap();
+    assert_eq!(
+        request,
+        words(&["CLIENT", "DURABILITY", "REPLICAS", "1", "TIMEOUT", "250"])
+    );
+
+    let (reply, _) = probe("-ERR denied\r\n", |c| c.client_durability(1, None));
+    assert!(matches!(reply, Err(Error::Server(m)) if m == "ERR denied"));
+}
+
+#[test]
 fn exec_decodes_results_aborts_and_garbage() {
     let (reply, request) = probe("*2\r\n+OK\r\n:1\r\n", |c| c.exec());
     assert_eq!(
