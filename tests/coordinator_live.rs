@@ -1879,4 +1879,9 @@ fn a_replica_started_later_is_found_and_can_be_promoted() {
         .unwrap();
 
     assert!(refused.contains("listed in the file"), "{refused}");
+    let refused = group
+        .on_leader(&["COORDINATOR", "FORGET", "main", &third])
+        .unwrap();
+
+    assert!(refused.contains("is the primary"), "{refused}");
 }

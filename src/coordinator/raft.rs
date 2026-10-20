@@ -60,8 +60,16 @@ pub enum Request {
     /// coordinators are upgraded together.
     Commit(BTreeMap<String, Raised>),
     /// The group's members from now on: the configured ones and the replicas discovered
-    /// following its primary, less those forgotten (`COORDINATOR FORGET`).
-    SetMembers { group: String, members: Vec<Member> },
+    /// following its primary. Applied only while the recorded list is still `previous` (the
+    /// one the leader started from), holds no address twice and holds the current primary.
+    SetMembers {
+        group: String,
+        previous: Option<Vec<Member>>,
+        members: Vec<Member>,
+    },
+    /// `COORDINATOR FORGET`: `member` (a client address) leaves the group's recorded list and
+    /// is not discovered again. Refused for the current primary.
+    Forget { group: String, member: String },
 }
 
 /// One group's committed sequences that rose under the primary of `epoch`.
@@ -417,6 +425,9 @@ struct MachineState {
     /// list holds).
     #[serde(default)]
     members: BTreeMap<String, Vec<Member>>,
+    /// Per group, the client addresses forgotten with `COORDINATOR FORGET`.
+    #[serde(default)]
+    forgotten: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -474,10 +485,16 @@ impl StateMachine {
     /// `configured` with its members as recorded: the recorded list, then any member of the
     /// file it does not hold (added to the file since). The file's list until one is recorded.
     pub fn group(&self, configured: &Group) -> Group {
+        self.group_and_record(configured).0
+    }
+
+    /// [`StateMachine::group`] and the recorded list it was built from, read together.
+    pub fn group_and_record(&self, configured: &Group) -> (Group, Option<Vec<Member>>) {
         let state = self.state.read().unwrap_or_else(|error| error.into_inner());
         let mut group = configured.clone();
+        let record = state.members.get(&configured.name).cloned();
 
-        if let Some(recorded) = state.members.get(&configured.name) {
+        if let Some(recorded) = &record {
             let mut members = recorded.clone();
 
             for member in &configured.members {
@@ -487,7 +504,18 @@ impl StateMachine {
             }
             group.members = members;
         }
-        group
+        (group, record)
+    }
+
+    /// The client addresses forgotten in `group`.
+    pub fn forgotten(&self, group: &str) -> Vec<String> {
+        self.state
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .forgotten
+            .get(group)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn commits(&self) -> Recorded {
@@ -537,24 +565,71 @@ pub fn apply_move(moves: &mut Moves, primaries: &Primaries, request: &Request) -
             true
         }
         Request::EndMove { id } => moves.current.take_if(|current| current.id == *id).is_some(),
-        Request::SetPrimary { .. } | Request::Commit(_) | Request::SetMembers { .. } => false,
+        Request::SetPrimary { .. }
+        | Request::Commit(_)
+        | Request::SetMembers { .. }
+        | Request::Forget { .. } => false,
     }
 }
 
-/// Applies a members record; returns whether it changed anything.
-pub fn apply_members(members: &mut BTreeMap<String, Vec<Member>>, request: &Request) -> bool {
-    let Request::SetMembers {
-        group,
-        members: listed,
-    } = request
-    else {
-        return false;
-    };
-    if members.get(group) == Some(listed) {
-        return false;
+/// Applies a members record or a forget; returns whether it changed anything. The checks
+/// read only the state, so every coordinator decides the same.
+pub fn apply_members(
+    members: &mut BTreeMap<String, Vec<Member>>,
+    forgotten: &mut BTreeMap<String, Vec<String>>,
+    primaries: &Primaries,
+    request: &Request,
+) -> bool {
+    let primary = |group: &String| primaries.get(group).map(|primary| primary.member.clone());
+
+    match request {
+        Request::SetMembers {
+            group,
+            previous,
+            members: listed,
+        } => {
+            let twice = listed.iter().enumerate().any(|(index, member)| {
+                listed[..index]
+                    .iter()
+                    .any(|other| other.address == member.address)
+            });
+            let holds_primary = primary(group).is_none_or(|primary| {
+                listed
+                    .iter()
+                    .any(|member| member.address.to_string() == primary)
+            });
+
+            if members.get(group) != previous.as_ref()
+                || twice
+                || !holds_primary
+                || members.get(group) == Some(listed)
+            {
+                return false;
+            }
+            members.insert(group.clone(), listed.clone());
+            true
+        }
+        Request::Forget { group, member } => {
+            if primary(group).as_ref() == Some(member) {
+                return false;
+            }
+            let known = forgotten.entry(group.clone()).or_default();
+            let mut changed = false;
+
+            if !known.contains(member) {
+                known.push(member.clone());
+                changed = true;
+            }
+            if let Some(listed) = members.get_mut(group) {
+                let before = listed.len();
+
+                listed.retain(|known| known.address.to_string() != *member);
+                changed |= listed.len() != before;
+            }
+            changed
+        }
+        _ => false,
     }
-    members.insert(group.clone(), listed.clone());
-    true
 }
 
 /// After a `SetPrimary` that applied: the group's committed sequences under the new primary.
@@ -615,7 +690,8 @@ pub fn apply_request(primaries: &mut Primaries, request: &Request) -> bool {
         | Request::CommitMove { .. }
         | Request::EndMove { .. }
         | Request::Commit(_)
-        | Request::SetMembers { .. } => false,
+        | Request::SetMembers { .. }
+        | Request::Forget { .. } => false,
         Request::SetPrimary {
             group,
             member,
@@ -721,7 +797,12 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
                     } else {
                         apply_move(&mut state.moves, &state.primaries, &request)
                             || apply_commit(&mut state.commits, &state.primaries, &request)
-                            || apply_members(&mut state.members, &request)
+                            || apply_members(
+                                &mut state.members,
+                                &mut state.forgotten,
+                                &state.primaries,
+                                &request,
+                            )
                     }
                 }
                 EntryPayload::Membership(membership) => {
@@ -1125,13 +1206,60 @@ mod tests {
         // Nothing recorded: the file's list.
         assert_eq!(machine.group(&configured), configured);
         let mut members = BTreeMap::new();
+        let mut forgotten = BTreeMap::new();
+        let mut primaries = Primaries::new();
+
+        primaries.insert(
+            "main".into(),
+            Primary {
+                member: "127.0.0.1:6380".into(),
+                epoch: 2,
+            },
+        );
+        macro_rules! apply {
+            ($request:expr) => {
+                apply_members(&mut members, &mut forgotten, &primaries, $request)
+            };
+        }
         let found = Request::SetMembers {
             group: "main".into(),
+            previous: None,
             members: vec![member(6379), member(6380), member(6381)],
         };
 
-        assert!(apply_members(&mut members, &found));
-        assert!(!apply_members(&mut members, &found));
+        // A list without the primary, or with an address twice, is refused.
+        assert!(!apply!(&Request::SetMembers {
+            group: "main".into(),
+            previous: None,
+            members: vec![member(6379), member(6381)],
+        }));
+        assert!(!apply!(&Request::SetMembers {
+            group: "main".into(),
+            previous: None,
+            members: vec![member(6379), member(6380), member(6381), member(6381)],
+        }));
+        assert!(apply!(&found));
+        // Built from a list that changed since: refused.
+        assert!(!apply!(&found));
+        // The primary is not forgotten; another member is, once.
+        assert!(!apply!(&Request::Forget {
+            group: "main".into(),
+            member: "127.0.0.1:6380".into(),
+        }));
+        let forget = Request::Forget {
+            group: "main".into(),
+            member: "127.0.0.1:6381".into(),
+        };
+
+        assert!(apply!(&forget));
+        assert!(!apply!(&forget));
+        assert_eq!(forgotten["main"], ["127.0.0.1:6381"]);
+        assert_eq!(members["main"].len(), 2);
+        assert!(apply!(&Request::SetMembers {
+            group: "main".into(),
+            previous: Some(vec![member(6379), member(6380)]),
+            members: vec![member(6379), member(6380), member(6381)],
+        }));
         machine.state.write().unwrap().members = members;
         let listed = |group: &Group| -> Vec<u16> {
             group

@@ -455,10 +455,12 @@ coordinator restart is needed.
 
 Members are known by their client address (`host:port` as listed): the Raft record names the primary
 by it. A member that stops answering stays in the list as down. `COORDINATOR FORGET group host:port`
-on the leader removes one for good; it is refused for the primary and for a member the file lists
-(remove it there and restart the coordinators). A replica that still follows the primary is found
-again, so stop it or point it elsewhere first. A member added to the file later is added to the
-recorded list when the coordinators restart.
+on the leader removes one for good and keeps it from being found again, also while it still follows
+the primary (a backup or analytics replica that must never be promoted); it is refused for the primary
+and for a member the file lists (remove it there and restart the coordinators). To take a forgotten
+replica back, list it in the file. A member added to the file later is added to the recorded list
+when the coordinators restart. A replica whose replication address cannot be read is tried again
+after 30 seconds; discovery runs on its own task and never delays a failover.
 
 ## Adding and removing coordinators
 

@@ -1161,7 +1161,19 @@ struct Leader {
     commits: Commits,
     switches: Switches,
     leadership: Arc<Leadership>,
+    discovery: Arc<Discovery>,
 }
+
+/// Replica discovery's own bookkeeping: the groups a discovery runs for, and replicas whose
+/// replication address could not be read, with when, so they are tried again only later.
+#[derive(Default)]
+struct Discovery {
+    running: Mutex<Vec<String>>,
+    failed: Mutex<HashMap<String, Instant>>,
+}
+
+/// How long a replica whose replication address could not be read is left alone.
+const DISCOVERY_RETRY: Duration = Duration::from_secs(30);
 
 /// The leader's loop: start each group from its configured primary, fail over a primary a
 /// majority sees down, and point every answering member at the agreed primary. Each group is
@@ -1184,6 +1196,7 @@ pub async fn lead(
         commits: commits.clone(),
         switches,
         leadership: Arc::clone(&moves.leadership),
+        discovery: Arc::default(),
     };
     let tending: Arc<Mutex<Vec<usize>>> = Arc::default();
     let mut tick = tokio::time::interval(config.ping_interval);
@@ -1260,6 +1273,7 @@ impl Leader {
             commits,
             switches,
             leadership,
+            ..
         } = self;
         let fence = Leading { leadership, raft };
         let group = &machine.group(configured);
@@ -1337,18 +1351,15 @@ impl Leader {
         }
 
         reconcile(config, group, &primary, &seen, &fence).await;
-        self.discover(group, &seen[at]).await;
+        self.start_discovery(configured, group, &seen[at]);
     }
 }
 
 impl Leader {
-    /// Records the replicas the answering primary lists that `group` does not have yet, so
-    /// they are watched, followed and can be promoted. Each is listed by the address clients
-    /// reach it at (as the primary lists it); its replication address comes from its own
-    /// `CONFIG GET replication-listen`, with the listed host when it listens on every
-    /// interface. A replica the group has under another name (a host name for the same
-    /// address) is not added again.
-    async fn discover(&self, group: &Group, primary: &Sighting) {
+    /// Starts [`Leader::discover`] on its own task when the answering primary lists replicas
+    /// that `group` does not have, have not been forgotten and did not fail lately; one at a
+    /// time per group, so it never delays the group's tending.
+    fn start_discovery(&self, configured: &Group, group: &Group, primary: &Sighting) {
         if primary.role != Some(Role::Master)
             || primary
                 .last_ok
@@ -1356,59 +1367,132 @@ impl Leader {
         {
             return;
         }
-        let unknown: Vec<&super::config::Endpoint> = primary
-            .replicas
-            .iter()
-            .filter(|replica| {
-                !group
+        let forgotten = self.machine.forgotten(&group.name);
+        let mut unknown: Vec<super::config::Endpoint> = Vec::new();
+
+        {
+            let mut failed = self
+                .discovery
+                .failed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+
+            failed.retain(|_, at| at.elapsed() < DISCOVERY_RETRY);
+            for replica in &primary.replicas {
+                let name = replica.to_string();
+
+                if !group
                     .members
                     .iter()
-                    .any(|member| member.address == **replica)
-            })
-            .collect();
-
+                    .any(|member| member.address == *replica)
+                    && !forgotten.contains(&name)
+                    && !failed.contains_key(&name)
+                    && !unknown.contains(replica)
+                {
+                    unknown.push(replica.clone());
+                }
+            }
+        }
         if unknown.is_empty() {
             return;
         }
+        {
+            let mut running = self
+                .discovery
+                .running
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+
+            if running.contains(&group.name) {
+                return;
+            }
+            running.push(group.name.clone());
+        }
+        let (leader, configured) = (self.clone(), configured.clone());
+
+        tokio::spawn(async move {
+            leader.discover(&configured, unknown).await;
+            leader
+                .discovery
+                .running
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .retain(|name| *name != configured.name);
+        });
+    }
+
+    /// Records the `unknown` replicas the primary lists, so they are watched, followed and can
+    /// be promoted. Each is listed by the address clients reach it at (as the primary lists
+    /// it); its replication address comes from its own `CONFIG GET replication-listen`, with
+    /// the listed host when it listens on every interface. A replica the group has under
+    /// another name (a host name for the same address) is not added again, and neither is
+    /// one whose address does not resolve now. The list is written only if the recorded one
+    /// did not change meanwhile; otherwise the next tick tries again.
+    async fn discover(&self, configured: &Group, unknown: Vec<super::config::Endpoint>) {
         let mut known = Vec::new();
+        let (group, _) = self.machine.group_and_record(configured);
 
         for member in &group.members {
             known.extend(resolve(&member.address).await);
         }
-        let mut members = group.members.clone();
+        let mut found = Vec::new();
 
         for replica in unknown {
-            if resolve(replica)
-                .await
-                .iter()
-                .any(|address| known.contains(address))
-            {
+            let addresses = resolve(&replica).await;
+
+            if addresses.is_empty() || addresses.iter().any(|address| known.contains(address)) {
                 continue;
             }
-            let Some(replication) = replication_address(replica, self.config.auth.as_deref()).await
+            let Some(replication) =
+                replication_address(&replica, self.config.auth.as_deref()).await
             else {
+                self.discovery
+                    .failed
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(replica.to_string(), Instant::now());
                 continue;
             };
 
-            info!(group = %group.name, member = %replica, %replication, "found a new replica of the group");
-            members.push(Member {
-                address: replica.clone(),
+            known.extend(addresses);
+            found.push(Member {
+                address: replica,
                 replication,
             });
         }
-        if members.len() == group.members.len() {
+        if found.is_empty() {
             return;
         }
+        // Read again just before writing: the write applies only over this exact list.
+        let (group, previous) = self.machine.group_and_record(configured);
+        let mut members = group.members;
+
+        for member in found {
+            if members.iter().all(|known| known.address != member.address) {
+                info!(group = %configured.name, member = %member.address, replication = %member.replication, "found a new replica of the group");
+                members.push(member);
+            }
+        }
         let request = Request::SetMembers {
-            group: group.name.clone(),
+            group: configured.name.clone(),
+            previous,
             members,
         };
 
-        if let Err(error) = self.raft.client_write(request).await {
-            warn!(group = %group.name, %error, "could not record the group's new replicas");
+        match tokio::time::timeout(DISCOVERY_WRITE, self.raft.client_write(request)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                warn!(group = %configured.name, %error, "could not record the group's new replicas")
+            }
+            Err(_) => {
+                warn!(group = %configured.name, "recording the group's new replicas timed out")
+            }
         }
     }
 }
+
+/// How long recording discovered replicas may take before it is tried again on a later tick.
+const DISCOVERY_WRITE: Duration = Duration::from_secs(5);
 
 /// The socket addresses `endpoint` names now; none when it does not resolve.
 async fn resolve(endpoint: &super::config::Endpoint) -> Vec<std::net::SocketAddr> {
@@ -1887,6 +1971,13 @@ async fn reconcile(
             continue;
         }
 
+        // The primary listed again under another entry (the same address or replication
+        // address): never pointed at itself.
+        if index != at
+            && (member.address == target.address || member.replication == target.replication)
+        {
+            continue;
+        }
         let agrees = if index == at {
             sighting.role == Some(Role::Master)
         } else {
@@ -2640,6 +2731,33 @@ mod tests {
         assert_eq!(sent(), 1);
         reconcile(&config, &group, primary, &seen, &Allow(3.into())).await;
         assert_eq!(sent(), 4);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_primary_listed_twice_is_never_pointed_at_itself() {
+        let (mut group, commands) = listening(3, false).await;
+
+        // Entry 2 is the primary under another name.
+        group.members[2] = group.members[0].clone();
+        let primary = &Primary {
+            member: group.members[0].address.to_string(),
+            epoch: 2,
+        };
+        let seen = vec![
+            member(Role::Master, &[10], &[0]),
+            member(following(&group, 0), &[10], &[0]),
+            member(Role::Master, &[10], &[0]),
+        ];
+
+        reconcile(
+            &config(Duration::from_millis(1000)),
+            &group,
+            primary,
+            &seen,
+            &Allow(3.into()),
+        )
+        .await;
+        assert_eq!(commands.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]

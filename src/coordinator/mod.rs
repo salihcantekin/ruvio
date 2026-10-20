@@ -644,26 +644,23 @@ impl Api {
         {
             return Value::Error(format!("ERR {address} is the primary of {}", group.name));
         }
-        let members: Vec<config::Member> = group
-            .members
-            .iter()
-            .filter(|member| member.address != address)
-            .cloned()
-            .collect();
-
-        if members.len() == group.members.len() {
+        if !group.members.iter().any(|member| member.address == address) {
             return Value::Error(format!("ERR {address} is not a member of {}", group.name));
         }
-        let request = raft::Request::SetMembers {
+        let request = raft::Request::Forget {
             group: group.name.clone(),
-            members,
+            member: address.to_string(),
         };
 
         match tokio::time::timeout(MEMBERSHIP_WAIT, self.raft.client_write(request)).await {
-            Ok(Ok(_)) => {
+            Ok(Ok(reply)) if reply.data => {
                 info!(group = %group.name, member = %address, "forgot a member");
                 Value::Simple("OK".into())
             }
+            Ok(Ok(_)) => Value::Error(format!(
+                "ERR {address} was not forgotten: it is the primary of {} now",
+                group.name
+            )),
             Ok(Err(error)) => Value::Error(format!("ERR {error}")),
             Err(_) => Value::Error("ERR the change was not committed in time".into()),
         }
