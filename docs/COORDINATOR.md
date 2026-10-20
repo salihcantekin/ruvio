@@ -54,6 +54,12 @@ learns it was replaced. Two settings on the data nodes bound that window:
 Writes the old primary took in that window are lost when it rejoins. Use `min-replicas-to-write 1` (or
 higher) in every group a coordinator manages.
 
+A lost `LEASE` or `SEMAPHORE` grant does not come back as the same token: tokens carry the cluster
+map's version, which grows with every failover and every committed move, so the new primary's tokens
+are larger than any the old one handed out. A resource that keeps the largest token it has seen
+refuses a holder whose grant was lost. Without a coordinator the generation is the replication epoch;
+with a hand-written map and no coordinator, it is the larger of the epoch and the map's `version`.
+
 ## Setting it up
 
 Each data node needs `replication.listen` (so a promoted replica can serve replicas) and a WAL-backed

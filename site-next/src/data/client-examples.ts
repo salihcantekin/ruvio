@@ -73,7 +73,7 @@ const bucket = await c.limitTokensWithRetry('api:key-7:burst', 10, 1_000, 2);
 
 let mut db = Client::connect("127.0.0.1", 6379)?;
 let token = db.lease("job:nightly-report", 30_000)?;
-// Some(17) -> you hold it, token 17
+// Some(token) -> you hold it
 // None     -> someone else holds it
 if let Some(token) = token {
     let released = db.release("job:nightly-report", token as u64)?;
@@ -83,7 +83,7 @@ if let Some(token) = token {
 var db = await connection.GetDefaultDatabaseAsync();
 
 long? token = await db.LeaseAsync("job:nightly-report", 30_000);
-// 17   -> you hold it, token 17
+// token -> you hold it
 // null -> someone else holds it
 if (token is long held)
 {
@@ -96,14 +96,14 @@ if err != nil { return err }
 token, ok, err := c.Lease(ctx, "job:nightly-report", 30*time.Second)
 if err != nil { return err }
 if !ok { return nil } // someone else holds it
-// you hold it, token 17
+// you hold it
 released, err := c.Release(ctx, "job:nightly-report", token)
 if err != nil { return err }
 fmt.Println(released) // true -> released (false if the token no longer matches)`,
     java: `var c = RuvioClient.connect("127.0.0.1", 6379);
 
 Long token = c.lease("job:nightly-report", 30_000);
-// 17   -> you hold it, token 17
+// token -> you hold it
 // null -> someone else holds it
 if (token != null) {
     Boolean released = c.release("job:nightly-report", token);
@@ -113,7 +113,7 @@ if (token != null) {
 
 r = ruvio.Ruvio("127.0.0.1", 6379)
 token = r.lease("job:nightly-report", 30_000)
-# 17   -> you hold it, token 17
+# token -> you hold it
 # None -> someone else holds it
 if token is not None:
     released = r.release("job:nightly-report", token)
@@ -122,7 +122,7 @@ if token is not None:
 
 const c = createClient({ host: '127.0.0.1', port: 6379 });
 const token = await c.lease('job:nightly-report', 30_000);
-// 17   -> you hold it, token 17
+// token -> you hold it
 // null -> someone else holds it
 if (token !== null) {
   const released = await c.release('job:nightly-report', token);

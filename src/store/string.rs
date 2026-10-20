@@ -577,7 +577,7 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         }
 
         if kind.is_none() {
-            return Ok(Some((1, expires_at)));
+            return Ok(Some((self.next_fence_token(0), expires_at)));
         }
 
         let Some(Value::Lease(lease)) = self.object_value(key).ok().flatten() else {
@@ -588,7 +588,7 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
             return Ok(None);
         }
 
-        Ok(Some((lease.token.saturating_add(1), expires_at)))
+        Ok(Some((self.next_fence_token(lease.token), expires_at)))
     }
 
     pub(crate) fn lease_release_plan(
@@ -656,6 +656,8 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
 
         let before = self.entry_charge(key);
 
+        self.note_fence_token(token);
+
         if kind.is_none() {
             self.insert_entry(
                 key,
@@ -695,11 +697,12 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         let expires_at = now.saturating_add(ttl_ms);
 
         match self.object_value(key) {
-            Ok(None) => Ok(Some((first_semaphore_token(now), expires_at, true))),
+            Ok(None) => Ok(Some((self.next_fence_token(0), expires_at, true))),
             Ok(Some(Value::Semaphore(semaphore))) => {
                 let live = semaphore.holders().filter(|(_, at)| *at > now).count() as u64;
+                let after = semaphore.next_token().saturating_sub(1);
 
-                Ok((live < max).then_some((semaphore.next_token(), expires_at, false)))
+                Ok((live < max).then(|| (self.next_fence_token(after), expires_at, false)))
             }
 
             _ => Err(WrongType),
@@ -717,6 +720,8 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
     ) -> Result<(), WrongType> {
         let now = self.now_unix_millis().get();
         let before = self.entry_charge(key);
+
+        self.note_fence_token(token);
 
         match self.value_kind(key) {
             None => {

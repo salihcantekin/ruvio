@@ -277,6 +277,15 @@ fn coordinators_fail_over_a_dead_primary_and_bring_it_back_as_a_replica() {
             .starts_with("WRONGPASS")
     );
 
+    // A lease the old primary granted: the new one's tokens are larger, from a newer generation.
+    let lease = |node: usize| -> u64 {
+        call(&group.resp[node].to_string(), &["LEASE", "fence", "100"])
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let old_token = lease(0);
+
     // The primary dies: a replica takes over and the other follows it.
     nodes[0].kill();
     let killed = Instant::now();
@@ -294,6 +303,12 @@ fn coordinators_fail_over_a_dead_primary_and_bring_it_back_as_a_replica() {
         killed.elapsed() < Duration::from_secs(15),
         "failover took {:?}",
         killed.elapsed()
+    );
+    let new_token = lease(promoted);
+
+    assert!(
+        new_token >> 48 > old_token >> 48,
+        "token {new_token} after the failover is not from a newer generation than {old_token}"
     );
     wait_until("the other replica to follow the new primary", || {
         call(&group.resp[other].to_string(), &["GET", "after"]).as_deref() == Some("1")
@@ -617,6 +632,13 @@ fn a_slot_range_moves_between_groups_while_a_client_keeps_writing() {
         );
     }
 
+    // A lease in the range moves with it; the new owner's next token is from a newer generation.
+    let lock = key_in(100..200, "lock");
+    let old_token: u64 = call(&groups.node(0), &["LEASE", &lock, "600000"])
+        .unwrap()
+        .parse()
+        .unwrap();
+
     // A client writes one key of the range throughout, following MOVED and TRYAGAIN as a
     // cluster client does; every write it saw acknowledged must be on the new owner.
     let busy = key_in(100..200, "busy");
@@ -687,6 +709,21 @@ fn a_slot_range_moves_between_groups_while_a_client_keeps_writing() {
         (0..4).all(|index| groups.version(index).as_deref() == Some("4"))
     });
     let b_port = groups.resp[2].port();
+    let token = old_token.to_string();
+
+    assert_eq!(
+        call(&groups.node(2), &["RELEASE", &lock, &token]).as_deref(),
+        Some("1")
+    );
+    let new_token: u64 = call(&groups.node(2), &["LEASE", &lock, "600000"])
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    assert!(
+        new_token >> 48 > old_token >> 48,
+        "token {new_token} after the move is not from a newer generation than {old_token}"
+    );
 
     for key in &keys {
         let slot = ruvio::routing::hash_slot(key.as_bytes());
