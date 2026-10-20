@@ -11,6 +11,7 @@ const READ_BYTES: usize = 64 * 1024;
 const QUEUE_HIGH_WATER: usize = crate::pubsub::PUBSUB_QUEUE / 2;
 const IDLE_POLL: Duration = Duration::from_millis(20);
 const HEARTBEAT: Duration = Duration::from_secs(1);
+const FOLLOWS_ANOTHER: &str = "the shard follows another primary; resume on it";
 
 /// Validates the request and starts the stream; returns the cursor the stream begins after.
 pub(super) fn start(
@@ -65,7 +66,11 @@ pub(super) fn start(
         subscription,
         resp3,
         start,
-        Feed { durable, committed },
+        Feed {
+            durable,
+            committed,
+            epoch: state.epoch.get(),
+        },
         shutdown,
     ));
 
@@ -77,6 +82,8 @@ pub(super) fn start(
 struct Feed {
     durable: Arc<AtomicU64>,
     committed: Option<Arc<crate::replication::DurableReplies>>,
+    /// The shard's epoch when the stream was asked for.
+    epoch: u64,
 }
 
 impl Feed {
@@ -149,9 +156,21 @@ async fn stream(
     // Where the last chunk stopped in the log, so the next one does not rescan the segment.
     let mut reader = FrameCursor::default();
     let mut last_report = Instant::now();
+    // `REPLICAOF host port` cuts this shard's log back to a fork and continues it with
+    // another primary's records, and a promotion after that starts a new generation; past
+    // either, the cursors this stream labels would be wrong. The subscriber resumes on the
+    // primary the shard now follows, where a cursor past the fork is rewound.
+    let followed = || {
+        state.role.get() == crate::config::ReplicationRole::Replica
+            || state.epoch.get() != feed.epoch
+    };
 
     loop {
         if outbound.closed.get() || shutdown.is_requested() {
+            return;
+        }
+        if followed() {
+            resync(&outbound, resp3, FOLLOWS_ANOTHER);
             return;
         }
 
@@ -203,6 +222,12 @@ async fn stream(
             reader = cursor;
             read
         });
+
+        // The shard may have changed role while the log was read.
+        if followed() {
+            resync(&outbound, resp3, FOLLOWS_ANOTHER);
+            return;
+        }
 
         let frames = match read {
             Ok(Ok(FrameRead::Frames(frames))) => frames,
