@@ -508,9 +508,9 @@ there (`stopped` on the old leader); run `COORDINATOR REBALANCE` on the new lead
 it again is always safe, since it starts from where the slots are. A group listed with `slots = []`
 gets its share this way.
 
-A target group's replica takes a moved range when the next move's copy reaches it from its primary,
-even if the coordinators' map for the first move has not reached it yet, so moves can run back to
-back.
+Before each move the leader also sends the current map to the target group's replicas (waiting at
+most 1 s for each): a replica still waiting for the map of the move before cannot record the new range
+when its copy arrives, and would then refuse every newer map. So moves can run back to back.
 
 The range is frozen from step 3 until the source gets the new map. Measured locally (debug build, one
 Mac running other builds, two groups of a primary and a replica with durability `always`, 303 keys,
@@ -647,6 +647,10 @@ releases side by side, so the refused handshake itself was not part of the run. 
 
 - Ranges move only when an operator asks (`COORDINATOR MOVE`, `COORDINATOR REBALANCE`), one at a time;
   nothing rebalances by keys, memory or load, and nothing starts a rebalance on its own.
+- A replica of a target group that is down, or does not answer within 1 s, while two moves into its group
+  run can be left on an old map once it is back: it refuses the second range and every newer map
+  (`gives this node slot ..., whose data is not here` in its log). Give it a full copy again
+  (restart it with an empty data directory).
 
 ## Tests
 
