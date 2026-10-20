@@ -26,6 +26,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 /** Slot table, hashtags, key extraction and MOVED handling against scripted fake servers (no live server). */
 class ClusterUnitTest {
@@ -396,6 +397,136 @@ class ClusterUnitTest {
         assertEquals("from-third", c.get(k));
         assertEquals(2, p.a.commands("CLUSTER").size(), "unknown node -> CLUSTER SLOTS refresh");
         assertTrue(c.nodeAddresses().contains(third.node.address()));
+    }
+
+    // ---- ASK and TRYAGAIN -------------------------------------------------------------------------
+
+    @Test
+    @Timeout(20)
+    void askSendsAskingThenTheCommandToTheNamedNodeAndLeavesTheTableAlone() throws Exception {
+        Pair p = new Pair();
+        RuvioClient<String, String> c = p.client();
+        String k = p.key(true, 0);
+        int slot = HashSlot.of(k.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        p.b.store.put(k, "from-b");
+        java.util.concurrent.atomic.AtomicInteger aGets = new java.util.concurrent.atomic.AtomicInteger();
+        p.a.node.handler = a -> a.get(0).equalsIgnoreCase("GET") && aGets.incrementAndGet() == 1
+                ? FakeNode.error("ASK " + slot + " " + p.b.node.address()) : p.a.handle(a);
+        p.a.store.put(k, "from-a");
+        // B does not own the slot; after ASKING it answers the command anyway.
+        p.b.node.handler = a -> a.get(0).equalsIgnoreCase("GET") ? FakeNode.bulk(p.b.store.get(a.get(1))) : p.b.handle(a);
+        assertEquals("from-b", c.get(k));
+        assertEquals(Arrays.asList(Arrays.asList("ASKING"), Arrays.asList("GET", k)),
+                p.b.received().stream().filter(x -> !x.get(0).equalsIgnoreCase("CLUSTER")).collect(java.util.stream.Collectors.toList()),
+                "B got ASKING then the command");
+        assertEquals("from-a", c.get(k), "the table was not updated: the next command goes to A again");
+        assertEquals(2, p.a.commands("GET").size());
+        assertEquals(1, p.b.commands("GET").size());
+        assertEquals(1, p.a.commands("CLUSTER").size(), "no reload for a known node");
+    }
+
+    @Test
+    @Timeout(20)
+    void askToAnUnknownNodeIsFollowed() throws Exception {
+        Pair p = new Pair();
+        Shard third = new Shard(0, 0);
+        RuvioClient<String, String> c = p.client();
+        String k = p.key(true, 0);
+        int slot = HashSlot.of(k.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        third.store.put(k, "from-third");
+        p.a.node.handler = a -> a.get(0).equalsIgnoreCase("GET")
+                ? FakeNode.error("ASK " + slot + " " + third.node.address()) : p.a.handle(a);
+        third.node.handler = a -> a.get(0).equalsIgnoreCase("GET") ? FakeNode.bulk(third.store.get(a.get(1))) : third.handle(a);
+        assertEquals("from-third", c.get(k));
+        assertEquals("ASKING", third.received().get(0).get(0));
+        assertEquals(Arrays.asList("GET", k), third.received().get(1));
+        assertEquals(1, p.a.commands("CLUSTER").size(), "no table reload for an ASK");
+    }
+
+    @Test
+    @Timeout(20)
+    void anErrorToAskingFailsTheCommand() throws Exception {
+        Pair p = new Pair();
+        RuvioClient<String, String> c = p.client();
+        String k = p.key(true, 0);
+        int slot = HashSlot.of(k.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        p.a.node.handler = a -> a.get(0).equalsIgnoreCase("GET")
+                ? FakeNode.error("ASK " + slot + " " + p.b.node.address()) : p.a.handle(a);
+        p.b.node.handler = a -> a.get(0).equalsIgnoreCase("ASKING") ? FakeNode.error("ERR no asking") : FakeNode.bulk("x");
+        RuvioServerException e = assertThrows(RuvioServerException.class, () -> c.get(k));
+        assertEquals("ERR", e.code());
+    }
+
+    @Test
+    @Timeout(20)
+    void tryAgainIsRetriedAfterAShortWait() throws Exception {
+        Pair p = new Pair();
+        RuvioClient<String, String> c = p.client();
+        String k = p.key(true, 0);
+        p.a.store.put(k, "v");
+        java.util.concurrent.atomic.AtomicInteger gets = new java.util.concurrent.atomic.AtomicInteger();
+        p.a.node.handler = a -> a.get(0).equalsIgnoreCase("GET") && gets.incrementAndGet() == 1
+                ? FakeNode.error("TRYAGAIN slot is being moved") : p.a.handle(a);
+        long t0 = System.nanoTime();
+        assertEquals("v", c.get(k));
+        assertTrue(System.nanoTime() - t0 >= 4_000_000L, "waited about 5 ms before the retry");
+        assertEquals(2, p.a.commands("GET").size());
+    }
+
+    @Test
+    @Timeout(20)
+    void tryAgainIsRetriedInTheAsyncApi() throws Exception {
+        Pair p = new Pair();
+        RuvioClient<String, String> c = p.client();
+        String k = p.key(true, 0);
+        p.a.store.put(k, "v");
+        java.util.concurrent.atomic.AtomicInteger gets = new java.util.concurrent.atomic.AtomicInteger();
+        p.a.node.handler = a -> a.get(0).equalsIgnoreCase("GET") && gets.incrementAndGet() <= 2
+                ? FakeNode.error("TRYAGAIN slot is being moved") : p.a.handle(a);
+        long t0 = System.nanoTime();
+        assertEquals("v", c.async().get(k).get(10, java.util.concurrent.TimeUnit.SECONDS));
+        assertTrue(System.nanoTime() - t0 >= 14_000_000L, "waited 5 ms and 10 ms");
+        assertEquals(3, p.a.commands("GET").size());
+    }
+
+    @Test
+    @Timeout(20)
+    void tryAgainFourTimesReturnsTheErrorAfterThreeRetries() throws Exception {
+        Pair p = new Pair();
+        RuvioClient<String, String> c = p.client();
+        String k = p.key(true, 0);
+        p.a.node.handler = a -> a.get(0).equalsIgnoreCase("GET")
+                ? FakeNode.error("TRYAGAIN slot is being moved") : p.a.handle(a);
+        RuvioServerException e = assertThrows(RuvioServerException.class, () -> c.get(k));
+        assertEquals("TRYAGAIN", e.code());
+        assertEquals(4, p.a.commands("GET").size(), "sent once plus three retries");
+    }
+
+    @Test
+    @Timeout(20)
+    void askAndMovedShareOneRedirectBudget() throws Exception {
+        Pair p = new Pair();
+        RuvioClient<String, String> c = p.client();
+        String k = p.key(true, 0);
+        int slot = HashSlot.of(k.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        String toB = "ASK " + slot + " " + p.b.node.address();
+        // A: ASK -> B; B: MOVED -> A; A: ASK -> B; B: ASK -> A (the fourth redirect, given to the caller).
+        java.util.concurrent.atomic.AtomicInteger aGets = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger bGets = new java.util.concurrent.atomic.AtomicInteger();
+        p.a.node.handler = a -> a.get(0).equalsIgnoreCase("GET")
+                ? FakeNode.error(aGets.incrementAndGet() == 3 ? "ASK " + slot + " " + p.b.node.address() : toB)
+                : p.a.handle(a);
+        p.b.node.handler = a -> {
+            if (!a.get(0).equalsIgnoreCase("GET")) {
+                return p.b.handle(a);
+            }
+            return FakeNode.error(bGets.incrementAndGet() == 1 ? "MOVED " + slot + " " + p.a.node.address()
+                    : "ASK " + slot + " " + p.a.node.address());
+        };
+        RuvioServerException e = assertThrows(RuvioServerException.class, () -> c.get(k));
+        assertEquals("ASK", e.code());
+        assertEquals(2, p.a.commands("GET").size(), "A saw the first send and the MOVED retry");
+        assertEquals(2, p.b.commands("GET").size());
     }
 
     // ---- failures -------------------------------------------------------------------------------

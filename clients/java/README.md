@@ -186,6 +186,11 @@ pipelined commands; use `{hashtag}` keys to keep related keys in one slot.
   table is re-read with `CLUSTER SLOTS` only when the named node is unknown, or from the second MOVED for the same
   command on; the retry still goes to the node the MOVED named. The retry runs on a small background thread, never on a connection reader thread. The router keeps a copy of each
   command's frame for this (about 100 bytes allocated per routed command: the request object and the copy).
+* **ASK**: `ASKING` and the command are sent to the named node in one write (an unknown node is opened first), the
+  `+OK` is dropped and the command's reply is returned; the slot table is not changed, so the next command for the
+  slot still goes to its owner. ASK and MOVED share the 3-redirect budget.
+* **TRYAGAIN**: the command is sent again, routed by the current slot table, at most 3 times after waits of 5, 10
+  and 20 ms (scheduled on the background thread, never a sleep); the error is returned after the 3rd retry.
 * **Connection loss**: only commands in flight on that node fail (`RuvioConnectionException`); nothing is
   replayed, the other nodes keep working, and the node's connection reopens with its next command.
 * **Pipelines** (`pipeline()`): commands are routed when queued and grouped per node; `flush()` sends one write

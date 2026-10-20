@@ -59,16 +59,21 @@ class _State:
 
 class _RoutedFuture(asyncio.Future):  # type: ignore[type-arg]
     """The future of a single-key command handed to the shared connection. It behaves like any
-    future; only a ``-MOVED`` reply is intercepted (in ``set_exception``) and followed to the node
+    future; only a ``-MOVED`` / ``-ASK`` / ``-TRYAGAIN`` reply is intercepted (in ``set_exception``) and followed to the node
     the reply names. This keeps the warm path free of an extra coroutine."""
 
     __slots__ = ("owner", "data", "conv", "dec")
 
     def set_exception(self, exc: BaseException) -> None:
-        if exc.__class__ is MovedError and not self.done():
+        if (exc.__class__ is MovedError or (exc.__class__ is ResponseError and cl.is_tryagain(exc))) and not self.done():
             asyncio.ensure_future(self.owner._retry_moved(self, exc), loop=self.get_loop())
         else:
             asyncio.Future.set_exception(self, exc)
+
+
+def _consume(fut: "asyncio.Future[Any]") -> None:
+    if not fut.cancelled():
+        fut.exception()
 
 
 def _is_blocking(name: bytes, args: List[bytes]) -> bool:
@@ -98,7 +103,7 @@ class ClusterRuvio(Ruvio):
     * ``dbsize`` adds up all shards, ``keys`` joins them, ``flushdb``/``flushall`` run on every shard,
       ``auth``/``select``/``client_setname`` apply to every node, ``scan`` walks shards in turn (opaque cursor).
     * Pipelines are grouped per node; transactions must use one slot.
-    * ``MOVED`` is followed up to 3 times per command. Failed node connections are reopened by the next
+    * ``MOVED`` and ``ASK`` are followed up to 3 times per command in all, ``TRYAGAIN`` is retried up to 3 times. Failed node connections are reopened by the next
       command; a failed command is never re-sent.
     * With ``read_policy=ReadPolicy.PREFER_REPLICA`` or ``REPLICA`` (default ``PRIMARY``), commands the server
       flags read-only and not blocking go to one replica of the key's shard, picked at random whenever the slot
@@ -465,8 +470,10 @@ class ClusterRuvio(Ruvio):
         proto.send(data)
         try:
             return await fut
-        except MovedError as err:
-            return await self._redirect(err, data, conv, dec, False)
+        except ResponseError as err:
+            if err.__class__ is MovedError or cl.is_tryagain(err):
+                return await self._redirect(err, data, conv, dec, False)
+            raise
 
     # ---------------------------------------------------------------- reads from replicas
     async def _replica(self, ni: int) -> Optional[_Node]:
@@ -508,9 +515,9 @@ class ClusterRuvio(Ruvio):
         if node is not None:
             try:
                 return await self._send(node, data, conv, dec)
-            except MovedError as err:
-                return await self._redirect(err, data, conv, dec, False)
             except ResponseError as exc:
+                if exc.__class__ is MovedError or cl.is_tryagain(exc):
+                    return await self._redirect(exc, data, conv, dec, False)
                 if not self._loading(node, exc) or self._cl.policy == cl.POLICY_REPLICA:
                     raise
         if slot is None:
@@ -564,21 +571,95 @@ class ClusterRuvio(Ruvio):
             return proto
         raise error
 
-    async def _redirect(self, err: MovedError, data: bytes, conv: Conv, dec: bool, blocking: bool) -> Any:
-        """``-MOVED``: re-sends the command to the node the reply names, at most
-        ``MAX_REDIRECTS`` times; the last ``MovedError`` is raised when they run out."""
-        for hop in range(cl.MAX_REDIRECTS):
-            mv = cl.parse_moved(err)
-            if mv is None:
-                raise err
-            node = await self._moved_to(mv, hop)
+    async def _redirect(self, err: ResponseError, data: bytes, conv: Conv, dec: bool, blocking: bool) -> Any:
+        """Follows ``-MOVED`` and ``-ASK`` (one budget of ``MAX_REDIRECTS`` per command) and re-sends after
+        ``-TRYAGAIN`` (``TRYAGAIN_DELAYS``, one ``asyncio.sleep`` before each re-send); the last error is raised
+        when a budget runs out. ``ASK`` sends ``ASKING`` and the command to the named node and leaves the table alone."""
+        hops = moved = tries = 0
+        while True:
+            ask = None
+            if cl.is_tryagain(err):
+                node = self._route_node(data)
+                if node is None or tries == len(cl.TRYAGAIN_DELAYS):
+                    raise err
+                await asyncio.sleep(cl.TRYAGAIN_DELAYS[tries])
+                tries += 1
+            else:
+                if hops == cl.MAX_REDIRECTS:
+                    raise err
+                ask = cl.parse_ask(err)
+                if ask is not None:
+                    node = self._ask_node(ask)
+                else:
+                    mv = cl.parse_moved(err)
+                    if mv is None:
+                        raise err
+                    node = await self._moved_to(mv, moved)
+                    moved += 1
+                hops += 1
             try:
+                if ask is not None:
+                    return await self._send_asking(node, data, conv, dec, blocking)
                 if blocking:
                     return await self._send_blocking(node, data, conv, dec)
                 return await self._send(node, data, conv, dec)
-            except MovedError as e:
+            except ResponseError as e:
+                if e.__class__ is not MovedError and not cl.is_tryagain(e):
+                    raise
                 err = e
-        raise err
+
+    def _route_node(self, data: bytes) -> Optional[_Node]:
+        """The node the current table names for a command's frame (the seed for a keyless one); None for a
+        command that is split over several nodes or sent to all of them."""
+        c = self._cl
+        ni = cl.node_index(data, c.slots)
+        if ni is not None:
+            return c.targets[ni]
+        name, _ = _frame_head(data)
+        p = cl.plan(name.upper(), cl.split_frame(data))
+        if p[0] == cl.PLAN_SLOT:
+            return self._owner(p[1])
+        if p[0] == cl.PLAN_SPLIT and p[1]:
+            return self._owner(cl.key_slot(p[1][0])) if len({cl.key_slot(k) for k in p[1]}) == 1 else None
+        return None
+
+    def _ask_node(self, ask: Tuple[int, str, int]) -> _Node:
+        """The node an ``ASK`` names; one that is not known yet gets a connection, the table is not touched."""
+        _, host, port = ask
+        c = self._cl
+        node = c.by_addr.get((host, port))
+        if node is None:
+            node = self._new_node(host, port)
+            c.by_addr[(host, port)] = node
+        return node
+
+    async def _send_asking(self, node: _Node, data: bytes, conv: Conv, dec: bool, blocking: bool) -> Any:
+        """``ASKING`` and the command in one write; the ``ASKING`` reply is dropped unless it is an error."""
+        if blocking:
+            proto = await _open(node.opts, None)
+        else:
+            proto = node.proto
+            if proto is None or proto.closed:
+                proto = await self._open_node(node)
+        try:
+            afut = proto.loop.create_future()
+            fut = proto.loop.create_future()
+            proto.pending.append((afut, None, dec))
+            proto.pending.append((fut, conv, dec))
+            if blocking:
+                proto.transport.write(cl.ASKING + data)
+            else:
+                proto.send(cl.ASKING + data)
+            try:
+                await afut
+            except BaseException:
+                fut.add_done_callback(_consume)  # the command still gets its reply: read it, drop it
+                raise
+            return await fut
+        finally:
+            if blocking:
+                proto.on_lost = None
+                proto.transport.close()
 
     async def _moved_to(self, mv: Tuple[int, str, int], hop: int) -> _Node:
         """The node a ``MOVED`` names. The command's first ``MOVED`` to a node in the table points
@@ -605,8 +686,10 @@ class ClusterRuvio(Ruvio):
             if node.proto is None or node.proto.closed:
                 node = await self._open_owner(slot)
             return await self._send(node, data, conv, dec)
-        except MovedError as err:
-            return await self._redirect(err, data, conv, dec, blocking)
+        except ResponseError as err:
+            if err.__class__ is MovedError or cl.is_tryagain(err):
+                return await self._redirect(err, data, conv, dec, blocking)
+            raise
 
     async def _special(self, name: bytes, data: bytes, conv: Conv, dec: bool) -> Any:
         args = cl.split_frame(data)

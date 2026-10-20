@@ -4,6 +4,7 @@ Notable changes to the Rust client crate `ruvio-client`. New entries go under "U
 
 ## Unreleased
 
+- A cluster client now follows `-ASK slot host:port`: it sends `ASKING` and the command to the named node in one write and returns the command's reply, without changing the slot map. `ASK` and `MOVED` share the limit of 3 redirects per command. A `-TRYAGAIN` reply is retried up to 3 times, after sleeps of 5, 10 and 20 ms, before it is returned. Normal replies are not affected.
 - **Behavior change:** `ClientOptions::command_timeout` is now `Some(30 s)` by default (was `None`, no limit); `None` turns it off. It also applies after a reconnect and on new shard sockets, but not on Pub/Sub sockets, and `MONITOR` drops it from its socket. A blocking command gets its own wait on top (`BLPOP k 5` may take 5 s plus the timeout; a wait of 0, or one the client cannot parse, has no deadline; a pipeline takes its largest wait), and a Pub/Sub or `MONITOR` connection never times out while it waits for messages (issue #48 follow-up).
 - `move_slots(first, last, shard)` and `move_slots_status()` for `RUVIO MOVESLOTS`, which moves a slot range to another shard of the same server.
 - `hmset(key, fields)` sends `HMSET` (multi-field `HSET` that replies `OK`; Redis marks it deprecated) (issue #26).

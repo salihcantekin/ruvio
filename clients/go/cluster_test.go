@@ -1020,3 +1020,153 @@ func TestMayBlockFindsBlockingCommandsInAPipeline(t *testing.T) {
 		}
 	}
 }
+
+// askReply is an -ASK reply for the slot of args[1] naming node to.
+func askReply(args []string, to *fakeNode) string {
+	return fmt.Sprintf("-ASK %d %s\r\n", KeySlot(args[1]), to.addr)
+}
+
+func TestFakeAskIsFollowedWithoutPatchingTheTable(t *testing.T) {
+	k := keyFor(true, 0)
+	var b *fakeNode
+	var asked atomic.Bool
+	a, b := twoNodes(t, func(f *fakeNode, args []string) string {
+		if strings.ToUpper(args[0]) == "GET" && asked.CompareAndSwap(false, true) {
+			return askReply(args, b)
+		}
+		return defaultFake(f, args)
+	}, nil)
+	c := newClusterClient(t, a.addr)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	v, err := getS(c, ctx, k)
+	if err != nil || v != "v:"+k+"@"+b.addr {
+		t.Fatalf("%q %v", v, err)
+	}
+	if got := b.commands(); len(got) != 2 || got[0] != "ASKING" || got[1] != "GET "+k {
+		t.Fatalf("node B got %v, want ASKING then the GET", got)
+	}
+	// the table was not touched: the next GET for the slot goes to A again
+	v, err = getS(c, ctx, k)
+	if err != nil || v != "v:"+k+"@"+a.addr {
+		t.Fatalf("%q %v", v, err)
+	}
+	if a.count("GET") != 2 || b.count("GET") != 1 {
+		t.Fatalf("a=%v b=%v", a.commands(), b.commands())
+	}
+}
+
+func TestFakeAskToUnknownNodeIsFollowed(t *testing.T) {
+	var c3 *fakeNode
+	a, _ := twoNodes(t, func(f *fakeNode, args []string) string {
+		if strings.ToUpper(args[0]) == "GET" {
+			return askReply(args, c3)
+		}
+		return defaultFake(f, args)
+	}, nil)
+	c3 = newFakeNode(t, nil)
+	c3.handler = defaultFake
+	k := keyFor(true, 0)
+	c := newClusterClient(t, a.addr)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	v, err := getS(c, ctx, k)
+	if err != nil || v != "v:"+k+"@"+c3.addr {
+		t.Fatalf("%q %v", v, err)
+	}
+	if got := c3.commands(); len(got) != 2 || got[0] != "ASKING" {
+		t.Fatalf("node C got %v", got)
+	}
+}
+
+func TestFakeTryAgainThenSuccess(t *testing.T) {
+	k := keyFor(true, 0)
+	var sent atomic.Int32
+	a, _ := twoNodes(t, func(f *fakeNode, args []string) string {
+		if strings.ToUpper(args[0]) == "GET" && sent.Add(1) == 1 {
+			return "-TRYAGAIN slot is being handed over\r\n"
+		}
+		return defaultFake(f, args)
+	}, nil)
+	c := newClusterClient(t, a.addr)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	v, err := getS(c, ctx, k)
+	if err != nil || v != "v:"+k+"@"+a.addr {
+		t.Fatalf("%q %v", v, err)
+	}
+	if d := time.Since(start); d < 5*time.Millisecond {
+		t.Fatalf("retried after %v, want a wait of at least 5ms", d)
+	}
+	if a.count("GET") != 2 {
+		t.Fatal(a.commands())
+	}
+}
+
+func TestFakeTryAgainGivesUpAfterThreeRetries(t *testing.T) {
+	k := keyFor(true, 0)
+	a, _ := twoNodes(t, func(f *fakeNode, args []string) string {
+		if strings.ToUpper(args[0]) == "GET" {
+			return "-TRYAGAIN slot is being handed over\r\n"
+		}
+		return defaultFake(f, args)
+	}, nil)
+	c := newClusterClient(t, a.addr)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := getS(c, ctx, k)
+	var se *Error
+	if !errors.As(err, &se) || se.Prefix() != "TRYAGAIN" {
+		t.Fatalf("want the TRYAGAIN error, got %v", err)
+	}
+	if n := a.count("GET"); n != 4 {
+		t.Fatalf("GET sent %d times, want 4", n)
+	}
+}
+
+func TestFakeTryAgainWaitEndsWithContext(t *testing.T) {
+	k := keyFor(true, 0)
+	a, _ := twoNodes(t, func(f *fakeNode, args []string) string {
+		if strings.ToUpper(args[0]) == "GET" {
+			return "-TRYAGAIN slot is being handed over\r\n"
+		}
+		return defaultFake(f, args)
+	}, nil)
+	c := newClusterClient(t, a.addr)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := getS(c, ctx, k); err == nil {
+		t.Fatal("want an error from the cancelled context")
+	}
+}
+
+func TestFakeAskAndMovedShareTheRedirectBudget(t *testing.T) {
+	// ASK, MOVED, ASK, ASK: the fourth redirect is returned to the caller.
+	k := keyFor(true, 0)
+	var a, b *fakeNode
+	var gets atomic.Int32
+	reply := func(f *fakeNode, args []string) string {
+		if strings.ToUpper(args[0]) != "GET" {
+			return defaultFake(f, args)
+		}
+		switch gets.Add(1) {
+		case 1, 3, 4:
+			return askReply(args, b)
+		default:
+			return fmt.Sprintf("-MOVED %d %s\r\n", KeySlot(args[1]), a.addr)
+		}
+	}
+	a, b = twoNodes(t, reply, reply)
+	c := newClusterClient(t, a.addr)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := getS(c, ctx, k)
+	var se *Error
+	if !errors.As(err, &se) || se.Prefix() != "ASK" {
+		t.Fatalf("want the fourth redirect (ASK) returned, got %v", err)
+	}
+	if n := int(gets.Load()); n != 4 {
+		t.Fatalf("GET sent %d times, want 4", n)
+	}
+}

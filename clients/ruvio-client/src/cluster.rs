@@ -19,6 +19,13 @@ pub const SLOT_COUNT: u16 = 16_384;
 
 const MAX_REDIRECTS: usize = 3;
 
+/// Sleeps before the first, second and third retry of a command answered `TRYAGAIN`.
+const TRYAGAIN_BACKOFF: [Duration; 3] = [
+    Duration::from_millis(5),
+    Duration::from_millis(10),
+    Duration::from_millis(20),
+];
+
 /// What the server answers for a command whose keys span slots; the client answers it the same
 /// way without sending the command.
 const CROSSSLOT: &str = "CROSSSLOT Keys in request do not hash to the same slot";
@@ -433,6 +440,107 @@ impl Connection {
         self.write_commands(&[arguments])?;
 
         self.read_reply()
+    }
+
+    /// `send`, preceded by `ASKING` in the same write when `asking` is set. A failed `ASKING`
+    /// reply is returned instead of the command's.
+    pub(crate) fn send_with(
+        &mut self,
+        arguments: &[&str],
+        asking: bool,
+    ) -> Result<RespValue, Error> {
+        if !asking {
+            return self.send(arguments);
+        }
+
+        self.asked(
+            self.timeout.is_some().then(|| blocking_wait(arguments)),
+            |connection| connection.write_commands(&[&["ASKING"], arguments]),
+        )
+    }
+
+    pub(crate) fn send_owned_with(
+        &mut self,
+        arguments: &[String],
+        asking: bool,
+    ) -> Result<RespValue, Error> {
+        let borrowed: Vec<&str> = arguments.iter().map(String::as_str).collect();
+
+        self.send_with(&borrowed, asking)
+    }
+
+    /// Binary-safe `send_with`.
+    pub(crate) fn send_bytes_with(
+        &mut self,
+        arguments: &[&[u8]],
+        asking: bool,
+    ) -> Result<RespValue, Error> {
+        if !asking {
+            return self.send_bytes(arguments);
+        }
+
+        self.asked(
+            self.timeout.is_some().then(|| blocking_wait(arguments)),
+            |connection| connection.write_bytes_commands(&[&[b"ASKING"], arguments]),
+        )
+    }
+
+    /// Writes `ASKING` and a command with `write`, reads both replies and returns the command's,
+    /// or the `ASKING` error. Only the `ASK` path runs this.
+    #[cold]
+    fn asked(
+        &mut self,
+        wait: Option<Wait>,
+        write: impl FnOnce(&mut Self) -> Result<(), Error>,
+    ) -> Result<RespValue, Error> {
+        let wait = wait.unwrap_or(Wait::None);
+
+        self.widen(wait)?;
+
+        let result = write(self).and_then(|()| {
+            let asking = self.read_reply()?;
+            let reply = self.read_reply()?;
+
+            Ok(if matches!(asking, RespValue::Error(_)) {
+                asking
+            } else {
+                reply
+            })
+        });
+
+        self.narrow();
+
+        result
+    }
+
+    fn write_bytes_commands(&mut self, commands: &[&[&[u8]]]) -> Result<(), Error> {
+        if self.broken {
+            return Err(closed_socket());
+        }
+
+        let mut scratch = std::mem::take(&mut self.scratch);
+
+        scratch.clear();
+
+        let encoded = commands
+            .iter()
+            .try_for_each(|command| crate::codec::append_bytes(&mut scratch, command));
+        let write = encoded.and_then(|()| {
+            let stream = self.stream.get_mut();
+
+            stream
+                .write_all(&scratch)
+                .and_then(|()| stream.flush())
+                .map_err(|error| {
+                    self.broken = true;
+
+                    Error::Io(error)
+                })
+        });
+
+        self.scratch = scratch;
+
+        write
     }
 
     /// Runs `run` with the read timeout widened by a blocking command's own wait, then puts
@@ -1049,8 +1157,9 @@ impl ClusterRouter {
             && self.endpoints[target].replica
             && loading(&reply)
         {
-            return self
-                .read_again_from_primary(target, reply, |connection| connection.send(arguments));
+            return self.read_again_from_primary(target, reply, |connection, asking| {
+                connection.send_with(arguments, asking)
+            });
         }
 
         Ok(reply)
@@ -1104,7 +1213,7 @@ impl ClusterRouter {
         &mut self,
         replica: usize,
         reply: RespValue,
-        mut send: impl FnMut(&mut Connection) -> Result<RespValue, Error>,
+        mut send: impl FnMut(&mut Connection, bool) -> Result<RespValue, Error>,
     ) -> Result<RespValue, Error> {
         for read in &mut self.read_routes {
             if *read == Some(replica) {
@@ -1131,9 +1240,9 @@ impl ClusterRouter {
         };
 
         self.open(primary, false)?;
-        let reply = send(self.connection(primary)?)?;
+        let reply = send(self.connection(primary)?, false)?;
 
-        self.follow_moved(reply, send)
+        self.follow_moved(primary, reply, send)
     }
 
     /// Binary-safe command. Routed by its second argument (the key) unless the command is
@@ -1148,14 +1257,16 @@ impl ClusterRouter {
         };
 
         let reply = self.connection(current)?.send_bytes(arguments)?;
-        let reply = self.follow_moved(reply, |connection| connection.send_bytes(arguments))?;
+        let reply = self.follow_moved(current, reply, |connection, asking| {
+            connection.send_bytes_with(arguments, asking)
+        })?;
 
         if self.options.read_policy != ReadPolicy::Primary
             && self.endpoints[current].replica
             && loading(&reply)
         {
-            return self.read_again_from_primary(current, reply, |connection| {
-                connection.send_bytes(arguments)
+            return self.read_again_from_primary(current, reply, |connection, asking| {
+                connection.send_bytes_with(arguments, asking)
             });
         }
 
@@ -1253,7 +1364,9 @@ impl ClusterRouter {
             if matches!(reply, RespValue::Error(_)) {
                 let first = std::mem::replace(reply, RespValue::Null);
 
-                *reply = self.follow_moved(first, |connection| connection.send(commands[index]))?;
+                *reply = self.follow_moved(targets[index], first, |connection, asking| {
+                    connection.send_with(commands[index], asking)
+                })?;
             }
         }
 
@@ -1388,8 +1501,9 @@ impl ClusterRouter {
 
             for ((destination, command), value) in destinations.into_iter().zip(&batch).zip(values)
             {
-                let value =
-                    self.follow_moved(value, |connection| connection.send_owned(command))?;
+                let value = self.follow_moved(target, value, |connection, asking| {
+                    connection.send_owned_with(command, asking)
+                })?;
 
                 match destination {
                     Destination::Whole(index) => replies[index] = value,
@@ -1644,8 +1758,8 @@ impl ClusterRouter {
                 && self.endpoints[target].replica
                 && loading(&reply)
             {
-                reply = self.read_again_from_primary(target, reply, |connection| {
-                    connection.send(&command)
+                reply = self.read_again_from_primary(target, reply, |connection, asking| {
+                    connection.send_with(&command, asking)
                 })?;
             }
 
@@ -1663,28 +1777,88 @@ impl ClusterRouter {
     fn send_routed(&mut self, target: usize, arguments: &[&str]) -> Result<RespValue, Error> {
         let reply = self.connection(target)?.send(arguments)?;
 
-        self.follow_moved(reply, |connection| connection.send(arguments))
+        self.follow_moved(target, reply, |connection, asking| {
+            connection.send_with(arguments, asking)
+        })
     }
 
-    /// Follows the `MOVED` redirects of a reply already read for one command, sending it again
-    /// with `send`. The count is capped so a slot map that keeps changing cannot loop forever:
-    /// after `MAX_REDIRECTS` redirects the last `MOVED` is returned.
+    /// Follows the `MOVED`, `ASK` and `TRYAGAIN` replies of a reply already read for one command,
+    /// sending it again with `send` (its flag asks for `ASKING` to go first). `owner` is the
+    /// endpoint the command was routed to. `MOVED` and `ASK` share one budget of `MAX_REDIRECTS`
+    /// so a slot map that keeps changing cannot loop forever: the next redirect is returned. An
+    /// `ASK` is answered by the named node and leaves the slot map alone. `TRYAGAIN` sends the
+    /// command to the slot's current owner again after a short sleep, at most
+    /// `TRYAGAIN_BACKOFF.len()` times; the last `TRYAGAIN` is returned.
     fn follow_moved(
         &mut self,
+        mut owner: usize,
         mut reply: RespValue,
-        mut send: impl FnMut(&mut Connection) -> Result<RespValue, Error>,
+        mut send: impl FnMut(&mut Connection, bool) -> Result<RespValue, Error>,
     ) -> Result<RespValue, Error> {
-        for redirect in 1..=MAX_REDIRECTS {
-            let Some((slot, host, port)) = moved(&reply) else {
+        let mut redirects = 0;
+        let mut moves = 0;
+        let mut retries = 0;
+
+        loop {
+            let RespValue::Error(text) = &reply else {
                 return Ok(reply);
             };
 
-            let target = self.redirect(slot, &host, port, redirect)?;
+            if text.starts_with("TRYAGAIN") {
+                let Some(pause) = TRYAGAIN_BACKOFF.get(retries) else {
+                    return Ok(reply);
+                };
 
-            reply = send(self.connection(target)?)?;
+                retries += 1;
+                std::thread::sleep(*pause);
+                reply = send(self.connection(owner)?, false)?;
+
+                continue;
+            }
+
+            if redirects == MAX_REDIRECTS {
+                return Ok(reply);
+            }
+
+            if let Some((slot, host, port)) = redirect_target(text, "MOVED ") {
+                redirects += 1;
+                moves += 1;
+                owner = self.redirect(slot, &host, port, moves)?;
+                reply = send(self.connection(owner)?, false)?;
+            } else if let Some((_, host, port)) = redirect_target(text, "ASK ") {
+                redirects += 1;
+
+                let target = self.ask_target(&host, port)?;
+
+                reply = send(self.connection(target)?, true)?;
+            } else {
+                return Ok(reply);
+            }
         }
+    }
 
-        Ok(reply)
+    /// The endpoint of the node an `ASK` names, opened on demand. The slot map is not touched: the
+    /// node is only added to the known nodes when the client has never seen it.
+    fn ask_target(&mut self, host: &str, port: u16) -> Result<usize, Error> {
+        let node = match self.topology.node_index(host, port) {
+            Some(node) => node,
+            None => {
+                let endpoint = self.endpoint_index(host, port);
+
+                self.topology.nodes.push((host.to_owned(), port));
+                self.topology.replicas.push(Vec::new());
+                self.routes.push(endpoint);
+                if !self.read_routes.is_empty() {
+                    self.read_routes.push(None);
+                }
+                self.topology.nodes.len() - 1
+            }
+        };
+        let endpoint = self.routes[node];
+
+        self.open(endpoint, false)?;
+
+        Ok(endpoint)
     }
 
     /// Applies one `MOVED` before the command is sent again to the named node. The whole slot map
@@ -2159,13 +2333,10 @@ fn merge(
     }
 }
 
-/// The slot and node of a `MOVED` reply. A slot outside the slot range makes it malformed.
-fn moved(reply: &RespValue) -> Option<(u16, String, u16)> {
-    let RespValue::Error(text) = reply else {
-        return None;
-    };
-
-    let mut fields = text.strip_prefix("MOVED ")?.split_whitespace();
+/// The slot and node of a `MOVED` or `ASK` error text, given its prefix (`"MOVED "`). A slot
+/// outside the slot range makes it malformed.
+fn redirect_target(text: &str, prefix: &str) -> Option<(u16, String, u16)> {
+    let mut fields = text.strip_prefix(prefix)?.split_whitespace();
     let slot = fields
         .next()?
         .parse()
@@ -2806,6 +2977,10 @@ mod more_tests {
 
     #[test]
     fn moved_parsing() {
+        let moved = |reply: &RespValue| match reply {
+            RespValue::Error(text) => redirect_target(text, "MOVED "),
+            _ => None,
+        };
         let error = |text: &str| RespValue::Error(text.to_owned());
 
         assert_eq!(
@@ -2831,6 +3006,13 @@ mod more_tests {
         assert_eq!(moved(&error("ERR MOVED 1 h:5")), None);
         assert_eq!(moved(&RespValue::Simple("MOVED 1 h:5".into())), None);
         assert_eq!(moved(&RespValue::Null), None);
+
+        assert_eq!(
+            redirect_target("ASK 3999 127.0.0.1:6381", "ASK "),
+            Some((3999, "127.0.0.1".into(), 6381))
+        );
+        assert_eq!(redirect_target("ASK 16384 h:5", "ASK "), None);
+        assert_eq!(redirect_target("MOVED 1 h:5", "ASK "), None);
     }
 
     #[test]
