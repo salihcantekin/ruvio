@@ -19,7 +19,7 @@ use tokio::{
 use tracing::{info, warn};
 
 pub use config::CoordinatorConfig;
-use monitor::{Sightings, Switches};
+use monitor::{Commits, Sightings, Switches};
 use raft::{Network, Raft, RpcRequest, RpcResponse, StateMachine};
 use resp::Value;
 
@@ -74,6 +74,7 @@ async fn serve(
     }
 
     let sightings = Sightings::default();
+    let commits = Commits::default();
     let (switches, _) = tokio::sync::broadcast::channel(64);
 
     info!(id = config.id, listen = %config.listen, groups = config.groups.len(), "coordinator listening");
@@ -89,6 +90,7 @@ async fn serve(
         raft.clone(),
         machine.clone(),
         sightings.clone(),
+        commits.clone(),
         switches.clone(),
         moves.clone(),
     ));
@@ -97,6 +99,7 @@ async fn serve(
         raft: raft.clone(),
         machine,
         sightings,
+        commits,
         switches,
         moves,
     };
@@ -140,6 +143,7 @@ struct Api {
     raft: Raft,
     machine: StateMachine,
     sightings: Sightings,
+    commits: Commits,
     switches: Switches,
     moves: migrate::Context,
 }
@@ -241,11 +245,38 @@ impl Api {
     }
 
     /// `COORDINATOR MOVE first last group shard`, `COORDINATOR STATUS`, `COORDINATOR CANCEL`:
-    /// moving slot ranges between groups.
+    /// moving slot ranges between groups. `COORDINATOR FAILOVER group FORCE`: promoting a
+    /// replica that lacks committed records.
     async fn coordinator(&self, words: &[String]) -> Value {
         let word = |index: usize| words.get(index).map(String::as_str);
 
         match (word(1), words.len()) {
+            (Some("failover"), 4) if word(3) == Some("force") => {
+                if !self.moves.leading().await {
+                    return Value::Error(self.moves.not_leader().await);
+                }
+                let Some(group) = self
+                    .config
+                    .groups
+                    .iter()
+                    .find(|group| group.name.eq_ignore_ascii_case(&words[2]))
+                else {
+                    return Value::Error(format!("ERR no group named {}", words[2]));
+                };
+                let force = monitor::Force {
+                    config: &self.config,
+                    raft: &self.raft,
+                    machine: &self.machine,
+                    sightings: &self.sightings,
+                    commits: &self.commits,
+                    switches: &self.switches,
+                };
+
+                match monitor::force_failover(force, group).await {
+                    Ok(address) => Value::bulk(address),
+                    Err(error) => Value::Error(error),
+                }
+            }
             (Some("move"), 6) => {
                 let (Ok(first), Ok(last), Ok(shard)) = (
                     words[2].parse::<u16>(),
@@ -273,7 +304,7 @@ impl Api {
                 Err(error) => Value::Error(error),
             },
             _ => Value::Error(
-                "ERR COORDINATOR expects MOVE first last group shard, STATUS or CANCEL".into(),
+                "ERR COORDINATOR expects MOVE first last group shard, STATUS, CANCEL or FAILOVER group FORCE".into(),
             ),
         }
     }
@@ -310,12 +341,22 @@ impl Api {
                     match primaries.get(&group.name) {
                         Some(primary) => {
                             text += &format!(
-                                "group_{}:primary={},epoch={}\r\n",
+                                "group_{}:primary={},epoch={}",
                                 group.name, group.members[primary.member].address, primary.epoch
                             )
                         }
-                        None => text += &format!("group_{}:primary=,epoch=0\r\n", group.name),
+                        None => text += &format!("group_{}:primary=,epoch=0", group.name),
                     }
+                    // Only for groups whose clients use `CLIENT DURABILITY`: per shard, the
+                    // highest record a failover must keep.
+                    let committed = self.commits.known(&group.name);
+
+                    if committed.iter().any(|&sequence| sequence > 0) {
+                        let shards: Vec<String> = committed.iter().map(u64::to_string).collect();
+
+                        text += &format!(",committed={}", shards.join("/"));
+                    }
+                    text += "\r\n";
                 }
                 Value::bulk(text)
             }

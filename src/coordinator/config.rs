@@ -97,6 +97,10 @@ struct FileConfig {
     ping_interval_ms: u64,
     #[serde(default = "default_down_after_ms")]
     down_after_ms: u64,
+    /// Promote the best replica even when none holds every record a `CLIENT DURABILITY`
+    /// reply was released for; those records are lost.
+    #[serde(default)]
+    unclean_failover: bool,
     /// Password (or `username password`) the coordinator logs in to data nodes with.
     #[serde(default)]
     auth: Option<String>,
@@ -125,6 +129,7 @@ pub struct CoordinatorConfig {
     pub peers: Vec<(u64, Endpoint)>,
     pub ping_interval: Duration,
     pub down_after: Duration,
+    pub unclean_failover: bool,
     pub auth: Option<String>,
     pub secret: Option<String>,
     pub groups: Vec<Group>,
@@ -211,6 +216,7 @@ impl CoordinatorConfig {
             peers,
             ping_interval: Duration::from_millis(file.ping_interval_ms),
             down_after: Duration::from_millis(file.down_after_ms),
+            unclean_failover: file.unclean_failover,
             auth: file.auth.filter(|auth| !auth.is_empty()),
             secret: std::env::var("RUVIO_COORDINATOR_SECRET")
                 .ok()
@@ -392,6 +398,7 @@ members = [
         assert_eq!(config.quorum(), 2);
         assert_eq!(config.ping_interval, Duration::from_millis(500));
         assert_eq!(config.down_after, Duration::from_millis(1000));
+        assert!(!config.unclean_failover);
         assert_eq!(config.group("main").unwrap().members.len(), 2);
         assert!(config.group("other").is_none());
     }

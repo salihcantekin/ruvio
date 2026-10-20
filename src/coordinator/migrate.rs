@@ -60,11 +60,11 @@ pub struct Context {
 }
 
 impl Context {
-    async fn leading(&self) -> bool {
+    pub(super) async fn leading(&self) -> bool {
         self.raft.current_leader().await == Some(self.config.id)
     }
 
-    async fn not_leader(&self) -> String {
+    pub(super) async fn not_leader(&self) -> String {
         match self.raft.current_leader().await {
             Some(leader) => format!("ERR not the leader; send it to coordinator {leader}"),
             None => "ERR no leader yet; try again".into(),

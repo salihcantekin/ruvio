@@ -13,13 +13,13 @@ Without coordinators nothing changes: a primary and its replicas run as describe
 ## What happens on a failure
 
 1. Every coordinator connects to every member each `ping_interval_ms` and reads `ROLE`, `CONFIG GET
-   shards` and `INFO replication` (the synced sequence of every shard).
+   shards` and `INFO replication` (the synced and the committed sequence of every shard).
 2. When the Raft leader among the coordinators has not heard from the primary for `down_after_ms`, it
    asks the others. The primary is down when a majority of coordinators (the leader included) have not
    heard from it within `down_after_ms`. One coordinator's own network trouble cannot start a failover.
 3. The leader picks the replica that answers, is not still copying its primary (`LOADING`), and holds the
    most of the history (the largest sum of `wal_durable_sequence` over its shards); ties go to the member
-   listed first.
+   listed first. With `CLIENT DURABILITY` in use it must also hold every committed write (see below).
 4. It records "primary = that member, epoch + 1" in the Raft log (a majority must accept it), sends the
    member `REPLICAOF NO ONE`, points the other members at it with `REPLICAOF host port`, and publishes
    `+switch-master` to subscribers.
@@ -44,6 +44,28 @@ turns on `CLIENT DURABILITY REPLICAS 1` for its connection: every reply then wai
 holds the writes before it on disk, and becomes `NOREPLICAS` if none does within the timeout (default
 5000 ms; the writes stay applied). The client libraries have a connect option that sends it on every
 connection. `WAIT 1 timeout_ms` after a write does the same for one write at a time.
+
+A failover keeps such writes. The primary records, per shard, the highest sequence it released a
+durable reply for (`replication_committed_sequence` in `INFO`) and passes it to its replicas; every
+coordinator reads it from the members' `INFO replication` on each ping and keeps the highest value it
+has seen per group and shard. The leader promotes only a replica whose `wal_durable_sequence` is at
+least that value in every shard, and among those the one holding the most. When no answering replica
+qualifies, it does not fail over: it logs a warning on every tick and waits, and the group has no
+writer meanwhile. Two ways out, both losing the records the promoted replica lacks (the leader logs
+which, per shard):
+
+- `unclean_failover = true` in `coordinator.toml` promotes the best replica anyway, every time.
+- `COORDINATOR FAILOVER group FORCE` on the leader (after `AUTH secret`) does it once, now, and answers
+  the promoted member's address. It is refused while the primary still answers the leader, and by other
+  coordinators with `ERR not the leader; send it to coordinator <id>`.
+
+After a failover to a replica that held every committed record, the values still apply, so the next
+failover also waits for a replica that caught up. After an unclean one those records are gone and the
+new primary reuses their sequence numbers: the old values are dropped, and the stale ones replicas keep
+reporting are ignored until the new primary commits past them. The values are held in memory: a
+coordinator that restarts while the primary is down learns only what the remaining members report.
+Coordinators' `INFO` shows them as `committed=` on the group's line. Groups whose clients never use
+`CLIENT DURABILITY` report 0 everywhere and fail over as before.
 
 A primary cut off from the coordinators but still reachable by clients keeps taking writes until it
 learns it was replaced. Two settings on the data nodes bound that window:
@@ -79,6 +101,7 @@ peers = ["1@ruvio-1:26400", "2@ruvio-2:26400", "3@ruvio-3:26400"]
 secret = "change-me"                    # shared by every coordinator; RUVIO_COORDINATOR_SECRET overrides it
 ping_interval_ms = 500                  # default 500
 down_after_ms = 3000                    # default 3000
+unclean_failover = false                # default false: wait for a replica with every committed write
 auth = "password"                       # how coordinators log in to data nodes; "user password" works too
 
 [[groups]]
@@ -130,7 +153,7 @@ support connects to the coordinators with the group name as the service name:
 | `SENTINEL sentinels group` | The other coordinators |
 | `SUBSCRIBE +switch-master` | `group old-host old-port new-host new-port` on every failover |
 | `ROLE` | `["sentinel", [groups]]` |
-| `INFO` | `coordinator_id`, `leader_id`, `is_leader`, and `group_<name>:primary=…,epoch=…` |
+| `INFO` | `coordinator_id`, `leader_id`, `is_leader`, and `group_<name>:primary=…,epoch=…` (with `,committed=…` per shard, joined by `/`, once a durable reply was released) |
 | `AUTH secret` | Required first when `secret` is set; `NOAUTH` otherwise |
 
 Checked with redis-py's `Sentinel` (5.2): it discovers the primary, writes through it, and writes to
@@ -219,6 +242,7 @@ is never slowed down. Nodes need durability `memory`, `everysec` or `always` (no
   them with the new `peers`).
 - No primary leases: an isolated primary is stopped by `min-replicas-to-write`, not by the coordinators.
 - Ranges move only when an operator asks (`COORDINATOR MOVE`); nothing rebalances by load yet.
+- The committed sequences a failover must keep live in the coordinators' memory, not in Raft.
 
 ## Tests
 

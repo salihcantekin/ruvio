@@ -9,6 +9,10 @@ peers = ["1@10.0.0.1:26400", "2@10.0.0.2:26400", "3@10.0.0.3:26400"]
 secret = "change-me"
 ping_interval_ms = 500
 down_after_ms = 3000
+# true: when no replica holds every write a CLIENT DURABILITY reply was released for, promote the
+# best one anyway and lose those writes. false (default): wait (COORDINATOR FAILOVER group FORCE
+# overrides once).
+unclean_failover = false
 # How coordinators log in to the data nodes (requirepass, or "user password").
 auth = "data-node-password"
 
