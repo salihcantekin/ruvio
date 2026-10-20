@@ -1316,7 +1316,9 @@ fn primary_cut_from_the_coordinators(lease_ms: Option<u64>) -> CutResult {
         group.node_with(dir.path(), 1, Some(0), &env),
         group.node_with(dir.path(), 2, Some(0), &env),
     ];
-    let extra = lease_ms.map_or_else(String::new, |ms| format!("primary_lease_ms = {ms}"));
+    let extra = lease_ms.map_or_else(String::new, |ms| {
+        format!("primary_lease_ms = {ms}\nprimary_lease_drift_percent = 5")
+    });
     let mut addresses = group.resp.clone();
 
     addresses[0] = ports.address_at(0);
@@ -1419,7 +1421,8 @@ fn primary_cut_from_the_coordinators(lease_ms: Option<u64>) -> CutResult {
 
 #[test]
 fn with_the_lease_a_primary_cut_from_the_coordinators_stops_writing_before_the_failover() {
-    // ping 200 ms, down_after 1000 ms: a 700 ms lease counts as ended 970 ms after a grant.
+    // ping 200 ms, down_after 1000 ms: a 700 ms lease with 5% drift counts as ended 974 ms
+    // after a grant (700 * 105 / 95, rounded up, plus 200).
     let result = primary_cut_from_the_coordinators(Some(700));
 
     // Every write the old primary took came before any coordinator named another primary,
@@ -1467,7 +1470,7 @@ fn a_stalled_member_does_not_hold_up_the_primary_lease() {
             group.coordinator_with(
                 dir.path(),
                 index,
-                "primary_lease_ms = 700",
+                "primary_lease_ms = 700\nprimary_lease_drift_percent = 5",
                 &group.resp,
                 None,
             )

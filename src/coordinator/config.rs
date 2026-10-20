@@ -105,7 +105,8 @@ struct FileConfig {
     /// default, grants none. Nodes with `primary-lease` on take writes only under it.
     #[serde(default)]
     primary_lease_ms: u64,
-    /// How much faster or slower, in percent, a clock may run than another's.
+    /// How much faster or slower than real time, in percent, any coordinator's or data
+    /// node's clock may run; below 100.
     #[serde(default = "default_lease_drift_percent")]
     primary_lease_drift_percent: u64,
     /// Password (or `username password`) the coordinator logs in to data nodes with.
@@ -138,10 +139,15 @@ const NODE_TICK: Duration = Duration::from_millis(100);
 /// How long after its last grant a coordinator counts a primary's lease as ended: the lease
 /// stretched by the clock drift, plus the node's check interval and as much again as margin.
 /// A failover waits until a majority of coordinators passed this.
+///
+/// Each clock runs at most `drift_percent` (d) faster or slower than real time. A node whose
+/// clock runs slow holds the lease for up to `lease / (1 - d)` of real time, and a coordinator
+/// whose clock runs fast measures that as `lease * (1 + d) / (1 - d)`. `drift_percent` must be
+/// below 100.
 pub fn lease_safe_interval(lease: Duration, drift_percent: u64) -> Duration {
     let stretched = lease.as_millis() as u64 * (100 + drift_percent);
 
-    Duration::from_millis(stretched.div_ceil(100)) + NODE_TICK * 2
+    Duration::from_millis(stretched.div_ceil(100 - drift_percent)) + NODE_TICK * 2
 }
 
 #[derive(Clone, Debug)]
@@ -199,8 +205,14 @@ impl CoordinatorConfig {
             if lease > crate::primary_lease::MAX_LEASE {
                 return Err("primary_lease_ms must be at most 60000".into());
             }
-            if file.primary_lease_drift_percent > 100 {
-                return Err("primary_lease_drift_percent must be at most 100".into());
+            if file.primary_lease_drift_percent >= 100 {
+                return Err("primary_lease_drift_percent must be below 100".into());
+            }
+            if peers.len() > crate::primary_lease::MAX_VOTERS as usize {
+                return Err(format!(
+                    "at most {} coordinators can grant a primary lease",
+                    crate::primary_lease::MAX_VOTERS
+                ));
             }
             // A node closes its gate `GATE_MARGIN` before the lease ends, so a renewal every
             // ping must leave more than that, with room for the round trip.
@@ -606,14 +618,19 @@ members = [
 
     #[test]
     fn a_primary_lease_must_end_before_a_failover_starts() {
-        // 2000 ms stretched by 10% is 2200, plus two node ticks.
+        // 2000 ms stretched by 110/90 is 2444.4, rounded up, plus two node ticks.
         assert_eq!(
             lease_safe_interval(Duration::from_millis(2000), 10),
-            Duration::from_millis(2400)
+            Duration::from_millis(2645)
         );
         assert_eq!(
-            lease_safe_interval(Duration::from_millis(1001), 10),
-            Duration::from_millis(1302)
+            lease_safe_interval(Duration::from_millis(1000), 0),
+            Duration::from_millis(1200)
+        );
+        // The largest drift and lease do not overflow.
+        assert_eq!(
+            lease_safe_interval(Duration::from_millis(60_000), 99),
+            Duration::from_millis(11_940_200)
         );
         let lease = |text: &str| {
             CoordinatorConfig::parse(&SAMPLE.replace("down_after_ms = 1000", text))
@@ -622,20 +639,20 @@ members = [
 
         assert_eq!(
             lease("down_after_ms = 3000\nprimary_lease_ms = 2000").unwrap(),
-            Some((Duration::from_millis(2000), Duration::from_millis(2400)))
+            Some((Duration::from_millis(2000), Duration::from_millis(2645)))
         );
         for (text, reason) in [
             (
-                "down_after_ms = 2000\nprimary_lease_ms = 2000",
-                "at least 2400",
+                "down_after_ms = 2600\nprimary_lease_ms = 2000",
+                "at least 2645",
             ),
             (
                 "down_after_ms = 3000\nprimary_lease_ms = 1000",
                 "at least 1500",
             ),
             (
-                "down_after_ms = 3000\nprimary_lease_ms = 2000\nprimary_lease_drift_percent = 101",
-                "at most 100",
+                "down_after_ms = 3000\nprimary_lease_ms = 2000\nprimary_lease_drift_percent = 100",
+                "below 100",
             ),
             (
                 "down_after_ms = 90000\nprimary_lease_ms = 61000",
@@ -648,13 +665,45 @@ members = [
             ),
             (
                 "down_after_ms = 3000\nprimary_lease_ms = 2000\nprimary_lease_drift_percent = 9223372036854775807",
-                "at most 100",
+                "below 100",
             ),
         ] {
             let error = lease(text).unwrap_err();
 
             assert!(error.contains(reason), "{text}: {error}");
         }
+    }
+
+    #[test]
+    fn a_primary_lease_takes_at_most_the_largest_coordinator_count_a_grant_may_name() {
+        let peers = |count: usize| {
+            let list: Vec<String> = (1..=count)
+                .map(|id| format!("\"{id}@127.0.0.1:{}\"", 20_000 + id))
+                .collect();
+
+            SAMPLE
+                .replace(
+                    "\"1@127.0.0.1:26400\", \"2@127.0.0.1:26401\", \"3@127.0.0.1:26402\"",
+                    &list.join(", "),
+                )
+                .replace(
+                    "down_after_ms = 1000",
+                    "down_after_ms = 3000\nprimary_lease_ms = 2000",
+                )
+        };
+        let most = crate::primary_lease::MAX_VOTERS as usize;
+
+        assert!(CoordinatorConfig::parse(&peers(most)).is_ok());
+        assert!(
+            CoordinatorConfig::parse(&peers(most + 1))
+                .unwrap_err()
+                .contains("at most 255 coordinators")
+        );
+        // Without the lease the count is not limited here.
+        assert!(
+            CoordinatorConfig::parse(&peers(most + 1).replace("primary_lease_ms = 2000", ""))
+                .is_ok()
+        );
     }
 
     #[test]
