@@ -39,7 +39,7 @@ interrupted half way is finished by the next leader.
 When the coordinators are partitioned from each other, only the side with a majority acts. The Raft
 library keeps a leader that lost its majority believing it leads, so before each tick's work on the data
 nodes (a failover, pointing members at the agreed primary, sending the cluster map, a step of a slot
-move) and before `COORDINATOR FAILOVER group FORCE`, `MOVE` and `CANCEL`, the leader confirms with a
+move) and before `COORDINATOR FAILOVER group FORCE`, `MOVE`, `CANCEL`, `ADD` and `REMOVE`, the leader confirms with a
 heartbeat that a majority of coordinators still follows it. It confirms again before every command it
 sends a data node; a confirmation is trusted for one `ping_interval_ms` (capped at 1 second, below the
 election timeout) and shared by everything in that window, and waits at most that long. So a leader that
@@ -249,12 +249,13 @@ coordinator; to shorten it (or lower the drift), restart the coordinators one at
 old lease length after each restart, so no coordinator reports a lease ended by the new, shorter
 length while a grant of the old length runs.
 
-Changing the number of coordinators (all restarted with the new `peers`, see *Limits of this
-version*): each grant names its sender's coordinator count, and a primary needs a majority of the
+Changing the coordinators (`COORDINATOR ADD`/`REMOVE`, see *Adding and removing coordinators*):
+each grant names its sender's coordinator count, and a primary needs a majority of the
 largest count among its running grants. Adding coordinators raises the bar at once. After removing
 some, the grants of the larger count keep the higher bar until they end, at most `primary_lease_ms`
 after the last one was sent; until then the primary refuses writes unless a majority of the old count
-still grants it. To avoid that pause, turn `primary-lease` off on the data nodes for the change.
+still grants it. To avoid that pause, turn `primary-lease` off on the data nodes for the change, or
+remove a coordinator only while a majority of the larger set still runs.
 
 Checked with Docker (debug build, `ping_interval_ms` 500, `down_after_ms` 3000, `primary_lease_ms`
 2000, `min-replicas-to-write 1` on every node), the old primary and one replica on one network, the
@@ -314,6 +315,7 @@ unclean_failover = false                # default false: wait for a replica with
 primary_lease_ms = 0                    # default 0 (off); 2000 with the defaults above, see "Primary lease"
 primary_lease_drift_percent = 10        # default 10: how much faster or slower than real time a clock may run; below 100
 auth = "password"                       # how coordinators log in to data nodes; "user password" works too
+join = false                            # true only when adding a coordinator to running ones
 
 [[groups]]
 name = "main"
@@ -460,6 +462,28 @@ one client writing the range throughout, 5 runs): the writer saw `TRYAGAIN` for 
 of it the target's replica syncing the copy record by record. The time grows with the keys written
 during the freeze, not with the size of the range. Not measured on release builds or real machines.
 
+## Adding and removing coordinators
+
+The coordinators that vote are the ones in the Raft record; `peers` in the file is only the first
+membership, proposed on the very first start. Majorities (failovers, the lease, `SENTINEL` `quorum`)
+count the recorded coordinators, and `INFO` lists them as `coordinators:id@host:port,…`.
+
+To add one, give it its own `id`, `listen` and an empty `data_dir`, `join = true`, and the same
+`secret`, groups and settings as the others (`peers` must list at least itself), start it, then on the
+leader:
+
+```text
+COORDINATOR ADD 4 ruvio-4:26400
+```
+
+It catches up as a learner and then votes; the command answers `OK` once the change is committed
+(at most 30 s; a coordinator that is not running with `join = true` is refused). To remove one,
+`COORDINATOR REMOVE 3` on the leader, then stop it; a coordinator that is already down can be removed
+the same way. One change at a time, and keep an odd number: four survive the loss of one, like three.
+Without `join = true` a new coordinator would propose `peers` as a membership of its own; with it, it
+waits to be added. A coordinator that starts with `peers` different from the record logs a warning and
+uses the record.
+
 ## Upgrading
 
 Upgrade the coordinators first, then the data nodes group by group. Clients need no change for
@@ -544,8 +568,6 @@ releases side by side, so the refused handshake itself was not part of the run. 
 ## Limits of this version
 
 - Groups are declared in the file; replicas are not discovered from the primary yet.
-- The coordinators do not change membership at run time (adding a coordinator means restarting all of
-  them with the new `peers`).
 - Ranges move only when an operator asks (`COORDINATOR MOVE`); nothing rebalances by load yet.
 
 ## Tests

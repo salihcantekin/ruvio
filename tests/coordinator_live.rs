@@ -41,6 +41,8 @@ struct Group {
     resp: Vec<SocketAddr>,
     replication: Vec<SocketAddr>,
     coordinators: Vec<SocketAddr>,
+    /// A free address for a coordinator that joins later.
+    spare: SocketAddr,
     /// Shards per data node; shard i of a node listens on its ports plus i.
     shards: u16,
     _ports: (test_ports::PortBlock, test_ports::PortBlock),
@@ -65,6 +67,7 @@ impl Group {
             coordinators: (0..3)
                 .map(|index| data.address_at(3 * shards + index))
                 .collect(),
+            spare: data.address_at(3 * shards + 3),
             shards,
             _ports: (data, replication),
         }
@@ -192,6 +195,17 @@ impl Group {
                 .spawn()
                 .unwrap(),
         )
+    }
+
+    /// `args` on whichever coordinator takes it as the leader.
+    fn on_leader(&self, args: &[&str]) -> Option<String> {
+        self.coordinators.iter().find_map(|coordinator| {
+            call_with_secret(&coordinator.to_string(), args).filter(|reply| {
+                !reply.starts_with("ERR not the leader")
+                    && !reply.starts_with("ERR no leader")
+                    && !reply.starts_with("ERR this leader")
+            })
+        })
     }
 
     /// `INFO` of the coordinator that answers as the leader.
@@ -1738,5 +1752,84 @@ fn primary_with_one_shard_cut_off(lease: bool) {
             call(&shard(group.resp[promoted], offset).to_string(), &["ROLE"])
                 .is_some_and(|role| role.starts_with("master"))
         })
+    });
+}
+
+/// A coordinator joins running ones with `COORDINATOR ADD` and one leaves with `COORDINATOR
+/// REMOVE`; failovers need a majority of the coordinators as they are now, not as `peers`
+/// listed them at the first start.
+#[test]
+fn coordinators_are_added_and_removed_while_they_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut group = Group::new();
+    let mut nodes = [
+        group.node(dir.path(), 0, None),
+        group.node(dir.path(), 1, Some(0)),
+        group.node(dir.path(), 2, Some(0)),
+    ];
+    let mut coordinators: Vec<Process> = (0..3)
+        .map(|index| group.coordinator(dir.path(), index))
+        .collect();
+
+    wait_until("the coordinators to agree on the primary", || {
+        (0..3).all(|index| group.primary_by(index) == Some(0))
+    });
+
+    // A fourth coordinator (id 4) starts with `join = true` and is added.
+    group.coordinators.push(group.spare);
+    coordinators.push(group.coordinator_with(dir.path(), 3, "join = true", &group.resp, None));
+    let spare = group.spare.to_string();
+
+    wait_until("the leader to add coordinator 4", || {
+        group
+            .on_leader(&["COORDINATOR", "ADD", "4", &spare])
+            .as_deref()
+            == Some("OK")
+    });
+    wait_until(
+        "every coordinator to count four and the new one to know the primary",
+        || {
+            group.primary_by(3) == Some(0)
+                && group.coordinators.iter().all(|coordinator| {
+                    call_with_secret(&coordinator.to_string(), &["INFO"]).is_some_and(|info| {
+                        info.lines()
+                            .find_map(|line| line.strip_prefix("coordinators:"))
+                            .is_some_and(|list| list.split(',').count() == 4)
+                    })
+                })
+        },
+    );
+
+    // Two of four are no majority: with coordinators 2 and 3 down, a dead primary stays.
+    coordinators[1].kill();
+    coordinators[2].kill();
+    nodes[0].kill();
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(group.primary_by(0), Some(0));
+    assert_eq!(group.primary_by(3), Some(0));
+
+    // Three of four are: coordinator 2 returns and the group fails over.
+    coordinators[1] = group.coordinator(dir.path(), 1);
+    wait_until("a failover with three of four coordinators", || {
+        group.primary_by(0).is_some_and(|node| node != 0)
+    });
+    let first = group.primary_by(0).unwrap();
+
+    wait_until("every live coordinator to name the new primary", || {
+        [0, 1, 3]
+            .iter()
+            .all(|&index| group.primary_by(index) == Some(first))
+    });
+
+    // Coordinator 3, still down, is removed: three vote, so two of them are a majority.
+    wait_until("the leader to remove coordinator 3", || {
+        group.on_leader(&["COORDINATOR", "REMOVE", "3"]).as_deref() == Some("OK")
+    });
+    coordinators[0].kill();
+    nodes[first].kill();
+    wait_until("a failover with two of three coordinators", || {
+        group
+            .primary_by(3)
+            .is_some_and(|node| node != 0 && node != first)
     });
 }

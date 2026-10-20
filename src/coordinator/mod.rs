@@ -23,6 +23,10 @@ use monitor::{Commits, Sightings, Switches};
 use raft::{Network, Raft, RpcRequest, RpcResponse, StateMachine};
 use resp::Value;
 
+/// How long `COORDINATOR ADD` and `REMOVE` wait for a new coordinator to catch up and for the
+/// change to commit.
+const MEMBERSHIP_WAIT: Duration = Duration::from_secs(30);
+
 /// Runs the coordinator until `shutdown` is requested.
 pub fn run(config: CoordinatorConfig, shutdown: crate::shutdown::ShutdownToken) -> io::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -65,8 +69,27 @@ async fn serve(
         .map_err(io::Error::other)?;
 
     // Every coordinator proposes the same membership on its first start; once one is
-    // committed the others' attempts are refused, which is expected.
-    if !raft.is_initialized().await.map_err(io::Error::other)? {
+    // committed the others' attempts are refused, which is expected. One joining a running
+    // set waits for the leader to add it (`COORDINATOR ADD`).
+    if raft.is_initialized().await.map_err(io::Error::other)? {
+        let mut recorded: Vec<u64> = monitor::coordinators(&config, &raft)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let mut listed: Vec<u64> = config.peers.iter().map(|(id, _)| *id).collect();
+
+        recorded.sort_unstable();
+        listed.sort_unstable();
+        if recorded != listed {
+            warn!(
+                ?recorded,
+                ?listed,
+                "the coordinators in the Raft record differ from peers in the file; the record counts (peers is only used for the first start)"
+            );
+        }
+    } else if config.join {
+        info!("waiting to be added to the running coordinators (COORDINATOR ADD on their leader)");
+    } else {
         let members: BTreeMap<u64, openraft::BasicNode> = config
             .peers
             .iter()
@@ -335,6 +358,26 @@ impl Api {
                     Err(error) => Value::Error(error),
                 }
             }
+            (Some("add"), 4) => {
+                if !self.moves.leading().await {
+                    return Value::Error(self.moves.not_leader().await);
+                }
+                let (Ok(id), Ok(address)) =
+                    (words[2].parse::<u64>(), config::Endpoint::parse(&words[3]))
+                else {
+                    return Value::Error("ERR COORDINATOR ADD needs id host:port".into());
+                };
+                self.add_coordinator(id, address).await
+            }
+            (Some("remove"), 3) => {
+                if !self.moves.leading().await {
+                    return Value::Error(self.moves.not_leader().await);
+                }
+                let Ok(id) = words[2].parse::<u64>() else {
+                    return Value::Error("ERR COORDINATOR REMOVE needs an id".into());
+                };
+                self.remove_coordinator(id).await
+            }
             (Some("status"), 2) => migrate::status(&self.moves),
             (Some("cancel"), 2) => match migrate::cancel(&self.moves).await {
                 Ok(()) => Value::Simple("OK".into()),
@@ -369,10 +412,16 @@ impl Api {
                 let (failovers, last_failover) = self.sightings.stats().failovers();
                 let mut text = format!(
                     "# Coordinator\r\ncoordinator_id:{}\r\nleader_id:{}\r\nis_leader:{}\r\n\
+                     coordinators:{}\r\n\
                      failovers_total:{failovers}\r\nlast_failover_unix_ms:{last_failover}\r\n",
                     self.config.id,
                     leader.map_or(-1, |id| id as i64),
                     u8::from(leader == Some(self.config.id)),
+                    monitor::coordinators(&self.config, &self.raft)
+                        .iter()
+                        .map(|(id, address)| format!("{id}@{address}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
                 );
                 let primaries = self.machine.primaries();
                 let recorded = self.machine.commits();
@@ -474,10 +523,10 @@ impl Api {
                 None => Value::Error("ERR No such master with that name".into()),
             },
             (Some("sentinel"), Some("sentinels")) => Value::array(
-                self.config
-                    .peers
-                    .iter()
+                monitor::coordinators(&self.config, &self.raft)
+                    .into_iter()
                     .filter(|(id, _)| *id != self.config.id)
+                    .filter_map(|(id, address)| Some((id, config::Endpoint::parse(&address).ok()?)))
                     .map(|(id, address)| {
                         Value::array(vec![
                             Value::bulk("name"),
@@ -494,6 +543,80 @@ impl Api {
                 "ERR unknown command for a Ruvio coordinator: {}",
                 words.join(" ")
             )),
+        }
+    }
+
+    /// `COORDINATOR ADD id host:port` on the leader: the coordinator listening there, started
+    /// with `join = true`, catches up as a learner and then votes.
+    async fn add_coordinator(&self, id: u64, address: config::Endpoint) -> Value {
+        let voters: std::collections::BTreeSet<u64> =
+            monitor::coordinators(&self.config, &self.raft)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+
+        if voters.contains(&id) {
+            return Value::Error(format!("ERR coordinator {id} already votes"));
+        }
+        if self.config.primary_lease.is_some()
+            && voters.len() >= crate::primary_lease::MAX_VOTERS as usize
+        {
+            return Value::Error(format!(
+                "ERR at most {} coordinators can grant a primary lease",
+                crate::primary_lease::MAX_VOTERS
+            ));
+        }
+        let node = openraft::BasicNode::new(address.to_string());
+        let learner =
+            tokio::time::timeout(MEMBERSHIP_WAIT, self.raft.add_learner(id, node, true)).await;
+
+        match learner {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => return Value::Error(format!("ERR {error}")),
+            Err(_) => {
+                return Value::Error(format!(
+                    "ERR coordinator {id} at {address} did not catch up; is it running with join = true?"
+                ));
+            }
+        }
+        let mut members = voters;
+
+        members.insert(id);
+        self.change_membership(members).await
+    }
+
+    /// `COORDINATOR REMOVE id` on the leader: coordinator `id` no longer votes. Stop it after.
+    async fn remove_coordinator(&self, id: u64) -> Value {
+        let mut members: std::collections::BTreeSet<u64> =
+            monitor::coordinators(&self.config, &self.raft)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+
+        if !members.remove(&id) {
+            return Value::Error(format!("ERR coordinator {id} does not vote"));
+        }
+        if members.is_empty() {
+            return Value::Error("ERR cannot remove the last coordinator".into());
+        }
+        self.change_membership(members).await
+    }
+
+    async fn change_membership(&self, members: std::collections::BTreeSet<u64>) -> Value {
+        match tokio::time::timeout(
+            MEMBERSHIP_WAIT,
+            self.raft.change_membership(members.clone(), false),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                info!(?members, "the coordinators changed");
+                Value::Simple("OK".into())
+            }
+            Ok(Err(error)) => Value::Error(format!("ERR {error}")),
+            Err(_) => Value::Error(
+                "ERR the change was not committed in time; see coordinators: in INFO".into(),
+            ),
         }
     }
 
@@ -533,12 +656,11 @@ impl Api {
 
         if primary {
             fields.push(("num-slaves", (group.members.len() - 1).to_string()));
-            fields.push(("quorum", self.config.quorum().to_string()));
+            let voters = monitor::coordinators(&self.config, &self.raft).len();
+
+            fields.push(("quorum", monitor::quorum(voters).to_string()));
             // Read by Sentinel clients (redis-py's `check_master_state`).
-            fields.push((
-                "num-other-sentinels",
-                (self.config.peers.len() - 1).to_string(),
-            ));
+            fields.push(("num-other-sentinels", voters.saturating_sub(1).to_string()));
             fields.push((
                 "down-after-milliseconds",
                 self.config.down_after.as_millis().to_string(),
