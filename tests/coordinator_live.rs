@@ -370,6 +370,147 @@ fn one_coordinator_without_a_majority_does_not_fail_over() {
     }
 }
 
+/// Several commands on one connection, each reply as `call` gives it.
+fn calls(address: &str, commands: &[&[&str]]) -> Option<Vec<String>> {
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&address.parse().ok()?, Duration::from_millis(300))
+            .ok()?;
+    let mut frame = String::new();
+
+    for args in commands {
+        frame.push_str(&format!("*{}\r\n", args.len()));
+        for arg in *args {
+            frame.push_str(&format!("${}\r\n{arg}\r\n", arg.len()));
+        }
+    }
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .ok()?;
+    stream.write_all(frame.as_bytes()).ok()?;
+    let mut reader = BufReader::new(stream);
+
+    commands.iter().map(|_| read_reply(&mut reader)).collect()
+}
+
+fn info_field(address: &str, name: &str) -> Option<u64> {
+    call(address, &["INFO", "replication"])?
+        .lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(':'))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+#[test]
+fn a_replica_missing_a_committed_record_is_promoted_only_when_forced() {
+    let dir = tempfile::tempdir().unwrap();
+    let group = Group::new();
+    let mut nodes = [
+        group.node(dir.path(), 0, None),
+        group.node(dir.path(), 1, Some(0)),
+        group.node(dir.path(), 2, Some(0)),
+    ];
+    let primary = group.resp[0].to_string();
+
+    assert_eq!(
+        call(&primary, &["SET", "before", "1"]).as_deref(),
+        Some("OK")
+    );
+    wait_until("the replicas to copy the primary", || {
+        (1..3).all(|node| {
+            call(&group.resp[node].to_string(), &["GET", "before"]).as_deref() == Some("1")
+        })
+    });
+    let _coordinators: Vec<Process> = (0..3)
+        .map(|index| group.coordinator(dir.path(), index))
+        .collect();
+
+    wait_until("the coordinators to agree on the primary", || {
+        (0..3).all(|index| group.primary_by(index) == Some(0))
+    });
+
+    // Member 2 is down while a durable write is answered: only member 1 holds it.
+    nodes[2].kill();
+    assert_eq!(
+        calls(
+            &primary,
+            &[
+                &["CLIENT", "DURABILITY", "REPLICAS", "1", "TIMEOUT", "10000"],
+                &["SET", "kept", "1"],
+            ],
+        ),
+        Some(vec!["OK".to_owned(), "OK".to_owned()])
+    );
+    let mut committed = 0;
+
+    wait_until("the primary to record the committed sequence", || {
+        committed = info_field(&primary, "replication_committed_sequence").unwrap_or(0);
+        committed > 0
+    });
+    let learned = format!(",committed={committed}\r\n");
+
+    wait_until("every coordinator to learn the committed sequence", || {
+        group.coordinators.iter().all(|coordinator| {
+            call_with_secret(&coordinator.to_string(), &["INFO"])
+                .is_some_and(|info| info.contains(&learned))
+        })
+    });
+
+    // The primary and member 1 die; member 2 comes back without the record.
+    nodes[0].kill();
+    nodes[1].kill();
+    nodes[2] = group.node(dir.path(), 2, Some(0));
+    let returned = group.resp[2].to_string();
+
+    assert!(info_field(&returned, "wal_durable_sequence").unwrap() < committed);
+    wait_until("the coordinators to see member 2 answer", || {
+        group.coordinators.iter().all(|coordinator| {
+            call_with_secret(&coordinator.to_string(), &["SENTINEL", "replicas", "main"])
+                .is_some_and(|replicas| {
+                    // One entry per replica, each starting with its name.
+                    replicas.split("name ").any(|replica| {
+                        replica.starts_with(&format!("{returned} "))
+                            && replica.contains(" flags slave ")
+                    })
+                })
+        })
+    });
+    // Several times down_after_ms: the group waits rather than lose the record.
+    std::thread::sleep(Duration::from_secs(4));
+    for index in 0..3 {
+        assert_eq!(group.primary_by(index), Some(0));
+    }
+    assert!(
+        call(&returned, &["SET", "x", "1"])
+            .unwrap()
+            .starts_with("READONLY")
+    );
+
+    // The operator accepts the loss on the leader; the others refuse.
+    let mut promoted = None;
+
+    wait_until("a coordinator to take the forced failover", || {
+        promoted = group.coordinators.iter().find_map(|coordinator| {
+            call_with_secret(
+                &coordinator.to_string(),
+                &["COORDINATOR", "FAILOVER", "main", "FORCE"],
+            )
+            .filter(|reply| {
+                !reply.starts_with("ERR not the leader") && !reply.starts_with("ERR no leader")
+            })
+        });
+        promoted.is_some()
+    });
+    assert_eq!(promoted.as_deref(), Some(returned.as_str()));
+    wait_until("every coordinator to name member 2", || {
+        (0..3).all(|index| group.primary_by(index) == Some(2))
+    });
+    wait_until("member 2 to take writes", || {
+        call(&returned, &["SET", "after", "1"]).as_deref() == Some("OK")
+    });
+    assert_eq!(call(&returned, &["GET", "kept"]).as_deref(), Some("(nil)"));
+}
+
 /// Two groups of a multi-node cluster under one coordinator: the coordinator sends every node
 /// the map, and after a failover in one group the other group's nodes redirect its keys to
 /// the new primary.
