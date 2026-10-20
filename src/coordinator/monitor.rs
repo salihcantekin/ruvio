@@ -934,6 +934,13 @@ impl Commits {
     }
 }
 
+/// Whether the replica chosen for a promotion still qualifies, looked at again right before
+/// the failover is recorded: it answers on every shard, is not copying its primary, and holds
+/// every committed record when the choice needed that (not an unclean or forced one).
+fn still_qualifies(sighting: &Sighting, committed: &[u64], clean: bool) -> bool {
+    sighting.complete() && !sighting.loading && (!clean || holds(sighting, committed))
+}
+
 /// Whether a member holds every committed record: in each shard, at least the committed
 /// sequence. Nothing committed (no `CLIENT DURABILITY` in use) asks for nothing.
 fn holds(sighting: &Sighting, committed: &[u64]) -> bool {
@@ -1822,6 +1829,7 @@ async fn failover(
         committed,
         force || config.unclean_failover,
     );
+    let clean = matches!(choice, Choice::Promote(_));
     let candidate = match choice {
         Choice::Promote(candidate) => candidate,
         Choice::Unclean(candidate) => {
@@ -1850,22 +1858,34 @@ async fn failover(
         }
     };
 
+    let promoted = &group.members[candidate];
+    // Its last answer may be up to `down_after` old: a replica that died with the primary
+    // still looks fresh. Looked at once more, now, before anything is recorded; the next tick
+    // chooses again if it does not answer.
+    let cluster = config.groups.iter().any(|group| group.shards.is_some());
+    let Some(now) = tokio::time::timeout(
+        CALL_TIMEOUT,
+        look(promoted, config.auth.as_deref(), cluster),
+    )
+    .await
+    .ok()
+    .flatten()
+    .filter(|now| still_qualifies(now, committed, clean)) else {
+        warn!(group = %group.name, member = %promoted.address, "the replica chosen for the failover no longer answers as one that can take over; choosing again");
+        return Err("ERR the chosen replica did not answer; try again".into());
+    };
+
     warn!(
         group = %group.name,
         from = %group.members[at].address,
-        to = %group.members[candidate].address,
+        to = %promoted.address,
         force,
         "primary is down; failing over"
     );
     // Decided once, here, from the promoted member as the leader sees it now, and recorded with
     // the promotion: every coordinator takes the same values from the record.
-    let kept = commits.after_promotion(
-        &group.name,
-        &seen[candidate].shard_durable,
-        primary.epoch + 1,
-    );
+    let kept = commits.after_promotion(&group.name, &now.shard_durable, primary.epoch + 1);
 
-    let promoted = &group.members[candidate];
     let new = &promoted.address;
 
     if !propose(raft, group, new.to_string(), primary.epoch + 1, Some(kept)).await {
@@ -2211,6 +2231,31 @@ mod tests {
 
     fn following(group: &Group, member: usize) -> Role {
         Role::Replica(Some(group.members[member].replication.to_string()))
+    }
+
+    #[test]
+    fn a_chosen_replica_looked_at_again_must_still_be_able_to_take_over() {
+        let answering = sharded(&[10, 10]);
+
+        assert!(still_qualifies(&answering, &[10, 10], true));
+        // Fell behind a committed record: only an unclean or forced choice takes it.
+        assert!(!still_qualifies(&answering, &[11, 10], true));
+        assert!(still_qualifies(&answering, &[11, 10], false));
+        // A shard down, or copying its primary again: never.
+        let partial = Sighting {
+            shards_answering: 1,
+            ..sharded(&[10, 10])
+        };
+        let loading = Sighting {
+            loading: true,
+            shards: 0,
+            shards_answering: 0,
+            ..sharded(&[])
+        };
+
+        for sighting in [partial, loading] {
+            assert!(!still_qualifies(&sighting, &[], false));
+        }
     }
 
     #[test]
