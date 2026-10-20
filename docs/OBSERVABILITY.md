@@ -17,6 +17,7 @@ fails when one is added without a row:
 | Section | Field | Meaning |
 | --- | --- | --- |
 | Server | `ruvio_version` | Server version |
+| Server | `run_id` | 40 hex digits, random per process and the same on every shard; `ruvio coordinator` uses it to tell one node listed under two addresses |
 | Server | `ruvio_backend` | Runtime backend (`evented`) |
 | Server | `ruvio_health` | `ok` while the shard answers |
 | Server | `ruvio_readiness` | `ready` once recovery finished |

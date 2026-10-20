@@ -634,6 +634,8 @@ impl Api {
                 "ERR {address} is listed in the file; remove it there and restart the coordinators"
             ));
         }
+        // Not while a failover of the group is being decided: it might choose this member.
+        let _decided = self.sightings.grants().decision(&configured.name).await;
         let group = self.machine.group(configured);
 
         if self
@@ -658,7 +660,7 @@ impl Api {
                 Value::Simple("OK".into())
             }
             Ok(Ok(_)) => Value::Error(format!(
-                "ERR {address} was not forgotten: it is the primary of {} now",
+                "ERR {address} was not forgotten: it is the primary of {} now, or was forgotten already",
                 group.name
             )),
             Ok(Err(error)) => Value::Error(format!("ERR {error}")),

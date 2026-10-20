@@ -572,6 +572,17 @@ pub fn apply_move(moves: &mut Moves, primaries: &Primaries, request: &Request) -
     }
 }
 
+/// A `SetPrimary` naming a member forgotten since the leader chose it: refused, so a forget
+/// that won a race with a failover never leaves the group with a primary it does not list.
+pub fn forgotten_primary(forgotten: &BTreeMap<String, Vec<String>>, request: &Request) -> bool {
+    let Request::SetPrimary { group, member, .. } = request else {
+        return false;
+    };
+    forgotten
+        .get(group)
+        .is_some_and(|forgotten| forgotten.contains(member))
+}
+
 /// Applies a members record or a forget; returns whether it changed anything. The checks
 /// read only the state, so every coordinator decides the same.
 pub fn apply_members(
@@ -599,8 +610,15 @@ pub fn apply_members(
                     .any(|member| member.address.to_string() == primary)
             });
 
+            let forgets = forgotten.get(group).is_some_and(|forgotten| {
+                listed
+                    .iter()
+                    .any(|member| forgotten.contains(&member.address.to_string()))
+            });
+
             if members.get(group) != previous.as_ref()
                 || twice
+                || forgets
                 || !holds_primary
                 || members.get(group) == Some(listed)
             {
@@ -791,7 +809,9 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
                 EntryPayload::Normal(request) => {
                     let state = &mut *state;
 
-                    if apply_request(&mut state.primaries, &request) {
+                    if forgotten_primary(&state.forgotten, &request) {
+                        false
+                    } else if apply_request(&mut state.primaries, &request) {
                         apply_promotion(&mut state.commits, &request);
                         true
                     } else {
@@ -1253,13 +1273,27 @@ mod tests {
 
         assert!(apply!(&forget));
         assert!(!apply!(&forget));
-        assert_eq!(forgotten["main"], ["127.0.0.1:6381"]);
-        assert_eq!(members["main"].len(), 2);
-        assert!(apply!(&Request::SetMembers {
+        // A forgotten member is neither listed again nor made primary.
+        assert!(!apply!(&Request::SetMembers {
             group: "main".into(),
             previous: Some(vec![member(6379), member(6380)]),
             members: vec![member(6379), member(6380), member(6381)],
         }));
+        assert!(forgotten_primary(
+            &forgotten,
+            &Request::SetPrimary {
+                group: "main".into(),
+                member: "127.0.0.1:6381".into(),
+                epoch: 3,
+                commit: None,
+            }
+        ));
+        assert_eq!(forgotten["main"], ["127.0.0.1:6381"]);
+        assert_eq!(members["main"].len(), 2);
+        members.insert(
+            "main".into(),
+            vec![member(6379), member(6380), member(6381)],
+        );
         machine.state.write().unwrap().members = members;
         let listed = |group: &Group| -> Vec<u16> {
             group

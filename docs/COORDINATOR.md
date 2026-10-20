@@ -13,7 +13,7 @@ Without coordinators nothing changes: a primary and its replicas run as describe
 ## What happens on a failure
 
 1. Every coordinator connects to every member each `ping_interval_ms` and reads `ROLE`, `CONFIG GET
-   shards` and, from every shard on its own port, `ROLE` and `INFO replication` (the synced and the
+   shards`, `INFO server` (`run_id`) and, from every shard on its own port, `ROLE` and `INFO replication` (the synced and the
    committed sequence of every shard). A member is heard from only when all its shards answer: a
    primary with one shard down is failed over like a dead one, and a replica with a shard down is not
    promoted. With the primary lease, a coordinator does not renew the lease of a primary with a
@@ -466,7 +466,8 @@ during the freeze, not with the size of the range. Not measured on release build
 
 The file's `members` are where a group starts. The leader also adds every replica that the agreed
 primary lists in `INFO replication` (`slaveN:ip=…,port=…`, the address the replica announces to
-clients) and that the group does not have yet, under any name that resolves to the same address. Its
+clients) and that the group does not have yet, under any name that resolves to the same address or
+reports the same `run_id` (`INFO server`). Its
 replication address comes from the replica's own `CONFIG GET replication-listen`, with the listed host
 when it listens on every interface. The list is recorded in Raft, so every coordinator watches the
 new replica, `SENTINEL replicas` shows it, and it can be promoted. To add a replica, start it

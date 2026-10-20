@@ -45,6 +45,8 @@ pub struct Sighting {
     /// The replicas it lists in `INFO replication` (`slaveN:ip=…,port=…`): where clients reach
     /// each one.
     pub replicas: Vec<super::config::Endpoint>,
+    /// Its process identity (`run_id` in `INFO server`), when it reports one.
+    pub run_id: Option<String>,
 }
 
 impl Sighting {
@@ -659,6 +661,13 @@ async fn look(member: &Member, auth: Option<&str>, cluster: bool) -> Option<Sigh
             _ => Some(0),
         };
     }
+
+    sighting.run_id = client
+        .call(&[b"INFO", b"server"], CALL_TIMEOUT)
+        .await
+        .ok()
+        .and_then(|info| info.text())
+        .and_then(|text| run_id_in(&text));
 
     // Every shard's synced sequence: shard i answers on the address's port plus i.
     let shards = match client
@@ -1429,11 +1438,18 @@ impl Leader {
     /// one whose address does not resolve now. The list is written only if the recorded one
     /// did not change meanwhile; otherwise the next tick tries again.
     async fn discover(&self, configured: &Group, unknown: Vec<super::config::Endpoint>) {
+        let auth = self.config.auth.as_deref();
         let mut known = Vec::new();
+        let mut identities = Vec::new();
         let (group, _) = self.machine.group_and_record(configured);
 
         for member in &group.members {
             known.extend(resolve(&member.address).await);
+            identities.extend(
+                self.sightings
+                    .get(&group.name, &member.address.to_string())
+                    .run_id,
+            );
         }
         let mut found = Vec::new();
 
@@ -1441,6 +1457,16 @@ impl Leader {
             let addresses = resolve(&replica).await;
 
             if addresses.is_empty() || addresses.iter().any(|address| known.contains(address)) {
+                continue;
+            }
+            // The same process under a name that does not resolve to a known address (a
+            // service address and a pod address, for example).
+            let identity = run_id(&replica, auth).await;
+
+            if identity
+                .as_ref()
+                .is_some_and(|identity| identities.contains(identity))
+            {
                 continue;
             }
             let Some(replication) =
@@ -1455,6 +1481,7 @@ impl Leader {
             };
 
             known.extend(addresses);
+            identities.extend(identity);
             found.push(Member {
                 address: replica,
                 replication,
@@ -1493,6 +1520,29 @@ impl Leader {
 
 /// How long recording discovered replicas may take before it is tried again on a later tick.
 const DISCOVERY_WRITE: Duration = Duration::from_secs(5);
+
+/// The node's `run_id` from `INFO server`: one per process, so two addresses of one node
+/// give the same. `None` when it does not answer or is too old to report one.
+async fn run_id(address: &super::config::Endpoint, auth: Option<&str>) -> Option<String> {
+    let mut client = NodeClient::connect(address, auth, CALL_TIMEOUT)
+        .await
+        .ok()?;
+    let text = client
+        .call(&[b"INFO", b"server"], CALL_TIMEOUT)
+        .await
+        .ok()?
+        .text()?;
+
+    run_id_in(&text)
+}
+
+/// The `run_id` line of an `INFO server` text.
+fn run_id_in(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("run_id:"))
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+}
 
 /// The socket addresses `endpoint` names now; none when it does not resolve.
 async fn resolve(endpoint: &super::config::Endpoint) -> Vec<std::net::SocketAddr> {
@@ -1991,6 +2041,10 @@ async fn reconcile(
             warn!(group = %group.name, "no longer confirmed as the leader; leaving the group's members as they are");
             return;
         }
+        // The primary itself under another address (same process identity): left alone.
+        if index != at && sighting.run_id.is_some() && sighting.run_id == seen[at].run_id {
+            continue;
+        }
         let result = if index == at {
             command(
                 member,
@@ -2069,6 +2123,7 @@ mod tests {
             loading: false,
             topology: None,
             replicas: Vec::new(),
+            run_id: None,
             shards: durable.len() as u16,
             shards_answering: durable.len() as u16,
         }
@@ -2747,6 +2802,32 @@ mod tests {
             member(Role::Master, &[10], &[0]),
             member(following(&group, 0), &[10], &[0]),
             member(Role::Master, &[10], &[0]),
+        ];
+
+        reconcile(
+            &config(Duration::from_millis(1000)),
+            &group,
+            primary,
+            &seen,
+            &Allow(3.into()),
+        )
+        .await;
+        assert_eq!(commands.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Under an address that is not the primary's, but the same process: left alone too.
+        let (group, commands) = listening(3, false).await;
+        let primary = &Primary {
+            member: group.members[0].address.to_string(),
+            epoch: 2,
+        };
+        let same = Sighting {
+            run_id: Some("a".repeat(40)),
+            ..member(Role::Master, &[10], &[0])
+        };
+        let seen = vec![
+            same.clone(),
+            member(following(&group, 0), &[10], &[0]),
+            same,
         ];
 
         reconcile(

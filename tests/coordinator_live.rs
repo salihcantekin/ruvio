@@ -1875,6 +1875,20 @@ fn a_replica_started_later_is_found_and_can_be_promoted() {
         call(&third, &["GET", "found"]).as_deref() == Some("1")
     });
 
+    // Every node reports a process identity, the coordinators' check for one node under two
+    // addresses.
+    let identity = |node: usize| {
+        call(&group.resp[node].to_string(), &["INFO", "server"])
+            .and_then(|info| {
+                info.lines()
+                    .find_map(|line| line.strip_prefix("run_id:").map(str::to_owned))
+            })
+            .unwrap()
+    };
+
+    assert_eq!(identity(2).len(), 40);
+    assert_ne!(identity(1), identity(2));
+
     // Only node 2 is left: it takes over.
     nodes[0].kill();
     nodes[1].kill();
