@@ -13,7 +13,7 @@ Without coordinators nothing changes: a primary and its replicas run as describe
 ## What happens on a failure
 
 1. Every coordinator connects to every member each `ping_interval_ms` and reads `ROLE`, `CONFIG GET
-   shards` and, from every shard on its own port, `ROLE` and `INFO replication` (the synced and the
+   shards`, `INFO server` (`run_id`) and, from every shard on its own port, `ROLE` and `INFO replication` (the synced and the
    committed sequence of every shard). A member is heard from only when all its shards answer: a
    primary with one shard down is failed over like a dead one, and a replica with a shard down is not
    promoted. With the primary lease, a coordinator does not renew the lease of a primary with a
@@ -485,6 +485,27 @@ one client writing the range throughout, 5 runs): the writer saw `TRYAGAIN` for 
 of it the target's replica syncing the copy record by record. The time grows with the keys written
 during the freeze, not with the size of the range. Not measured on release builds or real machines.
 
+## Replicas the file does not list
+
+The file's `members` are where a group starts. The leader also adds every replica that the agreed
+primary lists in `INFO replication` (`slaveN:ip=…,port=…`, the address the replica announces to
+clients) and that the group does not have yet, under any name that resolves to the same address or
+reports the same `run_id` (`INFO server`). Its
+replication address comes from the replica's own `CONFIG GET replication-listen`, with the listed host
+when it listens on every interface. The list is recorded in Raft, so every coordinator watches the
+new replica, `SENTINEL replicas` shows it, and it can be promoted. To add a replica, start it
+following the primary (`replication.role = "replica"` and `replication.primary`, or `REPLICAOF`); no
+coordinator restart is needed.
+
+Members are known by their client address (`host:port` as listed): the Raft record names the primary
+by it. A member that stops answering stays in the list as down. `COORDINATOR FORGET group host:port`
+on the leader removes one for good and keeps it from being found again, also while it still follows
+the primary (a backup or analytics replica that must never be promoted); it is refused for the primary
+and for a member the file lists (remove it there and restart the coordinators). To take a forgotten
+replica back, list it in the file. A member added to the file later is added to the recorded list
+when the coordinators restart. A replica whose replication address cannot be read is tried again
+after 30 seconds; discovery runs on its own task and never delays a failover.
+
 ## Adding and removing coordinators
 
 The coordinators that vote are the ones in the Raft record; `peers` in the file is only the first
@@ -590,7 +611,6 @@ releases side by side, so the refused handshake itself was not part of the run. 
 
 ## Limits of this version
 
-- Groups are declared in the file; replicas are not discovered from the primary yet.
 - Ranges move only when an operator asks (`COORDINATOR MOVE`); nothing rebalances by load yet.
 
 ## Tests

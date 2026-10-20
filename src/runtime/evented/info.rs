@@ -38,9 +38,10 @@ pub(super) fn evented_info(state: &ShardState, section: Option<&[u8]>) -> io::Re
 
     write!(
         info,
-        "# Server\r\nruvio_version:{}\r\nruvio_backend:evented\r\nruvio_health:ok\r\nruvio_readiness:ready\r\nruvio_durability:{}\r\nruvio_persistence_state:{}\r\nrecovered_wal_records:{}\r\nwal_last_sequence:{}\r\nwal_unsynced_bytes:{}\r\nruvio_shard_id:{shard_id}\r\nruvio_shard_count:{shard_count}\r\n\
+        "# Server\r\nruvio_version:{}\r\nrun_id:{}\r\nruvio_backend:evented\r\nruvio_health:ok\r\nruvio_readiness:ready\r\nruvio_durability:{}\r\nruvio_persistence_state:{}\r\nrecovered_wal_records:{}\r\nwal_last_sequence:{}\r\nwal_unsynced_bytes:{}\r\nruvio_shard_id:{shard_id}\r\nruvio_shard_count:{shard_count}\r\n\
          # Stats\r\nconnected_clients:{}\r\ntotal_connections_received:{}\r\nrejected_connections:{}\r\ntotal_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\n# Buffers\r\ninput_buffer_peak_bytes:{}\r\noutput_buffer_peak_bytes:{}\r\npubsub_queue_peak_frames:{}\r\npubsub_queue_peak_bytes:{}\r\npubsub_cluster_dropped:{}\r\n# Memory\r\ncharged_memory_bytes:{}\r\n# Keyspace\r\nkeys:{}\r\nexpired_keys:{}\r\nexpired_keys_passive:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nexpires:{}\r\n",
         env!("CARGO_PKG_VERSION"),
+        run_id(),
         persistence.profile(),
         persistence_state,
         state.recovery.records_replayed,
@@ -209,6 +210,28 @@ pub(super) fn evented_info(state: &ShardState, section: Option<&[u8]>) -> io::Re
 /// The `# Name` blocks of `info` that `INFO name` asks for. Names compare without case or
 /// spaces (`commandcounters`); `all`, `everything` and `default` keep every block, and an
 /// unknown name gives an empty reply, as in Redis.
+/// This process's random identity, 40 hex digits as Redis's `run_id`: the same on every
+/// shard, new on every start. Coordinators use it to tell one node listed under two addresses.
+pub(crate) fn run_id() -> &'static str {
+    static RUN_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    RUN_ID.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+
+        (0..3)
+            .map(|round: u32| {
+                // `RandomState` is seeded from the operating system for each instance.
+                let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+
+                hasher.write_u32(round);
+                hasher.write_u32(std::process::id());
+                format!("{:016x}", hasher.finish())
+            })
+            .collect::<String>()[..40]
+            .to_owned()
+    })
+}
+
 fn only_section(info: &[u8], name: &[u8]) -> Vec<u8> {
     let wanted: Vec<u8> = name.to_ascii_lowercase();
 

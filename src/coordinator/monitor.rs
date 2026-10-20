@@ -42,6 +42,11 @@ pub struct Sighting {
     /// How many shards it runs, and how many of them answered `ROLE` and `INFO replication`.
     pub shards: u16,
     pub shards_answering: u16,
+    /// The replicas it lists in `INFO replication` (`slaveN:ip=…,port=…`): where clients reach
+    /// each one.
+    pub replicas: Vec<super::config::Endpoint>,
+    /// Its process identity (`run_id` in `INFO server`), when it reports one.
+    pub run_id: Option<String>,
 }
 
 impl Sighting {
@@ -58,11 +63,11 @@ pub enum Role {
     Replica(Option<String>),
 }
 
-/// Every member's latest sighting, by group and member index, this coordinator's lease
+/// Every member's latest sighting, by group and member address, this coordinator's lease
 /// grants, and what it did as the leader.
 #[derive(Clone, Default)]
 pub struct Sightings(
-    Arc<Mutex<HashMap<(String, usize), Sighting>>>,
+    Arc<Mutex<HashMap<(String, String), Sighting>>>,
     Grants,
     Arc<Stats>,
 );
@@ -78,32 +83,47 @@ impl Sightings {
 
     /// How many members of `group` answered on every shard within `fresh`.
     pub fn answering(&self, group: &Group, fresh: Duration) -> usize {
-        (0..group.members.len())
-            .filter(|&member| {
-                let sighting = self.get(&group.name, member);
-
+        self.seen(group)
+            .iter()
+            .filter(|sighting| {
                 sighting.complete() && sighting.last_ok.is_some_and(|at| at.elapsed() <= fresh)
             })
             .count()
     }
 
-    pub fn get(&self, group: &str, member: usize) -> Sighting {
+    /// The sighting of `member` (its client address) of `group`.
+    pub fn get(&self, group: &str, member: &str) -> Sighting {
         self.0
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .get(&(group.to_owned(), member))
+            .get(&(group.to_owned(), member.to_owned()))
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Every member's sighting, in the order `group` lists them.
+    pub fn seen(&self, group: &Group) -> Vec<Sighting> {
+        group
+            .members
+            .iter()
+            .map(|member| self.get(&group.name, &member.address.to_string()))
+            .collect()
     }
 
     /// Takes in a look at a member. One where a shard did not answer keeps the last complete
     /// sighting and only updates how many shards answered: the member is not heard from, so it
     /// is down once `down_after` passes without a complete answer, and is no candidate meanwhile.
-    fn set(&self, group: &str, member: usize, sighting: Sighting) {
+    fn set(&self, group: &str, member: &str, sighting: Sighting) {
         let mut sightings = self.0.lock().unwrap_or_else(|error| error.into_inner());
-        let key = (group.to_owned(), member);
+        let key = (group.to_owned(), member.to_owned());
 
         if sighting.complete() {
+            let mut sighting = sighting;
+
+            // One failed `INFO server` does not forget who the member is.
+            if sighting.run_id.is_none() {
+                sighting.run_id = sightings.get(&key).and_then(|known| known.run_id.clone());
+            }
             sightings.insert(key, sighting);
         } else {
             let known = sightings.entry(key).or_default();
@@ -113,16 +133,12 @@ impl Sightings {
         }
     }
 
-    /// Milliseconds since each member of `group` last answered, as [`RpcRequest::Observe`]
+    /// Milliseconds since `member` of `group` last answered, as [`RpcRequest::Observe`]
     /// reports it.
-    pub fn ages(&self, group: &Group) -> Vec<Option<u64>> {
-        (0..group.members.len())
-            .map(|member| {
-                self.get(&group.name, member)
-                    .last_ok
-                    .map(|at| at.elapsed().as_millis() as u64)
-            })
-            .collect()
+    pub fn age(&self, group: &str, member: &str) -> Option<u64> {
+        self.get(group, member)
+            .last_ok
+            .map(|at| at.elapsed().as_millis() as u64)
     }
 }
 
@@ -145,7 +161,7 @@ struct GrantBook {
     /// A coordinator that just started may have granted before it stopped: it reports every
     /// lease as granted at its start.
     started: Instant,
-    members: Mutex<HashMap<(String, usize), Granting>>,
+    members: Mutex<HashMap<(String, String), Granting>>,
     /// One per group, held by the leader while it decides whether to fail that group over.
     decisions: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -212,18 +228,20 @@ impl Granting {
 }
 
 impl Grants {
-    fn with<R>(&self, group: &str, member: usize, act: impl FnOnce(&mut Granting) -> R) -> R {
+    fn with<R>(&self, group: &str, member: &str, act: impl FnOnce(&mut Granting) -> R) -> R {
         let mut members = self
             .0
             .members
             .lock()
             .unwrap_or_else(|error| error.into_inner());
 
-        act(members.entry((group.to_owned(), member)).or_default())
+        act(members
+            .entry((group.to_owned(), member.to_owned()))
+            .or_default())
     }
 
-    /// [`Granting::report`] for `member` of `group`.
-    pub fn report(&self, group: &str, member: usize, safe: Duration) -> bool {
+    /// [`Granting::report`] for `member` (its client address) of `group`.
+    pub fn report(&self, group: &str, member: &str, safe: Duration) -> bool {
         let started = self.0.started;
 
         self.with(group, member, |granting| {
@@ -250,7 +268,7 @@ impl Grants {
 
 impl Grants {
     /// When this coordinator last granted `member` of `group` a lease, if it did since it started.
-    pub fn last(&self, group: &str, member: usize) -> Option<Instant> {
+    pub fn last(&self, group: &str, member: &str) -> Option<Instant> {
         self.with(group, member, |granting| granting.last)
     }
 }
@@ -374,7 +392,7 @@ pub async fn confirm_locally(
         let _decided = grants.decision(group).await;
 
         raft.ensure_linearizable().await.ok()?;
-        machine.primaries().get(group).copied()
+        machine.primaries().get(group).cloned()
     };
 
     tokio::time::timeout(CONFIRM_BUDGET, confirmed)
@@ -475,24 +493,23 @@ async fn renew(
         return;
     };
     let name = group.name.as_str();
-    let member = primary.member;
+    let member = primary.member.as_str();
     let asked_at = grants.with(name, member, |granting| {
         (granting.cleared != Some(primary.epoch)).then_some(granting.reports)
     });
 
     if let Some(asked_at) = asked_at {
-        if confirm(config, raft, machine, grants, name).await != Some(primary) {
+        if confirm(config, raft, machine, grants, name).await.as_ref() != Some(&primary) {
             return;
         }
         grants.with(name, member, |granting| {
             granting.confirm(asked_at, primary.epoch)
         });
     }
-    let Some(target) = group.members.get(member) else {
+    let Ok(target) = super::config::Endpoint::parse(member) else {
         return;
     };
-    let Ok(mut client) =
-        NodeClient::connect(&target.address, config.auth.as_deref(), CALL_TIMEOUT).await
+    let Ok(mut client) = NodeClient::connect(&target, config.auth.as_deref(), CALL_TIMEOUT).await
     else {
         return;
     };
@@ -558,12 +575,12 @@ pub async fn renew_leases(
         let primaries = machine.primaries();
 
         for group in &config.groups {
-            let Some(primary) = primaries.get(&group.name).copied() else {
+            let Some(primary) = primaries.get(&group.name).cloned() else {
                 continue;
             };
             // A primary with a shard this coordinator cannot reach is not renewed: it would
             // keep writing on the others while the coordinators fail it over.
-            if !sightings.get(&group.name, primary.member).complete() {
+            if !sightings.get(&group.name, &primary.member).complete() {
                 continue;
             }
             {
@@ -651,6 +668,13 @@ async fn look(member: &Member, auth: Option<&str>, cluster: bool) -> Option<Sigh
         };
     }
 
+    sighting.run_id = client
+        .call(&[b"INFO", b"server"], CALL_TIMEOUT)
+        .await
+        .ok()
+        .and_then(|info| info.text())
+        .and_then(|text| run_id_in(&text));
+
     // Every shard's synced sequence: shard i answers on the address's port plus i.
     let shards = match client
         .call(&[b"CONFIG", b"GET", b"shards"], CALL_TIMEOUT)
@@ -679,6 +703,10 @@ async fn look(member: &Member, auth: Option<&str>, cluster: bool) -> Option<Sigh
         };
         sighting.shards_answering += u16::from(info.is_some());
         let text = info.and_then(|info| info.text()).unwrap_or_default();
+
+        if shard == 0 {
+            sighting.replicas = listed_replicas(&text);
+        }
         let field = |name: &str| {
             text.lines()
                 .find_map(|line| line.strip_prefix(name))
@@ -695,6 +723,26 @@ async fn look(member: &Member, auth: Option<&str>, cluster: bool) -> Option<Sigh
     }
 
     Some(sighting)
+}
+
+/// The replicas an `INFO replication` text lists, by the address clients reach them at.
+fn listed_replicas(text: &str) -> Vec<super::config::Endpoint> {
+    text.lines()
+        .filter(|line| line.starts_with("slave"))
+        .filter_map(|line| {
+            let (_, fields) = line.split_once(':')?;
+            let field = |name: &str| {
+                fields
+                    .split(',')
+                    .find_map(|field| field.strip_prefix(name)?.strip_prefix('='))
+            };
+
+            Some(super::config::Endpoint {
+                host: field("ip")?.to_owned(),
+                port: field("port")?.parse().ok()?,
+            })
+        })
+        .collect()
 }
 
 /// Shard `address` of a member: its `INFO replication` when it answers `ROLE` and that, or
@@ -763,23 +811,25 @@ fn at(values: &[u64], shard: usize) -> u64 {
 
 impl Commit {
     /// Takes in what the primary and the replicas following it report now.
-    fn learn(&mut self, group: &Group, primary: Primary, seen: &[Sighting], fresh: Duration) {
+    fn learn(&mut self, group: &Group, primary: &Primary, seen: &[Sighting], fresh: Duration) {
         // Only under the primary the values belong to: after a failover the Raft record
         // brings the values the promotion kept (see `Commit::after_promotion`).
         if self.epoch != primary.epoch {
             return;
         }
-
-        let head = &seen[primary.member];
+        let Some(index) = primary.index(group) else {
+            return;
+        };
+        let head = &seen[index];
         // A primary that answers bounds what can be committed: a replica's higher value is
         // left from an earlier primary.
         let alive = head.last_ok.is_some_and(|at| at.elapsed() <= fresh);
         let following = Some(Role::Replica(Some(
-            group.members[primary.member].replication.to_string(),
+            group.members[index].replication.to_string(),
         )));
 
         for (member, sighting) in seen.iter().enumerate() {
-            let own = member == primary.member && sighting.role == Some(Role::Master);
+            let own = member == index && sighting.role == Some(Role::Master);
 
             if !own && sighting.role != following {
                 continue;
@@ -809,7 +859,7 @@ impl Commits {
     pub fn learn(
         &self,
         group: &Group,
-        primary: Primary,
+        primary: &Primary,
         seen: &[Sighting],
         fresh: Duration,
         recorded: &Recorded,
@@ -964,7 +1014,7 @@ fn missing(sighting: &Sighting, committed: &[u64]) -> String {
 }
 
 /// Pings every member of every group, every `ping_interval`.
-pub async fn watch(config: Arc<CoordinatorConfig>, sightings: Sightings) {
+pub async fn watch(config: Arc<CoordinatorConfig>, machine: StateMachine, sightings: Sightings) {
     let mut tick = tokio::time::interval(config.ping_interval);
 
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -974,19 +1024,20 @@ pub async fn watch(config: Arc<CoordinatorConfig>, sightings: Sightings) {
         let cluster = config.groups.iter().any(|group| group.shards.is_some());
 
         for group in &config.groups {
-            for (index, member) in group.members.iter().enumerate() {
+            for member in machine.group(group).members {
                 let auth = config.auth.clone();
-                let member = member.clone();
                 let name = group.name.clone();
 
                 looks.push(tokio::spawn(async move {
-                    (name, index, look(&member, auth.as_deref(), cluster).await)
+                    let sighting = look(&member, auth.as_deref(), cluster).await;
+
+                    (name, member.address.to_string(), sighting)
                 }));
             }
         }
         for look in looks {
-            if let Ok((name, index, Some(sighting))) = look.await {
-                sightings.set(&name, index, sighting);
+            if let Ok((name, address, Some(sighting))) = look.await {
+                sightings.set(&name, &address, sighting);
             }
         }
     }
@@ -1026,16 +1077,11 @@ async fn objectively_down(
     raft: &Raft,
     sightings: &Sightings,
     group: &Group,
-    primary: usize,
+    primary: &str,
 ) -> (Verdict, bool) {
     let down_after = config.down_after.as_millis() as u64;
-    let is_down = |ages: &[Option<u64>]| {
-        ages.get(primary)
-            .copied()
-            .flatten()
-            .is_none_or(|age| age > down_after)
-    };
-    let mut heard_down = usize::from(is_down(&sightings.ages(group)));
+    let is_down = |age: Option<u64>| age.is_none_or(|age| age > down_after);
+    let mut heard_down = usize::from(is_down(sightings.age(&group.name, primary)));
     let mut lease_on = config.primary_lease.is_some();
     let mut ended = usize::from(match config.primary_lease {
         Some((_, safe)) => sightings.grants().report(&group.name, primary, safe),
@@ -1048,16 +1094,17 @@ async fn objectively_down(
         if *id == config.id {
             continue;
         }
-        let (address, secret, name) = (
+        let (address, secret, name, member) = (
             address.clone(),
             config.secret.clone().unwrap_or_default(),
             group.name.clone(),
+            primary.to_owned(),
         );
 
         calls.spawn(async move {
             let leases = RpcRequest::Leases {
                 group: name.clone(),
-                member: primary,
+                member: member.clone(),
             };
 
             match super::raft::call(&address, &secret, leases, CALL_TIMEOUT).await {
@@ -1069,7 +1116,10 @@ async fn objectively_down(
                 _ => match super::raft::call(
                     &address,
                     &secret,
-                    RpcRequest::Observe { group: name },
+                    RpcRequest::Observe {
+                        group: name,
+                        member,
+                    },
                     CALL_TIMEOUT,
                 )
                 .await
@@ -1085,7 +1135,7 @@ async fn objectively_down(
             continue;
         };
 
-        heard_down += usize::from(heard.is_some_and(|ages| is_down(&ages)));
+        heard_down += usize::from(heard.is_some_and(is_down));
         ended += usize::from(peer_ended);
         lease_on |= peer_lease_on;
     }
@@ -1126,7 +1176,19 @@ struct Leader {
     commits: Commits,
     switches: Switches,
     leadership: Arc<Leadership>,
+    discovery: Arc<Discovery>,
 }
+
+/// Replica discovery's own bookkeeping: the groups a discovery runs for, and replicas whose
+/// replication address could not be read, with when, so they are tried again only later.
+#[derive(Default)]
+struct Discovery {
+    running: Mutex<Vec<String>>,
+    failed: Mutex<HashMap<String, Instant>>,
+}
+
+/// How long a replica whose replication address could not be read is left alone.
+const DISCOVERY_RETRY: Duration = Duration::from_secs(30);
 
 /// The leader's loop: start each group from its configured primary, fail over a primary a
 /// majority sees down, and point every answering member at the agreed primary. Each group is
@@ -1149,6 +1211,7 @@ pub async fn lead(
         commits: commits.clone(),
         switches,
         leadership: Arc::clone(&moves.leadership),
+        discovery: Arc::default(),
     };
     let tending: Arc<Mutex<Vec<usize>>> = Arc::default();
     let mut tick = tokio::time::interval(config.ping_interval);
@@ -1171,11 +1234,10 @@ pub async fn lead(
 
             for group in &config.groups {
                 if let Some(primary) = primaries.get(&group.name) {
-                    let seen: Vec<Sighting> = (0..group.members.len())
-                        .map(|member| sightings.get(&group.name, member))
-                        .collect();
+                    let group = &machine.group(group);
+                    let seen = sightings.seen(group);
 
-                    commits.learn(group, *primary, &seen, config.down_after, &recorded);
+                    commits.learn(group, primary, &seen, config.down_after, &recorded);
                 }
             }
             continue;
@@ -1217,7 +1279,7 @@ pub async fn lead(
 impl Leader {
     /// One tick of one group: record its first primary, fail it over when a majority sees the
     /// primary down, or point its members at the agreed primary.
-    async fn tend(&self, group: &Group) {
+    async fn tend(&self, configured: &Group) {
         let Self {
             config,
             raft,
@@ -1226,12 +1288,12 @@ impl Leader {
             commits,
             switches,
             leadership,
+            ..
         } = self;
         let fence = Leading { leadership, raft };
-        let seen: Vec<Sighting> = (0..group.members.len())
-            .map(|member| sightings.get(&group.name, member))
-            .collect();
-        let Some(primary) = machine.primaries().get(&group.name).copied() else {
+        let group = &machine.group(configured);
+        let seen = sightings.seen(group);
+        let Some(primary) = machine.primaries().get(&group.name).cloned() else {
             // First start: record the member that already is the primary. Nothing is
             // changed on the data nodes until exactly one of them answers as one.
             let masters: Vec<usize> = (0..seen.len())
@@ -1240,7 +1302,9 @@ impl Leader {
 
             match masters.as_slice() {
                 [only] => {
-                    propose(raft, group, *only, 1, None).await;
+                    let member = group.members[*only].address.to_string();
+
+                    propose(raft, group, member, 1, None).await;
                 }
                 [] => {}
                 _ => {
@@ -1249,15 +1313,25 @@ impl Leader {
             }
             return;
         };
-        let committed = commits.learn(group, primary, &seen, config.down_after, &machine.commits());
-        let primary_age = seen[primary.member].last_ok.map(|at| at.elapsed());
+        let Some(at) = primary.index(group) else {
+            warn!(group = %group.name, primary = %primary.member, "the recorded primary is not among the group's members; leaving the group as it is");
+            return;
+        };
+        let committed = commits.learn(
+            group,
+            &primary,
+            &seen,
+            config.down_after,
+            &machine.commits(),
+        );
+        let primary_age = seen[at].last_ok.map(|at| at.elapsed());
 
         // Held until the failover is recorded, so no coordinator is confirmed this primary
         // between reporting its lease ended and the record naming another member.
         if primary_age.is_none_or(|age| age > config.down_after) {
             let decided = sightings.grants().decision(&group.name).await;
 
-            match objectively_down(config, raft, sightings, group, primary.member)
+            match objectively_down(config, raft, sightings, group, &primary.member)
                 .await
                 .0
             {
@@ -1265,6 +1339,7 @@ impl Leader {
                     let failing = Failing {
                         group,
                         primary,
+                        at,
                         seen: &seen,
                         committed: &committed,
                         commits,
@@ -1290,8 +1365,259 @@ impl Leader {
             sightings.stats().enter(&group.name, GroupState::Ok);
         }
 
-        reconcile(config, group, primary, &seen, &fence).await;
+        reconcile(config, group, &primary, &seen, &fence).await;
+        self.list_again(configured).await;
+        self.start_discovery(configured, group, &seen[at]);
     }
+}
+
+impl Leader {
+    /// Records the group's list again when the file names a member that was forgotten, which
+    /// takes it back (see [`super::raft::apply_members`]). Rare: only after the file changed.
+    async fn list_again(&self, configured: &Group) {
+        let forgotten = self.machine.forgotten(&configured.name);
+
+        if !configured
+            .members
+            .iter()
+            .any(|member| forgotten.contains(&member.address.to_string()))
+        {
+            return;
+        }
+        let (group, previous) = self.machine.group_and_record(configured);
+        let request = Request::SetMembers {
+            group: configured.name.clone(),
+            previous,
+            members: group.members,
+        };
+
+        match tokio::time::timeout(DISCOVERY_WRITE, self.raft.client_write(request)).await {
+            Ok(Ok(reply)) if reply.data => {
+                info!(group = %configured.name, "a forgotten member is listed in the file again; it is a member again")
+            }
+            _ => {}
+        }
+    }
+
+    /// Starts [`Leader::discover`] on its own task when the answering primary lists replicas
+    /// that `group` does not have, have not been forgotten and did not fail lately; one at a
+    /// time per group, so it never delays the group's tending.
+    fn start_discovery(&self, configured: &Group, group: &Group, primary: &Sighting) {
+        if primary.role != Some(Role::Master)
+            || primary
+                .last_ok
+                .is_none_or(|at| at.elapsed() > self.config.down_after)
+        {
+            return;
+        }
+        let forgotten = self.machine.forgotten(&group.name);
+        let mut unknown: Vec<super::config::Endpoint> = Vec::new();
+
+        {
+            let mut failed = self
+                .discovery
+                .failed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+
+            failed.retain(|_, at| at.elapsed() < DISCOVERY_RETRY);
+            for replica in &primary.replicas {
+                let name = replica.to_string();
+
+                if !group
+                    .members
+                    .iter()
+                    .any(|member| member.address == *replica)
+                    && !forgotten.contains(&name)
+                    && !failed.contains_key(&name)
+                    && !unknown.contains(replica)
+                {
+                    unknown.push(replica.clone());
+                }
+            }
+        }
+        if unknown.is_empty() {
+            return;
+        }
+        {
+            let mut running = self
+                .discovery
+                .running
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+
+            if running.contains(&group.name) {
+                return;
+            }
+            running.push(group.name.clone());
+        }
+        let (leader, configured) = (self.clone(), configured.clone());
+
+        tokio::spawn(async move {
+            leader.discover(&configured, unknown).await;
+            leader
+                .discovery
+                .running
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .retain(|name| *name != configured.name);
+        });
+    }
+
+    /// Records the `unknown` replicas the primary lists, so they are watched, followed and can
+    /// be promoted. Each is listed by the address clients reach it at (as the primary lists
+    /// it); its replication address comes from its own `CONFIG GET replication-listen`, with
+    /// the listed host when it listens on every interface. A replica the group has under
+    /// another name (a host name for the same address) is not added again, and neither is
+    /// one whose address does not resolve now. The list is written only if the recorded one
+    /// did not change meanwhile; otherwise the next tick tries again.
+    async fn discover(&self, configured: &Group, unknown: Vec<super::config::Endpoint>) {
+        let auth = self.config.auth.as_deref();
+        let mut known = Vec::new();
+        let mut identities = Vec::new();
+        let (group, _) = self.machine.group_and_record(configured);
+
+        for member in &group.members {
+            known.extend(resolve(&member.address).await);
+            identities.extend(
+                self.sightings
+                    .get(&group.name, &member.address.to_string())
+                    .run_id,
+            );
+        }
+        let mut found = Vec::new();
+
+        for replica in unknown {
+            let addresses = resolve(&replica).await;
+
+            if addresses.is_empty() || addresses.iter().any(|address| known.contains(address)) {
+                continue;
+            }
+            // The same process under a name that does not resolve to a known address (a
+            // service address and a pod address, for example).
+            let identity = run_id(&replica, auth).await;
+
+            if identity
+                .as_ref()
+                .is_some_and(|identity| identities.contains(identity))
+            {
+                continue;
+            }
+            let Some(replication) =
+                replication_address(&replica, self.config.auth.as_deref()).await
+            else {
+                self.discovery
+                    .failed
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(replica.to_string(), Instant::now());
+                continue;
+            };
+
+            known.extend(addresses);
+            identities.extend(identity);
+            found.push(Member {
+                address: replica,
+                replication,
+            });
+        }
+        if found.is_empty() {
+            return;
+        }
+        // Read again just before writing: the write applies only over this exact list.
+        let (group, previous) = self.machine.group_and_record(configured);
+        let mut members = group.members;
+
+        for member in found {
+            if members.iter().all(|known| known.address != member.address) {
+                info!(group = %configured.name, member = %member.address, replication = %member.replication, "found a new replica of the group");
+                members.push(member);
+            }
+        }
+        let request = Request::SetMembers {
+            group: configured.name.clone(),
+            previous,
+            members,
+        };
+
+        match tokio::time::timeout(DISCOVERY_WRITE, self.raft.client_write(request)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                warn!(group = %configured.name, %error, "could not record the group's new replicas")
+            }
+            Err(_) => {
+                warn!(group = %configured.name, "recording the group's new replicas timed out")
+            }
+        }
+    }
+}
+
+/// How long recording discovered replicas may take before it is tried again on a later tick.
+const DISCOVERY_WRITE: Duration = Duration::from_secs(5);
+
+/// The node's `run_id` from `INFO server`: one per process, so two addresses of one node
+/// give the same. `None` when it does not answer or is too old to report one.
+async fn run_id(address: &super::config::Endpoint, auth: Option<&str>) -> Option<String> {
+    let mut client = NodeClient::connect(address, auth, CALL_TIMEOUT)
+        .await
+        .ok()?;
+    let text = client
+        .call(&[b"INFO", b"server"], CALL_TIMEOUT)
+        .await
+        .ok()?
+        .text()?;
+
+    run_id_in(&text)
+}
+
+/// The `run_id` line of an `INFO server` text.
+fn run_id_in(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("run_id:"))
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+}
+
+/// The socket addresses `endpoint` names now; none when it does not resolve.
+async fn resolve(endpoint: &super::config::Endpoint) -> Vec<std::net::SocketAddr> {
+    match tokio::time::timeout(
+        CALL_TIMEOUT,
+        tokio::net::lookup_host((endpoint.host.as_str(), endpoint.port)),
+    )
+    .await
+    {
+        Ok(Ok(addresses)) => addresses.collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Where the replica at `address` takes replication connections: its `replication-listen`,
+/// with `address`'s host when it listens on every interface. `None` when it does not answer
+/// or has no replication listener.
+async fn replication_address(
+    address: &super::config::Endpoint,
+    auth: Option<&str>,
+) -> Option<super::config::Endpoint> {
+    let mut client = NodeClient::connect(address, auth, CALL_TIMEOUT)
+        .await
+        .ok()?;
+    let reply = client
+        .call(&[b"CONFIG", b"GET", b"replication-listen"], CALL_TIMEOUT)
+        .await
+        .ok()?;
+    let Value::Array(Some(pair)) = reply else {
+        return None;
+    };
+    let mut listen = super::config::Endpoint::parse(&pair.get(1)?.text()?).ok()?;
+    let anywhere = listen
+        .host
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_unspecified());
+
+    if anywhere {
+        listen.host.clone_from(&address.host);
+    }
+    Some(listen)
 }
 
 /// Sends the cluster map to every answering member that serves an older one, so `MOVED`
@@ -1314,8 +1640,8 @@ async fn push_cluster_map(
     let map: Arc<[u8]> = map.into_bytes().into();
 
     for group in &config.groups {
-        for (index, member) in group.members.iter().enumerate() {
-            let sighting = sightings.get(&group.name, index);
+        for member in machine.group(group).members {
+            let sighting = sightings.get(&group.name, &member.address.to_string());
 
             if sighting
                 .last_ok
@@ -1421,7 +1747,7 @@ async fn record_commits(raft: &Raft, commits: &Commits, recorded: &Recorded) -> 
 async fn propose(
     raft: &Raft,
     group: &Group,
-    member: usize,
+    member: String,
     epoch: u64,
     commit: Option<Commit>,
 ) -> bool {
@@ -1446,6 +1772,8 @@ async fn propose(
 struct Failing<'a> {
     group: &'a Group,
     primary: Primary,
+    /// The primary's index in `group`.
+    at: usize,
     seen: &'a [Sighting],
     committed: &'a [u64],
     commits: &'a Commits,
@@ -1469,6 +1797,7 @@ async fn failover(
     let Failing {
         group,
         primary,
+        at,
         seen,
         committed,
         commits,
@@ -1477,7 +1806,7 @@ async fn failover(
     } = failing;
     let choice = choose(
         group,
-        primary.member,
+        at,
         seen,
         config.down_after,
         committed,
@@ -1513,7 +1842,7 @@ async fn failover(
 
     warn!(
         group = %group.name,
-        from = %group.members[primary.member].address,
+        from = %group.members[at].address,
         to = %group.members[candidate].address,
         force,
         "primary is down; failing over"
@@ -1526,7 +1855,10 @@ async fn failover(
         primary.epoch + 1,
     );
 
-    if !propose(raft, group, candidate, primary.epoch + 1, Some(kept)).await {
+    let promoted = &group.members[candidate];
+    let new = &promoted.address;
+
+    if !propose(raft, group, new.to_string(), primary.epoch + 1, Some(kept)).await {
         return Err("ERR the failover was not recorded; try again".into());
     }
     stats.failed_over();
@@ -1535,9 +1867,7 @@ async fn failover(
     // primary. The calls to the data nodes below need not hold it up.
     drop(decided);
 
-    let promoted = &group.members[candidate];
     let timeout = command_timeout(config);
-    let new = &promoted.address;
 
     // The newest map first: a range the group gave away is then answered with `MOVED`
     // before the promoted member takes writes.
@@ -1574,7 +1904,7 @@ async fn failover(
         warn!(group = %group.name, %error, "the chosen replica refused promotion");
     }
 
-    let old = &group.members[primary.member].address;
+    let old = &group.members[at].address;
     let _ = switches.send(format!(
         "{} {} {} {} {}",
         group.name, old.host, old.port, new.host, new.port
@@ -1583,8 +1913,8 @@ async fn failover(
     reconcile(
         config,
         group,
-        Primary {
-            member: candidate,
+        &Primary {
+            member: new.to_string(),
             epoch: primary.epoch + 1,
         },
         seen,
@@ -1608,21 +1938,26 @@ pub struct Force<'a> {
 /// `COORDINATOR FAILOVER group FORCE` on the leader: promotes the best answering replica of a
 /// group whose primary is down now, even one that lacks committed records. The promoted
 /// member's address.
-pub async fn force_failover(force: Force<'_>, group: &Group) -> Result<String, String> {
+pub async fn force_failover(force: Force<'_>, configured: &Group) -> Result<String, String> {
     if !caught_up(force.raft) {
         return Err("ERR the leader is still applying the log; try again".into());
     }
-    let Some(primary) = force.machine.primaries().get(&group.name).copied() else {
+    let group = &force.machine.group(configured);
+    let Some(primary) = force.machine.primaries().get(&group.name).cloned() else {
         return Err(format!(
             "ERR group {} has no agreed primary yet",
             group.name
         ));
     };
-    let seen: Vec<Sighting> = (0..group.members.len())
-        .map(|member| force.sightings.get(&group.name, member))
-        .collect();
+    let Some(at) = primary.index(group) else {
+        return Err(format!(
+            "ERR the primary of {} is not among its members",
+            group.name
+        ));
+    };
+    let seen = force.sightings.seen(group);
 
-    if seen[primary.member]
+    if seen[at]
         .last_ok
         .is_some_and(|at| at.elapsed() <= force.config.down_after)
     {
@@ -1641,7 +1976,7 @@ pub async fn force_failover(force: Force<'_>, group: &Group) -> Result<String, S
         force.raft,
         force.sightings,
         group,
-        primary.member,
+        &primary.member,
     )
     .await
     {
@@ -1661,7 +1996,7 @@ pub async fn force_failover(force: Force<'_>, group: &Group) -> Result<String, S
     }
     let committed = force.commits.learn(
         group,
-        primary,
+        &primary,
         &seen,
         force.config.down_after,
         &force.machine.commits(),
@@ -1669,6 +2004,7 @@ pub async fn force_failover(force: Force<'_>, group: &Group) -> Result<String, S
     let failing = Failing {
         group,
         primary,
+        at,
         seen: &seen,
         committed: &committed,
         commits: force.commits,
@@ -1698,11 +2034,14 @@ pub async fn force_failover(force: Force<'_>, group: &Group) -> Result<String, S
 async fn reconcile(
     config: &CoordinatorConfig,
     group: &Group,
-    primary: Primary,
+    primary: &Primary,
     seen: &[Sighting],
     fence: &impl Fence,
 ) {
-    let target = &group.members[primary.member];
+    let Some(at) = primary.index(group) else {
+        return;
+    };
+    let target = &group.members[at];
     let timeout = command_timeout(config);
 
     for (index, member) in group.members.iter().enumerate() {
@@ -1716,7 +2055,14 @@ async fn reconcile(
             continue;
         }
 
-        let agrees = if index == primary.member {
+        // The primary listed again under another entry (the same address or replication
+        // address): never pointed at itself.
+        if index != at
+            && (member.address == target.address || member.replication == target.replication)
+        {
+            continue;
+        }
+        let agrees = if index == at {
             sighting.role == Some(Role::Master)
         } else {
             sighting.role == Some(Role::Replica(Some(target.replication.to_string())))
@@ -1729,7 +2075,11 @@ async fn reconcile(
             warn!(group = %group.name, "no longer confirmed as the leader; leaving the group's members as they are");
             return;
         }
-        let result = if index == primary.member {
+        // The primary itself under another address (same process identity): left alone.
+        if index != at && sighting.run_id.is_some() && sighting.run_id == seen[at].run_id {
+            continue;
+        }
+        let result = if index == at {
             command(
                 member,
                 config.auth.as_deref(),
@@ -1787,6 +2137,11 @@ mod tests {
         }
     }
 
+    /// Member `index`'s client address in [`group`].
+    fn address(index: usize) -> String {
+        format!("127.0.0.1:{}", 6379 + index)
+    }
+
     fn replica(durable: u64) -> Sighting {
         sharded(&[durable])
     }
@@ -1801,6 +2156,8 @@ mod tests {
             shard_committed: vec![0; durable.len()],
             loading: false,
             topology: None,
+            replicas: Vec::new(),
+            run_id: None,
             shards: durable.len() as u16,
             shards_answering: durable.len() as u16,
         }
@@ -1830,18 +2187,18 @@ mod tests {
             ..sharded(&[10, 10])
         };
 
-        sightings.set("main", 1, whole);
+        sightings.set("main", &address(1), whole);
         // Shard 1 stops answering: the last complete sighting stays, with the count.
         sightings.set(
             "main",
-            1,
+            &address(1),
             Sighting {
                 shards: 2,
                 shards_answering: 1,
                 ..sharded(&[20, 0])
             },
         );
-        let kept = sightings.get("main", 1);
+        let kept = sightings.get("main", &address(1));
 
         assert_eq!(kept.last_ok, Some(earlier));
         assert_eq!(kept.shard_durable, [10, 10]);
@@ -1849,14 +2206,14 @@ mod tests {
         // Never seen whole: not heard from at all.
         sightings.set(
             "main",
-            2,
+            &address(2),
             Sighting {
                 shards: 2,
                 shards_answering: 1,
                 ..sharded(&[20, 0])
             },
         );
-        assert_eq!(sightings.get("main", 2).last_ok, None);
+        assert_eq!(sightings.get("main", &address(2)).last_ok, None);
 
         // A fresh replica with a shard down is passed over for a complete one.
         let group = group(3);
@@ -1914,6 +2271,20 @@ mod tests {
         stats.failed_over();
         assert_eq!(stats.failovers().0, 1);
         assert!(stats.failovers().1 > 0);
+    }
+
+    #[test]
+    fn the_replicas_a_primary_lists_are_read_from_its_info() {
+        let text = "# Replication\r\nrole:master\r\nconnected_slaves:3\r\n\
+                    slave0:ip=10.0.0.2,port=6379,state=online,offset=10,lag=0\r\n\
+                    slave1:ip=ruvio-3,port=7000,state=online,offset=10,lag=1\r\n\
+                    slave_read_only:1\r\n";
+        let listed: Vec<String> = listed_replicas(text)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+
+        assert_eq!(listed, ["10.0.0.2:6379", "ruvio-3:7000"]);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2075,7 +2446,7 @@ mod tests {
         let fresh = Duration::from_secs(5);
         let commits = Commits::default();
         let primary = Primary {
-            member: 0,
+            member: address(0),
             epoch: 1,
         };
         let mut seen = vec![
@@ -2086,21 +2457,21 @@ mod tests {
         ];
 
         assert_eq!(
-            commits.learn(&group, primary, &seen, fresh, &Recorded::new()),
+            commits.learn(&group, &primary, &seen, fresh, &Recorded::new()),
             vec![20, 30]
         );
         // A replica's value above what the answering primary holds is left from an earlier
         // primary: it counts only up to the primary's sequence.
         seen[1].shard_committed = vec![70, 30];
         assert_eq!(
-            commits.learn(&group, primary, &seen, fresh, &Recorded::new()),
+            commits.learn(&group, &primary, &seen, fresh, &Recorded::new()),
             vec![50, 30]
         );
         // The primary is down: replicas' values count as told, and the highest one stays.
         seen[0].last_ok = None;
         seen[1].shard_committed = vec![55, 10];
         assert_eq!(
-            commits.learn(&group, primary, &seen, fresh, &Recorded::new()),
+            commits.learn(&group, &primary, &seen, fresh, &Recorded::new()),
             vec![55, 30]
         );
         assert_eq!(
@@ -2120,7 +2491,7 @@ mod tests {
         };
         assert!(
             commits
-                .learn(&other, primary, &quiet, fresh, &Recorded::new())
+                .learn(&other, &primary, &quiet, fresh, &Recorded::new())
                 .is_empty()
         );
     }
@@ -2146,11 +2517,11 @@ mod tests {
         fn promote(&mut self, member: usize, epoch: u64, commit: Option<Commit>) -> Primary {
             self.apply(Request::SetPrimary {
                 group: "main".into(),
-                member,
+                member: address(member),
                 epoch,
                 commit,
             });
-            self.primaries["main"]
+            self.primaries["main"].clone()
         }
 
         /// What the leader writes at the end of a tick.
@@ -2177,7 +2548,7 @@ mod tests {
         ];
 
         assert_eq!(
-            commits.learn(&group, first, &seen, fresh, &agreed.recorded),
+            commits.learn(&group, &first, &seen, fresh, &agreed.recorded),
             vec![40]
         );
         agreed.record(&commits);
@@ -2194,7 +2565,7 @@ mod tests {
         seen[1] = member(Role::Master, &[45], &[0]);
         seen[2] = member(following(&group, 1), &[30], &[40]);
         assert_eq!(
-            commits.learn(&group, second, &seen, fresh, &agreed.recorded),
+            commits.learn(&group, &second, &seen, fresh, &agreed.recorded),
             vec![40]
         );
         assert_eq!(choose(&group, 1, &seen, fresh, &[40], false), Choice::Wait);
@@ -2207,24 +2578,24 @@ mod tests {
         seen[1] = member(following(&group, 2), &[30], &[40]);
         seen[2] = member(Role::Master, &[32], &[0]);
         assert_eq!(
-            commits.learn(&group, third, &seen, fresh, &agreed.recorded),
+            commits.learn(&group, &third, &seen, fresh, &agreed.recorded),
             vec![0]
         );
         seen[2].last_ok = None;
         assert_eq!(
-            commits.learn(&group, third, &seen, fresh, &agreed.recorded),
+            commits.learn(&group, &third, &seen, fresh, &agreed.recorded),
             vec![0]
         );
         // A durable write of the new primary above the old value counts again.
         seen[1].shard_committed = vec![41];
         assert_eq!(
-            commits.learn(&group, third, &seen, fresh, &agreed.recorded),
+            commits.learn(&group, &third, &seen, fresh, &agreed.recorded),
             vec![41]
         );
         // A primary record of an older epoch read late changes nothing.
         seen[1].shard_committed = vec![99];
         assert_eq!(
-            commits.learn(&group, second, &seen, fresh, &agreed.recorded),
+            commits.learn(&group, &second, &seen, fresh, &agreed.recorded),
             vec![41]
         );
     }
@@ -2242,7 +2613,7 @@ mod tests {
             member(following(&group, 0), &[30], &[0]),
         ];
 
-        leader.learn(&group, first, &seen, fresh, &agreed.recorded);
+        leader.learn(&group, &first, &seen, fresh, &agreed.recorded);
         agreed.record(&leader);
         // A clean promotion of member 1, then every coordinator restarts and has not seen
         // member 1 yet: its values stay, they are not taken for an unclean promotion's.
@@ -2251,7 +2622,7 @@ mod tests {
         let restarted = Commits::default();
 
         assert_eq!(
-            restarted.learn(&group, clean, &unseen, fresh, &agreed.recorded),
+            restarted.learn(&group, &clean, &unseen, fresh, &agreed.recorded),
             vec![40]
         );
         assert_eq!(
@@ -2273,7 +2644,7 @@ mod tests {
         let restarted = Commits::default();
 
         assert_eq!(
-            restarted.learn(&group, unclean, &reporting, fresh, &agreed.recorded),
+            restarted.learn(&group, &unclean, &reporting, fresh, &agreed.recorded),
             vec![0]
         );
         assert_eq!(agreed.recorded["main"].stale, [40]);
@@ -2293,7 +2664,7 @@ mod tests {
         ];
 
         assert_eq!(
-            old_leader.learn(&group, primary, &seen, fresh, &agreed.recorded),
+            old_leader.learn(&group, &primary, &seen, fresh, &agreed.recorded),
             vec![40]
         );
         // Only the shard that rose is sent.
@@ -2306,7 +2677,7 @@ mod tests {
         );
         agreed.record(&old_leader);
         assert!(old_leader.raised(&agreed.recorded).is_empty());
-        old_leader.learn(&group, primary, &seen, fresh, &agreed.recorded);
+        old_leader.learn(&group, &primary, &seen, fresh, &agreed.recorded);
         assert!(old_leader.raised(&agreed.recorded).is_empty());
 
         // The old leader and the primary are gone, and so is member 1; member 2 never held
@@ -2318,12 +2689,12 @@ mod tests {
 
         assert!(
             new_leader
-                .learn(&group, primary, &seen, fresh, &Recorded::new())
+                .learn(&group, &primary, &seen, fresh, &Recorded::new())
                 .is_empty()
         );
         let new_leader = Commits::default();
         assert_eq!(
-            new_leader.learn(&group, primary, &seen, fresh, &agreed.recorded),
+            new_leader.learn(&group, &primary, &seen, fresh, &agreed.recorded),
             vec![40]
         );
         assert_eq!(
@@ -2339,7 +2710,7 @@ mod tests {
             member(following(&group, 0), &[45], &[0]),
             Sighting::default(),
         ];
-        quiet.learn(&group, primary, &idle, fresh, &Recorded::new());
+        quiet.learn(&group, &primary, &idle, fresh, &Recorded::new());
         assert!(quiet.raised(&Recorded::new()).is_empty());
     }
 
@@ -2430,8 +2801,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_leader_that_stops_leading_mid_tick_sends_no_further_commands() {
         let (group, commands) = listening(3, false).await;
-        let primary = Primary {
-            member: 0,
+        let primary = &Primary {
+            member: group.members[0].address.to_string(),
             epoch: 2,
         };
         // Every member disagrees with the record: three commands to send.
@@ -2453,10 +2824,63 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn the_primary_listed_twice_is_never_pointed_at_itself() {
+        let (mut group, commands) = listening(3, false).await;
+
+        // Entry 2 is the primary under another name.
+        group.members[2] = group.members[0].clone();
+        let primary = &Primary {
+            member: group.members[0].address.to_string(),
+            epoch: 2,
+        };
+        let seen = vec![
+            member(Role::Master, &[10], &[0]),
+            member(following(&group, 0), &[10], &[0]),
+            member(Role::Master, &[10], &[0]),
+        ];
+
+        reconcile(
+            &config(Duration::from_millis(1000)),
+            &group,
+            primary,
+            &seen,
+            &Allow(3.into()),
+        )
+        .await;
+        assert_eq!(commands.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Under an address that is not the primary's, but the same process: left alone too.
+        let (group, commands) = listening(3, false).await;
+        let primary = &Primary {
+            member: group.members[0].address.to_string(),
+            epoch: 2,
+        };
+        let same = Sighting {
+            run_id: Some("a".repeat(40)),
+            ..member(Role::Master, &[10], &[0])
+        };
+        let seen = vec![
+            same.clone(),
+            member(following(&group, 0), &[10], &[0]),
+            same,
+        ];
+
+        reconcile(
+            &config(Duration::from_millis(1000)),
+            &group,
+            primary,
+            &seen,
+            &Allow(3.into()),
+        )
+        .await;
+        assert_eq!(commands.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn a_member_that_never_answers_holds_a_command_for_down_after_not_longer() {
         let (group, commands) = listening(2, true).await;
-        let primary = Primary {
-            member: 0,
+        let primary = &Primary {
+            member: group.members[0].address.to_string(),
             epoch: 2,
         };
         let seen = vec![

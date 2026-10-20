@@ -510,10 +510,9 @@ async fn interrupted(context: &Context, migration: &Migration) -> Option<Ended> 
 
 /// The agreed primary's client address of `group`, `shard` ports up.
 fn primary_address(context: &Context, group: &str, shard: usize) -> Option<Endpoint> {
-    let primary = context.machine.primaries().get(group)?.member;
-    let group = context.config.group(group)?;
+    let primary = context.machine.primaries().get(group)?.member.clone();
 
-    Some(group.members.get(primary)?.address.plus(shard as u16))
+    Some(Endpoint::parse(&primary).ok()?.plus(shard as u16))
 }
 
 /// Ends the move on both primaries (and on the members that were primaries when it began,
@@ -524,6 +523,8 @@ async fn cancel_on_nodes(context: &Context, migration: &Migration) {
 
     for (group, shard) in [(&migration.from, 0), (&migration.to, migration.shard)] {
         if let Some(group) = context.config.group(group) {
+            let group = context.machine.group(group);
+
             targets.extend(
                 group
                     .members
