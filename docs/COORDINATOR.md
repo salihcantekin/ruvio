@@ -27,6 +27,8 @@ Without coordinators nothing changes: a primary and its replicas run as describe
 3. The leader picks the replica that answers, is not still copying its primary (`LOADING`), and holds the
    most of the history (the largest sum of `wal_durable_sequence` over its shards); ties go to the member
    listed first. With `CLIENT DURABILITY` in use it must also hold every committed write (see below).
+   Right before recording the promotion it looks at that replica once more; one that no longer answers
+   (it died with the primary) is not promoted, and the next round chooses again.
 4. It records "primary = that member, epoch + 1" in the Raft log (a majority must accept it), sends the
    member `REPLICAOF NO ONE`, points the other members at it with `REPLICAOF host port YIELD`, and publishes
    `+switch-master` to subscribers.
