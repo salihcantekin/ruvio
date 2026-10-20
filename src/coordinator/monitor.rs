@@ -39,6 +39,16 @@ pub struct Sighting {
     /// The cluster map version it serves (`RUVIO TOPOLOGY VERSION`), read only when the
     /// coordinators manage a multi-node cluster.
     pub topology: Option<u64>,
+    /// How many shards it runs, and how many of them answered `ROLE` and `INFO replication`.
+    pub shards: u16,
+    pub shards_answering: u16,
+}
+
+impl Sighting {
+    /// Every shard answered: a look at a member with a shard down does not count as an answer.
+    pub fn complete(&self) -> bool {
+        self.shards_answering == self.shards
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,11 +77,21 @@ impl Sightings {
             .unwrap_or_default()
     }
 
+    /// Takes in a look at a member. One where a shard did not answer keeps the last complete
+    /// sighting and only updates how many shards answered: the member is not heard from, so it
+    /// is down once `down_after` passes without a complete answer, and is no candidate meanwhile.
     fn set(&self, group: &str, member: usize, sighting: Sighting) {
-        self.0
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert((group.to_owned(), member), sighting);
+        let mut sightings = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let key = (group.to_owned(), member);
+
+        if sighting.complete() {
+            sightings.insert(key, sighting);
+        } else {
+            let known = sightings.entry(key).or_default();
+
+            known.shards = sighting.shards;
+            known.shards_answering = sighting.shards_answering;
+        }
     }
 
     /// Milliseconds since each member of `group` last answered, as [`RpcRequest::Observe`]
@@ -374,6 +394,11 @@ pub async fn renew_leases(
             let Some(primary) = primaries.get(&group.name).copied() else {
                 continue;
             };
+            // A primary with a shard this coordinator cannot reach is not renewed: it would
+            // keep writing on the others while the coordinators fail it over.
+            if !sightings.get(&group.name, primary.member).complete() {
+                continue;
+            }
             {
                 let mut running = running.lock().unwrap_or_else(|error| error.into_inner());
 
@@ -473,22 +498,19 @@ async fn look(member: &Member, auth: Option<&str>, cluster: bool) -> Option<Sigh
         _ => 1,
     };
 
+    sighting.shards = shards;
     for shard in 0..shards {
-        let address = member.address.plus(shard);
+        // Shard 0 answered `ROLE` above; every other shard must answer it too, so a member
+        // with one shard down is not heard from (see `Sightings::set`).
         let info = if shard == 0 {
             client
                 .call(&[b"INFO", b"replication"], CALL_TIMEOUT)
                 .await
                 .ok()
         } else {
-            match NodeClient::connect(&address, auth, CALL_TIMEOUT).await {
-                Ok(mut other) => other
-                    .call(&[b"INFO", b"replication"], CALL_TIMEOUT)
-                    .await
-                    .ok(),
-                Err(_) => None,
-            }
+            other_shard(&member.address.plus(shard), auth, &mut sighting).await
         };
+        sighting.shards_answering += u16::from(info.is_some());
         let text = info.and_then(|info| info.text()).unwrap_or_default();
         let field = |name: &str| {
             text.lines()
@@ -506,6 +528,30 @@ async fn look(member: &Member, auth: Option<&str>, cluster: bool) -> Option<Sigh
     }
 
     Some(sighting)
+}
+
+/// Shard `address` of a member: its `INFO replication` when it answers `ROLE` and that, or
+/// `None`. A shard still loading marks the member loading.
+async fn other_shard(
+    address: &super::config::Endpoint,
+    auth: Option<&str>,
+    sighting: &mut Sighting,
+) -> Option<Value> {
+    let mut client = NodeClient::connect(address, auth, CALL_TIMEOUT)
+        .await
+        .ok()?;
+
+    match client.call(&[b"ROLE"], CALL_TIMEOUT).await.ok()? {
+        Value::Error(error) if error.starts_with("LOADING") || error.starts_with("MASTERDOWN") => {
+            sighting.loading = true;
+        }
+        Value::Array(Some(_)) => {}
+        _ => return None,
+    }
+    client
+        .call(&[b"INFO", b"replication"], CALL_TIMEOUT)
+        .await
+        .ok()
 }
 
 /// How long a member may take to answer a command: `down_after`, at least 1 s. `REPLICAOF`
@@ -674,8 +720,8 @@ fn holds(sighting: &Sighting, committed: &[u64]) -> bool {
         .all(|(shard, &sequence)| at(&sighting.shard_durable, shard) >= sequence)
 }
 
-/// The member to promote: answering, a replica with a complete copy that holds every
-/// committed record, holding the most of the history; ties go to the lowest index.
+/// The member to promote: answering on every shard, a replica with a complete copy that holds
+/// every committed record, holding the most of the history; ties go to the lowest index.
 pub fn choose_candidate(
     group: &Group,
     primary: usize,
@@ -689,6 +735,7 @@ pub fn choose_candidate(
             let sighting = &sightings[member];
 
             !sighting.loading
+                && sighting.complete()
                 && sighting.last_ok.is_some_and(|at| at.elapsed() <= fresh)
                 && matches!(sighting.role, Some(Role::Replica(_)))
                 && holds(sighting, committed)
@@ -1553,6 +1600,8 @@ mod tests {
             shard_committed: vec![0; durable.len()],
             loading: false,
             topology: None,
+            shards: durable.len() as u16,
+            shards_answering: durable.len() as u16,
         }
     }
 
@@ -1567,6 +1616,81 @@ mod tests {
 
     fn following(group: &Group, member: usize) -> Role {
         Role::Replica(Some(group.members[member].replication.to_string()))
+    }
+
+    #[test]
+    fn a_member_with_a_shard_down_is_not_heard_from_and_is_no_candidate() {
+        let sightings = Sightings::default();
+        let earlier = Instant::now() - Duration::from_secs(5);
+        let whole = Sighting {
+            last_ok: Some(earlier),
+            shards: 2,
+            shards_answering: 2,
+            ..sharded(&[10, 10])
+        };
+
+        sightings.set("main", 1, whole);
+        // Shard 1 stops answering: the last complete sighting stays, with the count.
+        sightings.set(
+            "main",
+            1,
+            Sighting {
+                shards: 2,
+                shards_answering: 1,
+                ..sharded(&[20, 0])
+            },
+        );
+        let kept = sightings.get("main", 1);
+
+        assert_eq!(kept.last_ok, Some(earlier));
+        assert_eq!(kept.shard_durable, [10, 10]);
+        assert!(!kept.complete());
+        // Never seen whole: not heard from at all.
+        sightings.set(
+            "main",
+            2,
+            Sighting {
+                shards: 2,
+                shards_answering: 1,
+                ..sharded(&[20, 0])
+            },
+        );
+        assert_eq!(sightings.get("main", 2).last_ok, None);
+
+        // A fresh replica with a shard down is passed over for a complete one.
+        let group = group(3);
+        let fresh = Duration::from_secs(1);
+        let partial = Sighting {
+            shards: 2,
+            shards_answering: 1,
+            ..sharded(&[50, 50])
+        };
+        let complete = Sighting {
+            shards: 2,
+            shards_answering: 2,
+            ..sharded(&[10, 10])
+        };
+
+        assert_eq!(
+            choose_candidate(
+                &group,
+                0,
+                &[replica(0), partial.clone(), complete],
+                fresh,
+                &[]
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            choose_candidate(
+                &group,
+                0,
+                &[replica(0), partial.clone(), partial],
+                fresh,
+                &[]
+            ),
+            None
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

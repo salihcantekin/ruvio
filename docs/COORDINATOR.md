@@ -13,7 +13,12 @@ Without coordinators nothing changes: a primary and its replicas run as describe
 ## What happens on a failure
 
 1. Every coordinator connects to every member each `ping_interval_ms` and reads `ROLE`, `CONFIG GET
-   shards` and `INFO replication` (the synced and the committed sequence of every shard).
+   shards` and, from every shard on its own port, `ROLE` and `INFO replication` (the synced and the
+   committed sequence of every shard). A member is heard from only when all its shards answer: a
+   primary with one shard down is failed over like a dead one, and a replica with a shard down is not
+   promoted. With the primary lease, a coordinator does not renew the lease of a primary with a
+   shard it cannot reach. A member that answers on some shards keeps the role it had and is pointed at the agreed
+   primary once all its shards answer again.
 2. When the Raft leader among the coordinators has not heard from the primary for `down_after_ms`, it
    asks the others. The primary is down when a majority of coordinators (the leader included) have not
    heard from it within `down_after_ms`. One coordinator's own network trouble cannot start a failover.
