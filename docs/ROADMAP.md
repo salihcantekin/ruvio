@@ -321,7 +321,8 @@ slows a command or raises RSS for the same data does not land.
 - [x] **P2 — Add failure detection and leader/primary election with a documented
   split-brain model.** `ruvio coordinator` (three or five, Raft): majority-confirmed
   detection, failover with `REPLICAOF`, the old primary demoted on return; split
-  brain bounded by `min-replicas-to-write` and the epoch. See
+  brain bounded by `min-replicas-to-write` (every replica, for a primary cut off together with
+  one of its replicas) and the epoch. See
   [COORDINATOR.md](COORDINATOR.md).
 - [ ] **P2 — Prove failover with deterministic fault injection, partitions,
   delayed packets, process crashes, and disk loss.**

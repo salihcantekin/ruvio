@@ -177,7 +177,7 @@ These classes of bugs were found by this testing and are fixed:
 | Failover | Promotion is manual in these runs. Automatic failover with `ruvio coordinator` has its own fault runs: `scripts/coordinator_faults.py` (partitions through a TCP proxy, a coordinator leader killed, no majority, restart, loss under load) and `tests/coordinator_live.rs`; see [COORDINATOR.md](COORDINATOR.md) |
 | Power loss beyond WAL contents | Directory entries and checkpoint files are not part of the power-loss model |
 | Failover and `IDEM`, `ONCE`, `LIMIT`, `LEASE` | Not run with a promoted replica. By design, a write the old primary had not shipped is lost unless its connection used `CLIENT DURABILITY`; deadlines are wall-clock times, so clocks must agree. See [IDEM.md](IDEM.md) |
-| Network partitions | Replica tests kill and restart processes; they do not cut or delay the link alone |
+| Network partitions | Replica tests kill and restart processes; they do not cut or delay the link alone. With coordinators, an old primary cut off together with one of its replicas keeps taking writes for the whole partition unless `min-replicas-to-write` counts every replica, and `CLIENT DURABILITY REPLICAS 1` does not keep acknowledged writes in that shape; see *What can still lose data* in [COORDINATOR.md](COORDINATOR.md#what-can-still-lose-data) |
 | Part of the command surface | The checker's workload has no MOVE, SWAPDB, multiple databases or JSON commands |
 | Platforms | Disk faults, power loss and torn writes use an LD_PRELOAD shim, so they run on Linux only |
 | Disk faults on replicas | Replica configurations do not inject disk faults |

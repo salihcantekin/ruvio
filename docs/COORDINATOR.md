@@ -57,7 +57,8 @@ holds the writes before it on disk, and becomes `NOREPLICAS` if none does within
 5000 ms; the writes stay applied). The client libraries have a connect option that sends it on every
 connection. `WAIT 1 timeout_ms` after a write does the same for one write at a time.
 
-A failover keeps such writes. The primary records, per shard, the highest sequence it released a
+A failover keeps such writes as long as the coordinators learned that they were committed (see
+*What can still lose data* below for the shapes where they cannot). The primary records, per shard, the highest sequence it released a
 durable reply for (`replication_committed_sequence` in `INFO`) and passes it to its replicas; every
 coordinator reads it from the members' `INFO replication` on each ping and keeps the highest value it
 has seen per group and shard. The leader promotes only a replica whose `wal_durable_sequence` is at
@@ -79,29 +80,76 @@ coordinator that restarts while the primary is down learns only what the remaini
 Coordinators' `INFO` shows them as `committed=` on the group's line. Groups whose clients never use
 `CLIENT DURABILITY` report 0 everywhere and fail over as before.
 
-`IDEM`, `ONCE`, `LIMIT` and `LEASE` are ordinary writes in this respect: they are kept across a failover
-when their connection uses `CLIENT DURABILITY`, and the last ones can be lost without it. Their
-deadlines are wall-clock times, so the nodes' clocks must agree. See "Across a failover" in
+The coordinators learn committed values only from the members they reach: the primary, and the replicas
+following it (the primary passes the value on to them). A write acknowledged with `CLIENT DURABILITY
+REPLICAS k` is on at least `k` replicas, but when those replicas are cut off from the coordinators
+together with the primary, the coordinators never see that value, count the replica they can reach as
+complete, and promote it. With `REPLICAS` equal to the number of replicas in the group every replica
+holds every acknowledged write, so whichever one is promoted has it; with fewer, an acknowledged write
+can be lost in that shape (see the table below).
+
+`IDEM`, `ONCE`, `LIMIT` and `LEASE` are ordinary writes in this respect: they survive a failover exactly
+when an acknowledged durable write does, and the last ones can be lost without `CLIENT DURABILITY`.
+Their deadlines are wall-clock times, so the nodes' clocks must agree. See "Across a failover" in
 [IDEM.md](IDEM.md) for the details and a lock recipe.
 
-A primary cut off from the coordinators but still reachable by clients keeps taking writes until it
-learns it was replaced. Two settings on the data nodes bound that window:
+### An old primary that keeps taking writes
 
-- `min-replicas-to-write 1` with `min-replicas-max-lag` (seconds): once its replicas follow the new
-  primary, the old one refuses writes with `NOREPLICAS` within the lag. In the partition test it refused
-  0.1 seconds after the failover.
+A primary that does not learn it was replaced keeps taking writes, and they are lost when it rejoins as
+a replica. It learns in three ways:
+
+- A coordinator reaches it again and makes it a replica of the new primary (within a ping).
 - The epoch: a replica that follows the new primary refuses the old one, and the old one stops taking
   writes as soon as such a replica connects to it.
+- `min-replicas-to-write` with `min-replicas-max-lag` (seconds): the old primary refuses writes with
+  `NOREPLICAS` once fewer replicas than the first value acknowledged within the second. It checks
+  every 100 ms, so it refuses at most `min-replicas-max-lag` + 0.1 seconds after the last replica it
+  needed stopped acknowledging.
 
-Writes the old primary took in that window are lost when it rejoins. Use `min-replicas-to-write 1` (or
-higher) in every group a coordinator manages.
+How long the window lasts depends on which replicas the old primary still reaches:
+
+- **Cut off from the coordinators only.** Its replicas still reach the coordinators and are pointed at
+  the new primary, so they stop acknowledging the old one. With `min-replicas-to-write 1` it then
+  refuses writes within the lag; in the partition test it refused 0.1 seconds after the failover. With
+  the default `min-replicas-to-write 0` it keeps taking writes until a coordinator reaches it again.
+- **Cut off together with one of its replicas**, while another replica stays with the coordinators.
+  That replica is promoted, and the one that stayed with the old primary keeps acknowledging it, so
+  `min-replicas-to-write 1` stays satisfied and the old primary takes writes for the whole partition.
+  Only `min-replicas-to-write` equal to the number of replicas (every replica) bounds it: the old
+  primary then refuses writes at most `min-replicas-max-lag` + 0.1 seconds after the cut. The
+  promotion comes `down_after_ms` after the coordinators' last answered ping of the primary, which is
+  normally less than one `ping_interval_ms` before the cut (longer when a ping to another member is
+  slow). With the defaults (`min-replicas-max-lag` 10, `down_after_ms` 3000, `ping_interval_ms` 500)
+  both primaries take writes for up to about 7.5 seconds. Keep the lag well below `down_after_ms`, for
+  example `min-replicas-max-lag 2` with `down_after_ms 4000`, so the old primary stops first. The price:
+  losing any one replica stops writes in the group.
+
+Writes the old primary took in the window are lost in both shapes. Use `min-replicas-to-write 1` (or
+higher) in every group a coordinator manages, and the number of replicas where a split must stay
+bounded.
+
+### What can still lose data
+
+`k` is the `CLIENT DURABILITY REPLICAS` value of the writing connection, `r` the number of replicas in
+the group.
+
+| Failure | Writes without `CLIENT DURABILITY` | Writes with `CLIENT DURABILITY REPLICAS k` | What the operator can do |
+| --- | --- | --- | --- |
+| Primary process or machine dies | The last writes it had not shipped are lost (0–1 of about 225 in the test above) | None lost while a replica holding them answers: the coordinators learn the committed value from the primary or from the replicas, and promote only a replica holding it; otherwise the group waits | Use `k` ≥ 1 where a lost write matters; leave `unclean_failover` off |
+| Primary cut off from the coordinators only, its replicas still reach the coordinators | Writes the old primary takes until it learns it was replaced are lost: within `min-replicas-max-lag` + 0.1 s with `min-replicas-to-write` ≥ 1, until the partition heals with 0 | None lost with `k = r`. With smaller `k`, a write acknowledged between the promotion and the moment the replicas are pointed at the new primary can be lost | `min-replicas-to-write 1` or more; `k = r` for writes that must not be lost |
+| Primary and one replica cut off together from the other replicas and the coordinators | The old primary takes writes for the whole partition unless `min-replicas-to-write` = `r`; with `r` it stops within `min-replicas-max-lag` + 0.1 s. Everything it took is lost | With `k < r` acknowledged writes can be lost: the replica that stayed acknowledges them, the coordinators never learn the committed value, and the promoted replica lacks them. With `k = r` none: the old primary cannot get a reply released without the cut-off replica | `min-replicas-to-write` = `r` with `min-replicas-max-lag` well below `down_after_ms` (for example 2 with `down_after_ms` 4000); `k = r` |
+| Every coordinator down | Nothing is lost by it; data nodes keep serving, but a primary that fails meanwhile is not replaced | Same | Run three or five coordinators on different machines; promote by hand with `REPLICAOF NO ONE` while none runs |
+| The primary's process or VM paused longer than `down_after_ms` | A replica is promoted; when the old primary resumes it may take writes until it learns it was replaced (as in the rows above), and they are lost | None lost with `k = r`: the replicas follow the new primary and do not acknowledge the old one | `min-replicas-to-write` ≥ 1 |
+| Clocks running at different rates | Timeouts are measured with each process's own monotonic clock, so a rate difference only shifts when a failover starts | Same | Keep clocks synchronized for the wall-clock deadlines of `IDEM`, `ONCE`, `LIMIT`, `LEASE` and `SEMAPHORE` |
+| Coordinators of different versions | The messages between coordinators carry no version | Same | Upgrade every coordinator of a deployment together |
 
 A `CHANGES SUBSCRIBE` consumer may already have seen records a failover takes back. Its cursor
 carries the generation (the replication epoch) of the log it read, so when it resumes on the new
 primary with a cursor past the fork, the stream first sends `["rewound", cursor]` with the fork in
 the new generation: undo or reload what was applied after it. A consumer that subscribes with
 `COMMITTED` gets only records a `CLIENT DURABILITY` reply committed, which a coordinator's failover
-keeps (unless it was forced or `unclean_failover` is set), so it never sees one taken back; it sees nothing until durable writes commit. See
+keeps (unless it was forced, `unclean_failover` is set, or the commit happened where the coordinators
+could not see it, as in the table above), so it does not see one taken back; it sees nothing until durable writes commit. See
 [CONFIGURATION.md](CONFIGURATION.md), *Change stream*.
 
 A lost `LEASE` or `SEMAPHORE` grant does not come back as the same token: tokens carry the cluster
@@ -265,7 +313,9 @@ is never slowed down. Nodes need durability `memory`, `everysec` or `always` (no
 - Groups are declared in the file; replicas are not discovered from the primary yet.
 - The coordinators do not change membership at run time (adding a coordinator means restarting all of
   them with the new `peers`).
-- No primary leases: an isolated primary is stopped by `min-replicas-to-write`, not by the coordinators.
+- No primary leases: an old primary is stopped by `min-replicas-to-write` and the epoch, not by the
+  coordinators, so one cut off together with one of its replicas keeps taking writes unless every
+  replica is required (see *An old primary that keeps taking writes*).
 - Ranges move only when an operator asks (`COORDINATOR MOVE`); nothing rebalances by load yet.
 - The committed sequences a failover must keep live in the coordinators' memory, not in Raft.
 
