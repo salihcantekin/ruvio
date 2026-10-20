@@ -37,6 +37,7 @@ jobs:
       # Standards tests, matrix drift and the zero-cost guards; reuses the build above.
       - run: scripts/check.sh
       - run: python3 scripts/test_benchmark_regression.py
+      - run: python3 tests/soak/test_soak.py
       # A job is billed by the started minute, so this few-second check rides along here.
       - run: python3 scripts/check_package_metadata.py
 

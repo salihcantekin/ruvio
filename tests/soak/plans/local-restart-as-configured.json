@@ -1,0 +1,28 @@
+{
+  "name": "local-restart-as-configured",
+  "seed": 1,
+  "duration_s": 25,
+  "warmup_s": 3,
+  "restart_as": "configured",
+  "cluster": { "ping_interval_ms": 200, "down_after_ms": 1000 },
+  "load": {
+    "rate_per_worker": 30,
+    "keys_per_worker": 4,
+    "counters": 1,
+    "appenders": 1,
+    "registers": 1,
+    "readers_per_register": 1,
+    "profiles": { "durable": { "replicas": 1 } }
+  },
+  "faults": {
+    "interval_s": [4, 4],
+    "recovery_timeout_s": 20,
+    "sequence": [
+      { "kind": "kill-primary", "group": "g1", "down": 3 },
+      { "kind": "kill-replica", "group": "g1", "host": 0, "down": 0.5 }
+    ]
+  },
+  "metrics_interval_s": 2,
+  "status_interval_s": 10,
+  "startup_timeout_s": 30
+}
