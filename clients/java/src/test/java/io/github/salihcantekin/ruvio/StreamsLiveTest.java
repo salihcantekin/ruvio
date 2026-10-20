@@ -5,12 +5,14 @@ import io.github.salihcantekin.ruvio.args.XAddArgs;
 import io.github.salihcantekin.ruvio.args.XClaimArgs;
 import io.github.salihcantekin.ruvio.args.XReadArgs;
 import io.github.salihcantekin.ruvio.model.AutoClaimResult;
+import io.github.salihcantekin.ruvio.model.KeyValue;
 import io.github.salihcantekin.ruvio.model.PendingEntry;
 import io.github.salihcantekin.ruvio.model.PendingSummary;
 import io.github.salihcantekin.ruvio.model.StreamEntry;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -40,6 +42,25 @@ class StreamsLiveTest {
         return m;
     }
 
+    static List<KeyValue<String, String>> kv(String... kv) {
+        List<KeyValue<String, String>> out = new ArrayList<>();
+        for (int i = 0; i < kv.length; i += 2) {
+            out.add(new KeyValue<>(kv[i], kv[i + 1]));
+        }
+        return out;
+    }
+
+    @Test
+    void repeatedFieldsKeepTheirOrder() {
+        c.execute("XADD", "st:dup", "1-0", "f", "1", "g", "", "f", "3");
+        List<KeyValue<String, String>> want = kv("f", "1", "g", "", "f", "3");
+        assertEquals(want, c.xrange("st:dup", "-", "+").get(0).fields());
+        assertEquals(want, c.xrevrange("st:dup", "+", "-").get(0).fields());
+        assertEquals(want, c.xread("st:dup", "0").get("st:dup").get(0).fields());
+        c.xgroupCreate("st:dup", "g", "0");
+        assertEquals(want, c.xreadgroup("g", "c", "st:dup").get("st:dup").get(0).fields());
+    }
+
     @Test
     void basics() {
         String id1 = c.xadd("st", f("a", "1", "b", "2"));
@@ -51,7 +72,7 @@ class StreamsLiveTest {
         assertEquals(3L, c.xlen("st"));
         List<StreamEntry<String, String>> all = c.xrange("st", "-", "+");
         assertEquals(3, all.size());
-        assertEquals(f("a", "1", "b", "2"), all.get(0).fields());
+        assertEquals(kv("a", "1", "b", "2"), all.get(0).fields());
         assertEquals(1, c.xrange("st", "-", "+", 1).size());
         assertEquals(id2, c.xrevrange("st", "+", "-", 2).get(1).id());
         assertEquals(3, c.xrevrange("st", "+", "-").size());
@@ -139,7 +160,7 @@ class StreamsLiveTest {
             var waiting = d.async().xread(XReadArgs.builder().block(10_000).count(1), fromStart);
             Thread.sleep(50);
             c.xadd("bs", f("k", "v"));
-            assertEquals("v", waiting.get(15, java.util.concurrent.TimeUnit.SECONDS).get("bs").get(0).fields().get("k"));
+            assertEquals("v", waiting.get(15, java.util.concurrent.TimeUnit.SECONDS).get("bs").get(0).fields().get(0).value());
             Map<String, String> s = new LinkedHashMap<>();
             s.put("bs", "$");
             assertTrue(d.xread(XReadArgs.builder().block(20), s).isEmpty());

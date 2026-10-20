@@ -130,9 +130,14 @@ test('streams and consumer groups', { skip: SKIP }, async () => {
     await c.xadd('st', '*', { c: '3' }, { maxLen: 10, approximate: true });
     assert.equal(await c.xlen('st'), 3);
     const all = await c.xrange('st');
-    assert.deepEqual(all[0], { id: id1, fields: { a: '1' } });
+    assert.deepEqual(all[0], { id: id1, fields: [['a', '1']] });
     assert.equal((await c.xrange('st', '-', '+', 1)).length, 1);
-    assert.equal((await c.xrevrange('st', '+', '-', 1))[0]!.fields['c'], '3');
+    assert.deepEqual((await c.xrevrange('st', '+', '-', 1))[0]!.fields, [['c', '3']]);
+    await c.call('XADD', 'sd', '1-0', 'f', '1', 'g', '', 'f', '3');
+    const want = [['f', '1'], ['g', ''], ['f', '3']];
+    assert.deepEqual((await c.xrange('sd'))[0]!.fields, want);
+    assert.deepEqual((await c.xrevrange('sd', '+', '-'))[0]!.fields, want);
+    assert.deepEqual((await c.xread({ sd: '0' }))![0]!.entries[0]!.fields, want);
     const read = await c.xread({ st: '0' }, { count: 2 });
     assert.equal(read![0]!.key, 'st');
     assert.equal(read![0]!.entries.length, 2);
@@ -196,7 +201,7 @@ test('streams and consumer groups', { skip: SKIP }, async () => {
       const waiting = b.xreadgroup('g2', 'c', 'gs', { block: 10_000 });
       setTimeout(() => void c.xadd('gs', '*', { late: 1 }), 30);
       const late = await waiting;
-      assert.equal(late![0]!.entries[0]!.fields['late'], '1');
+      assert.deepEqual(late![0]!.entries[0]!.fields, [['late', '1']]);
     } finally {
       await b.quit();
     }

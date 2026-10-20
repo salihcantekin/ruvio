@@ -79,10 +79,10 @@ class StreamEntry(NamedTuple):
 
     Attributes:
         id: The entry id as text, ``"<ms>-<seq>"``.
-        fields: ``{field: value}`` of the entry.
+        fields: ``(field, value)`` pairs in stored order; a field name may repeat.
     """
     id: str
-    fields: Dict[Any, Any]
+    fields: List[Tuple[Any, Any]]
 
 
 class GeoResult(NamedTuple):

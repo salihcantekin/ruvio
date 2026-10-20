@@ -4,6 +4,7 @@ Notable changes to the Python client `ruvio-client` on PyPI. New entries go unde
 
 ## Unreleased
 
+- **Behavior change:** `StreamEntry.fields` is now a list of `(field, value)` tuples in stored order instead of a `dict`, so a field name written twice (`XADD s * f 1 f 2`) is no longer collapsed to its last value; use `dict(entry.fields)` for the old shape. Applies to `xrange`, `xrevrange`, `xread`, `xreadgroup`, `xclaim`, `xautoclaim` and `xinfo_stream`. Fixed: `hrandfield(key, -n, withvalues=True)` returned each field once; it now returns all `n` pairs, repeats included.
 - **Behavior change:** `socket_timeout` of the sync client is now 30.0 seconds by default (was `None`, no limit); `None` turns it off. A blocking command gets its own wait on top (`BLPOP k 5` may take 5 s plus the timeout; a wait of 0, or one the client cannot parse, has no deadline; a pipeline takes its largest wait), and a Pub/Sub or `MONITOR` connection never times out while it waits for messages (issue #48 follow-up). The asyncio client still has no per-command timeout.
 - `move_slots(first, last, shard)` and `move_slots_status()` for `RUVIO MOVESLOTS`, which moves a slot range to another shard of the same server, sync and asyncio.
 - `hmset(key, mapping)` sends `HMSET` (multi-field `HSET` that replies `OK`; Redis marks it deprecated) (issue #26).

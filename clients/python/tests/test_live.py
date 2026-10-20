@@ -438,6 +438,9 @@ async def test_hashes(c):
     assert len(await c.hrandfield("h", 2)) == 2
     pairs = await c.hrandfield("h", 2, withvalues=True)
     assert len(pairs) == 2 and all(len(p) == 2 for p in pairs)
+    # A negative count may repeat a field; every pair is returned.
+    await c.hset("h1", "only", "v")
+    assert await c.hrandfield("h1", -3, withvalues=True) == [("only", "v")] * 3
     # field TTLs
     assert await c.hexpire("h", 100, "f1", "nope") == [1, -2]
     assert await c.hexpire("h", 50, "f1", gt=True) == [0]
@@ -661,7 +664,7 @@ async def test_streams(c):
     assert await c.xadd("nost", {"a": "1"}, nomkstream=True) is None
     assert await c.xlen("st") == 2
     rows = await c.xrange("st")
-    assert rows[0] == StreamEntry(i1, {"a": "1"})
+    assert rows[0] == StreamEntry(i1, [("a", "1")])
     assert await c.xrange("st", count=1) == [rows[0]]
     assert (await c.xrevrange("st", count=1))[0].id == i2
     assert await c.xrevrange("st", "+", "-") == rows[::-1]
@@ -726,8 +729,20 @@ async def test_streams(c):
     while later in (None, [], [("ds", [])]) and time.monotonic() < deadline:
         await asyncio.sleep(0.05)
         later = await c.xreadgroup("g", "w", {"ds": ">"})
-    assert later[0][1][0].fields == {"job": "later"}
+    assert later[0][1][0].fields == [("job", "later")]
 
+
+
+async def test_stream_fields_keep_order_and_repeats(c):
+    await c.execute_command("XADD", "sd", "1-0", "f", "1", "g", "", "f", "3")
+    want = [("f", "1"), ("g", ""), ("f", "3")]
+    assert (await c.xrange("sd"))[0].fields == want
+    assert (await c.xrevrange("sd", "+", "-"))[0].fields == want
+    assert (await c.xread({"sd": "0"}))[0][1][0].fields == want
+    assert await c.xgroup_create("sd", "g", "0") is True
+    assert (await c.xreadgroup("g", "c", {"sd": ">"}))[0][1][0].fields == want
+    assert (await c.xclaim("sd", "g", "c2", 0, ["1-0"]))[0].fields == want
+    assert (await c.xinfo_stream("sd"))["first-entry"].fields == want
 
 async def test_server(c):
     text = await c.info()

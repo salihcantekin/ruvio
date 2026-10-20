@@ -12,6 +12,7 @@ import io.github.salihcantekin.ruvio.internal.Cmd;
 import io.github.salihcantekin.ruvio.internal.Reply;
 import io.github.salihcantekin.ruvio.internal.Request;
 import io.github.salihcantekin.ruvio.model.AutoClaimResult;
+import io.github.salihcantekin.ruvio.model.KeyValue;
 import io.github.salihcantekin.ruvio.model.PendingEntry;
 import io.github.salihcantekin.ruvio.model.PendingSummary;
 import io.github.salihcantekin.ruvio.model.StreamEntry;
@@ -45,11 +46,12 @@ public abstract class StreamCommands<K, V> extends GeoCommands<K, V> {
         List<Object> parts = Reply.list(tree);
         String id = Reply.str(parts.get(0));
         Object rawFields = parts.size() > 1 ? parts.get(1) : null;
-        Map<Object, Object> fields = new LinkedHashMap<>();
+        List<KeyValue<Object, Object>> fields = Collections.emptyList();
         if (rawFields != null) {
             List<Object> f = Reply.list(rawFields);
+            fields = new ArrayList<>(f.size() / 2);
             for (int i = 0; i + 1 < f.size(); i += 2) {
-                fields.put(Reply.decodeWith(q.keys, f.get(i)), Reply.decodeWith(q.values, f.get(i + 1)));
+                fields.add(new KeyValue<>(Reply.decodeWith(q.keys, f.get(i)), Reply.decodeWith(q.values, f.get(i + 1))));
             }
         }
         return new StreamEntry<>(id, fields);
