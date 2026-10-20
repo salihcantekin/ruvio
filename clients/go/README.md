@@ -41,7 +41,7 @@ Import path `github.com/salihcantekin/ruvio/clients/go` (package `ruvio`).
   "seen before".
 
 - **Cluster routing** (`Options.Cluster`): `CLUSTER SLOTS` slot table, one lazily connected
-  multiplexed connection per node, `-MOVED` handling, cross-slot `MGET/MSET/DEL/...`
+  multiplexed connection per node, `-MOVED`, `-ASK` and `-TRYAGAIN` handling, cross-slot `MGET/MSET/DEL/...`
   split and re-assembled. A standalone server is detected and handled as before. See
   [Cluster](#cluster).
 
@@ -214,13 +214,17 @@ by `TestRoutingCoversMatrix`; the key table is in `cluster_keys.go`):
 `-MOVED slot host:port`: the slot is patched in the table at once and the command is sent
 again to the named node (the server did not run it, so this is safe). The whole table is
 reloaded with `CLUSTER SLOTS` only when the named node is unknown or from the second `MOVED` for
-the same command. A command follows at most **3** redirects; a fourth `MOVED` is returned to
-the caller as `*Error`. `-ASK` is not followed and `ASKING` is never sent (Ruvio forwards instead of
-answering `-ASK`); an `-ASK` reply comes back as `*Error`.
+the same command. `-ASK slot host:port`: `ASKING` and the command are sent to the named node in
+one write and its reply is returned; the table is not changed, so the next command for the slot
+still goes to the table's owner. `-MOVED` and `-ASK` share one budget: a command follows at
+most **3** redirects; a fourth is returned to the caller as `*Error`. `-TRYAGAIN` (a slot is
+being handed over; nothing ran) sends the command again, routed by the current table, up to 3
+times after waits of 5, 10 and 20 ms (a cancelled context ends the wait); the third retry's
+`-TRYAGAIN` is returned as `*Error`. The budgets are separate.
 
 Pipelines: commands are grouped by node, each group is one pipelined write, groups run
-concurrently, replies come back in the caller's order; `MOVED` replies inside a pipeline are
-repaired one by one, with the same 3-redirect limit. `MGET`, `MSET`, `DEL`, `UNLINK`, `EXISTS`
+concurrently, replies come back in the caller's order; `MOVED`, `ASK` and `TRYAGAIN` replies inside a pipeline are
+repaired one by one, with the same limits. `MGET`, `MSET`, `DEL`, `UNLINK`, `EXISTS`
 and `TOUCH` whose keys span slots are split exactly like the plain command: one command per
 slot, each sent in its place in its node's write, and the merged reply (`MGET` in key order,
 counts summed, `MSET` OK) sits at the command's index; an error in one part becomes that
@@ -381,10 +385,10 @@ client tracking, pipelines, transactions, every helper). `TestCoverage` reads
 ## Not done / not verified
 
 - Cluster, verified against a 3-shard per-shard-port Ruvio server and a scripted fake server:
-  topology, routing, split, pipelines, `MOVED`, transactions, Pub/Sub, helpers, fallback.
+  topology, routing, split, pipelines, `MOVED`, `ASK`, `TRYAGAIN`, transactions, Pub/Sub, helpers, fallback.
   Reads from replicas (`Options.ReadPolicy`) are verified with scripted fake nodes and a live
   2-shard primary with its replica. **Not done / not verified:** replicas that change address
-  between slot map loads while a read is in flight, `-ASK` (the server has no live
+  between slot map loads while a read is in flight, `-ASK` and `-TRYAGAIN` against a live server (only scripted fake nodes; the server has no live
   slot migration), `RENAME`/`COPY`/`SMOVE`/`LMOVE` across slots (fail with `ErrCrossSlot`; no
   copy-and-delete emulation), split `MSETNX`/`BITOP`/`SUNION`... (all-or-nothing or
   non-decomposable commands fail across slots), automatic topology refresh in the background

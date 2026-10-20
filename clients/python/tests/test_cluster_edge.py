@@ -236,21 +236,125 @@ async def test_malformed_moved_is_surfaced_not_followed(make, fc):
     await c.aclose()
 
 
-async def test_ask_redirect_is_surfaced_and_not_followed(make, fc):
+def bounded(kind, make, addr):
+    """A cluster client whose every command is bounded: socket timeout (sync) or ``wait_for`` (asyncio, below)."""
+    return make(addr, **({"socket_timeout": 5} if kind == "sync" else {}))
+
+
+async def within(coro, seconds=10):
+    return await asyncio.wait_for(coro, seconds)
+
+
+async def test_ask_sends_asking_then_the_command_and_leaves_the_slot_map_alone(kind, make, fc):
     k = key_in(8192, 16383)
+    slot = cl.key_slot(k)
 
     def ask(cl_, node, args):
-        if node is cl_.nodes[0]:
-            return err(f"ASK {cl.key_slot(k)} {cl_.nodes[1].addr}")
-        return None
+        return err(f"ASK {slot} {cl_.nodes[1].addr}") if node is cl_.nodes[0] else None
 
     cluster = fc(extra={"GET": ask})
-    c = make(cluster.nodes[0].addr)
-    await c.ping()
-    st(c).slots[cl.key_slot(k)] = 0  # pretend node0 owns it
-    with pytest.raises(ruvio.MovedError, match="^ASK "):  # ASK needs an ASKING handshake: left to the caller
-        await c.get(k)
-    assert not cluster.nodes[1].commands("GET")
+    cluster.nodes[1].store[k] = "from-b"
+    c = bounded(kind, make, cluster.nodes[0].addr)
+    await within(c.ping())
+    st(c).slots[slot] = 0  # node0 is the owner on the map
+    assert await within(c.get(k)) == "from-b"
+    assert cluster.nodes[1].commands() == [["ASKING"], ["GET", k]]
+    assert len(cluster.nodes[0].commands("GET")) == 1
+    assert st(c).slots[slot] == 0  # an ASK does not touch the map
+    assert await within(c.get(k)) == "from-b"
+    assert len(cluster.nodes[0].commands("GET")) == 2  # the next command goes to the owner again
+    await c.aclose()
+
+
+async def test_ask_to_a_node_not_in_the_map_opens_a_connection(kind, make, fc):
+    k = key_in(8192, 16383)
+    seen = []
+
+    def stranger(node, args):
+        seen.append(args)
+        return bulk("asked") if args[0].upper() == "GET" else OK
+
+    other = FakeNode(stranger)
+    try:
+        cluster = fc(extra={"GET": lambda cl_, node, args: err(f"ASK {cl.key_slot(k)} {other.addr}")})
+        c = bounded(kind, make, cluster.nodes[0].addr)
+        await within(c.ping())
+        st(c).slots[cl.key_slot(k)] = 0
+        assert await within(c.get(k)) == "asked"
+        assert seen == [["ASKING"], ["GET", k]]
+        await c.aclose()
+    finally:
+        other.close()
+
+
+async def test_asking_error_reply_is_returned_instead_of_the_command_reply(kind, make, fc):
+    k = key_in(8192, 16383)
+
+    def handler(cl_, node, args):
+        if node is cl_.nodes[0] and args[0] == "GET":
+            return err(f"ASK {cl.key_slot(k)} {cl_.nodes[1].addr}")
+        return err("ERR asking refused") if args[0] == "ASKING" else None
+
+    cluster = fc(extra={"GET": handler, "ASKING": handler})
+    c = bounded(kind, make, cluster.nodes[0].addr)
+    await within(c.ping())
+    st(c).slots[cl.key_slot(k)] = 0
+    with pytest.raises(ruvio.ResponseError, match="asking refused"):
+        await within(c.get(k))
+    assert await within(c.ping()) in (True, "PONG")  # the connection is still in step
+    await c.aclose()
+
+
+async def test_tryagain_is_retried_after_a_short_sleep(kind, make, fc):
+    k = key_in(8192, 16383)
+    sent = []
+
+    def tryagain(cl_, node, args):
+        sent.append(node)
+        return err("TRYAGAIN slot is being handed over") if len(sent) == 1 else None
+
+    cluster = fc(extra={"GET": tryagain})
+    cluster.nodes[1].store[k] = "ok"
+    c = bounded(kind, make, cluster.nodes[0].addr)
+    t0 = time.monotonic()
+    assert await within(c.get(k)) == "ok"
+    assert time.monotonic() - t0 >= 0.0045
+    assert len(sent) == 2 and sent[0] is sent[1] is cluster.nodes[1]
+    await c.aclose()
+
+
+async def test_tryagain_four_times_gives_the_error_after_three_retries(kind, make, fc):
+    k = key_in(8192, 16383)
+    cluster = fc(extra={"GET": lambda cl_, node, args: err("TRYAGAIN slot is being handed over")})
+    c = bounded(kind, make, cluster.nodes[0].addr)
+    t0 = time.monotonic()
+    with pytest.raises(ruvio.ResponseError, match="^TRYAGAIN") as info:
+        await within(c.get(k))
+    assert not isinstance(info.value, ruvio.MovedError)
+    assert time.monotonic() - t0 >= 0.034  # 5 + 10 + 20 ms
+    assert len(cluster.nodes[1].commands("GET")) == 4
+    await c.aclose()
+
+
+async def test_ask_and_moved_share_one_redirect_budget(kind, make, fc):
+    k = key_in(8192, 16383)
+    slot = cl.key_slot(k)
+    script = []
+
+    def scripted(cl_, node, args):
+        script.append(node)
+        n0, n1 = cl_.nodes
+        steps = [f"ASK {slot} {n1.addr}", f"MOVED {slot} {n0.addr}", f"ASK {slot} {n1.addr}", f"ASK {slot} {n1.addr}"]
+        return err(steps[len(script) - 1])
+
+    cluster = fc(extra={"GET": scripted})
+    c = bounded(kind, make, cluster.nodes[0].addr)
+    await within(c.ping())
+    st(c).slots[slot] = 0
+    with pytest.raises(ruvio.MovedError, match="^ASK "):  # the 4th redirect goes to the caller
+        await within(c.get(k))
+    n0, n1 = cluster.nodes
+    assert script == [n0, n1, n0, n1]
     await c.aclose()
 
 

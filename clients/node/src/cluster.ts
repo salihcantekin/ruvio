@@ -300,8 +300,16 @@ const T_FANOUT = 3;
 const T_NOSLOT = 4;
 const T_NOREPLICA = 5;
 
-/** MOVED redirects followed per command before the MOVED error is returned. */
+/** MOVED and ASK redirects followed per command (one shared budget) before the redirect error is returned. */
 const MAX_REDIRECTS = 3;
+/** TRYAGAIN retries per command; the wait before retry n (from 0) is `TRYAGAIN_WAIT_MS << n`. */
+const MAX_TRYAGAIN = 3;
+const TRYAGAIN_WAIT_MS = 5;
+/** `ASKING`, written before the command a node was asked to serve for a slot it is handing over. */
+const ASKING_FRAME = Buffer.from('*1\r\n$6\r\nASKING\r\n');
+
+/** Error codes the router handles by sending the command again. */
+const isRedirect = (code: string): boolean => code === 'MOVED' || code === 'ASK' || code === 'TRYAGAIN';
 
 // ---- nodes ----------------------------------------------------------------------------------
 
@@ -600,7 +608,7 @@ class Router {
     n.conn.keepFrames(
       (e, buf, off, len, tf, fl, res, rej) => {
         const f = frame(buf, off, len);
-        (e.code === 'MOVED' ? this.moved(e, f, tf, fl) : this.replicaFailed(n, e, f, tf, fl)).then(res, rej);
+        (isRedirect(e.code) ? this.moved(e, f, tf, fl) : this.replicaFailed(n, e, f, tf, fl)).then(res, rej);
       },
       (e, buf, off, len, tf, fl, res, rej) => {
         this.replicaFailed(n, e, frame(buf, off, len), tf, fl).then(res, rej);
@@ -756,7 +764,7 @@ class Router {
       conn.trackCb(
         resolve,
         (e) => {
-          if (e instanceof RuvioError && e.code === 'MOVED') this.moved(e, frame, tf, fl).then(resolve, reject);
+          if (e instanceof RuvioError && isRedirect(e.code)) this.moved(e, frame, tf, fl).then(resolve, reject);
           else if (node.primary !== null && replicaFault(e)) this.replicaFailed(node, e, frame, tf, fl).then(resolve, reject);
           else if (e instanceof ConnectionError && e.unreachable) this.lost(node, e, frame, tf, fl).then(resolve, reject);
           else reject(e);
@@ -791,7 +799,7 @@ class Router {
   }
 
   onError(e: unknown, frame: Buffer, tf: Tf | null, fl: number): Promise<any> {
-    if (e instanceof RuvioError && e.code === 'MOVED') return this.moved(e, frame, tf, fl);
+    if (e instanceof RuvioError && isRedirect(e.code)) return this.moved(e, frame, tf, fl);
     return Promise.reject(e);
   }
 
@@ -831,39 +839,76 @@ class Router {
     try {
       return await conn.track(tf, fl);
     } catch (e2) {
-      if (e2 instanceof RuvioError && e2.code === 'MOVED') return this.moved(e2, frame, tf, fl, 2);
+      if (e2 instanceof RuvioError && isRedirect(e2.code)) return this.moved(e2, frame, tf, fl, 2, 0, true);
       throw e2;
     }
   }
 
   /**
-   * `MOVED slot host:port`: point that slot at the named node and send the command there. The
-   * whole table is reloaded only for an unknown node or a second MOVED for the same command; the
-   * MOVED after `MAX_REDIRECTS` redirects is returned as the error.
+   * Follows `MOVED`, `ASK` and `TRYAGAIN` for one command, re-sending from the caller's frame.
+   * `MOVED slot host:port` points that slot at the named node and sends the command there; the
+   * whole table is reloaded only for an unknown node or a second MOVED for the same command.
+   * `ASK slot host:port` sends `ASKING` and the command to the named node in one write and leaves
+   * the table alone. MOVED and ASK share `MAX_REDIRECTS`; the redirect after that is returned as
+   * the error. `TRYAGAIN` waits 5, 10, 20 ms and routes the command again by the current table, at
+   * most `MAX_TRYAGAIN` times; the TRYAGAIN after that is returned.
    */
-  async moved(e: RuvioError, frame: Buffer, tf: Tf | null, fl: number, hop = 1): Promise<any> {
-    const parts = e.message.split(' ');
-    const slot = Number(parts[1]);
-    const addr = parts[2];
-    if (hop > MAX_REDIRECTS || addr === undefined || !(slot >= 0 && slot < SLOT_COUNT)) throw e;
-    this.redirects++;
-    let node = this.nodes.get(addr);
-    if (node === undefined || hop > 1) {
-      try {
-        await this.refresh();
-      } catch {
-        /* keep the redirect target below */
+  async moved(e: RuvioError, frame: Buffer, tf: Tf | null, fl: number, hop = 1, tries = 0, movedBefore = false): Promise<any> {
+    for (;;) {
+      let conn: Connection;
+      let asking = false;
+      if (e.code === 'TRYAGAIN') {
+        if (tries >= MAX_TRYAGAIN) throw e;
+        await new Promise((r) => setTimeout(r, TRYAGAIN_WAIT_MS << tries));
+        tries++;
+        const t = this.target(frame, 0);
+        if (typeof t === 'number') throw e;
+        conn = t.conn;
+      } else {
+        const parts = e.message.split(' ');
+        const slot = Number(parts[1]);
+        const addr = parts[2];
+        if (hop > MAX_REDIRECTS || addr === undefined || !(slot >= 0 && slot < SLOT_COUNT)) throw e;
+        hop++;
+        this.redirects++;
+        let node = this.nodes.get(addr);
+        if (e.code === 'ASK') {
+          node ??= this.nodeAt(addr);
+          asking = true;
+        } else {
+          if (node === undefined || movedBefore) {
+            try {
+              await this.refresh();
+            } catch {
+              /* keep the redirect target below */
+            }
+            node = this.nodeAt(addr);
+          }
+          movedBefore = true;
+          this.slots[slot] = node;
+        }
+        conn = node.conn;
       }
-      node = this.nodeAt(addr);
-    }
-    this.slots[slot] = node;
-    const conn = node.conn;
-    conn.writeFrames(frame);
-    try {
-      return await conn.track(tf, fl);
-    } catch (e2) {
-      if (e2 instanceof RuvioError && e2.code === 'MOVED') return this.moved(e2, frame, tf, fl, hop + 1);
-      throw e2;
+      try {
+        if (!asking) {
+          conn.writeFrames(frame);
+          return await conn.track(tf, fl);
+        }
+        conn.writeFrames(ASKING_FRAME);
+        const pa = conn.track(null, 0);
+        conn.writeFrames(frame);
+        const pc = conn.track(tf, fl);
+        try {
+          await pa;
+        } catch (x) {
+          pc.catch(() => undefined);
+          throw x;
+        }
+        return await pc;
+      } catch (e2) {
+        if (!(e2 instanceof RuvioError && isRedirect(e2.code))) throw e2;
+        e = e2;
+      }
     }
   }
 
@@ -1082,7 +1127,7 @@ class ClusterSink implements BatchSink {
         return;
       }
     }
-    if (v instanceof RuvioError && v.code === 'MOVED') {
+    if (v instanceof RuvioError && isRedirect(v.code)) {
       this.r.moved(v, this.frame(i), null, this.fls[i]!).then(
         (x) => this.out.set(i, x),
         (e) => this.out.set(i, e),
@@ -1186,8 +1231,9 @@ class ClusterTransactionImpl extends TransactionImpl {
  *   rejects with {@link RuvioError} code `CROSSSLOT` before anything is sent. Use `{tag}` in key names to colocate keys.
  *   Inside a pipeline the error sits in that command's slot and the rest still runs.
  * - A transaction (`multi()`) must stay in one slot.
- * - On `-MOVED` the slot is re-pointed and the command re-sent, at most 3 times; the 4th `MOVED` is returned as an error.
- *   Ruvio normally forwards a misrouted key instead of answering `MOVED`, so redirects are rare. `-ASK` is not followed.
+ * - On `-MOVED` the slot is re-pointed and the command re-sent; on `-ASK` the command is sent to the named node after `ASKING` and the
+ *   slot is left alone. Both share one budget of 3 redirects; the 4th is returned as an error. `-TRYAGAIN` is retried up to 3 times
+ *   after 5, 10 and 20 ms, then returned. Ruvio normally forwards a misrouted key instead of answering `MOVED`, so redirects are rare.
  * - Blocking commands run on a dedicated connection to the owning node so they do not stall the shared one.
  * - `SCAN` and the `CLIENT *`/`SLOWLOG`/`INFO` family reach one node only; use {@link scanIterator} to walk every node.
  *

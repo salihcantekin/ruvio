@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // ErrCrossSlot is returned, without sending anything, for a multi-key command, pipeline
@@ -319,7 +320,36 @@ func parseMoved(msg []byte) (slot int, addr string, ok bool) {
 	if len(msg) < 8 || string(msg[:6]) != "MOVED " {
 		return 0, "", false
 	}
-	rest := msg[6:]
+	return parseSlotAddr(msg[6:])
+}
+
+// parseAsk decodes "ASK <slot> host:port".
+func parseAsk(msg []byte) (slot int, addr string, ok bool) {
+	if len(msg) < 6 || string(msg[:4]) != "ASK " {
+		return 0, "", false
+	}
+	return parseSlotAddr(msg[4:])
+}
+
+// isTryAgain reports whether an error reply is -TRYAGAIN.
+func isTryAgain(msg []byte) bool {
+	return len(msg) >= 8 && string(msg[:8]) == "TRYAGAIN"
+}
+
+// isRedirectErr reports whether an error reply is one the cluster client follows: -MOVED,
+// -ASK or -TRYAGAIN.
+func isRedirectErr(msg []byte) bool {
+	if _, _, ok := parseMoved(msg); ok {
+		return true
+	}
+	if _, _, ok := parseAsk(msg); ok {
+		return true
+	}
+	return isTryAgain(msg)
+}
+
+// parseSlotAddr decodes "<slot> host:port", the part after the prefix of -MOVED and -ASK.
+func parseSlotAddr(rest []byte) (slot int, addr string, ok bool) {
 	sp := -1
 	for i, c := range rest {
 		if c == ' ' {
@@ -337,9 +367,16 @@ func parseMoved(msg []byte) (slot int, addr string, ok bool) {
 	return n, string(rest[sp+1:]), true
 }
 
-// maxRedirects is how many -MOVED replies one command follows before the last one is
-// returned to the caller.
+// maxRedirects is how many -MOVED and -ASK replies one command follows before the last
+// one is returned to the caller.
 const maxRedirects = 3
+
+// maxTryAgain is how many times one command is sent again after -TRYAGAIN; the wait before
+// retry n is tryAgainWait << (n-1).
+const (
+	maxTryAgain  = 3
+	tryAgainWait = 5 * time.Millisecond
+)
 
 // applyMoved updates the table after -MOVED and returns the node to retry on: the one the
 // MOVED named. The slot is patched at once; the whole table is reloaded only when the target

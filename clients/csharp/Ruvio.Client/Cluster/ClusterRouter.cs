@@ -7,11 +7,18 @@ namespace Ruvio.Client;
 
 /// <summary>
 /// Routes commands to the shard that owns their slot. Built from <c>CLUSTER SLOTS</c>;
-/// a <c>MOVED</c> reply points that slot at the named node and retries, at most three times.
+/// a <c>MOVED</c> reply points that slot at the named node and retries, and an <c>ASK</c> reply sends the command once
+/// (after <c>ASKING</c>) to the named node without changing the map; both count against one budget of three redirects.
+/// <c>TRYAGAIN</c> sends the command again after a short wait, at most three times.
 /// </summary>
 internal sealed class ClusterRouter : IDisposable
 {
     private const int MaxRedirects = 3;
+    private const int MaxTryAgains = 3;
+    private const int FirstTryAgainDelayMs = 5;
+
+    private static readonly string[] AskingCommand = ["ASKING"];
+    private static readonly byte[] AskingFrame = Encoding.ASCII.GetBytes("*1\r\n$6\r\nASKING\r\n");
 
     internal static readonly HashSet<string> SplitNames = new(StringComparer.Ordinal)
     {
@@ -164,7 +171,7 @@ internal sealed class ClusterRouter : IDisposable
             case "SCAN":
                 return await ScanAsync(arguments, cancellationToken);
             case "PUBLISH":
-                return await SendRoutedAsync(await ForSlotAsync(0, cancellationToken), arguments, cancellationToken);
+                return await SendRoutedAsync(await ForSlotAsync(0, cancellationToken), arguments, cancellationToken, slot: 0);
         }
 
         IReadOnlyList<string> keys = ClusterKeys.Of(name, arguments);
@@ -224,18 +231,25 @@ internal sealed class ClusterRouter : IDisposable
         RespCommand command, int slot, int redirects, CancellationToken cancellationToken)
     {
         RuvioSocket connection = await ForSlotAsync(slot, cancellationToken).ConfigureAwait(false);
+        RespValue reply = await connection.SendAsync(command, cancellationToken).ConfigureAwait(false);
 
-        for (int redirect = redirects; ; redirect++)
-        {
-            RespValue reply = await connection.SendAsync(command, cancellationToken).ConfigureAwait(false);
+        return NeedsFollowUp(reply)
+            ? await FollowUpAsync(command, slot, redirects, reply, cancellationToken).ConfigureAwait(false)
+            : reply;
+    }
 
-            if (redirect >= MaxRedirects || MovedTarget(reply) is not { } moved)
-            {
-                return reply;
-            }
+    /// <summary>The slow path of <see cref="SendToSlotAsync"/>: only an error reply that is a redirect or <c>TRYAGAIN</c> gets here.</summary>
+    private Task<RespValue> FollowUpAsync(
+        RespCommand command, int slot, int redirects, RespValue reply, CancellationToken cancellationToken)
+    {
+        IReadOnlyList<string> arguments = command.AsList();
 
-            connection = await FollowMovedAsync(moved, redirect, cancellationToken).ConfigureAwait(false);
-        }
+        return ResolveAsync(
+            reply,
+            redirects,
+            token => ForSlotAsync(slot, token),
+            (node, asking, token) => asking ? AskAsync(node, arguments, token) : node.SendAsync(arguments, token).AsTask(),
+            cancellationToken);
     }
 
     /// <summary>
@@ -258,14 +272,9 @@ internal sealed class ClusterRouter : IDisposable
                 : await SendToSlotAsync(command, slot, redirects, cancellationToken).ConfigureAwait(false);
         }
 
-        if (redirects >= MaxRedirects || MovedTarget(reply) is not { } moved)
-        {
-            return reply;
-        }
-
-        await FollowMovedAsync(moved, redirects, cancellationToken).ConfigureAwait(false);
-
-        return await SendToSlotAsync(command, slot, redirects + 1, cancellationToken).ConfigureAwait(false);
+        return NeedsFollowUp(reply)
+            ? await FollowUpAsync(command, slot, redirects, reply, cancellationToken).ConfigureAwait(false)
+            : reply;
     }
 
     /// <summary>The string-list form of <see cref="SendReadToSlotAsync"/>.</summary>
@@ -284,14 +293,9 @@ internal sealed class ClusterRouter : IDisposable
                 : await SendRoutedAsync(await ForSlotAsync(slot, cancellationToken), arguments, cancellationToken, redirects);
         }
 
-        if (redirects >= MaxRedirects || MovedTarget(reply) is not { } moved)
-        {
-            return reply;
-        }
-
-        RuvioSocket owner = await FollowMovedAsync(moved, redirects, cancellationToken).ConfigureAwait(false);
-
-        return await SendRoutedAsync(owner, arguments, cancellationToken, redirects + 1);
+        return NeedsFollowUp(reply)
+            ? await FollowUpAsync(arguments, slot, redirects, reply, cancellationToken).ConfigureAwait(false)
+            : reply;
     }
 
     /// <summary>The socket a read goes to; <c>Topology</c> and <c>Node</c> name the replica when it is one.</summary>
@@ -439,32 +443,32 @@ internal sealed class ClusterRouter : IDisposable
                 : await SendBinaryToSlotAsync(arguments, slot, redirects, cancellationToken).ConfigureAwait(false);
         }
 
-        if (redirects >= MaxRedirects || MovedTarget(reply) is not { } moved)
-        {
-            return reply;
-        }
-
-        await FollowMovedAsync(moved, redirects, cancellationToken).ConfigureAwait(false);
-
-        return await SendBinaryToSlotAsync(arguments, slot, redirects + 1, cancellationToken).ConfigureAwait(false);
+        return NeedsFollowUp(reply)
+            ? await FollowUpAsync(arguments, slot, redirects, reply, cancellationToken).ConfigureAwait(false)
+            : reply;
     }
 
     private async Task<RespValue> SendBinaryToSlotAsync(
         IReadOnlyList<ReadOnlyMemory<byte>> arguments, int slot, int redirects, CancellationToken cancellationToken)
     {
         RuvioSocket connection = await ForSlotAsync(slot, cancellationToken).ConfigureAwait(false);
+        RespValue reply = await connection.SendBinaryAsync(arguments, cancellationToken).ConfigureAwait(false);
 
-        for (int redirect = redirects; ; redirect++)
-        {
-            RespValue reply = await connection.SendBinaryAsync(arguments, cancellationToken).ConfigureAwait(false);
+        return NeedsFollowUp(reply)
+            ? await FollowUpAsync(arguments, slot, redirects, reply, cancellationToken).ConfigureAwait(false)
+            : reply;
+    }
 
-            if (redirect >= MaxRedirects || MovedTarget(reply) is not { } moved)
-            {
-                return reply;
-            }
-
-            connection = await FollowMovedAsync(moved, redirect, cancellationToken).ConfigureAwait(false);
-        }
+    /// <summary>The binary form of the slow path of <see cref="SendToSlotAsync"/>.</summary>
+    private Task<RespValue> FollowUpAsync(
+        IReadOnlyList<ReadOnlyMemory<byte>> arguments, int slot, int redirects, RespValue reply, CancellationToken cancellationToken)
+    {
+        return ResolveAsync(
+            reply,
+            redirects,
+            token => ForSlotAsync(slot, token),
+            (node, asking, token) => asking ? AskBinaryAsync(node, arguments, token) : node.SendBinaryAsync(arguments, token).AsTask(),
+            cancellationToken);
     }
 
     /// <summary>Sends a binary <c>DEL</c>, <c>UNLINK</c> or <c>EXISTS</c> once per slot and sums the counts; <c>EXISTS</c> parts are reads.</summary>
@@ -657,7 +661,7 @@ internal sealed class ClusterRouter : IDisposable
             // Every command is for one node: the plain pipeline, unchanged.
             IReadOnlyList<RespValue> values = await sockets[only]!.SendManyAsync(commands, cancellationToken);
 
-            return HasMoved(values) ? await ResendMovedAsync(values, commands, cancellationToken) : values;
+            return HasFollowUp(values) ? await ResendFollowUpAsync(values, commands, cancellationToken) : values;
         }
 
         var sends = new ValueTask<IReadOnlyList<RespValue>>[nodes + 1];
@@ -716,7 +720,7 @@ internal sealed class ClusterRouter : IDisposable
             }
         }
 
-        return HasMoved(replies) ? await ResendMovedAsync(replies, commands, cancellationToken) : replies;
+        return HasFollowUp(replies) ? await ResendFollowUpAsync(replies, commands, cancellationToken) : replies;
     }
 
     private static void Scatter(int[] scratch, int count, int node, IReadOnlyList<RespValue> values, RespValue[] replies)
@@ -732,11 +736,11 @@ internal sealed class ClusterRouter : IDisposable
         }
     }
 
-    private static bool HasMoved(IReadOnlyList<RespValue> replies)
+    private static bool HasFollowUp(IReadOnlyList<RespValue> replies)
     {
         for (int index = 0; index < replies.Count; index++)
         {
-            if (replies[index] is { Kind: RespKind.Error, Text: { } text } && text.StartsWith("MOVED ", StringComparison.Ordinal))
+            if (NeedsFollowUp(replies[index]))
             {
                 return true;
             }
@@ -745,8 +749,8 @@ internal sealed class ClusterRouter : IDisposable
         return false;
     }
 
-    /// <summary>Sends each command that got a <c>MOVED</c> again, straight from the caller's arguments, to the node named.</summary>
-    private async Task<IReadOnlyList<RespValue>> ResendMovedAsync(
+    /// <summary>Sends each command that got a <c>MOVED</c>, <c>ASK</c> or <c>TRYAGAIN</c> again, straight from the caller's arguments.</summary>
+    private async Task<IReadOnlyList<RespValue>> ResendFollowUpAsync(
         IReadOnlyList<RespValue> values,
         IReadOnlyList<IReadOnlyList<string>> commands,
         CancellationToken cancellationToken)
@@ -755,11 +759,9 @@ internal sealed class ClusterRouter : IDisposable
 
         for (int index = 0; index < replies.Length; index++)
         {
-            if (MovedTarget(replies[index]) is { } moved)
+            if (NeedsFollowUp(replies[index]))
             {
-                RuvioSocket owner = await FollowMovedAsync(moved, 0, cancellationToken);
-
-                replies[index] = await SendRoutedAsync(owner, commands[index], cancellationToken, redirects: 1);
+                replies[index] = await FollowUpAsync(commands[index], -1, 0, replies[index], cancellationToken);
             }
         }
 
@@ -883,12 +885,11 @@ internal sealed class ClusterRouter : IDisposable
         for (int index = 0; index < replies.Length; index++)
         {
             // A split command's own index stays empty until its parts are merged below.
-            if (replies[index] is { } reply && MovedTarget(reply) is { } moved)
+            if (replies[index] is { } reply && NeedsFollowUp(reply))
             {
                 IReadOnlyList<string> command = index < commands.Count ? commands[index] : extra![index - commands.Count];
-                RuvioSocket owner = await FollowMovedAsync(moved, 0, cancellationToken);
 
-                replies[index] = await SendRoutedAsync(owner, command, cancellationToken, redirects: 1);
+                replies[index] = await FollowUpAsync(command, -1, 0, reply, cancellationToken);
             }
         }
 
@@ -1246,11 +1247,9 @@ internal sealed class ClusterRouter : IDisposable
                 }
             }
 
-            if (MovedTarget(replies[part]) is { } moved)
+            if (NeedsFollowUp(replies[part]))
             {
-                RuvioSocket owner = await FollowMovedAsync(moved, 0, cancellationToken);
-
-                replies[part] = await SendRoutedAsync(owner, parts[part].Command, cancellationToken, redirects: 1);
+                replies[part] = await FollowUpAsync((IReadOnlyList<string>)parts[part].Command, parts[part].Slot, 0, replies[part], cancellationToken);
             }
         }
 
@@ -1435,20 +1434,128 @@ internal sealed class ClusterRouter : IDisposable
         RuvioSocket connection,
         IReadOnlyList<string> arguments,
         CancellationToken cancellationToken,
-        int redirects = 0)
+        int redirects = 0,
+        int slot = -1)
     {
-        for (int redirect = redirects; ; redirect++)
-        {
-            RespValue reply = await connection.SendAsync(arguments, cancellationToken);
+        RespValue reply = await connection.SendAsync(arguments, cancellationToken);
 
-            if (redirect >= MaxRedirects || MovedTarget(reply) is not { } moved)
+        return NeedsFollowUp(reply)
+            ? await FollowUpAsync(arguments, slot, redirects, reply, cancellationToken)
+            : reply;
+    }
+
+    /// <summary>
+    /// The slow path of the string-list sends. A retry goes to the owner of <paramref name="slot"/>, or of the
+    /// command's keys when the slot is -1.
+    /// </summary>
+    private Task<RespValue> FollowUpAsync(
+        IReadOnlyList<string> arguments, int slot, int redirects, RespValue reply, CancellationToken cancellationToken)
+    {
+        return ResolveAsync(
+            reply,
+            redirects,
+            token => slot >= 0
+                ? ForSlotAsync(slot, token)
+                : TargetAsync(ClusterKeys.Of(ClusterKeys.Name(arguments), arguments), token),
+            (node, asking, token) => asking ? AskAsync(node, arguments, token) : node.SendAsync(arguments, token).AsTask(),
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// Follows the redirects and <c>TRYAGAIN</c> replies <paramref name="reply"/> starts, until a reply that is neither
+    /// or a budget runs out (3 redirects shared by <c>MOVED</c> and <c>ASK</c>, 3 retries of <c>TRYAGAIN</c>); that reply is returned.
+    /// <paramref name="redirects"/> counts the <c>MOVED</c> replies already followed. <paramref name="route"/> picks the
+    /// node for a retry from the current slot map; <paramref name="send"/> sends the command to a node, after <c>ASKING</c> when asked.
+    /// </summary>
+    private async Task<RespValue> ResolveAsync(
+        RespValue reply,
+        int redirects,
+        Func<CancellationToken, ValueTask<RuvioSocket>> route,
+        Func<RuvioSocket, bool, CancellationToken, Task<RespValue>> send,
+        CancellationToken cancellationToken)
+    {
+        int moves = redirects;
+        int retries = 0;
+
+        while (true)
+        {
+            if (MovedTarget(reply) is { } moved)
+            {
+                if (redirects >= MaxRedirects)
+                {
+                    return reply;
+                }
+
+                redirects++;
+
+                RuvioSocket owner = await FollowMovedAsync(moved, moves++, cancellationToken).ConfigureAwait(false);
+
+                reply = await send(owner, false, cancellationToken).ConfigureAwait(false);
+            }
+            else if (AskTarget(reply) is { } ask)
+            {
+                if (redirects >= MaxRedirects)
+                {
+                    return reply;
+                }
+
+                redirects++;
+
+                RuvioSocket node = await ConnectionAsync(ask.Host, ask.Port, cancellationToken).ConfigureAwait(false);
+
+                reply = await send(node, true, cancellationToken).ConfigureAwait(false);
+            }
+            else if (IsTryAgain(reply) && retries < MaxTryAgains)
+            {
+                await Task.Delay(FirstTryAgainDelayMs << retries++, cancellationToken).ConfigureAwait(false);
+
+                RuvioSocket owner = await route(cancellationToken).ConfigureAwait(false);
+
+                reply = await send(owner, false, cancellationToken).ConfigureAwait(false);
+            }
+            else
             {
                 return reply;
             }
-
-            connection = await FollowMovedAsync(moved, redirect, cancellationToken);
         }
     }
+
+    /// <summary>Sends <c>ASKING</c> and the command in one write; the <c>ASKING</c> reply is dropped, an error in it is thrown.</summary>
+    private static async Task<RespValue> AskAsync(RuvioSocket node, IReadOnlyList<string> arguments, CancellationToken cancellationToken)
+    {
+        IReadOnlyList<RespValue> replies = await node.SendManyAsync([AskingCommand, arguments], cancellationToken).ConfigureAwait(false);
+
+        RuvioSocket.ThrowOnError(replies[0]);
+
+        return replies[1];
+    }
+
+    /// <summary>The binary form of <see cref="AskAsync"/>.</summary>
+    private static async Task<RespValue> AskBinaryAsync(
+        RuvioSocket node, IReadOnlyList<ReadOnlyMemory<byte>> arguments, CancellationToken cancellationToken)
+    {
+        byte[] command = RespCodec.Encode(arguments);
+        byte[] frame = new byte[AskingFrame.Length + command.Length];
+
+        AskingFrame.CopyTo(frame, 0);
+        command.CopyTo(frame, AskingFrame.Length);
+
+        IReadOnlyList<RespValue> replies = await node.SendManyAsync(frame, 2, cancellationToken).ConfigureAwait(false);
+
+        RuvioSocket.ThrowOnError(replies[0]);
+
+        return replies[1];
+    }
+
+    /// <summary>True for an error reply that starts <c>MOVED</c>, <c>ASK</c> or <c>TRYAGAIN</c>; checked by prefix, only on errors.</summary>
+    private static bool NeedsFollowUp(RespValue reply) =>
+        reply is { Kind: RespKind.Error, Text: { } text }
+        && (text.StartsWith("MOVED ", StringComparison.Ordinal)
+            || text.StartsWith("ASK ", StringComparison.Ordinal)
+            || text.StartsWith("TRYAGAIN", StringComparison.Ordinal));
+
+    private static bool IsTryAgain(RespValue reply) =>
+        reply is { Kind: RespKind.Error, Text: { } text } && text.StartsWith("TRYAGAIN", StringComparison.Ordinal);
 
     /// <summary>
     /// Points the slot a <c>MOVED</c> names at its node and returns that node's socket; the
@@ -1475,9 +1582,14 @@ internal sealed class ClusterRouter : IDisposable
     }
 
     /// <summary>The slot and node of a <c>MOVED slot host:port</c> reply; null for any other reply.</summary>
-    internal static (int Slot, string Host, int Port)? MovedTarget(RespValue reply)
+    internal static (int Slot, string Host, int Port)? MovedTarget(RespValue reply) => RedirectTarget(reply, "MOVED ");
+
+    /// <summary>The slot and node of an <c>ASK slot host:port</c> reply; null for any other reply.</summary>
+    private static (int Slot, string Host, int Port)? AskTarget(RespValue reply) => RedirectTarget(reply, "ASK ");
+
+    private static (int Slot, string Host, int Port)? RedirectTarget(RespValue reply, string prefix)
     {
-        if (reply.Kind is not RespKind.Error || reply.Text is not { } text || !text.StartsWith("MOVED ", StringComparison.Ordinal))
+        if (reply.Kind is not RespKind.Error || reply.Text is not { } text || !text.StartsWith(prefix, StringComparison.Ordinal))
         {
             return null;
         }

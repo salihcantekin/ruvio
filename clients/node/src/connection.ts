@@ -801,7 +801,7 @@ export class Connection extends EventEmitter {
     }
     if (typeof res === 'function') {
       if (v instanceof RuvioError) {
-        if (fb !== null && (v.code === 'MOVED' || (this.replica && (v.code === 'LOADING' || v.code === 'MASTERDOWN')))) {
+        if (fb !== null && (v.code === 'MOVED' || v.code === 'ASK' || v.code === 'TRYAGAIN' || (this.replica && (v.code === 'LOADING' || v.code === 'MASTERDOWN')))) {
           this.onMoved!(v, fb, this.rFO![i]!, this.rFN![i]!, tf, this.rFl[i]!, res as (x: unknown) => void, rej as (e: unknown) => void);
           return;
         }

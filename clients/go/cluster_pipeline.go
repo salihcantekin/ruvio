@@ -324,7 +324,7 @@ func (cl *cluster) pipeSpread(ctx context.Context, t *topology, r *request, n in
 	}
 	for i := range out {
 		if out[i].Kind == KindError {
-			if _, _, isMoved := parseMoved(out[i].Bytes); isMoved {
+			if isRedirectErr(out[i].Bytes) {
 				cl.redo(ctx, r.buf[s.offs[i]:s.offs[i+1]], &out[i])
 			}
 		}
@@ -353,7 +353,7 @@ func frameAt(buf []byte, i int) []byte {
 	return buf[off : off+end]
 }
 
-// pipeOne sends the whole pipeline to one node and repairs -MOVED replies.
+// pipeOne sends the whole pipeline to one node and repairs -MOVED, -ASK and -TRYAGAIN replies.
 func (cl *cluster) pipeOne(ctx context.Context, node *Client, r *request, n int) ([]Value, error) {
 	ok, err := node.rtMany(ctx, r, n)
 	if !ok {
@@ -367,7 +367,7 @@ func (cl *cluster) pipeOne(ctx context.Context, node *Client, r *request, n int)
 	vals := r.vals
 	for i := range vals {
 		if vals[i].Kind == KindError {
-			if _, _, isMoved := parseMoved(vals[i].Bytes); isMoved {
+			if isRedirectErr(vals[i].Bytes) {
 				cl.redo(ctx, frameAt(r.buf, i), &vals[i])
 			}
 		}
@@ -376,7 +376,7 @@ func (cl *cluster) pipeOne(ctx context.Context, node *Client, r *request, n int)
 	return vals, nil
 }
 
-// redo sends one command again after -MOVED (the table is updated first) and stores the
+// redo sends one command again after -MOVED, -ASK or -TRYAGAIN (the table is updated first) and stores the
 // outcome in dst.
 func (cl *cluster) redo(ctx context.Context, frame []byte, dst *Value) {
 	req := getReq()
@@ -494,7 +494,7 @@ func (cl *cluster) pipeMany(ctx context.Context, t *topology, r *request, n int,
 				continue
 			}
 			if v.Kind == KindError {
-				if _, _, isMoved := parseMoved(v.Bytes); isMoved { // repair this part alone
+				if isRedirectErr(v.Bytes) { // repair this part alone
 					again := getReq()
 					plans[it.i].appendPart(again, it.part)
 					var err error
@@ -529,7 +529,7 @@ func (cl *cluster) pipeMany(ctx context.Context, t *topology, r *request, n int,
 			continue
 		}
 		if out[i].Kind == KindError {
-			if _, _, isMoved := parseMoved(out[i].Bytes); isMoved {
+			if isRedirectErr(out[i].Bytes) {
 				cl.redo(ctx, r.buf[offs[i]:offs[i+1]], &out[i])
 			}
 		}

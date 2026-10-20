@@ -10,7 +10,7 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ruvio_client::__bench::parse;
 use ruvio_client::{Client, ClientOptions, Error, RespValue, hash_slot};
@@ -1322,6 +1322,141 @@ fn up_to_three_redirects_are_followed_and_the_fourth_is_returned() {
 }
 
 #[test]
+fn an_ask_sends_asking_and_the_command_to_the_named_node_and_keeps_the_map() {
+    let cluster = Cluster::start(3);
+    let mut client = cluster.client();
+    let key = cluster.key_on(0, "ask");
+    let ask = format!("-ASK {} 127.0.0.1:{}\r\n", hash_slot(&key), cluster.port(1));
+
+    cluster.put(0, &key, Val::Str("on-a".into()), -1);
+    cluster.script("0:GET", ask.as_bytes(), 1);
+    // Node 1 does not own the slot; the scripted reply stands for the migrating import.
+    cluster.script("1:GET", &bulk("on-b"), 1);
+    cluster.clear_log();
+
+    assert_eq!(client.get_string(&key).unwrap().as_deref(), Some("on-b"));
+    assert!(cluster.seen("CLUSTER").is_empty());
+
+    let on_b: Vec<Vec<String>> = cluster
+        .log()
+        .into_iter()
+        .filter(|(node, _)| *node == 1)
+        .map(|(_, command)| command)
+        .collect();
+
+    assert_eq!(
+        on_b,
+        vec![vec!["ASKING".to_owned()], vec!["GET".into(), key.clone()]]
+    );
+
+    // The slot still belongs to node 0.
+    cluster.clear_log();
+    assert_eq!(client.get_string(&key).unwrap().as_deref(), Some("on-a"));
+    assert_eq!(cluster.seen("GET"), vec![(0, vec!["GET".into(), key])]);
+    assert!(cluster.seen("ASKING").is_empty());
+}
+
+#[test]
+fn an_ask_to_a_node_the_client_does_not_know_yet_is_followed() {
+    let cluster = Cluster::start(3);
+
+    // Node 2 owns nothing, so the map never lists it.
+    cluster.move_slots(10_923, 16_383, 1);
+
+    let mut client = cluster.client();
+    let key = cluster.key_on(1, "ghostask");
+    let ask = format!("-ASK {} 127.0.0.1:{}\r\n", hash_slot(&key), cluster.port(2));
+
+    cluster.put(1, &key, Val::Str("on-owner".into()), -1);
+    cluster.script("1:GET", ask.as_bytes(), 1);
+    cluster.script("2:GET", &bulk("on-importer"), 1);
+    cluster.clear_log();
+
+    assert_eq!(
+        client.get_string(&key).unwrap().as_deref(),
+        Some("on-importer")
+    );
+    assert_eq!(cluster.seen("ASKING"), vec![(2, vec!["ASKING".to_owned()])]);
+
+    cluster.clear_log();
+    assert_eq!(
+        client.get_string(&key).unwrap().as_deref(),
+        Some("on-owner")
+    );
+    assert_eq!(cluster.seen("GET"), vec![(1, vec!["GET".into(), key])]);
+}
+
+#[test]
+fn a_tryagain_is_retried_after_a_short_sleep() {
+    let cluster = Cluster::start(2);
+    let mut client = cluster.client();
+    let key = cluster.key_on(1, "retry");
+
+    cluster.put(1, &key, Val::Str("v".into()), -1);
+    cluster.script("GET", b"-TRYAGAIN slot is being handed over\r\n", 1);
+    cluster.clear_log();
+
+    let started = Instant::now();
+
+    assert_eq!(client.get_string(&key).unwrap().as_deref(), Some("v"));
+    assert!(started.elapsed() >= Duration::from_millis(5));
+    assert_eq!(
+        cluster.seen("GET"),
+        vec![(1, vec!["GET".into(), key.clone()]); 2]
+    );
+}
+
+#[test]
+fn the_fourth_tryagain_in_a_row_is_returned() {
+    let cluster = Cluster::start(2);
+    let mut client = cluster.client();
+    let key = cluster.key_on(1, "giveup");
+
+    cluster.script("GET", b"-TRYAGAIN slot is being handed over\r\n", 4);
+    cluster.clear_log();
+
+    let started = Instant::now();
+    let message = server_error(client.execute(&["GET", &key]));
+
+    assert!(message.starts_with("TRYAGAIN"), "{message}");
+    // Sleeps of 5, 10 and 20 ms came before the three retries.
+    assert!(started.elapsed() >= Duration::from_millis(35));
+    assert_eq!(cluster.seen("GET").len(), 4);
+}
+
+#[test]
+fn ask_and_moved_share_one_budget_of_three_redirects() {
+    let cluster = Cluster::start(2);
+    let mut client = cluster.client();
+    let key = cluster.key_on(0, "budget");
+    let slot = hash_slot(&key);
+    let port = cluster.port(1);
+
+    cluster.script(
+        "GET",
+        format!("-ASK {slot} 127.0.0.1:{port}\r\n").as_bytes(),
+        1,
+    );
+    cluster.script(
+        "GET",
+        format!("-MOVED {slot} 127.0.0.1:{port}\r\n").as_bytes(),
+        1,
+    );
+    cluster.script(
+        "GET",
+        format!("-ASK {slot} 127.0.0.1:{port}\r\n").as_bytes(),
+        2,
+    );
+    cluster.clear_log();
+
+    let message = server_error(client.execute(&["GET", &key]));
+
+    assert!(message.starts_with("ASK "), "{message}");
+    assert_eq!(cluster.seen("GET").len(), 4);
+    assert_eq!(cluster.seen("ASKING").len(), 2);
+}
+
+#[test]
 fn malformed_or_foreign_redirects_are_returned_as_errors() {
     let cluster = Cluster::start(2);
     let mut client = cluster.client();
@@ -1330,7 +1465,8 @@ fn malformed_or_foreign_redirects_are_returned_as_errors() {
         &b"-MOVED 5 hostwithoutport\r\n"[..],
         b"-MOVED\r\n",
         b"-MOVED 5 host:notaport\r\n",
-        b"-ASK 5 127.0.0.1:1\r\n",
+        b"-ASK 5 hostwithoutport\r\n",
+        b"-ASK 16384 127.0.0.1:1\r\n",
         b"-ERR something else\r\n",
     ] {
         cluster.script("GET", reply, 1);

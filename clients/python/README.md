@@ -283,6 +283,13 @@ Behaviour worth knowing:
   the table points that one slot at it; a node that is not in the table, or a second `MOVED` for
   the same command, re-reads `CLUSTER SLOTS`. `MOVED` means the command was not executed, so
   following it is safe.
+- **`-ASK`**: `ASKING` and the command are sent in one write to the node the reply names (a node
+  that is not in the table gets a connection), and its reply is returned. The slot table is not
+  changed, so the next command for that slot still goes to the table's owner. `ASK` and `MOVED`
+  share the budget of 3 redirects per command; an error reply to `ASKING` is the result.
+- **`-TRYAGAIN`**: the command is sent again, routed by the current table, at most **3 times**,
+  after 5 ms, 10 ms and 20 ms (`asyncio.sleep` in the asyncio client); a fourth `TRYAGAIN` is
+  raised. Redirects during the retries are followed with their own budget.
 - **No replay after transport failures.** A dropped node socket fails the command that saw it
   (`ConnectionError`), is closed, and is reopened by the next command for that node. Other nodes
   are not affected. A pipeline/split call that touched several nodes still reads every healthy
@@ -419,8 +426,9 @@ RUVIO_TEST_FLUSHALL=1 ...                                               # also r
   `MULTI`/`EXEC` sent one by one are refused (use `pipeline(transaction=True)`); a
   cross-slot `RENAME`/`COPY`/`SMOVE`/`LMOVE`/... is refused rather than emulated by
   copying; `CLUSTER NODES/SHARDS/INFO/MYID` and `CHANGES` go to the seed only; `SCRIPT EXISTS`
-  and `SCRIPT KILL` ask the seed only; there is no `ASK` handling (the server does not
-  migrate slots); no replica reads (`READONLY` is sent to the seed only); a cluster whose
+  and `SCRIPT KILL` ask the seed only; `ASK` and `TRYAGAIN` are handled
+  as described above, but only against scripted servers, since the server does not
+  migrate slots across nodes; no replica reads (`READONLY` is sent to the seed only); a cluster whose
   advertised host is unreachable from the client is not handled. Not verified: a server
   topology that changes while the client runs (`MOVED` recovery was verified by corrupting the
   client's table, not by moving slots on a server), clusters with more than 3 nodes, AUTH on
