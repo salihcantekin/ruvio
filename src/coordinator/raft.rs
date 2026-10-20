@@ -10,6 +10,7 @@ use std::{
     ops::RangeBounds,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
+    time::{Duration, Instant},
 };
 
 use openraft::{
@@ -724,9 +725,133 @@ impl RaftNetwork<TypeConfig> for PeerClient {
     }
 }
 
+/// The longest a confirmed leadership is trusted, and the longest one confirmation may take.
+/// Below the 1 s minimum election timeout and openraft's 2 s leader lease (a follower that
+/// answered the confirmation votes for nobody else within the lease), so no other leader can
+/// have been elected while a confirmation is still trusted.
+const LEADERSHIP_WINDOW: Duration = Duration::from_secs(1);
+
+/// Whether this coordinator leads with a majority behind it, asked before every action on the
+/// data nodes. openraft 0.9 keeps a leader that cannot reach the other coordinators leading
+/// (it steps down only on a higher vote or a membership change), so `current_leader()` alone
+/// lets a cut-off leader keep acting on its old record while the majority elects another.
+/// A confirmation (`ensure_linearizable`: a heartbeat a majority answers) is trusted for one
+/// window, so every caller in that window shares one round of heartbeats.
+pub struct Leadership {
+    id: NodeId,
+    window: Duration,
+    state: tokio::sync::Mutex<Confirmation>,
+}
+
+impl Leadership {
+    /// Confirmations trusted for one `ping_interval` (the leader's tick), at most 1 s.
+    pub fn new(id: NodeId, ping_interval: Duration) -> Self {
+        Self {
+            id,
+            window: ping_interval.min(LEADERSHIP_WINDOW),
+            state: tokio::sync::Mutex::default(),
+        }
+    }
+
+    /// True when this coordinator is the leader and a majority confirmed it within the window.
+    /// Never waits longer than the window.
+    pub async fn confirm(&self, raft: &Raft) -> bool {
+        let (leader, term) = {
+            let metrics = raft.metrics();
+            let metrics = metrics.borrow();
+
+            (metrics.current_leader, metrics.current_term)
+        };
+        // One caller confirms at a time; the others then find its answer.
+        let mut state = self.state.lock().await;
+
+        if leader != Some(self.id) {
+            *state = Confirmation::default();
+            return false;
+        }
+        if state.fresh(term, self.window) {
+            return true;
+        }
+        let started = Instant::now();
+        let confirmed = matches!(
+            tokio::time::timeout(self.window, raft.ensure_linearizable()).await,
+            Ok(Ok(_))
+        );
+
+        match state.record(term, started, confirmed) {
+            Some(true) => {
+                tracing::info!(
+                    term,
+                    "a majority of coordinators confirms this leader again; acting on the data nodes"
+                )
+            }
+            Some(false) => {
+                tracing::warn!(
+                    term,
+                    "this leader cannot reach a majority of coordinators; not acting on the data nodes until it can"
+                )
+            }
+            None => {}
+        }
+        confirmed
+    }
+}
+
+/// The last confirmation of one leader.
+#[derive(Debug, Default)]
+struct Confirmation {
+    /// When the last successful confirmation began, in which term.
+    at: Option<(u64, Instant)>,
+    /// The last confirmation failed (logged once, until one succeeds).
+    lost: bool,
+}
+
+impl Confirmation {
+    fn fresh(&self, term: u64, window: Duration) -> bool {
+        self.at
+            .is_some_and(|(known, at)| known == term && at.elapsed() < window)
+    }
+
+    /// Takes in one confirmation's outcome; `Some(confirmed)` when it changes from the last
+    /// (a leader's first success is not a change).
+    fn record(&mut self, term: u64, started: Instant, confirmed: bool) -> Option<bool> {
+        self.at = confirmed.then_some((term, started));
+        let changed = self.lost == confirmed;
+
+        self.lost = !confirmed;
+        changed.then_some(confirmed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_leadership_confirmation_is_trusted_for_one_window_of_its_term() {
+        let window = Duration::from_secs(60);
+        let mut confirmation = Confirmation::default();
+
+        assert!(!confirmation.fresh(1, window));
+        // The first success is not logged; it is trusted in its term only.
+        assert_eq!(confirmation.record(1, Instant::now(), true), None);
+        assert!(confirmation.fresh(1, window));
+        assert!(!confirmation.fresh(2, window));
+        // Older than the window: confirmed again.
+        let old = Instant::now() - Duration::from_millis(20);
+        confirmation.record(1, old, true);
+        assert!(!confirmation.fresh(1, Duration::from_millis(10)));
+
+        // A failure is logged once, not on every tick, and nothing is trusted meanwhile.
+        assert_eq!(confirmation.record(1, Instant::now(), false), Some(false));
+        assert!(!confirmation.fresh(1, window));
+        assert_eq!(confirmation.record(1, Instant::now(), false), None);
+        assert_eq!(confirmation.record(1, Instant::now(), false), None);
+        // The majority answers again: logged once.
+        assert_eq!(confirmation.record(1, Instant::now(), true), Some(true));
+        assert_eq!(confirmation.record(1, Instant::now(), true), None);
+        assert!(confirmation.fresh(1, window));
+    }
 
     #[test]
     fn set_primary_applies_only_above_the_recorded_epoch() {

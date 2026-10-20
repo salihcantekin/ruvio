@@ -31,6 +31,18 @@ If the leader coordinator dies, the remaining ones elect a new leader (one to tw
 Commands to data nodes are repeated on every tick until the members agree with the record, so a failover
 interrupted half way is finished by the next leader.
 
+When the coordinators are partitioned from each other, only the side with a majority acts. The Raft
+library keeps a leader that lost its majority believing it leads, so before each tick's work on the data
+nodes (a failover, pointing members at the agreed primary, sending the cluster map, a step of a slot
+move) and before `COORDINATOR FAILOVER group FORCE`, `MOVE` and `CANCEL`, the leader confirms with a
+heartbeat that a majority of coordinators still follows it. One confirmation per tick is shared by
+everything in that tick; it waits at most one `ping_interval_ms` (capped at 1 second, below the election
+timeout). A leader cut off from the others, even one that still reaches every data node, therefore does
+nothing to them: it logs one warning, those commands answer `ERR this leader cannot reach a majority of
+coordinators; try again`, and it acts again (logging that once) when the majority answers it, or follows
+the leader the majority elected meanwhile. The other side, if it is a majority, elects a new leader and
+fails over as usual.
+
 Measured on one Mac with three data nodes and three coordinators (`ping_interval_ms` 200,
 `down_after_ms` 1000, debug build): the new primary took writes 1.2 seconds after the old one was killed;
 with the coordinator leader killed first, 3.2–4 seconds.
@@ -261,7 +273,8 @@ is never slowed down. Nodes need durability `memory`, `everysec` or `always` (no
 
 - `tests/coordinator_live.rs`: three data nodes and three coordinators as real processes: failover after
   the primary is killed, the old primary returning as a replica, agreement kept across a restart of every
-  coordinator, no failover without a majority, and the secret; and two groups of a multi-node cluster,
+  coordinator, a leader cut off from the other coordinators that neither fails over nor
+  corrects a member while it still reaches the data nodes, and the secret; and two groups of a multi-node cluster,
   where a failover in one changes the other's `MOVED` answers, and a range moves from one to the other
   while a client keeps writing a key of it (every acknowledged write is on the new owner).
 - `tests/multi_node_live.rs`: the node side of a move driven by hand, and a prepared move kept across

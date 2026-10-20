@@ -340,7 +340,7 @@ fn coordinators_fail_over_a_dead_primary_and_bring_it_back_as_a_replica() {
 }
 
 #[test]
-fn one_coordinator_without_a_majority_does_not_fail_over() {
+fn a_leader_cut_off_from_the_other_coordinators_does_not_act() {
     let dir = tempfile::tempdir().unwrap();
     let group = Group::new();
     let mut nodes = [
@@ -348,26 +348,73 @@ fn one_coordinator_without_a_majority_does_not_fail_over() {
         group.node(dir.path(), 1, Some(0)),
         group.node(dir.path(), 2, Some(0)),
     ];
-    let mut coordinators: Vec<Process> = (0..3)
-        .map(|index| group.coordinator(dir.path(), index))
+    let mut coordinators: Vec<Option<Process>> = (0..3)
+        .map(|index| Some(group.coordinator(dir.path(), index)))
         .collect();
 
     wait_until("the coordinators to agree on the primary", || {
         (0..3).all(|index| group.primary_by(index) == Some(0))
     });
-    coordinators[1].kill();
-    coordinators[2].kill();
+    let is_leader = |index: usize| {
+        call_with_secret(&group.coordinators[index].to_string(), &["INFO"])
+            .is_some_and(|info| info.contains("is_leader:1"))
+    };
+    let mut leader = None;
+
+    wait_until("a leader", || {
+        leader = (0..3).find(|&index| is_leader(index));
+        leader.is_some()
+    });
+    let leader = leader.unwrap();
+
+    // The leader loses the other coordinators but still reaches every data node. openraft
+    // keeps it leading; only a confirmation by a majority stops it.
+    for (index, coordinator) in coordinators.iter_mut().enumerate() {
+        if index != leader {
+            coordinator.take().unwrap().kill();
+        }
+    }
+    // Longer than a confirmation is trusted (one ping interval).
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(is_leader(leader), "openraft stepped the lone leader down");
+
+    // As if the majority had promoted member 1 meanwhile: the stale leader's record still names
+    // member 0, and acting on it would point member 1 back at member 0.
+    let role = |node: usize| call(&group.resp[node].to_string(), &["ROLE"]).unwrap_or_default();
+
+    assert_eq!(
+        call(&group.resp[1].to_string(), &["REPLICAOF", "NO", "ONE"]).as_deref(),
+        Some("OK")
+    );
+    assert!(role(1).starts_with("master"));
     nodes[0].kill();
-    // Several times down_after_ms: a lone coordinator must not act.
-    std::thread::sleep(Duration::from_secs(4));
-    assert_eq!(group.primary_by(0), Some(0));
-    for node in 1..3 {
+    // Several times down_after_ms: the lone leader neither fails over nor reconciles.
+    let watched = Instant::now();
+
+    while watched.elapsed() < Duration::from_secs(4) {
+        assert_eq!(group.primary_by(leader), Some(0));
         assert!(
-            call(&group.resp[node].to_string(), &["SET", "x", "1"])
+            role(1).starts_with("master"),
+            "the cut-off leader pointed member 1 at its old record: {}",
+            role(1)
+        );
+        assert!(
+            call(&group.resp[2].to_string(), &["SET", "x", "1"])
                 .unwrap()
                 .starts_with("READONLY")
         );
+        std::thread::sleep(Duration::from_millis(100));
     }
+
+    // The majority is back: the coordinators act again, and member 1 is made a replica.
+    for (index, coordinator) in coordinators.iter_mut().enumerate() {
+        if index != leader {
+            *coordinator = Some(group.coordinator(dir.path(), index));
+        }
+    }
+    wait_until("the coordinators to act again with a majority", || {
+        role(1).starts_with("slave")
+    });
 }
 
 /// Several commands on one connection, each reply as `call` gives it.
