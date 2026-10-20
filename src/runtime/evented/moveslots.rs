@@ -1021,6 +1021,37 @@ async fn forget_range(state: Rc<ShardState>, session: Arc<MoveSession>, ended: &
 }
 
 /// Removes this shard's keys of `first..=last` in bounded steps, without logging it.
+/// [`drop_slots`] in one go, for a replica that must drop a range's copies before the next
+/// record of its log applies (its copies of a later range may follow at once).
+pub(super) fn drop_slots_now(state: &ShardState, first: u16, last: u16) {
+    let databases = state.store.borrow().database_ids();
+
+    for database in databases {
+        let mut cursor = 0;
+
+        loop {
+            let mut keys: Vec<Box<[u8]>> = Vec::new();
+
+            cursor = state.store.borrow().walk_slots(
+                database,
+                first,
+                last,
+                cursor,
+                CLEAN_UP_STEP,
+                &mut |key| keys.push(key.into()),
+            );
+            let mut store = state.store.borrow_mut();
+
+            for key in &keys {
+                store.forget_key(database, key);
+            }
+            if cursor == 0 {
+                break;
+            }
+        }
+    }
+}
+
 pub(super) async fn drop_slots(state: &ShardState, first: u16, last: u16) {
     let databases = state.store.borrow().database_ids();
 

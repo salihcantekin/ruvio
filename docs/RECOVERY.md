@@ -118,7 +118,8 @@ the same file. The target shard logs a `SlotsIncoming` record when a range begin
 as `SlotCopy` records, and a second `SlotsIncoming` record once the whole copy is synced (prepared);
 the `SLOTS` file names the range as gained from another node. A restart before the prepared record
 skips the copies. A prepared range is kept, not served, until a cluster map gives it to the group,
-which completes it, or `RUVIO MIGRATE CANCEL` drops it (a third record). The source logs a `SlotsGiven`
+which completes it (a `SlotsArrived` record, WAL format minor 6, so replicas complete it from the
+log too), or `RUVIO MIGRATE CANCEL` drops it (a third `SlotsIncoming` record). The source logs a `SlotsGiven`
 record when a newer map gave the range away; its copy is dropped after replay. Both records are WAL
 format minor 5, and replicas follow both sides from them. While the map has not decided, each side
 also keeps the move in a small file of its data directory (`MIGRATE_IN` on the target, `MIGRATE_OUT`

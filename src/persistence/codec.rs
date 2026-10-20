@@ -76,22 +76,24 @@ const FORMAT_MAJOR: u16 = 1;
 /// explicit expansion (62) and BloomAddMany (63); a reserve with the default expansion still
 /// uses record 9. Minor 3 adds SetBytesExpiring (64). Minor 4 adds SlotCopy (65) and
 /// SlotsMoved (66), written only by a slot move. Minor 5 adds SlotsIncoming (67) and
-/// SlotsGiven (68), written only by a move between nodes.
-pub(crate) const FORMAT_MINOR: u16 = 5;
+/// SlotsGiven (68), written only by a move between nodes. Minor 6 adds SlotsArrived (69), the
+/// end of a range arriving from another node.
+pub(crate) const FORMAT_MINOR: u16 = 6;
 /// The first record type of each minor. A new record type goes in a new last row with the
 /// next minor, and `FORMAT_MINOR` follows it; the codec tests refuse a decoder that knows a
 /// record type this table does not.
 #[cfg(test)]
-const RECORD_MINORS: [(u16, u16); 6] = [
+const RECORD_MINORS: [(u16, u16); 7] = [
     (record::SET_BYTES, 0),
     (record::SET_RANGE, 1),
     (record::BLOOM_RESERVE, 2),
     (record::SET_BYTES_EXPIRING, 3),
     (record::SLOT_COPY, 4),
     (record::SLOTS_INCOMING, 5),
+    (record::SLOTS_ARRIVED, 6),
 ];
 #[cfg(test)]
-const LAST_RECORD_TYPE: u16 = record::SLOTS_GIVEN;
+const LAST_RECORD_TYPE: u16 = record::SLOTS_ARRIVED;
 
 /// WAL record type numbers. Logs on disk and replicas depend on them, so a number is
 /// never reused or changed; a new record type takes the next number and a `RECORD_MINORS`
@@ -165,6 +167,9 @@ mod record {
     pub(super) const SLOTS_MOVED: u16 = 66;
     pub(super) const SLOTS_INCOMING: u16 = 67;
     pub(super) const SLOTS_GIVEN: u16 = 68;
+    /// `SlotsIncoming` with the `Completed` step: a reader of minor 5 refuses the segment
+    /// instead of an unknown step.
+    pub(super) const SLOTS_ARRIVED: u16 = 69;
 }
 
 pub(crate) struct SegmentHeader {
@@ -1168,6 +1173,14 @@ fn encode_payload(
             record::SLOTS_MOVED
         }
 
+        OwnedMutation::SlotsIncoming { first, last, step }
+            if *step == crate::slot_moves::IncomingStep::Completed as u8 =>
+        {
+            payload.extend_from_slice(&first.to_le_bytes());
+            payload.extend_from_slice(&last.to_le_bytes());
+            record::SLOTS_ARRIVED
+        }
+
         OwnedMutation::SlotsIncoming { first, last, step } => {
             payload.extend_from_slice(&first.to_le_bytes());
             payload.extend_from_slice(&last.to_le_bytes());
@@ -1551,13 +1564,23 @@ fn decode_payload(
             first: decoder.u16()?,
             last: decoder.u16()?,
             step: match decoder.u8()? {
-                step if crate::slot_moves::IncomingStep::from_u8(step).is_some() => step,
+                step if crate::slot_moves::IncomingStep::from_u8(step)
+                    .is_some_and(|step| step != crate::slot_moves::IncomingStep::Completed) =>
+                {
+                    step
+                }
                 _ => {
                     return Err(PersistenceError::Corruption(
                         "invalid incoming slot step".into(),
                     ));
                 }
             },
+        },
+        // Minor 6.
+        record::SLOTS_ARRIVED => OwnedMutation::SlotsIncoming {
+            first: decoder.u16()?,
+            last: decoder.u16()?,
+            step: crate::slot_moves::IncomingStep::Completed as u8,
         },
         record::SLOTS_GIVEN => OwnedMutation::SlotsGiven {
             first: decoder.u16()?,

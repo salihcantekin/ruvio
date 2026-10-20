@@ -116,6 +116,11 @@ fn round_trips_every_wal_mutation_type() {
             last: 9,
             step: 2,
         },
+        OwnedMutation::SlotsIncoming {
+            first: 7,
+            last: 9,
+            step: crate::slot_moves::IncomingStep::Completed as u8,
+        },
         OwnedMutation::SlotsGiven {
             first: 0,
             last: 16_383,
