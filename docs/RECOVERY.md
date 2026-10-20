@@ -118,7 +118,8 @@ the same file. The target shard logs a `SlotsIncoming` record when a range begin
 as `SlotCopy` records, and a second `SlotsIncoming` record once the whole copy is synced (prepared);
 the `SLOTS` file names the range as gained from another node. A restart before the prepared record
 skips the copies. A prepared range is kept, not served, until a cluster map gives it to the group,
-which completes it, or `RUVIO MIGRATE CANCEL` drops it (a third record). The source logs a `SlotsGiven`
+which completes it (a `SlotsArrived` record, WAL format minor 6, so replicas complete it from the
+log too), or `RUVIO MIGRATE CANCEL` drops it (a third `SlotsIncoming` record). The source logs a `SlotsGiven`
 record when a newer map gave the range away; its copy is dropped after replay. Both records are WAL
 format minor 5, and replicas follow both sides from them. While the map has not decided, each side
 also keeps the move in a small file of its data directory (`MIGRATE_IN` on the target, `MIGRATE_OUT`
@@ -209,7 +210,11 @@ An upgrade keeps the data directory and replaces the `ruvio` binary. Shard
 count, durability profile, and format major must stay the same. A data directory whose
 shards moved slots (`RUVIO MOVESLOTS`) has WAL format minor 4 records and a `SLOTS` file, so
 it cannot go back to a release before slot moves. One that took part in a move between groups has
-format minor 5 records and cannot go back to a release before such moves. Changing
+format minor 5 records and cannot go back to a release before such moves; one that received a range
+from another group after an upgrade to a release with the `SlotsArrived` record (format minor 6)
+cannot go back to a release before that record: the older release refuses the newer log segment at
+start. To go back, restore the backup taken before the upgrade (step 2 below), or give the node a
+full copy from a primary of the older release with an empty data directory. Changing
 `shards` is a new directory, not an in-place upgrade.
 
 1. Stop `ruvio`. `backup` takes an exclusive `LOCK` and fails immediately if the

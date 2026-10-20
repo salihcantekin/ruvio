@@ -349,7 +349,7 @@ fn a_cancelled_gain_skips_its_copies_on_restart() {
 
     moves.begin_gain(9000, 9100, 1, 40).unwrap();
     moves.prepare(55).unwrap();
-    moves.cancel();
+    assert!(moves.end_gain(9000, 9100, 1, None).unwrap().is_some());
 
     assert!(moves.pending_gain().is_none());
     let mut filter = moves.replay_filter(1, 0).unwrap();
@@ -443,4 +443,53 @@ fn the_map_completes_a_prepared_gain_and_refuses_slots_whose_data_is_elsewhere()
     fewer[100] = 2;
     assert!(half_node().reconcile(&fewer, false).is_err());
     assert!(half_node().reconcile(&fewer, true).is_ok());
+}
+
+#[test]
+fn a_gain_ends_only_by_its_own_range_and_shard_and_only_once() {
+    let mut moves = half_node();
+
+    moves.begin_gain(9000, 9100, 1, 40).unwrap();
+    moves.prepare(55).unwrap();
+    // An end of another range, or of the same range on another shard, leaves it alone.
+    assert_eq!(moves.end_gain(9200, 9300, 1, None), Ok(None));
+    assert_eq!(moves.end_gain(9000, 9100, 0, Some(60)), Ok(None));
+    assert!(moves.pending_gain().is_some());
+
+    let ended = moves.end_gain(9000, 9100, 1, Some(60)).unwrap().unwrap();
+
+    assert_eq!((ended.first, ended.last, ended.to), (9000, 9100, 1));
+    assert_eq!(moves.owner(9000), 1);
+    // Recorded once: the map's completion and the primary's record both end it.
+    assert_eq!(moves.end_gain(9000, 9100, 1, Some(70)), Ok(None));
+    assert_eq!(moves.end_gain(9000, 9100, 1, None), Ok(None));
+    assert_eq!(moves.owner(9000), 1);
+}
+
+#[test]
+fn a_late_cancel_of_an_earlier_gain_leaves_the_newer_one() {
+    let mut moves = half_node();
+
+    moves.begin_gain(9000, 9100, 1, 40).unwrap();
+    assert!(moves.end_gain(9000, 9100, 1, None).unwrap().is_some());
+    moves.begin_gain(9200, 9300, 0, 50).unwrap();
+    moves.prepare(60).unwrap();
+
+    assert_eq!(moves.end_gain(9000, 9100, 1, None), Ok(None));
+    assert!(moves.pending_gain().is_some_and(|gain| gain.first == 9200));
+}
+
+#[test]
+fn a_loss_recorded_after_a_prepared_gain_does_not_hide_it() {
+    let mut moves = half_node();
+
+    moves.begin_gain(9000, 9100, 1, 40).unwrap();
+    moves.prepare(55).unwrap();
+    // Another shard of the node gives a range away meanwhile.
+    let given = (0..8192u16).find(|&slot| moves.owner(slot) == 0).unwrap();
+    moves.lose(given, given, 0, 57).unwrap();
+
+    assert!(moves.pending_gain().is_some_and(|gain| gain.first == 9000));
+    assert!(moves.end_gain(9000, 9100, 1, Some(60)).unwrap().is_some());
+    assert_eq!(moves.owner(9000), 1);
 }

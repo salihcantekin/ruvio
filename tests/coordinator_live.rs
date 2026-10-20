@@ -981,6 +981,7 @@ struct TwoGroups {
     resp: Vec<SocketAddr>,
     coordinator: String,
     processes: Vec<Option<Process>>,
+    start: NodeStart,
     _stand_ins: Vec<StandIn>,
     _ports: (test_ports::PortBlock, test_ports::PortBlock),
 }
@@ -998,68 +999,61 @@ impl TwoGroups {
         env: &[(&str, &str)],
         stand_in: impl Fn(usize, SocketAddr) -> Option<StandIn>,
     ) -> Self {
-        Self::start_split(dir, env, 8192, stand_in)
+        Self::start_split(dir, env, 8192, 1, stand_in)
     }
 
-    /// Like [`TwoGroups::start_with`], with group `a` owning slots `0..split`.
+    /// Like [`TwoGroups::start_with`], with group `a` owning slots `0..split` and group `b`
+    /// running `b_shards` shards (at most 3).
     fn start_split(
         dir: &Path,
         env: &[(&str, &str)],
         split: u16,
+        b_shards: usize,
         stand_in: impl Fn(usize, SocketAddr) -> Option<StandIn>,
     ) -> Self {
         let (a_slots, b_slots) = (format!("0-{}", split - 1), format!("{split}-16383"));
         let data = test_ports::reserve();
         let replication = test_ports::reserve();
-        let resp: Vec<SocketAddr> = (0..4).map(|index| data.address_at(index)).collect();
-        let repl: Vec<SocketAddr> = (0..4).map(|index| replication.address_at(index)).collect();
-        let coordinator = data.address_at(4);
+        // Three ports a node: shard i answers on the node's port plus i.
+        let resp: Vec<SocketAddr> = (0..4).map(|index| data.address_at(index * 3)).collect();
+        let repl: Vec<SocketAddr> = (0..4)
+            .map(|index| replication.address_at(index * 3))
+            .collect();
+        let coordinator = data.address_at(12);
         let topology = dir.join("topology.toml");
         let mut stand_ins = Vec::new();
 
         std::fs::write(
             &topology,
-            [("a", &a_slots, 0), ("b", &b_slots, 2)].iter().fold(
+            [("a", &a_slots, 0, 1), ("b", &b_slots, 2, b_shards)].iter().fold(
                 "version = 1\n".to_owned(),
-                |text, (name, slots, node)| {
+                |text, (name, slots, node, shards)| {
                     format!(
-                        "{text}[[groups]]\nname = \"{name}\"\naddress = \"{}\"\nshards = 1\nslots = [\"{slots}\"]\n",
+                        "{text}[[groups]]\nname = \"{name}\"\naddress = \"{}\"\nshards = {shards}\nslots = [\"{slots}\"]\n",
                         resp[*node]
                     )
                 },
             ),
         )
         .unwrap();
+        let start = NodeStart {
+            dir: dir.to_owned(),
+            topology: topology.clone(),
+            resp: resp.clone(),
+            repl: repl.clone(),
+            env: env
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            b_shards,
+        };
         let mut processes: Vec<Option<Process>> = (0..4)
             .map(|index| {
                 if let Some(stand_in) = stand_in(index, resp[index]) {
                     stand_ins.push(stand_in);
                     return None;
                 }
-                let group = if index < 2 { "a" } else { "b" };
-                let mut command = Command::new(env!("CARGO_BIN_EXE_ruvio"));
-
-                command
-                    .args(["--address", &resp[index].to_string()])
-                    .args(["--durability", "always", "--data-dir"])
-                    .arg(dir.join(format!("node{index}")))
-                    .env("RUVIO_REPLICATION_LISTEN", repl[index].to_string())
-                    .env("RUVIO_CLUSTER_TOPOLOGY", &topology)
-                    .env("RUVIO_CLUSTER_GROUP", group)
-                    .envs(env.iter().copied())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null());
-                if index % 2 == 1 {
-                    command
-                        .env("RUVIO_REPLICATION_ROLE", "replica")
-                        .env("RUVIO_REPLICATION_PRIMARY", repl[index - 1].to_string());
-                } else {
-                    command.env("RUVIO_REPLICATION_ROLE", "primary");
-                }
-                let process = Process(command.spawn().unwrap());
-
-                wait_until("a data node to answer", || ping(&resp[index].to_string()));
-                Some(process)
+                Some(start.spawn(index))
             })
             .collect();
         let members = |first: usize| {
@@ -1081,7 +1075,7 @@ impl TwoGroups {
                 "id = 1\nlisten = \"{coordinator}\"\ndata_dir = \"{}\"\npeers = [\"1@{coordinator}\"]\n\
                  secret = \"{SECRET}\"\nping_interval_ms = 200\ndown_after_ms = 1000\n\n\
                  [[groups]]\nname = \"a\"\nshards = 1\nslots = [\"{a_slots}\"]\nmembers = [{}]\n\n\
-                 [[groups]]\nname = \"b\"\nshards = 1\nslots = [\"{b_slots}\"]\nmembers = [{}]\n",
+                 [[groups]]\nname = \"b\"\nshards = {b_shards}\nslots = [\"{b_slots}\"]\nmembers = [{}]\n",
                 dir.join("coordinator").display(),
                 members(0),
                 members(2),
@@ -1103,6 +1097,7 @@ impl TwoGroups {
             resp,
             coordinator: coordinator.to_string(),
             processes,
+            start,
             _stand_ins: stand_ins,
             _ports: (data, replication),
         };
@@ -1119,6 +1114,59 @@ impl TwoGroups {
 
     fn version(&self, index: usize) -> Option<String> {
         call(&self.node(index), &["RUVIO", "TOPOLOGY", "VERSION"])
+    }
+
+    /// Starts data node `index` again, with its data directory.
+    fn restart(&mut self, index: usize) {
+        self.processes[index] = Some(self.start.spawn(index));
+    }
+}
+
+/// How [`TwoGroups`] starts its data nodes.
+struct NodeStart {
+    dir: std::path::PathBuf,
+    topology: std::path::PathBuf,
+    resp: Vec<SocketAddr>,
+    repl: Vec<SocketAddr>,
+    env: Vec<(String, String)>,
+    b_shards: usize,
+}
+
+impl NodeStart {
+    /// Node `index`: 0 and 1 in group `a`, 2 and 3 in group `b`; the odd ones replicas.
+    fn spawn(&self, index: usize) -> Process {
+        let (group, shards) = if index < 2 {
+            ("a", 1)
+        } else {
+            ("b", self.b_shards)
+        };
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ruvio"));
+
+        command
+            .args(["--address", &self.resp[index].to_string()])
+            .args(["--durability", "always", "--data-dir"])
+            .arg(self.dir.join(format!("node{index}")))
+            .env("RUVIO_SHARDS", shards.to_string())
+            .env("RUVIO_REPLICATION_LISTEN", self.repl[index].to_string())
+            .env("RUVIO_CLUSTER_TOPOLOGY", &self.topology)
+            .env("RUVIO_CLUSTER_GROUP", group)
+            .envs(self.env.iter().map(|(name, value)| (name, value)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if index % 2 == 1 {
+            command.env("RUVIO_REPLICATION_ROLE", "replica").env(
+                "RUVIO_REPLICATION_PRIMARY",
+                self.repl[index - 1].to_string(),
+            );
+        } else {
+            command.env("RUVIO_REPLICATION_ROLE", "primary");
+        }
+        let process = Process(command.spawn().unwrap());
+
+        wait_until("a data node to answer", || {
+            ping(&self.resp[index].to_string())
+        });
+        process
     }
 }
 
@@ -1285,7 +1333,7 @@ fn a_slot_range_moves_between_groups_while_a_client_keeps_writing() {
 fn a_rebalance_evens_out_the_slots_in_moves_while_a_client_keeps_writing() {
     let dir = tempfile::tempdir().unwrap();
     // Group a owns 512 slots more than its share: two moves of 256 even it out.
-    let groups = TwoGroups::start_split(dir.path(), &[], 8704, |_, _| None);
+    let groups = TwoGroups::start_split(dir.path(), &[], 8704, 1, |_, _| None);
     let keys: Vec<String> = (0..)
         .map(|n| format!("spread:{n}"))
         .filter(|key| (8192..8704).contains(&ruvio::routing::hash_slot(key.as_bytes())))
@@ -1398,6 +1446,7 @@ fn a_cancel_ends_a_rebalance_with_its_move() {
         dir.path(),
         &[("RUVIO_MIGRATION_MAX_BYTES_PER_SEC", "4096")],
         8704,
+        1,
         |_, _| None,
     );
     let keys: Vec<String> = (0..)
@@ -1442,6 +1491,78 @@ fn a_cancel_ends_a_rebalance_with_its_move() {
         coordinator(&["COORDINATOR", "REBALANCE", "DRYRUN"]),
         "8448-8703 a/0 -> b/0 8192-8447 a/0 -> b/0"
     );
+}
+
+/// Keys of `range` written to `node`, each holding its own name.
+fn write_keys(node: &str, range: std::ops::Range<u16>, label: &str, count: usize) -> Vec<String> {
+    let keys: Vec<String> = (0..)
+        .map(|n| format!("{label}:{n}"))
+        .filter(|key| range.contains(&ruvio::routing::hash_slot(key.as_bytes())))
+        .take(count)
+        .collect();
+
+    for key in &keys {
+        assert_eq!(call(node, &["SET", key, key]).as_deref(), Some("OK"));
+    }
+    keys
+}
+
+#[test]
+fn a_replica_down_during_two_moves_takes_them_from_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut groups = TwoGroups::start_split(dir.path(), &[], 8704, 1, |_, _| None);
+    let keys = write_keys(&groups.node(0), 8192..8704, "down", 200);
+    let coordinator = |args: &[&str]| call_with_secret(&groups.coordinator, args).unwrap();
+
+    // b's replica misses both moves and both maps.
+    groups.processes[3].as_mut().unwrap().kill();
+    assert_eq!(coordinator(&["COORDINATOR", "REBALANCE"]), "2");
+    wait_until("the rebalance to finish", || {
+        call_with_secret(&groups.coordinator, &["COORDINATOR", "STATUS"])
+            .is_some_and(|status| status.contains("rebalance done rebalance_moves 2"))
+    });
+    wait_until("b's primary to serve the newest map", || {
+        groups.version(2).as_deref() == Some("5")
+    });
+
+    // Back, it reads both ranges' ends from its primary's log, so it takes the newest map.
+    groups.restart(3);
+    wait_until("b's replica to take the newest map", || {
+        groups.version(3).as_deref() == Some("5")
+    });
+    wait_until("b's replica to hold both ranges", || {
+        keys.iter()
+            .all(|key| call(&groups.node(3), &["GET", key]).as_deref() == Some(key.as_str()))
+    });
+}
+
+#[test]
+fn moves_to_both_shards_of_a_group_reach_its_replica() {
+    let dir = tempfile::tempdir().unwrap();
+    // b has two shards and half the slots: a rebalance gives it about two thirds, its
+    // moves taking turns between b's shards.
+    let groups = TwoGroups::start_split(dir.path(), &[], 8192, 2, |_, _| None);
+    let keys = write_keys(&groups.node(0), 5462..8192, "shards", 300);
+    let coordinator = |args: &[&str]| call_with_secret(&groups.coordinator, args).unwrap();
+    let planned: usize = coordinator(&["COORDINATOR", "REBALANCE"]).parse().unwrap();
+
+    assert!(planned > 2, "{planned} moves");
+    wait_until("the rebalance to finish", || {
+        call_with_secret(&groups.coordinator, &["COORDINATOR", "STATUS"])
+            .is_some_and(|status| status.contains("rebalance done"))
+    });
+    let version = (3 + planned).to_string();
+
+    wait_until("every node to take the newest map", || {
+        (0..4).all(|index| groups.version(index).as_deref() == Some(version.as_str()))
+    });
+    for node in [2, 3] {
+        wait_until("b's members to hold every moved key", || {
+            keys.iter()
+                .all(|key| call(&groups.node(node), &["GET", key]).as_deref() == Some(key.as_str()))
+        });
+    }
+    assert_eq!(coordinator(&["COORDINATOR", "REBALANCE", "DRYRUN"]), "");
 }
 
 #[test]

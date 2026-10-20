@@ -60,6 +60,8 @@ pub(crate) enum IncomingStep {
     Prepared = 1,
     /// The move was cancelled: the copies are dropped.
     Cancelled = 2,
+    /// The cluster map gave the range to this node at this record's sequence.
+    Completed = 3,
 }
 
 impl IncomingStep {
@@ -68,6 +70,7 @@ impl IncomingStep {
             0 => Some(Self::Begin),
             1 => Some(Self::Prepared),
             2 => Some(Self::Cancelled),
+            3 => Some(Self::Completed),
             _ => None,
         }
     }
@@ -426,9 +429,9 @@ impl SlotMoves {
     /// durable here.
     pub(crate) fn prepare(&mut self, prepared: u64) -> Result<(), &'static str> {
         let Some(entry) = self
-            .moves
-            .last_mut()
-            .filter(|entry| entry.gained() && !entry.completed())
+            .newest_gain()
+            .map(|index| &mut self.moves[index])
+            .filter(|entry| !entry.completed())
         else {
             return Err("no gain in progress");
         };
@@ -441,10 +444,36 @@ impl SlotMoves {
         Ok(())
     }
 
-    /// Ends the newest move unfinished: its copies are skipped on every later restart.
-    pub(crate) fn cancel(&mut self) {
-        if let Some(entry) = self.moves.last_mut().filter(|entry| !entry.completed()) {
-            entry.prepared = 0;
+    /// Ends the newest gain when it is `first..=last` arriving on shard `to` and not ended
+    /// yet: completed at `until`, or cancelled when `until` is `None`. The gain it ended, or
+    /// `None` when the newest gain is another one, or already ended: an end recorded once
+    /// already, or that of a gain whose records never reached here.
+    pub(crate) fn end_gain(
+        &mut self,
+        first: u16,
+        last: u16,
+        to: u16,
+        until: Option<u64>,
+    ) -> Result<Option<SlotMove>, &'static str> {
+        let Some(entry) = self
+            .newest_gain()
+            .map(|index| &mut self.moves[index])
+            .filter(|entry| (entry.first, entry.last, entry.to) == (first, last, to))
+        else {
+            return Ok(None);
+        };
+
+        match until {
+            _ if entry.completed() => Ok(None),
+            None => {
+                entry.prepared = 0;
+                Ok(Some(*entry))
+            }
+            Some(_) if entry.prepared == 0 => Err("the range from another node is not prepared"),
+            Some(until) => {
+                entry.until = until;
+                Ok(Some(*entry))
+            }
         }
     }
 
@@ -489,15 +518,22 @@ impl SlotMoves {
 
     /// The newest gain when the map has not completed it: arriving, prepared or cancelled.
     pub(crate) fn unfinished_gain(&self) -> Option<SlotMove> {
-        self.moves
-            .last()
-            .copied()
-            .filter(|entry| entry.gained() && !entry.completed())
+        self.newest_gain()
+            .map(|index| self.moves[index])
+            .filter(|entry| !entry.completed())
     }
 
     /// The prepared gain the cluster map has not decided yet.
     pub(crate) fn pending_gain(&self) -> Option<SlotMove> {
-        self.moves.last().copied().filter(SlotMove::pending)
+        self.newest_gain()
+            .map(|index| self.moves[index])
+            .filter(SlotMove::pending)
+    }
+
+    /// Where the newest range gained from another node is: losses recorded after it, by
+    /// other shards of the node, do not hide it.
+    fn newest_gain(&self) -> Option<usize> {
+        self.moves.iter().rposition(SlotMove::gained)
     }
 
     /// The owner every slot of `first..=last` has, or an error when they differ.
@@ -535,7 +571,12 @@ impl SlotMoves {
     /// Completes the newest move at the source's sequence `until` (for a gain, this shard's
     /// sequence when the map gave it the range). Until this is saved, the move did not happen.
     pub(crate) fn complete(&mut self, until: u64) -> Result<(), &'static str> {
-        let Some(entry) = self.moves.last_mut().filter(|entry| !entry.completed()) else {
+        let Some(entry) = self
+            .moves
+            .iter()
+            .rposition(|entry| !entry.completed())
+            .map(|index| &mut self.moves[index])
+        else {
             return Err("no move in progress");
         };
 

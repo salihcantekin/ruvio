@@ -513,9 +513,12 @@ there (`stopped` on the old leader); run `COORDINATOR REBALANCE` on the new lead
 it again is always safe, since it starts from where the slots are. A group listed with `slots = []`
 gets its share this way.
 
-Before each move the leader also sends the current map to the target group's replicas (waiting at
-most 1 s for each): a replica still waiting for the map of the move before cannot record the new range
-when its copy arrives, and would then refuse every newer map. So moves can run back to back.
+Replicas of the target take a range from their primary's log: the primary logs the range's end (a
+`SlotsArrived` record) on the shard that receives it when the map gives it the range, and a replica
+serves the range from that record on, whether or not the coordinators' map reached it first. A replica
+that was down during several moves into the same shard catches up on them from the log. Before each
+move the leader also sends the current map to the target group's replicas (waiting at most 1 s for
+each), so the replicas' maps keep up as well.
 
 The range is frozen from step 3 until the source gets the new map. Measured locally (debug build, one
 Mac running other builds, two groups of a primary and a replica with durability `always`, 303 keys,
@@ -652,10 +655,13 @@ releases side by side, so the refused handshake itself was not part of the run. 
 
 - Ranges move only when an operator asks (`COORDINATOR MOVE`, `COORDINATOR REBALANCE`), one at a time;
   nothing rebalances by keys, memory or load, and nothing starts a rebalance on its own.
-- A replica of a target group that is down, or does not answer within 1 s, while two moves into its group
-  run can be left on an old map once it is back: it refuses the second range and every newer map
-  (`gives this node slot ..., whose data is not here` in its log). Give it a full copy again
-  (restart it with an empty data directory).
+- Each shard replicates on its own. A multi-shard replica that is down, or does not answer within 1 s,
+  while moves into two of its shards run can get the second range's start before the first range's end
+  when it catches up; it then refuses the second range and every newer map (`gives this node slot ...,
+  whose data is not here` in its log). So can a replica that gets a full copy of its primary (a
+  snapshot, not the log) during a move into its group, or one that crashed between writing a range's
+  record to its log and saving its `SLOTS` file. Give such a replica a full copy again with an empty
+  data directory once the moves are done.
 
 ## Tests
 
@@ -668,7 +674,10 @@ releases side by side, so the refused handshake itself was not part of the run. 
   where a failover in one changes the other's `MOVED` answers, and a range moves from one to the other
   while a client keeps writing a key of it (every acknowledged write is on the new owner); a rebalance of
   two uneven groups (its dry run, two moves back to back while a client writes, the target's replica
-  holding both ranges) and a cancelled rebalance (nothing moved). A primary
+  holding both ranges) and a cancelled rebalance (nothing moved); a replica down during two moves taking both from its
+  primary's log once back, and moves taking turns between the two shards of a group reaching its
+  replica (the replica's shards happened to receive the records in order; the reverse order is not
+  forced). A primary
   cut off from the coordinators by a proxy while a client keeps writing to it: with the lease it
   takes no write once a replica is promoted, without it it keeps taking them; and a member that
   accepts connections but never answers does not hold up the primary's lease. With TLS on the coordinator
