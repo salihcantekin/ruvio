@@ -215,6 +215,10 @@ public class TransportEdgeTests
                 }
             }
         });
+        // On .NET 8, MeterListener.Dispose unsubscribes from the instruments only when this callback is set. Without it
+        // the listener kept recording every later command of the test run into the list above, and the allocation tests
+        // saw that list grow.
+        meterListener.MeasurementsCompleted = (_, _) => { };
         meterListener.Start();
 
         using var server = new FakeServer();
@@ -243,6 +247,10 @@ public class TransportEdgeTests
             Assert.Contains("write", measurements);
             Assert.Contains("reply", measurements);
         }
+
+        // No other test listens to these instruments, so they must be off once this listener is gone.
+        meterListener.Dispose();
+        Assert.False(RuvioSocket.PhaseMetricsEnabled, "the disposed listener still records socket phases");
     }
 
     [Fact(Timeout = 15000)]
