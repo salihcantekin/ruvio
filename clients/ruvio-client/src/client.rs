@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::args::{Args, Num};
-use crate::cluster::{ClusterRouter, Connection, Discovery, throw_error};
+use crate::cluster::{throw_error, ClusterRouter, Connection, Discovery};
 
 use crate::error::Error;
 use crate::value::RespValue;
@@ -308,12 +308,14 @@ fn ask_sentinel(
 /// A replica's reported primary is asked after the seeds, once per address. With
 /// [`ClientOptions::sentinel_master`] the seeds are coordinators: each names a primary, and the
 /// first that `ROLE` confirms wins. `avoid` is an address that must not be taken (the one that
-/// just answered `READONLY`). One round, every question bounded by [`probe_options`]; `None`
-/// when no address is confirmed.
+/// just answered `READONLY`) while it still says `master`: a replaced primary does. Once it
+/// answers `ROLE` as a replica it is cleared, so a later round takes it when it is promoted.
+/// One round, every question bounded by [`probe_options`]; `None` when no address is
+/// confirmed.
 pub(crate) fn find_primary(
     seeds: &[(String, u16)],
     start: usize,
-    avoid: Option<&(String, u16)>,
+    avoid: &mut Option<(String, u16)>,
     options: &ClientOptions,
 ) -> Result<Option<(String, u16)>, Error> {
     let probe = probe_options(options);
@@ -324,10 +326,12 @@ pub(crate) fn find_primary(
     if let Some(name) = &options.sentinel_master {
         for seed in queue {
             if let Some(address) = ask_sentinel(&seed, name, &probe)? {
-                if Some(&address) != avoid
-                    && matches!(ask_role(&address, &probe)?, Some(Role::Master))
-                {
-                    return Ok(Some(address));
+                match ask_role(&address, &probe)? {
+                    Some(Role::Master) if avoid.as_ref() != Some(&address) => {
+                        return Ok(Some(address));
+                    }
+                    Some(Role::Replica(_)) if avoid.as_ref() == Some(&address) => *avoid = None,
+                    _ => {}
                 }
             }
         }
@@ -339,10 +343,16 @@ pub(crate) fn find_primary(
 
     while let Some(address) = queue.pop_front() {
         match ask_role(&address, &probe)? {
-            Some(Role::Master) if Some(&address) != avoid => return Ok(Some(address)),
-            Some(Role::Replica(Some(reported))) if !seen.contains(&reported) => {
-                seen.push(reported.clone());
-                queue.push_back(reported);
+            Some(Role::Master) if avoid.as_ref() != Some(&address) => return Ok(Some(address)),
+            Some(Role::Replica(reported)) => {
+                if avoid.as_ref() == Some(&address) {
+                    *avoid = None;
+                }
+
+                if let Some(reported) = reported.filter(|reported| !seen.contains(reported)) {
+                    seen.push(reported.clone());
+                    queue.push_back(reported);
+                }
             }
             _ => {}
         }
@@ -588,7 +598,7 @@ impl Client {
         }
 
         if let Some(name) = &options.sentinel_master {
-            let primary = find_primary(&addresses, 0, None, &options)?.ok_or_else(|| {
+            let primary = find_primary(&addresses, 0, &mut None, &options)?.ok_or_else(|| {
                 Error::Protocol(format!("no coordinator names a primary for '{name}'"))
             })?;
 
@@ -1887,7 +1897,9 @@ impl Client {
         if follow {
             let seeds = self.follow_seeds();
 
-            if let Some(address) = find_primary(&seeds, start % seeds.len(), None, &self.options)? {
+            if let Some(address) =
+                find_primary(&seeds, start % seeds.len(), &mut None, &self.options)?
+            {
                 match Connection::open(&address.0, address.1, &self.options) {
                     Ok(connection) => return Ok((connection, self.locate(address))),
                     Err(Error::Io(_)) => {}
@@ -1971,6 +1983,9 @@ impl Client {
     fn follow_after_readonly(&mut self) -> Result<bool, Error> {
         let retry = !self.in_multi;
         let refused = self.addresses[self.current].clone();
+        // Kept across rounds: cleared once the refusing node says it is a replica, so its
+        // promotion a moment later is taken instead of waiting out every round.
+        let mut avoid = Some(refused.clone());
         let mut attempt = 0_u32;
 
         loop {
@@ -1983,7 +1998,7 @@ impl Client {
                 (self.current + 1) % seeds.len()
             };
 
-            if let Some(address) = find_primary(&seeds, start, Some(&refused), &self.options)? {
+            if let Some(address) = find_primary(&seeds, start, &mut avoid, &self.options)? {
                 match Connection::open(&address.0, address.1, &self.options) {
                     Ok(opened) => {
                         self.notify_lost(refused.0.clone(), refused.1);
@@ -2323,7 +2338,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use super::{Client, ClientOptions, Durability, Error, RespValue, read_ping};
+    use super::{read_ping, Client, ClientOptions, Durability, Error, RespValue};
 
     fn bound(stream: TcpStream) -> TcpStream {
         stream

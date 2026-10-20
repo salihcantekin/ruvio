@@ -406,7 +406,9 @@ client = Ruvio(seeds=["10.0.0.9:26379"], sentinel_master="main")             # a
   (`SENTINEL get-master-addr-by-name`, confirmed with `ROLE`) and raises `ProtocolError` when none names a primary.
 - **`READONLY`.** A command answered `READONLY` (the text is `READONLY` alone or followed by a space) makes the
   client search for the primary, up to 8 rounds with waits of 100 ms doubling to 2 s (7.1 s in all; the asyncio
-  client waits without blocking other tasks), move to it and send the refused command once more. The retry's reply
+  client waits without blocking other tasks), move to it and send the refused command once more. The node that
+  answered is skipped only while it still says `master`; once it says it is a replica, a later round takes it when
+  it is promoted. The retry's reply
   goes to the caller, a second `READONLY` included; there is never a third send. When no primary is found the
   `READONLY` error is raised and the connection stays where it was.
 - **Not resent.** A command inside a transaction opened with `multi()` (the connection still moves, so the next
