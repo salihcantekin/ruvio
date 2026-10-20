@@ -145,7 +145,7 @@ public partial interface IRuvioClient
     /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
     /// <returns>The new value. A missing key starts at 0.</returns>
     /// <exception cref="RuvioException">The value is not a number, or the result is not finite; <c>WRONGTYPE</c> for another type.</exception>
-    /// <remarks>Computed in double precision and printed with 15 significant digits (Redis uses long double). A TTL is kept.</remarks>
+    /// <remarks>Computed in double precision and printed with 16 significant digits (Redis uses long double). A TTL is kept.</remarks>
     /// <example>
     /// <code>
     /// double total = await db.IncrementByFloatAsync("balance", 2.5);
