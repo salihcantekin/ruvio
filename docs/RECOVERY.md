@@ -223,6 +223,19 @@ format minor 5 records and cannot go back to a release before such moves. Changi
 6. `redis-cli PING`, then `INFO server` and confirm `ruvio_readiness:ready`
    and a known key.
 
+With replication, a primary and its replicas must run the same release when the
+replication handshake changed between the two (the release notes say so); see
+*Promote a replica by hand* below. To upgrade such a group without losing
+acknowledged writes, either stop every member and run the steps above on each
+(primary first when starting again), or switch over to upgraded replicas: stop
+writes on the primary (`CONFIG SET min-replicas-to-write` above its replica count),
+wait until every replica holds what the primary has (steps 2 and 3 of *Promote a
+replica by hand*), upgrade and restart the replicas, stop the primary, promote one replica
+(`REPLICAOF NO ONE` on it, `REPLICAOF host port` on the others), and start the old
+primary with the new binary as a replica. Under `ruvio coordinator` the coordinators
+do the promotion; see [COORDINATOR.md](COORDINATOR.md#data-nodes), which also
+covers the order for the coordinators themselves.
+
 Host and cluster examples live in `deploy/`. Give the process one core per
 shard. Set `LimitNOFILE` above `max_global` (the example uses 65535). Size the
 volume for the data set plus WAL until the next checkpoint. `INFO prometheus` is the
@@ -343,7 +356,7 @@ Primary and replicas must run the same Ruvio version. The replication handshake
 carries a version; a primary refuses any other version with a `Version` status and
 logs a warning naming both versions, and a replica logs a warning when the primary
 refuses it or does not answer its handshake (an older primary cannot parse it and
-closes the link). Upgrade the primary and its replicas together.
+closes the link). Upgrade the primary and its replicas together (see *Upgrade*).
 
 `REPLICAOF host port` makes a running primary or replica follow another primary
 without a restart: writes answer `READONLY` at once, and every shard resumes from
