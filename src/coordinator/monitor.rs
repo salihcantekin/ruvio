@@ -26,6 +26,11 @@ pub struct Sighting {
     pub role: Option<Role>,
     /// Its `wal_durable_sequence` summed over shards: how much of the history it holds.
     pub durable: u64,
+    /// Each shard's `wal_durable_sequence`.
+    pub shard_durable: Vec<u64>,
+    /// Each shard's `replication_committed_sequence`: the highest record its primary released
+    /// a `CLIENT DURABILITY` reply for, as a replica was last told or a primary holds it.
+    pub shard_committed: Vec<u64>,
     /// It answered `LOADING`: still copying its primary, never a candidate.
     pub loading: bool,
     /// The cluster map version it serves (`RUVIO TOPOLOGY VERSION`), read only when the
@@ -161,16 +166,20 @@ async fn look(member: &Member, auth: Option<&str>, cluster: bool) -> Option<Sigh
                 Err(_) => None,
             }
         };
-        let durable = info
-            .and_then(|info| info.text())
-            .and_then(|text| {
-                text.lines()
-                    .find_map(|line| line.strip_prefix("wal_durable_sequence:"))
-                    .and_then(|value| value.trim().parse::<u64>().ok())
-            })
-            .unwrap_or(0);
+        let text = info.and_then(|info| info.text()).unwrap_or_default();
+        let field = |name: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(name))
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        let durable = field("wal_durable_sequence:");
 
         sighting.durable += durable;
+        sighting.shard_durable.push(durable);
+        sighting
+            .shard_committed
+            .push(field("replication_committed_sequence:"));
     }
 
     Some(sighting)
@@ -193,13 +202,132 @@ async fn command(member: &Member, auth: Option<&str>, args: &[&[u8]]) -> Result<
     }
 }
 
-/// The member to promote: answering, a replica with a complete copy, holding the most of the
-/// history; ties go to the lowest index.
+/// Every group's committed sequences as this coordinator learned them, per shard: a failover
+/// keeps these records. Held in memory; a restarted coordinator learns them again from the
+/// members.
+#[derive(Clone, Default)]
+pub struct Commits(Arc<Mutex<HashMap<String, Commit>>>);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Commit {
+    /// The primary's epoch the values belong to.
+    epoch: u64,
+    /// The highest committed sequence seen, per shard.
+    committed: Vec<u64>,
+    /// Per shard, what replicas may still report from a primary whose history an unclean
+    /// failover dropped (a replica keeps the highest value it was ever told); replica reports
+    /// up to it are ignored.
+    stale: Vec<u64>,
+}
+
+fn at(values: &[u64], shard: usize) -> u64 {
+    values.get(shard).copied().unwrap_or(0)
+}
+
+fn raise(values: &mut Vec<u64>, shard: usize, value: u64) {
+    if values.len() <= shard {
+        values.resize(shard + 1, 0);
+    }
+    values[shard] = values[shard].max(value);
+}
+
+impl Commit {
+    /// Takes in what the primary and the replicas following it report now.
+    fn learn(&mut self, group: &Group, primary: Primary, seen: &[Sighting], fresh: Duration) {
+        if self.epoch != primary.epoch {
+            // A failover. The promoted member holds what was committed before, so it stays
+            // committed, unless it was promoted without it: those records are gone and the
+            // new primary hands out their sequences again, so the old values no longer apply.
+            let promoted = &seen[primary.member];
+
+            for shard in 0..self.committed.len() {
+                let committed = self.committed[shard];
+
+                if at(&promoted.shard_durable, shard) < committed {
+                    raise(&mut self.stale, shard, committed);
+                    self.committed[shard] = 0;
+                }
+            }
+            self.epoch = primary.epoch;
+        }
+
+        let head = &seen[primary.member];
+        // A primary that answers bounds what can be committed: a replica's higher value is
+        // left from an earlier primary.
+        let alive = head.last_ok.is_some_and(|at| at.elapsed() <= fresh);
+        let following = Some(Role::Replica(Some(
+            group.members[primary.member].replication.to_string(),
+        )));
+
+        for (member, sighting) in seen.iter().enumerate() {
+            let own = member == primary.member && sighting.role == Some(Role::Master);
+
+            if !own && sighting.role != following {
+                continue;
+            }
+            for (shard, &reported) in sighting.shard_committed.iter().enumerate() {
+                let value = if own {
+                    reported.min(at(&sighting.shard_durable, shard))
+                } else if reported <= at(&self.stale, shard) {
+                    continue;
+                } else if alive {
+                    reported.min(at(&head.shard_durable, shard))
+                } else {
+                    reported
+                };
+
+                if value > 0 {
+                    raise(&mut self.committed, shard, value);
+                }
+            }
+        }
+    }
+}
+
+impl Commits {
+    /// Updates what is known committed in `group` from this tick's sightings and returns it.
+    pub fn learn(
+        &self,
+        group: &Group,
+        primary: Primary,
+        seen: &[Sighting],
+        fresh: Duration,
+    ) -> Vec<u64> {
+        let mut commits = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let commit = commits.entry(group.name.clone()).or_default();
+
+        commit.learn(group, primary, seen, fresh);
+        commit.committed.clone()
+    }
+
+    /// What is known committed in `group`, per shard; empty when nothing is.
+    pub fn known(&self, group: &str) -> Vec<u64> {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(group)
+            .map(|commit| commit.committed.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// Whether a member holds every committed record: in each shard, at least the committed
+/// sequence. Nothing committed (no `CLIENT DURABILITY` in use) asks for nothing.
+fn holds(sighting: &Sighting, committed: &[u64]) -> bool {
+    committed
+        .iter()
+        .enumerate()
+        .all(|(shard, &sequence)| at(&sighting.shard_durable, shard) >= sequence)
+}
+
+/// The member to promote: answering, a replica with a complete copy that holds every
+/// committed record, holding the most of the history; ties go to the lowest index.
 pub fn choose_candidate(
     group: &Group,
     primary: usize,
     sightings: &[Sighting],
     fresh: Duration,
+    committed: &[u64],
 ) -> Option<usize> {
     (0..group.members.len())
         .filter(|&member| member != primary)
@@ -209,6 +337,7 @@ pub fn choose_candidate(
             !sighting.loading
                 && sighting.last_ok.is_some_and(|at| at.elapsed() <= fresh)
                 && matches!(sighting.role, Some(Role::Replica(_)))
+                && holds(sighting, committed)
         })
         .max_by(|&left, &right| {
             sightings[left]
@@ -216,6 +345,54 @@ pub fn choose_candidate(
                 .cmp(&sightings[right].durable)
                 .then(right.cmp(&left))
         })
+}
+
+/// What a failover does.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Choice {
+    /// Promote this replica: it holds every committed record.
+    Promote(usize),
+    /// Promote this replica although it lacks committed records (`unclean_failover`, or
+    /// `COORDINATOR FAILOVER group FORCE`).
+    Unclean(usize),
+    /// Replicas answer, but none holds every committed record: wait for one.
+    Wait,
+    /// No replica can take over.
+    Nobody,
+}
+
+pub fn choose(
+    group: &Group,
+    primary: usize,
+    sightings: &[Sighting],
+    fresh: Duration,
+    committed: &[u64],
+    unclean: bool,
+) -> Choice {
+    if let Some(member) = choose_candidate(group, primary, sightings, fresh, committed) {
+        return Choice::Promote(member);
+    }
+    match choose_candidate(group, primary, sightings, fresh, &[]) {
+        Some(member) if unclean => Choice::Unclean(member),
+        Some(_) => Choice::Wait,
+        None => Choice::Nobody,
+    }
+}
+
+/// The committed records `sighting` lacks, per shard, for the log.
+fn missing(sighting: &Sighting, committed: &[u64]) -> String {
+    committed
+        .iter()
+        .enumerate()
+        .filter(|&(shard, &sequence)| at(&sighting.shard_durable, shard) < sequence)
+        .map(|(shard, &sequence)| {
+            format!(
+                "shard {shard}: holds {} of {sequence}",
+                at(&sighting.shard_durable, shard)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Pings every member of every group, every `ping_interval`.
@@ -294,6 +471,7 @@ pub async fn lead(
     raft: Raft,
     machine: StateMachine,
     sightings: Sightings,
+    commits: Commits,
     switches: Switches,
     moves: super::migrate::Context,
 ) {
@@ -303,6 +481,18 @@ pub async fn lead(
     loop {
         tick.tick().await;
         if raft.current_leader().await != Some(config.id) {
+            // Every coordinator learns what was committed, so a new leader knows it.
+            let primaries = machine.primaries();
+
+            for group in &config.groups {
+                if let Some(primary) = primaries.get(&group.name) {
+                    let seen: Vec<Sighting> = (0..group.members.len())
+                        .map(|member| sightings.get(&group.name, member))
+                        .collect();
+
+                    commits.learn(group, *primary, &seen, config.down_after);
+                }
+            }
             continue;
         }
 
@@ -328,12 +518,19 @@ pub async fn lead(
                 }
                 continue;
             };
+            let committed = commits.learn(group, primary, &seen, config.down_after);
             let primary_age = seen[primary.member].last_ok.map(|at| at.elapsed());
 
             if primary_age.is_none_or(|age| age > config.down_after)
                 && objectively_down(&config, &sightings, group, primary.member).await
             {
-                failover(&config, &raft, &machine, group, primary, &seen, &switches).await;
+                let failing = Failing {
+                    group,
+                    primary,
+                    seen: &seen,
+                    committed: &committed,
+                };
+                let _ = failover(&config, &raft, &machine, &switches, failing, false).await;
                 continue;
             }
 
@@ -445,28 +642,71 @@ async fn propose(raft: &Raft, group: &Group, member: usize, epoch: u64) -> bool 
     }
 }
 
+/// A group whose primary is down, as the leader sees it.
+struct Failing<'a> {
+    group: &'a Group,
+    primary: Primary,
+    seen: &'a [Sighting],
+    committed: &'a [u64],
+}
+
+/// Promotes a replica of a group whose primary is down: one that holds every committed record,
+/// or with `force` or `unclean_failover` the best one anyway. The promoted member's address.
 async fn failover(
     config: &CoordinatorConfig,
     raft: &Raft,
     machine: &StateMachine,
-    group: &Group,
-    primary: Primary,
-    seen: &[Sighting],
     switches: &Switches,
-) {
-    let Some(candidate) = choose_candidate(group, primary.member, seen, config.down_after) else {
-        warn!(group = %group.name, "primary is down and no replica can take over");
-        return;
+    failing: Failing<'_>,
+    force: bool,
+) -> Result<String, String> {
+    let Failing {
+        group,
+        primary,
+        seen,
+        committed,
+    } = failing;
+    let choice = choose(
+        group,
+        primary.member,
+        seen,
+        config.down_after,
+        committed,
+        force || config.unclean_failover,
+    );
+    let candidate = match choice {
+        Choice::Promote(candidate) => candidate,
+        Choice::Unclean(candidate) => {
+            warn!(
+                group = %group.name,
+                to = %group.members[candidate].address,
+                missing = %missing(&seen[candidate], committed),
+                "no replica holds every record a durable reply was released for; promoting the best one, and the records it lacks are lost"
+            );
+            candidate
+        }
+        Choice::Wait => {
+            warn!(
+                group = %group.name,
+                "primary is down and no replica holds every record a durable reply was released for; waiting (unclean_failover or COORDINATOR FAILOVER group FORCE promotes one anyway)"
+            );
+            return Err("ERR no replica holds every committed record; waiting for one".into());
+        }
+        Choice::Nobody => {
+            warn!(group = %group.name, "primary is down and no replica can take over");
+            return Err("ERR no replica can take over".into());
+        }
     };
 
     warn!(
         group = %group.name,
         from = %group.members[primary.member].address,
         to = %group.members[candidate].address,
-        "primary is down for a majority of coordinators; failing over"
+        force,
+        "primary is down; failing over"
     );
     if !propose(raft, group, candidate, primary.epoch + 1).await {
-        return;
+        return Err("ERR the failover was not recorded; try again".into());
     }
 
     let promoted = &group.members[candidate];
@@ -512,6 +752,61 @@ async fn failover(
         seen,
     )
     .await;
+    Ok(new.to_string())
+}
+
+/// What `COORDINATOR FAILOVER group FORCE` needs from the coordinator.
+pub struct Force<'a> {
+    pub config: &'a CoordinatorConfig,
+    pub raft: &'a Raft,
+    pub machine: &'a StateMachine,
+    pub sightings: &'a Sightings,
+    pub commits: &'a Commits,
+    pub switches: &'a Switches,
+}
+
+/// `COORDINATOR FAILOVER group FORCE` on the leader: promotes the best answering replica of a
+/// group whose primary is down now, even one that lacks committed records. The promoted
+/// member's address.
+pub async fn force_failover(force: Force<'_>, group: &Group) -> Result<String, String> {
+    let Some(primary) = force.machine.primaries().get(&group.name).copied() else {
+        return Err(format!(
+            "ERR group {} has no agreed primary yet",
+            group.name
+        ));
+    };
+    let seen: Vec<Sighting> = (0..group.members.len())
+        .map(|member| force.sightings.get(&group.name, member))
+        .collect();
+
+    if seen[primary.member]
+        .last_ok
+        .is_some_and(|at| at.elapsed() <= force.config.down_after)
+    {
+        return Err(format!(
+            "ERR the primary of {} answers; FORCE only overrides a failover that waits",
+            group.name
+        ));
+    }
+    let committed = force
+        .commits
+        .learn(group, primary, &seen, force.config.down_after);
+    let failing = Failing {
+        group,
+        primary,
+        seen: &seen,
+        committed: &committed,
+    };
+
+    failover(
+        force.config,
+        force.raft,
+        force.machine,
+        force.switches,
+        failing,
+        true,
+    )
+    .await
 }
 
 /// Makes every answering member agree with the record: the primary takes writes, the others
@@ -593,13 +888,33 @@ mod tests {
     }
 
     fn replica(durable: u64) -> Sighting {
+        sharded(&[durable])
+    }
+
+    /// An answering replica holding `durable` in each shard.
+    fn sharded(durable: &[u64]) -> Sighting {
         Sighting {
             last_ok: Some(Instant::now()),
             role: Some(Role::Replica(None)),
-            durable,
+            durable: durable.iter().sum(),
+            shard_durable: durable.to_vec(),
+            shard_committed: vec![0; durable.len()],
             loading: false,
             topology: None,
         }
+    }
+
+    /// A member as the leader saw it: its role, durable and committed sequences per shard.
+    fn member(role: Role, durable: &[u64], committed: &[u64]) -> Sighting {
+        Sighting {
+            role: Some(role),
+            shard_committed: committed.to_vec(),
+            ..sharded(durable)
+        }
+    }
+
+    fn following(group: &Group, member: usize) -> Role {
+        Role::Replica(Some(group.members[member].replication.to_string()))
     }
 
     #[test]
@@ -609,12 +924,142 @@ mod tests {
         let mut seen = vec![Sighting::default(), replica(10), replica(30), replica(30)];
 
         // Equal history: the lower index wins.
-        assert_eq!(choose_candidate(&group, 0, &seen, fresh), Some(2));
+        assert_eq!(choose_candidate(&group, 0, &seen, fresh, &[]), Some(2));
         seen[2].loading = true;
-        assert_eq!(choose_candidate(&group, 0, &seen, fresh), Some(3));
+        assert_eq!(choose_candidate(&group, 0, &seen, fresh, &[]), Some(3));
         seen[3].last_ok = None;
-        assert_eq!(choose_candidate(&group, 0, &seen, fresh), Some(1));
+        assert_eq!(choose_candidate(&group, 0, &seen, fresh, &[]), Some(1));
         seen[1].role = Some(Role::Master);
-        assert_eq!(choose_candidate(&group, 0, &seen, fresh), None);
+        assert_eq!(choose_candidate(&group, 0, &seen, fresh, &[]), None);
+    }
+
+    #[test]
+    fn only_a_replica_holding_every_committed_record_is_promoted() {
+        let group = group(3);
+        let fresh = Duration::from_secs(5);
+        let seen = vec![Sighting::default(), replica(10), replica(30)];
+        let choice =
+            |committed: &[u64], unclean| choose(&group, 0, &seen, fresh, committed, unclean);
+
+        // Nothing committed, or zeros: exactly the choice without the rule.
+        assert_eq!(choice(&[], false), Choice::Promote(2));
+        assert_eq!(choice(&[0], false), Choice::Promote(2));
+        assert_eq!(choice(&[30], false), Choice::Promote(2));
+        // Neither replica holds record 31: wait.
+        assert_eq!(choice(&[31], false), Choice::Wait);
+        // `unclean_failover` and `FORCE` promote the best one anyway.
+        assert_eq!(choice(&[31], true), Choice::Unclean(2));
+        // A qualifying replica is promoted cleanly even when unclean promotion is allowed.
+        assert_eq!(choice(&[30], true), Choice::Promote(2));
+        assert_eq!(missing(&seen[2], &[31]), "shard 0: holds 30 of 31");
+
+        let nobody = vec![Sighting::default(); 3];
+        assert_eq!(
+            choose(&group, 0, &nobody, fresh, &[5], true),
+            Choice::Nobody
+        );
+    }
+
+    #[test]
+    fn committed_records_are_compared_shard_by_shard() {
+        let group = group(3);
+        let fresh = Duration::from_secs(5);
+        // Member 1 holds more in total but lacks shard 1's committed records.
+        let seen = vec![Sighting::default(), sharded(&[100, 5]), sharded(&[20, 9])];
+
+        assert_eq!(choose_candidate(&group, 0, &seen, fresh, &[0, 0]), Some(1));
+        assert_eq!(choose_candidate(&group, 0, &seen, fresh, &[10, 8]), Some(2));
+        assert_eq!(choose_candidate(&group, 0, &seen, fresh, &[30, 8]), None);
+        // A shard the replica did not report holds nothing.
+        assert_eq!(choose_candidate(&group, 0, &seen, fresh, &[0, 0, 1]), None);
+    }
+
+    #[test]
+    fn the_leader_keeps_the_highest_committed_sequence_it_saw() {
+        let group = group(3);
+        let fresh = Duration::from_secs(5);
+        let commits = Commits::default();
+        let primary = Primary {
+            member: 0,
+            epoch: 1,
+        };
+        let mut seen = vec![
+            member(Role::Master, &[50, 40], &[20, 0]),
+            member(following(&group, 0), &[45, 40], &[20, 30]),
+            // Follows another address: its value is not this primary's.
+            member(following(&group, 2), &[0, 0], &[99, 99]),
+        ];
+
+        assert_eq!(commits.learn(&group, primary, &seen, fresh), vec![20, 30]);
+        // A replica's value above what the answering primary holds is left from an earlier
+        // primary: it counts only up to the primary's sequence.
+        seen[1].shard_committed = vec![70, 30];
+        assert_eq!(commits.learn(&group, primary, &seen, fresh), vec![50, 30]);
+        // The primary is down: replicas' values count as told, and the highest one stays.
+        seen[0].last_ok = None;
+        seen[1].shard_committed = vec![55, 10];
+        assert_eq!(commits.learn(&group, primary, &seen, fresh), vec![55, 30]);
+        assert_eq!(
+            choose(&group, 0, &seen, fresh, &[55, 30], false),
+            Choice::Wait
+        );
+
+        // Groups that never use durability know nothing committed.
+        let quiet = vec![
+            member(Role::Master, &[50], &[0]),
+            member(following(&group, 0), &[45], &[0]),
+            Sighting::default(),
+        ];
+        let other = Group {
+            name: "quiet".into(),
+            ..group.clone()
+        };
+        assert!(commits.learn(&other, primary, &quiet, fresh).is_empty());
+    }
+
+    #[test]
+    fn a_clean_failover_keeps_the_committed_records_and_an_unclean_one_drops_them() {
+        let group = group(3);
+        let fresh = Duration::from_secs(5);
+        let commits = Commits::default();
+        let first = Primary {
+            member: 0,
+            epoch: 1,
+        };
+        let mut seen = vec![
+            member(Role::Master, &[50], &[40]),
+            member(following(&group, 0), &[45], &[40]),
+            member(following(&group, 0), &[30], &[40]),
+        ];
+
+        assert_eq!(commits.learn(&group, first, &seen, fresh), vec![40]);
+
+        // Member 1 held every committed record and was promoted: they stay committed, so
+        // member 2 must catch up before it can take over.
+        let second = Primary {
+            member: 1,
+            epoch: 2,
+        };
+        seen[0] = Sighting::default();
+        seen[1] = member(Role::Master, &[45], &[0]);
+        seen[2] = member(following(&group, 1), &[30], &[40]);
+        assert_eq!(commits.learn(&group, second, &seen, fresh), vec![40]);
+        assert_eq!(choose(&group, 1, &seen, fresh, &[40], false), Choice::Wait);
+
+        // Forced onto member 2, which lacked them: those records are lost and its own
+        // sequences reuse their numbers. Member 1 keeps reporting 40 (a replica keeps the
+        // highest value it was told), which must not block the next failover.
+        let third = Primary {
+            member: 2,
+            epoch: 3,
+        };
+        seen[1] = member(following(&group, 2), &[30], &[40]);
+        seen[2] = member(Role::Master, &[32], &[0]);
+        assert_eq!(commits.learn(&group, third, &seen, fresh), vec![0]);
+        seen[2].last_ok = None;
+        assert_eq!(commits.learn(&group, third, &seen, fresh), vec![0]);
+        // A durable write of the new primary above the old value counts again.
+        seen[1].shard_committed = vec![41];
+        assert_eq!(commits.learn(&group, third, &seen, fresh), vec![41]);
     }
 }
