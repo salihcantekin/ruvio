@@ -503,9 +503,12 @@ pub async fn lead(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        // A new leader acts only once it has applied what earlier leaders recorded: until
-        // then its primaries and committed sequences may be those of an old snapshot.
-        if raft.current_leader().await != Some(config.id) || !caught_up(&raft) {
+        // A leader cut off from the other coordinators keeps `current_leader()` (openraft
+        // does not step it down), so a majority confirms it before anything is done on the
+        // data nodes. A new leader also acts only once it has applied what earlier leaders
+        // recorded: until then its primaries and committed sequences may be those of an old
+        // snapshot. Until both hold it only learns, like a follower.
+        if !moves.leadership.confirm(&raft).await || !caught_up(&raft) {
             // Every coordinator learns what was committed, so a new leader also knows what
             // rose after the last record.
             let primaries = machine.primaries();
