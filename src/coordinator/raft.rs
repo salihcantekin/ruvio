@@ -1,5 +1,6 @@
 //! The coordinators' replicated state on openraft: which member of each replication group is
-//! primary, at which epoch. Log, vote and snapshot are small JSON files written with temp file,
+//! primary, at which epoch, the slot ranges moved between groups, and the highest sequence
+//! committed per group and shard (what a failover must keep). Log, vote and snapshot are small JSON files written with temp file,
 //! fsync and rename, like Ruvio's other durable files; RPCs are length-prefixed JSON frames on
 //! the coordinator's own port.
 
@@ -40,6 +41,11 @@ pub enum Request {
         group: String,
         member: usize,
         epoch: u64,
+        /// The committed sequences that hold under the new primary, decided when it was chosen
+        /// (an unclean promotion drops the ones it lacks). Absent on the first record of a
+        /// group and in entries older coordinators wrote: the values carry over unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        commit: Option<Commit>,
     },
     /// A slot range begins to move between two groups; refused while another move runs.
     BeginMove(Migration),
@@ -47,7 +53,103 @@ pub enum Request {
     CommitMove { id: String },
     /// The move ended before its commit (cancelled, failed, or a failover interrupted it).
     EndMove { id: String },
+    /// Committed sequences the leader saw rise since the last record (0 for a shard that did
+    /// not). Coordinators older than this request cannot read a log that holds it: all
+    /// coordinators are upgraded together.
+    Commit(BTreeMap<String, Raised>),
 }
+
+/// One group's committed sequences that rose under the primary of `epoch`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Raised {
+    pub epoch: u64,
+    /// Per shard, the new committed sequence, or 0 where it did not rise; no trailing zeros.
+    pub committed: Vec<u64>,
+}
+
+/// A group's committed sequences under one primary epoch, per shard: a failover keeps them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Commit {
+    /// The primary's epoch the values belong to.
+    pub epoch: u64,
+    /// The highest committed sequence seen, per shard.
+    pub committed: Vec<u64>,
+    /// Per shard, what replicas may still report from a primary whose history an unclean
+    /// failover dropped (a replica keeps the highest value it was ever told); replica reports
+    /// up to it are ignored.
+    pub stale: Vec<u64>,
+}
+
+/// Raises `values[shard]` to at least `value`, growing `values` as needed.
+pub fn raise(values: &mut Vec<u64>, shard: usize, value: u64) {
+    if values.len() <= shard {
+        values.resize(shard + 1, 0);
+    }
+    values[shard] = values[shard].max(value);
+}
+
+impl Commit {
+    /// Takes in the record `other`: a newer epoch replaces these values (the promotion decided
+    /// which hold), the same epoch raises the committed ones shard by shard, an older one
+    /// changes nothing. The stale values are set only by a promotion, so within one epoch every
+    /// coordinator holds the same ones.
+    pub fn merge(&mut self, other: &Commit) {
+        if other.epoch > self.epoch {
+            *self = other.clone();
+        } else if other.epoch == self.epoch {
+            for (shard, &value) in other.committed.iter().enumerate() {
+                if value > 0 {
+                    raise(&mut self.committed, shard, value);
+                }
+            }
+        }
+    }
+
+    /// The values that hold once `promoted`, which holds `durable` per shard, is primary at
+    /// `epoch`: those it lacks are gone, and replicas that keep reporting them are ignored.
+    pub fn after_promotion(&self, durable: &[u64], epoch: u64) -> Commit {
+        let mut next = Commit {
+            epoch,
+            ..self.clone()
+        };
+
+        for (shard, committed) in next.committed.iter_mut().enumerate() {
+            if durable.get(shard).copied().unwrap_or(0) < *committed {
+                raise(&mut next.stale, shard, *committed);
+                *committed = 0;
+            }
+        }
+        next
+    }
+
+    /// Per shard, the committed sequence where it is above `recorded`'s and 0 elsewhere, without
+    /// trailing zeros: empty when nothing rose or the epochs differ.
+    pub fn raised_over(&self, recorded: &Commit) -> Vec<u64> {
+        if self.epoch != recorded.epoch {
+            return Vec::new();
+        }
+        let mut raised: Vec<u64> = self
+            .committed
+            .iter()
+            .enumerate()
+            .map(|(shard, &value)| {
+                if value > recorded.committed.get(shard).copied().unwrap_or(0) {
+                    value
+                } else {
+                    0
+                }
+            })
+            .collect();
+
+        while raised.last() == Some(&0) {
+            raised.pop();
+        }
+        raised
+    }
+}
+
+/// Every group's recorded committed sequences.
+pub type Recorded = BTreeMap<String, Commit>;
 
 /// A move between groups the coordinators agreed to start.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,6 +394,9 @@ struct MachineState {
     /// Absent in snapshots written before moves between groups existed.
     #[serde(default)]
     moves: Moves,
+    /// Absent in snapshots written before committed sequences were recorded.
+    #[serde(default)]
+    commits: Recorded,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -346,6 +451,14 @@ impl StateMachine {
             .clone()
     }
 
+    pub fn commits(&self) -> Recorded {
+        self.state
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .commits
+            .clone()
+    }
+
     fn snapshot_path(&self) -> PathBuf {
         self.dir.join("raft-snapshot.json")
     }
@@ -385,18 +498,73 @@ pub fn apply_move(moves: &mut Moves, primaries: &Primaries, request: &Request) -
             true
         }
         Request::EndMove { id } => moves.current.take_if(|current| current.id == *id).is_some(),
-        Request::SetPrimary { .. } => false,
+        Request::SetPrimary { .. } | Request::Commit(_) => false,
     }
+}
+
+/// After a `SetPrimary` that applied: the group's committed sequences under the new primary.
+pub fn apply_promotion(commits: &mut Recorded, request: &Request) {
+    let Request::SetPrimary {
+        group,
+        epoch,
+        commit,
+        ..
+    } = request
+    else {
+        return;
+    };
+    let entry = commits.entry(group.clone()).or_default();
+    let kept = commit.clone().unwrap_or_else(|| std::mem::take(entry));
+
+    *entry = Commit {
+        epoch: *epoch,
+        ..kept
+    };
+}
+
+/// Applies a commit record: raises the shards it names, for groups whose primary is still of
+/// the record's epoch. Returns whether it changed anything.
+pub fn apply_commit(commits: &mut Recorded, primaries: &Primaries, request: &Request) -> bool {
+    let Request::Commit(groups) = request else {
+        return false;
+    };
+    let mut changed = false;
+
+    for (group, raised) in groups {
+        if primaries.get(group).map(|primary| primary.epoch) != Some(raised.epoch) {
+            continue;
+        }
+        let entry = commits.entry(group.clone()).or_default();
+
+        if entry.epoch != raised.epoch {
+            // State from before commits were recorded: start the group's record here.
+            *entry = Commit {
+                epoch: raised.epoch,
+                ..Commit::default()
+            };
+        }
+        for (shard, &value) in raised.committed.iter().enumerate() {
+            if value > entry.committed.get(shard).copied().unwrap_or(0) {
+                raise(&mut entry.committed, shard, value);
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 /// Applies one request; returns whether it changed anything.
 pub fn apply_request(primaries: &mut Primaries, request: &Request) -> bool {
     match request {
-        Request::BeginMove(_) | Request::CommitMove { .. } | Request::EndMove { .. } => false,
+        Request::BeginMove(_)
+        | Request::CommitMove { .. }
+        | Request::EndMove { .. }
+        | Request::Commit(_) => false,
         Request::SetPrimary {
             group,
             member,
             epoch,
+            ..
         } => {
             if primaries
                 .get(group)
@@ -491,8 +659,13 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
                 EntryPayload::Normal(request) => {
                     let state = &mut *state;
 
-                    apply_request(&mut state.primaries, &request)
-                        || apply_move(&mut state.moves, &state.primaries, &request)
+                    if apply_request(&mut state.primaries, &request) {
+                        apply_promotion(&mut state.commits, &request);
+                        true
+                    } else {
+                        apply_move(&mut state.moves, &state.primaries, &request)
+                            || apply_commit(&mut state.commits, &state.primaries, &request)
+                    }
                 }
                 EntryPayload::Membership(membership) => {
                     state.membership = StoredMembership::new(Some(entry.log_id), membership);
@@ -860,6 +1033,7 @@ mod tests {
             group: "main".into(),
             member,
             epoch,
+            commit: None,
         };
 
         assert!(apply_request(&mut primaries, &set(0, 1)));
@@ -953,6 +1127,215 @@ mod tests {
             &Request::CommitMove { id: "m3".into() }
         ));
         assert_eq!(moves.moved.len(), 1);
+    }
+
+    #[test]
+    fn a_promotion_sets_the_commit_record_and_raises_apply_only_to_its_epoch() {
+        let mut primaries = Primaries::new();
+        let mut recorded = Recorded::new();
+        fn apply(primaries: &mut Primaries, recorded: &mut Recorded, request: Request) -> bool {
+            if apply_request(primaries, &request) {
+                apply_promotion(recorded, &request);
+                true
+            } else {
+                apply_commit(recorded, primaries, &request)
+            }
+        }
+        let raise = |epoch, committed: &[u64]| {
+            Request::Commit(BTreeMap::from([(
+                "main".to_owned(),
+                Raised {
+                    epoch,
+                    committed: committed.to_vec(),
+                },
+            )]))
+        };
+        let promote = |member, epoch, commit| Request::SetPrimary {
+            group: "main".into(),
+            member,
+            epoch,
+            commit,
+        };
+
+        // The first record of a group carries nothing.
+        assert!(apply(&mut primaries, &mut recorded, promote(0, 1, None)));
+        assert!(apply(&mut primaries, &mut recorded, raise(1, &[20, 30])));
+        // Retried or late: nothing changes.
+        assert!(!apply(&mut primaries, &mut recorded, raise(1, &[20, 30])));
+        assert!(!apply(&mut primaries, &mut recorded, raise(1, &[10])));
+        assert!(apply(&mut primaries, &mut recorded, raise(1, &[25])));
+        assert_eq!(recorded["main"].committed, [25, 30]);
+
+        // An unclean promotion decided what holds under epoch 2.
+        let kept = recorded["main"].after_promotion(&[25, 12], 2);
+        assert_eq!(kept.committed, [25, 0]);
+        assert_eq!(kept.stale, [0, 30]);
+        assert!(apply(
+            &mut primaries,
+            &mut recorded,
+            promote(2, 2, Some(kept.clone()))
+        ));
+        assert_eq!(recorded["main"], kept);
+        // A raise of the old epoch arriving late changes nothing.
+        assert!(!apply(&mut primaries, &mut recorded, raise(1, &[0, 90])));
+        assert_eq!(recorded["main"], kept);
+
+        // A promotion without a decision (written by an older coordinator) keeps the values.
+        assert!(apply(&mut primaries, &mut recorded, promote(1, 3, None)));
+        assert_eq!(
+            recorded["main"],
+            Commit {
+                epoch: 3,
+                ..kept.clone()
+            }
+        );
+        // A retried promotion changes nothing, not even the record.
+        assert!(!apply(
+            &mut primaries,
+            &mut recorded,
+            promote(0, 3, Some(Commit::default()))
+        ));
+        assert_eq!(recorded["main"].epoch, 3);
+        assert_eq!(recorded["main"].committed, [25, 0]);
+    }
+
+    #[test]
+    fn only_the_shards_that_rose_are_sent() {
+        let recorded = Commit {
+            epoch: 4,
+            committed: vec![10, 20, 30],
+            stale: vec![],
+        };
+        let seen = Commit {
+            committed: vec![10, 21, 30, 5],
+            ..recorded.clone()
+        };
+
+        assert_eq!(seen.raised_over(&recorded), [0, 21, 0, 5]);
+        // Nothing rose past the record: nothing to send.
+        assert!(recorded.raised_over(&seen).is_empty());
+        // Another epoch: the promotion's record comes first.
+        let older = Commit {
+            epoch: 3,
+            ..seen.clone()
+        };
+        assert!(older.raised_over(&recorded).is_empty());
+    }
+
+    #[test]
+    fn a_snapshot_without_commit_records_still_loads() {
+        let state: MachineState = serde_json::from_str(
+            r#"{"last_applied":null,"membership":{"log_id":null,"membership":{"configs":[],"nodes":{}}},"primaries":{}}"#,
+        )
+        .unwrap();
+
+        assert!(state.commits.is_empty());
+    }
+
+    /// The cost of recording committed sequences for 8 groups of 64 shards: bytes per entry
+    /// and the time to rewrite and sync the whole log once, at the log length the snapshot
+    /// policy allows. Run by hand:
+    /// `cargo test --features coordinator --lib -- --ignored --nocapture commit_record_cost`.
+    #[test]
+    #[ignore]
+    fn commit_record_cost() {
+        const GROUPS: usize = 8;
+        const SHARDS: u64 = 64;
+        let group = |index: usize| format!("group-{index}");
+        let full = Commit {
+            epoch: 7,
+            committed: (0..SHARDS).map(|shard| 1_000_000_000 + shard).collect(),
+            stale: Vec::new(),
+        };
+        // The entry an earlier draft wrote: every group's whole record.
+        let whole: Recorded = (0..GROUPS)
+            .map(|index| (group(index), full.clone()))
+            .collect();
+        let whole_bytes = serde_json::to_vec(&serde_json::json!({ "Commit": whole }))
+            .unwrap()
+            .len();
+        // `rose` shards of each group rose, the last ones (the most zeros before them).
+        let raised = |rose: u64| {
+            Request::Commit(
+                (0..GROUPS)
+                    .map(|index| {
+                        let raised = Raised {
+                            epoch: 7,
+                            committed: (0..SHARDS)
+                                .map(|shard| {
+                                    if shard >= SHARDS - rose {
+                                        1_000_000_000 + shard
+                                    } else {
+                                        0
+                                    }
+                                })
+                                .collect(),
+                        };
+
+                        (group(index), raised)
+                    })
+                    .collect(),
+            )
+        };
+        // An entry of about the earlier size, to time a log of such entries.
+        let padded = Request::SetPrimary {
+            group: "g".into(),
+            member: 0,
+            epoch: 7,
+            commit: Some(Commit {
+                epoch: 7,
+                committed: (0..GROUPS as u64 * SHARDS)
+                    .map(|shard| 1_000_000_000 + shard)
+                    .collect(),
+                stale: Vec::new(),
+            }),
+        };
+        let entry = |index: u64, request: &Request| Entry::<TypeConfig> {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
+            payload: EntryPayload::Normal(request.clone()),
+        };
+        let bytes = |request: &Request| serde_json::to_vec(&entry(1, request)).unwrap().len();
+        let time = |entries: u64, request: &Request| {
+            let dir = tempfile::tempdir().unwrap();
+            let store = LogStore::open(dir.path()).unwrap();
+            let mut inner = store.lock();
+
+            for index in 1..=entries {
+                inner.entries.insert(index, entry(index, request));
+            }
+            inner.persist().unwrap();
+            let rounds = 20;
+            let started = std::time::Instant::now();
+
+            for round in 0..rounds {
+                inner
+                    .entries
+                    .insert(entries + 1 + round, entry(entries + 1 + round, request));
+                inner.persist().unwrap();
+            }
+            let size = std::fs::metadata(dir.path().join("raft-log.json"))
+                .unwrap()
+                .len();
+
+            (started.elapsed() / rounds as u32, size)
+        };
+
+        println!("earlier entry, whole records: {whole_bytes} bytes");
+        println!("padded stand-in for it: {} bytes", bytes(&padded));
+        for shards in [1, 8, 64] {
+            println!(
+                "new entry, {shards} shard(s) rose per group: {} bytes",
+                bytes(&raised(shards))
+            );
+        }
+        let (per, size) = time(1100, &padded);
+        println!("before: 1100 entries of the earlier size: {per:?} per append, log {size} bytes");
+        for shards in [8, 64] {
+            let (per, size) = time(120, &raised(shards));
+            println!(
+                "after: 120 entries, {shards} shards rose per group: {per:?} per append, log {size} bytes"
+            );
+        }
     }
 
     #[test]
