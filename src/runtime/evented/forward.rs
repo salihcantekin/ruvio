@@ -311,6 +311,7 @@ impl Fabric {
                     .as_ref()
                     .map(|durability| crate::runtime::cluster::ShardPeers {
                         primary: durability.acks.primary(),
+                        following: durability.acks.following(),
                         replicas: durability.acks.replicas(),
                     })
                     .unwrap_or_default()
