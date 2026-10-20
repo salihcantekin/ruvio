@@ -420,7 +420,8 @@ receive ranges this way. One move runs at a time.
    until the target's connected replicas hold what was copied (`RUVIO MIGRATE REPLICAS`, at most 10 s),
    and sends the keys written meanwhile, until few are left. Clients keep using the source.
 3. The source freezes the range: its commands get `TRYAGAIN`, which every Ruvio client retries for
-   635 ms (7 retries, waits doubling from 5 ms). It sends the last changes and the target syncs them to its log. The source then keeps
+   635 ms (7 retries, waits doubling from 5 ms). It sends the last changes and the target syncs them to
+   its log. The source then keeps
    the frozen range on disk (`MIGRATE_OUT`), so a restart cannot serve it again on its own.
 4. The leader, asking every 10 ms, waits until the target's connected replicas hold the prepared copy
    (at most 10 s, or the move is cancelled and started again), commits the move only if neither group
