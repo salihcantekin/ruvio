@@ -17,7 +17,7 @@ use tracing::{info, warn};
 
 use super::{
     config::{CoordinatorConfig, Endpoint},
-    raft::{Migration, Raft, Request, StateMachine},
+    raft::{Leadership, Migration, Raft, Request, StateMachine},
     resp::{NodeClient, Value},
 };
 
@@ -57,15 +57,21 @@ pub struct Context {
     pub raft: Raft,
     pub machine: StateMachine,
     pub mover: Arc<Mover>,
+    /// Confirms this coordinator leads with a majority before each step on the data nodes.
+    pub leadership: Arc<Leadership>,
 }
 
 impl Context {
+    /// Leading, and a majority of coordinators confirmed it within the last tick.
     pub(super) async fn leading(&self) -> bool {
-        self.raft.current_leader().await == Some(self.config.id)
+        self.leadership.confirm(&self.raft).await
     }
 
     pub(super) async fn not_leader(&self) -> String {
         match self.raft.current_leader().await {
+            Some(leader) if leader == self.config.id => {
+                "ERR this leader cannot reach a majority of coordinators; try again".into()
+            }
             Some(leader) => format!("ERR not the leader; send it to coordinator {leader}"),
             None => "ERR no leader yet; try again".into(),
         }
