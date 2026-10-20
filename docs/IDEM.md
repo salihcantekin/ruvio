@@ -119,6 +119,34 @@ A lost BEGIN reply must not cause the business operation to be re-executed.
 A lost COMPLETE reply is uncertain; a later BEGIN can retrieve the result if it
 committed. Clients do not automatically retry ambiguous writes.
 
+## Across a failover
+
+`IDEM`, `ONCE` and `LIMIT` need no extra mechanism. Their state is written to the
+log and shipped to replicas like any write, so what a replica holds is what the
+primary had shipped. Replication is asynchronous: without durability, the last
+writes before a primary dies can be missing on the new primary. Then an `ONCE`
+key may be gone (the action can run twice), a `LIMIT` window may miss a few
+counts (usually acceptable), and an `IDEM` entry or its result may be gone (the
+request runs again). A connection that writes these commands with
+`CLIENT DURABILITY REPLICAS 1` (or more) gets its replies only after that many
+replicas hold the writes on disk, and `ruvio coordinator` promotes only a
+replica that has every such write; see [COORDINATOR.md](COORDINATOR.md). On
+`-NOREPLICAS` the write is applied but not confirmed: treat it as uncertain.
+Durability is not on by default, because every reply then waits for a replica;
+turn it on for the connections where a lost write matters.
+
+The deadlines of these commands, and of `LEASE` and `SEMAPHORE`, are absolute
+wall-clock times (Unix milliseconds) stored in the log. A new primary whose clock
+is behind the old one's extends holds and windows; one that is ahead ends them
+early. Keep the clocks of the nodes synchronized (NTP or similar).
+
+A lock that stays safe across a failover:
+
+1. `LEASE` on a connection that sent `CLIENT DURABILITY REPLICAS 1`. Tokens are
+   fenced: a later holder always gets a larger token, also after a failover.
+2. The holder sends its token with every write to the protected resource.
+3. The resource remembers the highest token it has seen and rejects a lower one.
+
 ## Clients and HTTP integration
 
 C# exposes `IRuvioClient.BeginIdempotencyAsync` (raw RESP state/result) and
