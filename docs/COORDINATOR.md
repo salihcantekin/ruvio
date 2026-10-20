@@ -35,9 +35,13 @@ When the coordinators are partitioned from each other, only the side with a majo
 library keeps a leader that lost its majority believing it leads, so before each tick's work on the data
 nodes (a failover, pointing members at the agreed primary, sending the cluster map, a step of a slot
 move) and before `COORDINATOR FAILOVER group FORCE`, `MOVE` and `CANCEL`, the leader confirms with a
-heartbeat that a majority of coordinators still follows it. One confirmation per tick is shared by
-everything in that tick; it waits at most one `ping_interval_ms` (capped at 1 second, below the election
-timeout). A leader cut off from the others, even one that still reaches every data node, therefore does
+heartbeat that a majority of coordinators still follows it. It confirms again before every command it
+sends a data node; a confirmation is trusted for one `ping_interval_ms` (capped at 1 second, below the
+election timeout) and shared by everything in that window, and waits at most that long. So a leader that
+loses its majority in the middle of a tick sends no further `REPLICAOF` or map from a record a newer
+leader may have replaced. Each group is tended on its own task, and a data node gets `down_after_ms`
+(at least 1 second) to answer a command: a member that accepts connections but stops answering holds up
+only its own group, never a failover elsewhere. A leader cut off from the others, even one that still reaches every data node, therefore does
 nothing to them: it logs one warning, those commands answer `ERR this leader cannot reach a majority of
 coordinators; try again`, and it acts again (logging that once) when the majority answers it, or follows
 the leader the majority elected meanwhile. The other side, if it is a majority, elects a new leader and
