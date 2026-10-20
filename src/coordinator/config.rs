@@ -119,6 +119,10 @@ struct FileConfig {
     secret: Option<String>,
     #[serde(default)]
     groups: Vec<Group>,
+    /// Joining a running set of coordinators: wait to be added with `COORDINATOR ADD` instead
+    /// of proposing `peers` as the first membership.
+    #[serde(default)]
+    join: bool,
 }
 
 fn default_ping_interval_ms() -> u64 {
@@ -165,6 +169,8 @@ pub struct CoordinatorConfig {
     pub auth: Option<String>,
     pub secret: Option<String>,
     pub groups: Vec<Group>,
+    /// Waits to be added to running coordinators instead of starting a new set.
+    pub join: bool,
 }
 
 impl CoordinatorConfig {
@@ -299,10 +305,12 @@ impl CoordinatorConfig {
                 .or(file.secret)
                 .filter(|secret| !secret.is_empty()),
             groups: file.groups,
+            join: file.join,
         })
     }
 
-    /// How many coordinators make a majority.
+    /// How many of the coordinators in `peers` make a majority; once running, the Raft
+    /// membership counts instead.
     pub fn quorum(&self) -> usize {
         self.peers.len() / 2 + 1
     }

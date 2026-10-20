@@ -383,6 +383,53 @@ pub async fn confirm_locally(
         .flatten()
 }
 
+/// The coordinators that vote, with their addresses: the Raft membership once there is one,
+/// `peers` from the file before that (a coordinator that has not started or joined yet).
+pub fn coordinators(config: &CoordinatorConfig, raft: &Raft) -> Vec<(NodeId, String)> {
+    let metrics = raft.metrics();
+    let metrics = metrics.borrow();
+    let membership = metrics.membership_config.membership();
+    let voters: Vec<(NodeId, String)> = membership
+        .voter_ids()
+        .filter_map(|id| membership.get_node(&id).map(|node| (id, node.addr.clone())))
+        .collect();
+
+    if voters.is_empty() {
+        config
+            .peers
+            .iter()
+            .map(|(id, address)| (*id, address.to_string()))
+            .collect()
+    } else {
+        voters
+    }
+}
+
+/// Where coordinator `id` listens: from the Raft membership (voters and learners), else from
+/// `peers`.
+pub fn address_of(config: &CoordinatorConfig, raft: &Raft, id: NodeId) -> Option<String> {
+    let known = raft
+        .metrics()
+        .borrow()
+        .membership_config
+        .membership()
+        .get_node(&id)
+        .map(|node| node.addr.clone());
+
+    known.or_else(|| {
+        config
+            .peers
+            .iter()
+            .find(|(peer, _)| *peer == id)
+            .map(|(_, address)| address.to_string())
+    })
+}
+
+/// How many of `voters` coordinators make a majority.
+pub fn quorum(voters: usize) -> usize {
+    voters / 2 + 1
+}
+
 /// The group's primary as the current leader confirms it ([`confirm_locally`]).
 async fn confirm(
     config: &CoordinatorConfig,
@@ -396,10 +443,10 @@ async fn confirm(
     if leader == config.id {
         return confirm_locally(raft, machine, grants, group).await;
     }
-    let (_, address) = config.peers.iter().find(|(id, _)| *id == leader)?;
+    let address = address_of(config, raft, leader)?;
 
     match super::raft::call(
-        &address.to_string(),
+        &address,
         config.secret.as_deref().unwrap_or(""),
         RpcRequest::Confirm {
             group: group.to_owned(),
@@ -458,7 +505,7 @@ async fn renew(
     let words = [
         token.to_string(),
         config.id.to_string(),
-        config.peers.len().to_string(),
+        coordinators(config, raft).len().to_string(),
         primary.epoch.to_string(),
         lease.as_millis().to_string(),
     ];
@@ -976,6 +1023,7 @@ pub fn verdict(heard_down: usize, lease_ended: usize, lease_on: bool, quorum: us
 /// counts for hearing. Also whether any coordinator grants leases.
 async fn objectively_down(
     config: &CoordinatorConfig,
+    raft: &Raft,
     sightings: &Sightings,
     group: &Group,
     primary: usize,
@@ -994,13 +1042,14 @@ async fn objectively_down(
         None => true,
     });
     let mut calls = tokio::task::JoinSet::new();
+    let voters = coordinators(config, raft);
 
-    for (id, address) in &config.peers {
+    for (id, address) in &voters {
         if *id == config.id {
             continue;
         }
         let (address, secret, name) = (
-            address.to_string(),
+            address.clone(),
             config.secret.clone().unwrap_or_default(),
             group.name.clone(),
         );
@@ -1042,7 +1091,7 @@ async fn objectively_down(
     }
 
     (
-        verdict(heard_down, ended, lease_on, config.quorum()),
+        verdict(heard_down, ended, lease_on, quorum(voters.len())),
         lease_on,
     )
 }
@@ -1208,7 +1257,7 @@ impl Leader {
         if primary_age.is_none_or(|age| age > config.down_after) {
             let decided = sightings.grants().decision(&group.name).await;
 
-            match objectively_down(config, sightings, group, primary.member)
+            match objectively_down(config, raft, sightings, group, primary.member)
                 .await
                 .0
             {
@@ -1587,7 +1636,15 @@ pub async fn force_failover(force: Force<'_>, group: &Group) -> Result<String, S
     // coordinator grants no lease, since the others may.
     let decided = force.sightings.grants().decision(&group.name).await;
 
-    match objectively_down(force.config, force.sightings, group, primary.member).await {
+    match objectively_down(
+        force.config,
+        force.raft,
+        force.sightings,
+        group,
+        primary.member,
+    )
+    .await
+    {
         (Verdict::LeaseRunning, _) => {
             return Err(format!(
                 "ERR the primary of {} may still hold its lease; try again once a majority of coordinators saw it end",
@@ -2365,6 +2422,7 @@ mod tests {
             auth: None,
             secret: None,
             groups: Vec::new(),
+            join: false,
         }
     }
 
