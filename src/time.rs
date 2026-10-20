@@ -16,10 +16,15 @@ impl UnixMillis {
         self.0
     }
 
+    /// Latest deadline any command may store; larger values would not fit the
+    /// signed 64-bit millisecond clock that `PEXPIRETIME` and `PTTL` report.
+    pub const MAX_DEADLINE: u64 = i64::MAX as u64;
+
+    /// `self + milliseconds`, or `None` when the result passes [`Self::MAX_DEADLINE`].
     pub const fn checked_add(self, milliseconds: u64) -> Option<Self> {
         match self.0.checked_add(milliseconds) {
-            Some(value) => Some(Self(value)),
-            None => None,
+            Some(value) if value <= Self::MAX_DEADLINE => Some(Self(value)),
+            _ => None,
         }
     }
 }

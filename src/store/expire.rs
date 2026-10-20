@@ -1076,7 +1076,7 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
     pub fn ttl_seconds(&self, key: &[u8]) -> i64 {
         match self.pttl(key) {
             remaining if remaining < 0 => remaining,
-            millis => (millis + 500) / 1_000,
+            millis => millis.saturating_add(500) / 1_000,
         }
     }
 

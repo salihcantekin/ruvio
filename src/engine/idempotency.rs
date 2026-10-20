@@ -77,7 +77,11 @@ pub(super) fn begin<'a, C: Clock, I: StorageIndex, S: MutationSink>(
             state(b"pending")
         });
     }
-    let Some(deadline) = shard.now_unix_millis().get().checked_add(ttl_ms) else {
+    let Some(deadline) = shard
+        .now_unix_millis()
+        .checked_add(ttl_ms)
+        .map(crate::UnixMillis::get)
+    else {
         return Ok(Response::Error(INPUT));
     };
     publish(

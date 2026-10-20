@@ -91,8 +91,8 @@ pub(super) fn expire_time<C: Clock, I: StorageIndex>(
 
     Response::Integer(match deadline {
         None => -1,
-        Some(at) if millis => at.get() as i64,
-        Some(at) => (at.get() / 1_000) as i64,
+        Some(at) if millis => i64::try_from(at.get()).unwrap_or(i64::MAX),
+        Some(at) => i64::try_from(at.get() / 1_000).unwrap_or(i64::MAX),
     })
 }
 

@@ -569,7 +569,7 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         self.remove_expired(key);
 
         let now = self.now_unix_millis().get();
-        let expires_at = now.saturating_add(ttl_ms);
+        let expires_at = now.saturating_add(ttl_ms).min(UnixMillis::MAX_DEADLINE);
         let kind = self.value_kind(key);
 
         if kind.is_some_and(|kind| kind != ValueKind::Lease) {
@@ -621,7 +621,7 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         self.remove_expired(key);
 
         let now = self.now_unix_millis().get();
-        let expires_at = now.saturating_add(ttl_ms);
+        let expires_at = now.saturating_add(ttl_ms).min(UnixMillis::MAX_DEADLINE);
 
         match self.object_value(key)? {
             Some(Value::Lease(lease)) if lease.token == token && now < lease.expires_at => {
@@ -694,7 +694,7 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         self.remove_expired(key);
 
         let now = self.now_unix_millis().get();
-        let expires_at = now.saturating_add(ttl_ms);
+        let expires_at = now.saturating_add(ttl_ms).min(UnixMillis::MAX_DEADLINE);
 
         match self.object_value(key) {
             Ok(None) => Ok(Some((self.next_fence_token(0), expires_at, true))),
@@ -907,7 +907,12 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
             return Ok(None);
         }
 
-        Ok(Some(self.now_unix_millis().get().saturating_add(ttl_ms)))
+        Ok(Some(
+            self.now_unix_millis()
+                .get()
+                .saturating_add(ttl_ms)
+                .min(UnixMillis::MAX_DEADLINE),
+        ))
     }
 
     pub(crate) fn put_once(&mut self, key: &[u8], expires_at: u64) -> Result<(), WrongType> {
