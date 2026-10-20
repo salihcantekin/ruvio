@@ -22,6 +22,11 @@ import org.junit.jupiter.api.Timeout;
 class CoordinatorFailoverLiveTest {
     /** The coordinators notice the kill after down_after_ms (1 s) and promote within a few ticks. */
     private static final long PATIENCE_NANOS = TimeUnit.SECONDS.toNanos(15);
+    /**
+     * Each client's first write after the kill comes within this, the seeds client included: the replica that refused
+     * is taken once it is promoted, not after the rounds run out (about 7 s).
+     */
+    private static final long FOLLOW_BOUND_MILLIS = 5_000;
 
     private static String[] list(String name) {
         String value = System.getenv(name);
@@ -104,6 +109,7 @@ class CoordinatorFailoverLiveTest {
                 millis.put(entry.getKey(), entry.getValue().get());
             }
             System.out.println("first write after the kill (ms): " + millis);
+            millis.forEach((name, ms) -> assertTrue(ms < FOLLOW_BOUND_MILLIS, name + ": the first write took " + ms + " ms"));
 
             assertTrue(isMaster(onNew), "the surviving member is not the primary");
             for (String name : clients.keySet()) {
