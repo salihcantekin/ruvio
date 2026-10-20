@@ -158,11 +158,11 @@ fn spawn_reader(
     primary_name: Option<(String, u16)>,
     yields: bool,
 ) -> io::Result<crate::replication::ReplicationThread> {
+    // Until the new primary accepts this shard, the cluster answers name the map's primary.
+    state.durable_acks.set_primary(None);
+    state.durable_acks.set_following(true);
     let (inbound, outbound) = mpsc::sync_channel(crate::replication::QUEUE_FRAMES);
     let dialed = shard_port(primary, shard_id)?;
-
-    // Until the new primary accepts this shard, it names no primary in the cluster answers.
-    state.durable_acks.set_primary(None);
     *state.followed.borrow_mut() = Some(match &primary_name {
         Some((host, _)) => (host.clone(), dialed.port()),
         None => (dialed.ip().to_string(), dialed.port()),
@@ -395,6 +395,7 @@ pub(super) fn promote(state: &ShardState, shard_id: u32, force: bool) -> io::Res
 
     // A primary lists its own replicas, not the one it used to follow.
     state.durable_acks.set_primary(None);
+    state.durable_acks.set_following(false);
     let lineage = writer_lineage(state, shard_id)?;
     let uses_wal = state.published_config.persistence.profile.uses_wal();
     {

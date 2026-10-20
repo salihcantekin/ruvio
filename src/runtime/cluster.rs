@@ -37,6 +37,8 @@ pub(crate) struct ClusterRoute {
 pub(crate) struct ShardPeers {
     /// Set on a replica that has been accepted by a primary that announced itself.
     pub primary: Option<Endpoint>,
+    /// The shard follows a primary, also before that primary accepted it.
+    pub following: bool,
     pub replicas: Vec<ReplicaPeer>,
 }
 
@@ -63,12 +65,25 @@ fn shard_nodes(route: &ClusterRoute, peers: &[ShardPeers], shard_id: usize) -> V
     };
     let peers = peers.get(shard_id);
 
-    if let Some(primary) = peers.and_then(|peers| peers.primary.as_ref()) {
+    let followed = peers.and_then(|peers| {
+        peers
+            .primary
+            .as_ref()
+            .map(|primary| (primary.host.clone(), primary.port))
+            .or_else(|| {
+                peers
+                    .following
+                    .then(|| mapped_primary(route, shard_id))
+                    .flatten()
+            })
+    });
+
+    if let Some((primary_host, primary_port)) = followed {
         return vec![
             Node {
-                id: node_id(&primary.host, primary.port),
-                host: primary.host.clone(),
-                port: primary.port,
+                id: node_id(&primary_host, primary_port),
+                host: primary_host,
+                port: primary_port,
                 primary: true,
                 offset: 0,
             },
@@ -89,6 +104,19 @@ fn shard_nodes(route: &ClusterRoute, peers: &[ShardPeers], shard_id: usize) -> V
     }
 
     nodes
+}
+
+/// Shard `shard_id` of this node's group's primary as the cluster map names it, for a replica
+/// whose primary has not accepted it yet; `None` without a map or when the map names this
+/// node itself.
+fn mapped_primary(route: &ClusterRoute, shard_id: usize) -> Option<(String, u16)> {
+    let topology = route.topology.as_ref()?.get();
+    let group = topology.groups.get(topology.local)?;
+    let port = group.port.wrapping_add(shard_id as u16);
+
+    (group.host != route.advertised_host
+        || port != route.advertised_port.wrapping_add(shard_id as u16))
+    .then(|| (group.host.clone(), port))
 }
 
 /// Who serves a slot range: a shard of this node, or shard `shard` of another group's
@@ -1197,6 +1225,76 @@ mod tests {
         assert!(text.contains(":8192\r\n:16383\r\n"), "{text}");
         assert!(text.contains("127.0.0.1\r\n:6379\r\n"), "{text}");
         assert!(text.contains("127.0.0.1\r\n:6380\r\n"), "{text}");
+    }
+
+    /// A replica in a multi-node cluster whose primary has not accepted it yet names its
+    /// group's primary from the map, not itself; with no map, a map naming this node, or a
+    /// shard that does not follow, it lists itself as before.
+    #[test]
+    fn a_replica_not_yet_accepted_names_the_mapped_primary() {
+        const MAP: &str = r#"
+            version = 4
+
+            [[groups]]
+            name = "a"
+            address = "10.0.0.1:7000"
+            shards = 1
+            slots = ["0-8191"]
+
+            [[groups]]
+            name = "b"
+            address = "10.0.0.2:7100"
+            shards = 1
+            slots = ["8192-16383"]
+        "#;
+        let route = |host: &str, port: u16, map: bool| {
+            let slots = SlotTable::from_formula(1);
+            let topology = map.then(|| {
+                let topology = crate::topology::Topology::parse(MAP, "a", 1).unwrap();
+
+                topology.apply(&slots, 1);
+                crate::topology::SharedTopology::new(topology)
+            });
+
+            ClusterRoute {
+                shard_id: 0,
+                shard_count: 1,
+                advertised_host: host.into(),
+                advertised_port: port,
+                slots,
+                topology,
+            }
+        };
+        let answer = |route: &ClusterRoute, following: bool| {
+            let mut encoded = Vec::new();
+            let peers = [ShardPeers {
+                following,
+                ..ShardPeers::default()
+            }];
+
+            write_cluster_slots(&mut encoded, Some(route), &peers).unwrap();
+            String::from_utf8(encoded).unwrap()
+        };
+        let mapped = "*4\r\n:0\r\n:8191\r\n*3\r\n$8\r\n10.0.0.1\r\n:7000\r\n";
+        let itself = "*3\r\n:0\r\n:8191\r\n*3\r\n$8\r\n10.0.0.3\r\n:7020\r\n";
+
+        let replica = route("10.0.0.3", 7020, true);
+        let text = answer(&replica, true);
+
+        assert!(text.contains(mapped), "{text}");
+        assert!(text.contains("$8\r\n10.0.0.3\r\n:7020\r\n"), "{text}");
+        assert!(answer(&replica, false).contains(itself));
+        // Without a map this node owns every slot.
+        assert!(
+            answer(&route("10.0.0.3", 7020, false), true)
+                .contains("*3\r\n:0\r\n:16383\r\n*3\r\n$8\r\n10.0.0.3\r\n:7020\r\n")
+        );
+        let named = answer(&route("10.0.0.1", 7000, true), true);
+
+        assert!(
+            named.contains("*3\r\n:0\r\n:8191\r\n*3\r\n$8\r\n10.0.0.1\r\n:7000\r\n"),
+            "{named}"
+        );
     }
 
     #[test]
