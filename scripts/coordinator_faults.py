@@ -7,22 +7,31 @@ coordinators, a TCP proxy between the coordinators and each data node):
   restart     every coordinator restarts; the agreed primary is kept
   loss        a writer runs while the primary is killed: acknowledged writes lost
   durable     the same with CLIENT DURABILITY REPLICAS 1: no acknowledged write is lost
-  client      redis-py's Sentinel client follows the failover (skipped without redis-py)"""
+  client      redis-py's Sentinel client follows the failover (skipped without redis-py)
+  stall       a replica is frozen (SIGSTOP): the healthy primary is kept and takes writes
+  coord-partition  the coordinator leader is cut from the other two (it still reaches the data
+              nodes), then the primary is killed: the majority fails over once and the new primary
+              stays primary"""
 import os, signal, socket, subprocess, sys, threading, time, shutil
 
 # Usage: scripts/coordinator_faults.py target/debug/ruvio [scenario ...]
-# Every scenario takes a few seconds; all of them well under a minute.
+# Every scenario takes a few seconds; `stall` and `coord-partition` hold their check for
+# RUVIO_FAULTS_HOLD_SECS (default 30) seconds.
 RUVIO = sys.argv[1]
-SCENARIOS = sys.argv[2:] or ["partition", "leader", "minority", "restart", "loss", "durable", "client"]
+HOLD = float(os.environ.get("RUVIO_FAULTS_HOLD_SECS", "30"))
+SCENARIOS = sys.argv[2:] or ["partition", "leader", "minority", "restart", "loss", "durable", "client", "stall", "coord-partition"]
 WORK = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"ruvio-coordinator-faults-{os.getpid()}")
 NODES = [(18300, 38300), (18320, 38320), (18340, 38340)]
 PROXY = [18500, 18520, 18540]           # coordinators reach node i through PROXY[i]
 COORDS = [(1, 28300), (2, 28301), (3, 28302)]
 SH = 1
+# coord-partition only: coordinator a reaches coordinator b through RAFT_PROXY(a, b), so one
+# coordinator can be cut from the others while it still reaches the data nodes.
+def RAFT_PROXY(a, b): return 18600 + 10 * a + b
 
 class Proxy:
     def __init__(self, listen, target):
-        self.target, self.cut, self.conns = target, False, []
+        self.listen, self.target, self.cut, self.conns = listen, target, False, []
         self.server = socket.socket(); self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server.bind(("127.0.0.1", listen)); self.server.listen(64)
         threading.Thread(target=self.accept, daemon=True).start()
@@ -73,10 +82,11 @@ def start_node(i, role, primary=None, extra=None):
     return subprocess.Popen([RUVIO, "--config", f"{d}/r.toml", "--address", f"127.0.0.1:{resp}", "--shards", str(SH),
                              "--durability", "always", "--data-dir", d], env=e, stdout=open(f"{d}.log", "a"), stderr=subprocess.STDOUT)
 
-def start_coord(cid, port):
+def start_coord(cid, port, raft_proxies=False):
     d = f"{WORK}/c{cid}"; os.makedirs(d, exist_ok=True)
     members = ",\n".join(f'  {{ address = "127.0.0.1:{PROXY[i]}", replication = "127.0.0.1:{NODES[i][1]}" }}' for i in range(3))
-    peers = ", ".join(f'"{i}@127.0.0.1:{p}"' for i, p in COORDS)
+    peer = lambda i, p: p if i == cid or not raft_proxies else RAFT_PROXY(cid, i)
+    peers = ", ".join(f'"{i}@127.0.0.1:{peer(i, p)}"' for i, p in COORDS)
     open(f"{d}/c.toml", "w").write(f'id = {cid}\nlisten = "127.0.0.1:{port}"\ndata_dir = "{d}/data"\npeers = [{peers}]\nping_interval_ms = 200\ndown_after_ms = 1000\n\n[[groups]]\nname = "main"\nmembers = [\n{members}\n]\n')
     return subprocess.Popen([RUVIO, "coordinator", "--config", f"{d}/c.toml"], stdout=open(f"{d}.log", "a"), stderr=subprocess.STDOUT)
 
@@ -85,12 +95,23 @@ def primary_index(port):
     a = addr(port)
     return PROXY.index(int(a[1])) if len(a) == 2 else None
 
-def setup(extra=None):
+def epoch(port):
+    for line in cli(port, "INFO", "replication").splitlines():
+        if line.startswith("replication_epoch:"): return int(line.split(":")[1])
+    return None
+
+def leader():
+    lead = [cid for cid, port in COORDS if "is_leader:1" in cli(port, "INFO")]
+    return lead[0] if len(lead) == 1 else None
+
+def setup(extra=None, raft_proxies=False):
     shutil.rmtree(WORK, ignore_errors=True); os.makedirs(WORK)
     proxies = [Proxy(PROXY[i], NODES[i][0]) for i in range(3)]
+    if raft_proxies:
+        proxies += [Proxy(RAFT_PROXY(a, b), pb) for a, _ in COORDS for b, pb in COORDS if a != b]
     nodes = [start_node(0, "primary", extra=extra), start_node(1, "replica", NODES[0][1], extra), start_node(2, "replica", NODES[0][1], extra)]
     assert wait(lambda: all(cli(r, "PING") == "PONG" for r, _ in NODES))
-    coords = {cid: start_coord(cid, p) for cid, p in COORDS}
+    coords = {cid: start_coord(cid, p, raft_proxies) for cid, p in COORDS}
     assert wait(lambda: all(primary_index(p) == 0 for _, p in COORDS)), "coordinators did not agree"
     return proxies, nodes, coords
 
@@ -111,7 +132,8 @@ def check(name, ok):
 
 def run(SCEN):
     print(f"== {SCEN}")
-    proxies, nodes, coords = setup({"RUVIO_MIN_REPLICAS_TO_WRITE": "1", "RUVIO_MIN_REPLICAS_MAX_LAG": "2"} if SCEN == "partition" else None)
+    proxies, nodes, coords = setup({"RUVIO_MIN_REPLICAS_TO_WRITE": "1", "RUVIO_MIN_REPLICAS_MAX_LAG": "2"} if SCEN == "partition" else None,
+                                   raft_proxies=SCEN == "coord-partition")
     try:
         if SCEN == "partition":
             cli(NODES[0][0], "SET", "before", "1")
@@ -169,6 +191,51 @@ def run(SCEN):
                     return False
             ok = wait(write, 20)
             check(f"redis-py writes to the new primary {time.time()-t0:.2f}s after the kill", ok)
+        elif SCEN == "stall":
+            # A frozen replica still holds its TCP connections open. The coordinators mark it
+            # down after down_after_ms; the healthy primary must be left alone the whole time.
+            e0 = epoch(NODES[0][0])
+            nodes[1].send_signal(signal.SIGSTOP)
+            moved, refused, i, end = 0, 0, 0, time.time() + HOLD
+            while time.time() < end:
+                if primary_index(COORDS[i % 3][1]) != 0: moved += 1
+                if cli(NODES[0][0], "SET", f"s{i}", "1") != "OK": refused += 1
+                i += 1; time.sleep(0.2)
+            check(f"the coordinators keep the healthy primary for {HOLD:.0f}s while a replica is frozen ({moved} other answers)", moved == 0)
+            check(f"the primary takes every write meanwhile ({i - refused}/{i})", refused == 0)
+            check("its epoch does not change", epoch(NODES[0][0]) == e0)
+            nodes[1].send_signal(signal.SIGCONT)
+            check("the thawed replica catches up", wait(lambda: cli(NODES[1][0], "GET", f"s{i - 1}") == "1", 20))
+            check("and is still a replica", cli(NODES[1][0], "ROLE").split("\n")[0] == "slave")
+        elif SCEN == "coord-partition":
+            assert wait(lambda: leader() is not None, 15), "no single coordinator leader"
+            old = leader(); others = [(cid, p) for cid, p in COORDS if cid != old]
+            cut = {RAFT_PROXY(a, b) for a, _ in COORDS for b, _ in COORDS if a != b and old in (a, b)}
+            for p in proxies:
+                if p.listen in cut: p.set_cut(True)
+            t0 = time.time()
+            elected = wait(lambda: any("is_leader:1" in cli(p, "INFO") for _, p in others), 20)
+            check(f"the other two elect a new leader ({time.time()-t0:.2f}s)", elected)
+            e0 = epoch(NODES[1][0])
+            t1 = time.time(); nodes[0].send_signal(signal.SIGKILL); nodes[0].wait()
+            moved = wait(lambda: primary_index(others[0][1]) not in (None, 0), 20)
+            check(f"the majority fails over the killed primary ({time.time()-t1:.2f}s)", moved)
+            new = primary_index(others[0][1]); rest = 3 - new
+            assert wait(lambda: cli(NODES[new][0], "SET", "after", "1") == "OK", 10), "the new primary takes no writes"
+            e1 = epoch(NODES[new][0])
+            check(f"the epoch went up exactly once ({e0} -> {e1})", e0 is not None and e1 == e0 + 1)
+            # While the cut-off leader is still alive and reaching the data nodes, nothing may
+            # move the primary again or repoint it.
+            flaps, epochs, end = 0, set(), time.time() + HOLD
+            while time.time() < end:
+                if cli(NODES[new][0], "ROLE").split("\n")[0] != "master": flaps += 1
+                epochs.add(epoch(NODES[new][0]))
+                time.sleep(0.2)
+            check(f"the new primary stays primary for {HOLD:.0f}s (flaps={flaps})", flaps == 0)
+            check(f"and its epoch stays {e1} (seen {sorted(e for e in epochs if e is not None)})", epochs == {e1})
+            check("the other replica follows it", wait(lambda: cli(NODES[rest][0], "GET", "after") == "1", 10))
+            for p in proxies[3:]: p.set_cut(False)
+            check("healed: the old leader agrees with the majority", wait(lambda: primary_index(dict(COORDS)[old]) == new, 20))
         elif SCEN in ("loss", "durable"):
             acked, stop_flag = [], threading.Event()
             def writer():
@@ -201,6 +268,8 @@ def run(SCEN):
             else:
                 check("lost writes are only the last ones before the crash", lost == 0 or all(k == "0" for k in keys[-lost:]))
     finally:
+        for n in nodes:
+            if n.poll() is None: n.send_signal(signal.SIGCONT)
         stop(list(coords.values()) + nodes)
         for p in proxies:
             # shutdown wakes the accept thread; close alone leaves the port listening.
