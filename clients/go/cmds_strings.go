@@ -315,7 +315,7 @@ func (c *cmds) DecrBy(ctx context.Context, key string, delta int64) (int64, erro
 
 // IncrByFloat adds a floating point delta to the number stored at key (INCRBYFLOAT) and
 // returns the new value. A missing key counts as 0. The sum is computed in float64 and
-// stored with 15 significant digits (Redis uses long double, so the last digits can
+// stored with 16 significant digits (Redis uses long double, so the last digits can
 // differ). The value must be a valid number, otherwise the server returns "ERR value is
 // not a valid float"; NaN is rejected and an infinite result is an error. An existing
 // TTL is kept.

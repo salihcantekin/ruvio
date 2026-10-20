@@ -263,7 +263,7 @@ impl Client {
     }
 
     /// Sends `INCRBYFLOAT`: adds a decimal to the value (missing counts as 0) and returns the new
-    /// value. Ruvio computes in double precision and prints 15 significant digits.
+    /// value. Ruvio computes in double precision and prints 16 significant digits.
     ///
     /// # Errors
     /// [`Error::Server`] if the value is not a number or the result is NaN/infinite.

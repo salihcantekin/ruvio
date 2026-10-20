@@ -2667,7 +2667,7 @@
       "family": "strings",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Computed in double precision and printed with 15 significant digits; Redis uses long double, so results with more digits can differ in the last places (Redis prints 153.10000000000000001 where Ruvio prints 153.1). Keeps the TTL. `EX seconds` or `PX milliseconds` sets a deadline only when the call creates the key; an existing key keeps its deadline. The write and the deadline are one WAL record.",
+      "limitations": "Computed in double precision and printed with 16 significant digits and stored as that rounded text, so later increments start from the rounded value (use integers for money); Redis uses long double, so results with more digits can differ in the last places (Redis prints 153.10000000000000001 where Ruvio prints 153.1). Keeps the TTL. `EX seconds` or `PX milliseconds` sets a deadline only when the call creates the key; an existing key keeps its deadline. The write and the deadline are one WAL record.",
       "coverage": [
         "scripts/redis_differential.py"
       ]
@@ -2837,7 +2837,7 @@
       "family": "hashes",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Computed in double precision and printed with 15 significant digits (Redis uses long double). Keeps a field TTL.",
+      "limitations": "Computed in double precision and printed with 16 significant digits and stored as that rounded text, so later increments start from the rounded value (use integers for money; Redis uses long double). Keeps a field TTL.",
       "coverage": [
         "scripts/redis_differential.py"
       ]
