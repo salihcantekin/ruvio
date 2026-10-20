@@ -67,6 +67,11 @@ coordinator that restarts while the primary is down learns only what the remaini
 Coordinators' `INFO` shows them as `committed=` on the group's line. Groups whose clients never use
 `CLIENT DURABILITY` report 0 everywhere and fail over as before.
 
+`IDEM`, `ONCE`, `LIMIT` and `LEASE` are ordinary writes in this respect: they are kept across a failover
+when their connection uses `CLIENT DURABILITY`, and the last ones can be lost without it. Their
+deadlines are wall-clock times, so the nodes' clocks must agree. See "Across a failover" in
+[IDEM.md](IDEM.md) for the details and a lock recipe.
+
 A primary cut off from the coordinators but still reachable by clients keeps taking writes until it
 learns it was replaced. Two settings on the data nodes bound that window:
 

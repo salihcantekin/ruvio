@@ -35,8 +35,8 @@ RENEW job:nightly-report 17 30000
 # 1     -> deadline moved to now + 30 s (0 if the token no longer holds it)
 RELEASE job:nightly-report 17
 # 1     -> released (0 if the token no longer matches)`,
-    body: "Each grant returns a token that grows. Send it with writes to the thing you protect and have that side reject older tokens. A long job calls <code>RENEW</code> with its token to keep the lock without releasing it. Expiry and <code>RELEASE</code> keep the sequence while the key exists.",
-    note: "Deleting the key restarts the token at 1, and data loss can do the same. A token alone does not fence an external system after that.",
+    body: "Each grant returns a token that grows. Send it with writes to the thing you protect and have that side reject older tokens. A long job calls <code>RENEW</code> with its token to keep the lock without releasing it. Tokens are opaque 64-bit integers that only grow.",
+    note: "Tokens never go backwards, also after expiry, a restart or a failover. For a lock that survives a failover, take it on a connection that sent CLIENT DURABILITY REPLICAS 1, keep the nodes' clocks synchronized, and have the protected resource reject a token lower than the last one it saw.",
     refs: [{ label: "LEASE, RENEW and RELEASE", href: commands }],
   },
   {
