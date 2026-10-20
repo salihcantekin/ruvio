@@ -37,6 +37,9 @@ const NOT_LOCAL: u16 = u16::MAX;
 /// The source of a range gained from another node, or the target of one given to another
 /// node.
 pub(crate) const REMOTE: u16 = u16::MAX;
+/// Why a source gave up a move whose target did not prepare the frozen range in time. The
+/// coordinators start such a move again; a busy disk on the target may be quicker next time.
+pub(crate) const PREPARE_LATE: &str = "the target did not prepare the range in time";
 
 /// Version 1 entries have no `prepared` field; version 2 adds it (and remote entries).
 const MAGIC_V1: &[u8; 8] = b"RVSLOTS1";

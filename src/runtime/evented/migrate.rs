@@ -1105,7 +1105,7 @@ async fn copy_and_prepare(
         let remaining = FREEZE_LIMIT.saturating_sub(frozen_at.elapsed());
         let reply = tokio::time::timeout(remaining, link.reply())
             .await
-            .map_err(|_| "the target did not prepare the range in time".to_string())??;
+            .map_err(|_| crate::slot_moves::PREPARE_LATE.to_string())??;
 
         if link.pending == 0 {
             break reply as u64;

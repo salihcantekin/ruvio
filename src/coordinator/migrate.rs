@@ -402,15 +402,7 @@ async fn attempt_move(context: &Context, migration: &Migration) -> Ended {
         match field("state") {
             Some("prepared") => break,
             Some("copying") => {}
-            Some(state) => {
-                return Ended::Aborted {
-                    reason: format!(
-                        "the source reports {state}: {}",
-                        field("error").unwrap_or("no reason given")
-                    ),
-                    again: false,
-                };
-            }
+            Some(state) => return source_ended(state, field("error")),
             None => {}
         }
     }
@@ -463,6 +455,18 @@ async fn attempt_move(context: &Context, migration: &Migration) -> Ended {
     {
         Ok(true) => Ended::Committed,
         _ => Ended::Handed,
+    }
+}
+
+/// A source that reports a move it no longer runs. One whose target did not prepare the
+/// frozen range in time served the range again and may manage it on another start.
+fn source_ended(state: &str, error: Option<&str>) -> Ended {
+    Ended::Aborted {
+        reason: format!(
+            "the source reports {state}: {}",
+            error.unwrap_or("no reason given")
+        ),
+        again: state == "failed" && error == Some(crate::slot_moves::PREPARE_LATE),
     }
 }
 
@@ -678,4 +682,25 @@ fn pairs(reply: &Value) -> Vec<(String, String)> {
         .chunks_exact(2)
         .filter_map(|pair| Some((pair[0].text()?, pair[1].text()?)))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_move_whose_target_prepared_too_late_starts_again() {
+        let again = |state, error| match source_ended(state, error) {
+            Ended::Aborted { again, .. } => again,
+            _ => unreachable!(),
+        };
+
+        assert!(again("failed", Some(crate::slot_moves::PREPARE_LATE)));
+        assert!(!again(
+            "failed",
+            Some("a flush or SWAPDB ran during the move")
+        ));
+        assert!(!again("failed", None));
+        assert!(!again("cancelled", Some(crate::slot_moves::PREPARE_LATE)));
+    }
 }

@@ -425,7 +425,9 @@ receive ranges this way. One move runs at a time.
    and sends the keys written meanwhile, until few are left. Clients keep using the source.
 3. The source freezes the range: its commands get `TRYAGAIN`, which every Ruvio client retries after 5,
    10 and 20 ms. It sends the last changes and the target syncs them to its log. The source then keeps
-   the frozen range on disk (`MIGRATE_OUT`), so a restart cannot serve it again on its own.
+   the frozen range on disk (`MIGRATE_OUT`), so a restart cannot serve it again on its own. If the
+   target does not finish within one second of the freeze (a busy disk), the source serves the range
+   again and the leader starts the move again, as after a failover.
 4. The leader, asking every 10 ms, waits until the target's connected replicas hold the prepared copy
    (at most 10 s, or the move is cancelled and started again), commits the move only if neither group
    failed over since it began, and sends the new map to the target's primary, then the source's, then
@@ -440,8 +442,8 @@ ends the running move before its commit, and the source serves the range again (
 in Raft before the nodes are told, so a late cancel never undoes a committed move). Send cancels to the
 coordinators, not with `RUVIO MIGRATE CANCEL` to the nodes. Before a failover the leader sends the
 newest map to the replica it promotes. A failover of either
-group before the commit cancels the move and starts it again with the new primaries (up to three
-times); a new leader takes over a move its predecessor began. After the commit nothing undoes the move:
+group before the commit, or a target too slow to prepare, cancels the move and starts it again (with
+the new primaries after a failover; up to three starts); a new leader takes over a move its predecessor began. After the commit nothing undoes the move:
 move the range back with another `COORDINATOR MOVE`. The copy rate of a source is capped by
 `migration_max_bytes_per_sec` in its configuration (0, the default, means no cap); the frozen hand-over
 is never slowed down. Nodes need durability `memory`, `everysec` or `always` (not `snapshot`).
