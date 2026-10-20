@@ -358,7 +358,7 @@ support connects to the coordinators with the group name as the service name:
 | `SENTINEL sentinels group` | The other coordinators |
 | `SUBSCRIBE +switch-master` | `group old-host old-port new-host new-port` on every failover |
 | `ROLE` | `["sentinel", [groups]]` |
-| `INFO` | `coordinator_id`, `leader_id`, `is_leader`, and `group_<name>:primary=…,epoch=…` (with `,recorded=…` (the Raft record) and `,committed=…` (what this coordinator knows) per shard, joined by `/`, once a durable reply was released) |
+| `INFO` | `coordinator_id`, `leader_id`, `is_leader`, `failovers_total` and `last_failover_unix_ms` (failovers this coordinator recorded as the leader, 0 for none), and per group `group_<name>:primary=…,epoch=…,members_answering=n/m` (members that answered on every shard within `down_after_ms`), then `,state=…,state_ms=…` once this coordinator led (`ok`, `lease_running`: the primary is down and its lease has not ended for a majority, `waiting`: no replica holds every committed record, `no_candidate`: no replica can take over; on a follower, as of when it last led), `,lease_grant_ms=…` with `primary_lease_ms` (since this coordinator last granted the primary a lease, -1 for never), and `,recorded=…` (the Raft record) and `,committed=…` (what this coordinator knows) per shard, joined by `/`, once a durable reply was released |
 | `AUTH secret` | Required first when `secret` is set; `NOAUTH` otherwise |
 
 Checked with redis-py's `Sentinel` (5.2): it discovers the primary, writes through it, and writes to

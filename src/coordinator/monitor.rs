@@ -58,14 +58,33 @@ pub enum Role {
     Replica(Option<String>),
 }
 
-/// Every member's latest sighting, by group and member index, and this coordinator's lease
-/// grants.
+/// Every member's latest sighting, by group and member index, this coordinator's lease
+/// grants, and what it did as the leader.
 #[derive(Clone, Default)]
-pub struct Sightings(Arc<Mutex<HashMap<(String, usize), Sighting>>>, Grants);
+pub struct Sightings(
+    Arc<Mutex<HashMap<(String, usize), Sighting>>>,
+    Grants,
+    Arc<Stats>,
+);
 
 impl Sightings {
     pub fn grants(&self) -> &Grants {
         &self.1
+    }
+
+    pub fn stats(&self) -> &Stats {
+        &self.2
+    }
+
+    /// How many members of `group` answered on every shard within `fresh`.
+    pub fn answering(&self, group: &Group, fresh: Duration) -> usize {
+        (0..group.members.len())
+            .filter(|&member| {
+                let sighting = self.get(&group.name, member);
+
+                sighting.complete() && sighting.last_ok.is_some_and(|at| at.elapsed() <= fresh)
+            })
+            .count()
     }
 
     pub fn get(&self, group: &str, member: usize) -> Sighting {
@@ -226,6 +245,107 @@ impl Grants {
         };
 
         lock.lock_owned().await
+    }
+}
+
+impl Grants {
+    /// When this coordinator last granted `member` of `group` a lease, if it did since it started.
+    pub fn last(&self, group: &str, member: usize) -> Option<Instant> {
+        self.with(group, member, |granting| granting.last)
+    }
+}
+
+/// Where a group stands, as the leader last tended it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupState {
+    /// The primary answers, or a majority of coordinators still hear it.
+    Ok,
+    /// A majority lost the primary, but its lease has not ended for a majority yet.
+    LeaseRunning,
+    /// The primary is down and no replica holds every committed record.
+    Waiting,
+    /// The primary is down and no replica can take over.
+    NoCandidate,
+}
+
+impl GroupState {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::LeaseRunning => "lease_running",
+            Self::Waiting => "waiting",
+            Self::NoCandidate => "no_candidate",
+        }
+    }
+}
+
+/// What this coordinator did as the leader, for `INFO`.
+#[derive(Default)]
+pub struct Stats {
+    failovers: std::sync::atomic::AtomicU64,
+    last_failover_unix_ms: std::sync::atomic::AtomicU64,
+    /// Per group: its state, since when, and when a warning about it was last logged.
+    groups: Mutex<HashMap<String, (GroupState, Instant, Instant)>>,
+}
+
+/// How often at most a group that stays without a writer is warned about.
+const WARN_EVERY: Duration = Duration::from_secs(10);
+
+impl Stats {
+    /// Records that `group` is in `state`; whether a warning about it is due: when it enters
+    /// the state, then every [`WARN_EVERY`] while it stays.
+    pub fn enter(&self, group: &str, state: GroupState) -> bool {
+        let now = Instant::now();
+        let mut groups = self
+            .groups
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
+        match groups.get_mut(group) {
+            Some((known, _, warned)) if *known == state => {
+                let due = now.duration_since(*warned) >= WARN_EVERY;
+
+                if due {
+                    *warned = now;
+                }
+                due
+            }
+            _ => {
+                groups.insert(group.to_owned(), (state, now, now));
+                true
+            }
+        }
+    }
+
+    /// `group`'s state and how long it has been in it; `None` until this coordinator led.
+    pub fn state(&self, group: &str) -> Option<(GroupState, Duration)> {
+        self.groups
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(group)
+            .map(|&(state, since, _)| (state, since.elapsed()))
+    }
+
+    fn failed_over(&self) {
+        use std::sync::atomic::Ordering;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64);
+
+        self.failovers.fetch_add(1, Ordering::Relaxed);
+        self.last_failover_unix_ms.store(now, Ordering::Relaxed);
+    }
+
+    /// Failovers this coordinator did as the leader, and when the last one was (Unix ms, 0
+    /// for none).
+    pub fn failovers(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+
+        (
+            self.failovers.load(Ordering::Relaxed),
+            self.last_failover_unix_ms.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -1088,22 +1208,37 @@ impl Leader {
         if primary_age.is_none_or(|age| age > config.down_after) {
             let decided = sightings.grants().decision(&group.name).await;
 
-            if objectively_down(config, sightings, group, primary.member)
+            match objectively_down(config, sightings, group, primary.member)
                 .await
                 .0
-                == Verdict::Down
             {
-                let failing = Failing {
-                    group,
-                    primary,
-                    seen: &seen,
-                    committed: &committed,
-                    commits,
-                    decided,
-                };
-                let _ = failover(config, raft, machine, switches, failing, false, &fence).await;
-                return;
+                Verdict::Down => {
+                    let failing = Failing {
+                        group,
+                        primary,
+                        seen: &seen,
+                        committed: &committed,
+                        commits,
+                        decided,
+                        stats: sightings.stats(),
+                    };
+                    let _ = failover(config, raft, machine, switches, failing, false, &fence).await;
+                    return;
+                }
+                Verdict::LeaseRunning => {
+                    if sightings
+                        .stats()
+                        .enter(&group.name, GroupState::LeaseRunning)
+                    {
+                        info!(group = %group.name, "primary is down; waiting for its lease to end (repeated at most every 10 s)");
+                    }
+                }
+                Verdict::Up => {
+                    sightings.stats().enter(&group.name, GroupState::Ok);
+                }
             }
+        } else {
+            sightings.stats().enter(&group.name, GroupState::Ok);
         }
 
         reconcile(config, group, primary, &seen, &fence).await;
@@ -1266,6 +1401,7 @@ struct Failing<'a> {
     committed: &'a [u64],
     commits: &'a Commits,
     decided: DecisionGuard,
+    stats: &'a Stats,
 }
 
 /// Promotes a replica of a group whose primary is down: one that holds every committed record,
@@ -1288,6 +1424,7 @@ async fn failover(
         committed,
         commits,
         decided,
+        stats,
     } = failing;
     let choice = choose(
         group,
@@ -1309,14 +1446,18 @@ async fn failover(
             candidate
         }
         Choice::Wait => {
-            warn!(
-                group = %group.name,
-                "primary is down and no replica holds every record a durable reply was released for; waiting (unclean_failover or COORDINATOR FAILOVER group FORCE promotes one anyway)"
-            );
+            if stats.enter(&group.name, GroupState::Waiting) {
+                warn!(
+                    group = %group.name,
+                    "primary is down and no replica holds every record a durable reply was released for; waiting (unclean_failover or COORDINATOR FAILOVER group FORCE promotes one anyway; repeated at most every 10 s)"
+                );
+            }
             return Err("ERR no replica holds every committed record; waiting for one".into());
         }
         Choice::Nobody => {
-            warn!(group = %group.name, "primary is down and no replica can take over");
+            if stats.enter(&group.name, GroupState::NoCandidate) {
+                warn!(group = %group.name, "primary is down and no replica can take over (repeated at most every 10 s)");
+            }
             return Err("ERR no replica can take over".into());
         }
     };
@@ -1339,6 +1480,8 @@ async fn failover(
     if !propose(raft, group, candidate, primary.epoch + 1, Some(kept)).await {
         return Err("ERR the failover was not recorded; try again".into());
     }
+    stats.failed_over();
+    stats.enter(&group.name, GroupState::Ok);
     // Applied here once recorded: a confirmation waiting for the decision reads the new
     // primary. The calls to the data nodes below need not hold it up.
     drop(decided);
@@ -1473,6 +1616,7 @@ pub async fn force_failover(force: Force<'_>, group: &Group) -> Result<String, S
         committed: &committed,
         commits: force.commits,
         decided,
+        stats: force.sightings.stats(),
     };
     let fence = Leading {
         leadership: force.leadership,
@@ -1691,6 +1835,28 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn a_group_state_is_warned_about_when_entered_then_at_most_every_ten_seconds() {
+        let stats = Stats::default();
+
+        assert_eq!(stats.state("main"), None);
+        assert!(stats.enter("main", GroupState::Waiting));
+        assert!(!stats.enter("main", GroupState::Waiting));
+        assert_eq!(stats.state("main").unwrap().0, GroupState::Waiting);
+        // Another group, or another state, is warned about at once.
+        assert!(stats.enter("other", GroupState::Waiting));
+        assert!(stats.enter("main", GroupState::NoCandidate));
+        // Ten seconds on, the same state is due again.
+        stats.groups.lock().unwrap().get_mut("main").unwrap().2 -= WARN_EVERY;
+        assert!(stats.enter("main", GroupState::NoCandidate));
+        assert!(!stats.enter("main", GroupState::NoCandidate));
+
+        assert_eq!(stats.failovers(), (0, 0));
+        stats.failed_over();
+        assert_eq!(stats.failovers().0, 1);
+        assert!(stats.failovers().1 > 0);
     }
 
     #[tokio::test(flavor = "current_thread")]

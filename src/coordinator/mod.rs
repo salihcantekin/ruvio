@@ -366,8 +366,10 @@ impl Api {
             (Some("ping"), _) => Value::Simple("PONG".into()),
             (Some("info"), _) => {
                 let leader = self.raft.metrics().borrow().current_leader;
+                let (failovers, last_failover) = self.sightings.stats().failovers();
                 let mut text = format!(
-                    "# Coordinator\r\ncoordinator_id:{}\r\nleader_id:{}\r\nis_leader:{}\r\n",
+                    "# Coordinator\r\ncoordinator_id:{}\r\nleader_id:{}\r\nis_leader:{}\r\n\
+                     failovers_total:{failovers}\r\nlast_failover_unix_ms:{last_failover}\r\n",
                     self.config.id,
                     leader.map_or(-1, |id| id as i64),
                     u8::from(leader == Some(self.config.id)),
@@ -384,6 +386,26 @@ impl Api {
                             )
                         }
                         None => text += &format!("group_{}:primary=,epoch=0", group.name),
+                    }
+                    text += &format!(
+                        ",members_answering={}/{}",
+                        self.sightings.answering(group, self.config.down_after),
+                        group.members.len()
+                    );
+                    // What this coordinator saw while it led: on a follower, from when it last led.
+                    if let Some((state, since)) = self.sightings.stats().state(&group.name) {
+                        text += &format!(",state={},state_ms={}", state.name(), since.as_millis());
+                    }
+                    if self.config.primary_lease.is_some()
+                        && let Some(primary) = primaries.get(&group.name)
+                    {
+                        let age = self
+                            .sightings
+                            .grants()
+                            .last(&group.name, primary.member)
+                            .map_or(-1, |at| at.elapsed().as_millis() as i64);
+
+                        text += &format!(",lease_grant_ms={age}");
                     }
                     // Only for groups whose clients use `CLIENT DURABILITY`: per shard, the
                     // values in the Raft record, then the highest record a failover must keep
