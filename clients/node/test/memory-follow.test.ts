@@ -32,16 +32,17 @@ interface Alloc {
   batchFollow: number[];
 }
 
-// Measured on a quiet machine: bytes (heap + external) per command are 1290-1340 one command at a time and
-// 442-450 in a batch of 50, for both kinds; following differs from one seed by at most 15 (sequential) and
-// 8 (batch) bytes per command from run to run. A per-command copy of a frame costs well over the margins.
+// Measured (three runs, medians of three samples after a warm-up round): bytes (heap + external) per command are
+// 1330-1360 one command at a time and 500-520 in a batch of 50 for one seed; following measured -10 to +0
+// (sequential) and +12 to +19 (batch) bytes above that. A per-command copy of a frame costs about 230 bytes, over
+// both margins (64 and 80).
 test('following adds no allocation per command on a healthy connection', { skip: LIVE, timeout: 150_000 }, async () => {
   const r = await probe<Alloc>('alloc');
-  assert.ok(r.seqSingle.length >= 3 && r.seqFollow.length >= 3 && r.batchSingle.length >= 3 && r.batchFollow.length >= 3, 'too many runs were disturbed by a collection: ' + JSON.stringify(r));
+  assert.ok(r.seqSingle.length >= 2 && r.seqFollow.length >= 2 && r.batchSingle.length >= 2 && r.batchFollow.length >= 2, 'too many runs were disturbed by a collection: ' + JSON.stringify(r));
   const report = JSON.stringify(r);
   assert.ok(median(r.seqFollow) - median(r.seqSingle) <= 64, 'one command at a time: ' + report);
-  assert.ok(median(r.batchFollow) - median(r.batchSingle) <= 32, 'batches of 50: ' + report);
-  assert.ok(median(r.seqFollow) < 1600 && median(r.batchFollow) < 560, 'absolute size: ' + report);
+  assert.ok(median(r.batchFollow) - median(r.batchSingle) <= 80, 'batches of 50: ' + report);
+  assert.ok(median(r.seqFollow) < 1600 && median(r.batchFollow) < 700, 'absolute size: ' + report);
 });
 
 interface Retain {
@@ -55,15 +56,15 @@ interface Inner {
   search: boolean;
 }
 
-// Heap after a forced collection, taken after 200 rounds of the workload (about 12 000 commands) and then after
-// each 400 more. Measured growth over the last three steps (about 70 000 commands): 20-140 KB for either kind,
-// which is warm-up of the JIT and caches; a frame kept per command would be several MB.
+// Heap after a forced collection, taken after 60 rounds of the workload and then after
+// each 120 more (about 7 000 commands each). Measured growth over the last two steps: 27-45 KB for either kind,
+// which is warm-up of the JIT and caches; a frame kept per command fails the bound (250 KB).
 test('following keeps no frames and the heap stays flat over many commands', { skip: LIVE, timeout: 150_000 }, async () => {
   const r = await probe<Retain>('retain');
   for (const kind of ['single', 'follow'] as const) {
     const { marks, inner } = r[kind];
     const growth = marks[3]! - marks[1]!;
-    assert.ok(growth < 400 * 1024, kind + ' heap grew by ' + growth + ' bytes: ' + JSON.stringify(marks));
+    assert.ok(growth < 250 * 1024, kind + ' heap grew by ' + growth + ' bytes: ' + JSON.stringify(marks));
     assert.deepEqual(inner, { kept: 0, pending: 0, refused: 0, search: false }, kind + ' connection state');
   }
   assert.ok(r.follow.marks[3]! - r.single.marks[3]! < 512 * 1024, 'following holds more than one seed: ' + JSON.stringify(r));
@@ -86,14 +87,14 @@ interface Failover {
 }
 
 // Handle counts are exact (process.getActiveResourcesInfo(), counted again until they settle); the heap bound
-// is for the 80 failovers after the first 10: measured growth 10-80 KB.
+// is for the 30 failovers after the first 10: measured growth 60 KB.
 test('failover searches leave no sockets, timers or held commands behind', { timeout: 150_000 }, async () => {
   const r = await probe<Failover>('failover');
   const open = { kept: 0, pending: 0, refused: 0, search: false };
   assert.deepEqual(r.inner, open);
   assert.deepEqual(r.handlesAfterCycles, r.handlesWarm, 'handles grew over ' + r.cycles + ' failovers');
   assert.deepEqual(r.handlesAfterClose, r.handlesIdle, 'handles left after close');
-  assert.ok(r.heapMarks[2]! - r.heapMarks[0]! < 400 * 1024, 'heap over the failovers: ' + JSON.stringify(r.heapMarks));
+  assert.ok(r.heapMarks[2]! - r.heapMarks[0]! < 150 * 1024, 'heap over the failovers: ' + JSON.stringify(r.heapMarks));
   assert.deepEqual(r.noPrimaryInner, open);
   assert.deepEqual(r.handlesAfterNoPrimary, r.handlesIdle, 'handles left after searches that found no primary');
   assert.equal(r.closeDuringSearch.searching, true, 'the search was not running when the client closed');

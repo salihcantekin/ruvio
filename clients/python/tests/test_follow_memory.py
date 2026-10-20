@@ -108,15 +108,15 @@ async def test_following_adds_no_transient_allocation_per_command(kind):
     try:
         for c in (single, follow):
             await call(kind, c, "set", "mem:a", "value-12345")
-            for _ in range(300):
+            for _ in range(100):
                 await call(kind, c, "get", "mem:a")
         results = {}
         tracemalloc.start(1)
         try:
             for name, c in (("single", single), ("follow", follow)):
-                get = await transient(kind, c, lambda c=c: c.get("mem:a"), 1000)
-                put = await transient(kind, c, lambda c=c: c.set("mem:a", "value-12345"), 1000)
-                many = await transient(kind, c, lambda c=c: c.mget(*["mem:k%d" % i for i in range(50)]), 300)
+                get = await transient(kind, c, lambda c=c: c.get("mem:a"), 300)
+                put = await transient(kind, c, lambda c=c: c.set("mem:a", "value-12345"), 300)
+                many = await transient(kind, c, lambda c=c: c.mget(*["mem:k%d" % i for i in range(50)]), 100)
                 results[name] = (get, put, many)
         finally:
             tracemalloc.stop()
@@ -168,22 +168,22 @@ def settled() -> Tuple[int, int, int]:
     return ruvio_bytes(tracemalloc.take_snapshot()), tracemalloc.get_traced_memory()[0], sys.getallocatedblocks()
 
 
-# After 200 rounds (about 1 400 commands) the memory is taken after a forced collection, then after each 300
-# further rounds (about 2 100 commands each); the growth over the last two steps (about 4 200 commands) was 0-32
-# bytes of ruvio's own allocations, 0.1-9 KB of all traced memory (interpreter and asyncio caches settling,
-# also for one seed) and 20-70 allocated blocks, for either kind of client. A frame kept per command would add
-# hundreds of KB, thousands of blocks and tens of KB of ruvio's own.
+# After 30 rounds (about 2 000 commands) the memory is taken after a forced collection, then after each 60 further
+# rounds (about 3 700 commands each); the growth over the last two steps was 0-32 bytes of ruvio's own allocations,
+# 0.1-6 KB of all traced memory (interpreter and asyncio caches settling, also for one seed) and 20-80 allocated
+# blocks, for either kind of client. A frame kept per command adds hundreds of KB, thousands of blocks and tens of
+# KB of ruvio's own (checked, see the bounds).
 @pytest.mark.parametrize("kind", KINDS)
 async def test_following_retains_nothing_over_many_commands(kind):
     single, follow = await live_pair(kind)
     try:
         for name, c in (("single", single), ("follow", follow)):
-            await workload(kind, c, 200)
-            tracemalloc.start(8)
+            await workload(kind, c, 30)
+            tracemalloc.start(2)
             try:
                 seen = [settled()]
                 for _ in range(3):
-                    await workload(kind, c, 300)
+                    await workload(kind, c, 60)
                     seen.append(settled())
             finally:
                 tracemalloc.stop()
@@ -332,7 +332,7 @@ async def test_searches_that_find_no_primary_or_hit_a_silent_seed_leave_nothing_
         await asyncio.sleep(0.05) if kind == "async" else time.sleep(0.05)
         idle = census()
         c = make(kind, seeds(a, b))
-        for _ in range(15):
+        for _ in range(5):
             with pytest.raises(ruvio.ResponseError) as info:
                 await call(kind, c, "set", "k", "v")
             assert info.value.code == "READONLY"

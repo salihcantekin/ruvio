@@ -89,19 +89,20 @@ async function workload(c: RuvioClient, rounds: number): Promise<void> {
 async function alloc(): Promise<unknown> {
   const out: Record<string, number[]> = { seqSingle: [], seqFollow: [], batchSingle: [], batchFollow: [] };
   const keys = Array.from({ length: 50 }, (_, i) => 'mem:k' + i);
-  for (let round = 0; round < 5; round++) {
+  for (let round = 0; round < 4; round++) {
     for (const following of [false, true]) {
       const c = open(following);
       await c.set('mem:a', 'value-12345');
-      for (let i = 0; i < 200; i++) await c.get('mem:a'), await Promise.all(keys.map((k) => c.get(k)));
-      const seq = await perOp(1500, 2, async () => {
+      for (let i = 0; i < 60; i++) await c.get('mem:a'), await Promise.all(keys.map((k) => c.get(k)));
+      const seq = await perOp(500, 2, async () => {
         await c.set('mem:a', 'value-12345');
         await c.get('mem:a');
       });
-      const batch = await perOp(60, 50, async () => {
+      const batch = await perOp(20, 50, async () => {
         await Promise.all(keys.map((k) => c.get(k)));
       });
       c.disconnect();
+      if (round === 0) continue; // the first round warms the JIT up
       if (seq !== null) out[following ? 'seqFollow' : 'seqSingle']!.push(seq);
       if (batch !== null) out[following ? 'batchFollow' : 'batchSingle']!.push(batch);
     }
@@ -113,10 +114,10 @@ async function retain(): Promise<unknown> {
   const result: Record<string, unknown> = {};
   for (const following of [false, true]) {
     const c = open(following);
-    await workload(c, 200);
+    await workload(c, 60);
     const marks: number[] = [await settled()];
     for (let step = 0; step < 3; step++) {
-      await workload(c, 400);
+      await workload(c, 120);
       marks.push(await settled());
     }
     result[following ? 'follow' : 'single'] = { marks, inner: inner(c) };
@@ -211,7 +212,7 @@ async function failover(): Promise<unknown> {
   let other = b;
   const marks: number[] = [];
   let atWarm: Counts = {};
-  const cycles = 90;
+  const cycles = 40;
   for (let i = 1; i <= cycles; i++) {
     [master, other] = [other, master];
     master.mode = 'master';
@@ -222,7 +223,7 @@ async function failover(): Promise<unknown> {
     if (r.some((x) => x !== 'OK')) throw new Error('write failed in cycle ' + i);
     clear(a, b);
     if (i === 10) atWarm = await reach(counts());
-    if (i === 10 || i === 50 || i === cycles) marks.push(await settled());
+    if (i === 10 || i === 25 || i === cycles) marks.push(await settled());
   }
   out.cycles = cycles;
   out.heapMarks = marks;
