@@ -477,4 +477,5 @@ the same state, and starting it over sends nodes an older map than they hold.
 - `scripts/coordinator_faults.py target/debug/ruvio [scenario ...]`: a TCP proxy between the coordinators
   and each data node; `partition` (primary cut from the coordinators only), `leader` (the coordinator
   leader killed, then the primary), `minority`, `restart`, `loss` (acknowledged writes lost under load),
+  `durable` (the same writer with `CLIENT DURABILITY REPLICAS 1`, batches of 32: none may be lost),
   `client` (redis-py's Sentinel client; skipped when redis-py is not installed).
