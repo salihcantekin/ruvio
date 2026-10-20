@@ -563,7 +563,7 @@ pub(super) async fn handle_client(
 
         let mut consumed = 0;
         let mut batch_commands = 0;
-        let mut flush_at = PIPELINE_FLUSH_BYTES;
+        let mut flush_at = flush_threshold(0, output.maximum());
         let mut wal_group = OpenWalGroup::new(&state);
 
         state.store.borrow().sample_time();
@@ -650,9 +650,7 @@ pub(super) async fn handle_client(
                 }
                 let unsent = flush_ready(&mut stream, &mut output, timeouts.write, &state).await?;
 
-                // A client that is not reading is retried at doubling sizes, so the unsent
-                // tail is not moved once per command on its way to the limit.
-                flush_at = PIPELINE_FLUSH_BYTES.max(unsent.saturating_mul(2));
+                flush_at = flush_threshold(unsent, output.maximum());
             }
 
             match if session.is_multi() || session.in_pubsub {
@@ -1367,6 +1365,17 @@ pub(super) async fn wrap_stream(stream: TcpStream, state: &ShardState) -> io::Re
 
 /// Replies a pipeline holds before it sends what the socket accepts.
 const PIPELINE_FLUSH_BYTES: usize = 64 * 1024;
+
+/// Output size at which a pipeline next sends what the socket takes. A client that is not
+/// reading is retried at doubling sizes, so the unsent tail is not moved once per command
+/// on its way to the limit. The size stays at or below half the limit: replies are only
+/// checked between commands, so a higher one let a reader that was keeping up overrun the
+/// limit with the replies queued before the next send, which dropped them and cut it off.
+pub(super) fn flush_threshold(unsent: usize, maximum: usize) -> usize {
+    PIPELINE_FLUSH_BYTES
+        .max(unsent.saturating_mul(2))
+        .min(maximum / 2)
+}
 
 /// Answers a frame that cannot be parsed, ending the connection. The batch's group is
 /// committed first: a client that does not read would otherwise keep it open, and every
