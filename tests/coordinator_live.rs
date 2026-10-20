@@ -194,6 +194,14 @@ impl Group {
         )
     }
 
+    /// `INFO` of the coordinator that answers as the leader.
+    fn leader_info(&self) -> Option<String> {
+        self.coordinators.iter().find_map(|coordinator| {
+            call_with_secret(&coordinator.to_string(), &["INFO"])
+                .filter(|info| info.contains("is_leader:1\r\n"))
+        })
+    }
+
     /// The primary coordinator `index` names, as an index into the data nodes.
     fn primary_by(&self, index: usize) -> Option<usize> {
         self.primary_among(index, &self.resp)
@@ -374,6 +382,12 @@ fn coordinators_fail_over_a_dead_primary_and_bring_it_back_as_a_replica() {
     });
     assert_eq!(group.primary_by(1), Some(promoted));
     assert_eq!(group.primary_by(2), Some(promoted));
+    // The leader counts the failover; the old primary no longer answers.
+    let info = group.leader_info().unwrap();
+
+    assert!(info.contains("failovers_total:1\r\n"), "{info}");
+    assert!(!info.contains("last_failover_unix_ms:0\r\n"), "{info}");
+    assert!(info.contains(",members_answering=2/3,state=ok,"), "{info}");
 
     // The old primary returns as a writer and is made a replica of the new one.
     nodes[0] = group.node(dir.path(), 0, None);
@@ -586,6 +600,13 @@ fn a_replica_missing_a_committed_record_is_promoted_only_when_forced() {
     for index in 0..3 {
         assert_eq!(group.primary_by(index), Some(0));
     }
+    let info = group.leader_info().unwrap();
+
+    assert!(info.contains("failovers_total:0\r\n"), "{info}");
+    assert!(
+        info.contains(",members_answering=1/3,state=waiting,"),
+        "{info}"
+    );
     assert!(
         call(&returned, &["SET", "x", "1"])
             .unwrap()
@@ -617,6 +638,10 @@ fn a_replica_missing_a_committed_record_is_promoted_only_when_forced() {
         call(&returned, &["SET", "after", "1"]).as_deref() == Some("OK")
     });
     assert_eq!(call(&returned, &["GET", "kept"]).as_deref(), Some("(nil)"));
+    let info = group.leader_info().unwrap();
+
+    assert!(info.contains("failovers_total:1\r\n"), "{info}");
+    assert!(info.contains(",state=ok,"), "{info}");
 }
 
 /// The committed sequences are in Raft: after the primary and the only replica holding a
