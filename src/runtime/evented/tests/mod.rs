@@ -490,6 +490,7 @@ fn tag_on_shard(shard: usize) -> String {
     panic!("no hash tag landed on shard {shard}");
 }
 
+mod change_failover;
 mod cluster;
 mod config_set;
 mod connection;

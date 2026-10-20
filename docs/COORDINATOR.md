@@ -79,6 +79,14 @@ learns it was replaced. Two settings on the data nodes bound that window:
 Writes the old primary took in that window are lost when it rejoins. Use `min-replicas-to-write 1` (or
 higher) in every group a coordinator manages.
 
+A `CHANGES SUBSCRIBE` consumer may already have seen records a failover takes back. Its cursor
+carries the generation (the replication epoch) of the log it read, so when it resumes on the new
+primary with a cursor past the fork, the stream first sends `["rewound", cursor]` with the fork in
+the new generation: undo or reload what was applied after it. A consumer that subscribes with
+`COMMITTED` gets only records a `CLIENT DURABILITY` reply committed, which a coordinator's failover
+keeps (unless it was forced or `unclean_failover` is set), so it never sees one taken back; it sees nothing until durable writes commit. See
+[CONFIGURATION.md](CONFIGURATION.md), *Change stream*.
+
 A lost `LEASE` or `SEMAPHORE` grant does not come back as the same token: tokens carry the cluster
 map's version, which grows with every failover and every committed move, so the new primary's tokens
 are larger than any the old one handed out. A resource that keeps the largest token it has seen
