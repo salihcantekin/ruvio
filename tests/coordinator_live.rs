@@ -41,18 +41,31 @@ struct Group {
     resp: Vec<SocketAddr>,
     replication: Vec<SocketAddr>,
     coordinators: Vec<SocketAddr>,
+    /// Shards per data node; shard i of a node listens on its ports plus i.
+    shards: u16,
     _ports: (test_ports::PortBlock, test_ports::PortBlock),
 }
 
 impl Group {
     fn new() -> Self {
+        Self::with_shards(1)
+    }
+
+    fn with_shards(shards: u16) -> Self {
         let data = test_ports::reserve();
         let replication = test_ports::reserve();
 
         Self {
-            resp: (0..3).map(|index| data.address_at(index)).collect(),
-            replication: (0..3).map(|index| replication.address_at(index)).collect(),
-            coordinators: (3..6).map(|index| data.address_at(index)).collect(),
+            resp: (0..3)
+                .map(|index| data.address_at(index * shards))
+                .collect(),
+            replication: (0..3)
+                .map(|index| replication.address_at(index * shards))
+                .collect(),
+            coordinators: (0..3)
+                .map(|index| data.address_at(3 * shards + index))
+                .collect(),
+            shards,
             _ports: (data, replication),
         }
     }
@@ -90,6 +103,7 @@ impl Group {
                 "RUVIO_REPLICATION_LISTEN",
                 self.replication[index].to_string(),
             )
+            .env("RUVIO_SHARDS", self.shards.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         match follow {
@@ -182,13 +196,19 @@ impl Group {
 
     /// The primary coordinator `index` names, as an index into the data nodes.
     fn primary_by(&self, index: usize) -> Option<usize> {
+        self.primary_among(index, &self.resp)
+    }
+
+    /// The primary coordinator `index` names, as an index into `addresses`: the data nodes'
+    /// addresses as the coordinators were given them.
+    fn primary_among(&self, index: usize, addresses: &[SocketAddr]) -> Option<usize> {
         let reply = call_with_secret(
             &self.coordinators[index].to_string(),
             &["SENTINEL", "get-master-addr-by-name", "main"],
         )?;
         let port: u16 = reply.split_whitespace().nth(1)?.parse().ok()?;
 
-        self.resp.iter().position(|address| address.port() == port)
+        addresses.iter().position(|address| address.port() == port)
     }
 }
 
@@ -1621,4 +1641,65 @@ fn a_stuck_member_of_one_group_does_not_delay_a_failover_in_another() {
         took < Duration::from_secs(4),
         "group b failed over {took:?} after its primary died"
     );
+}
+
+/// A primary one of whose shards the coordinators cannot reach is not heard from: they fail it
+/// over as if it were down, and do not promote a replica with a shard they cannot reach.
+#[test]
+fn a_primary_with_one_shard_cut_off_is_failed_over() {
+    primary_with_one_shard_cut_off(false);
+}
+
+/// With the lease, the coordinators stop renewing such a primary, so its lease ends and the
+/// failover goes ahead.
+#[test]
+fn with_the_lease_a_primary_with_one_shard_cut_off_is_failed_over() {
+    primary_with_one_shard_cut_off(true);
+}
+
+fn primary_with_one_shard_cut_off(lease: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let group = Group::with_shards(2);
+    let ports = test_ports::reserve();
+    let shard =
+        |address: SocketAddr, offset: u16| SocketAddr::new(address.ip(), address.port() + offset);
+    // The coordinators reach node 0's two shards through these.
+    let proxies = [
+        Proxy::start(ports.address_at(0), group.resp[0]),
+        Proxy::start(ports.address_at(1), shard(group.resp[0], 1)),
+    ];
+    let env = [("RUVIO_PRIMARY_LEASE", if lease { "yes" } else { "no" })];
+    let extra = if lease {
+        "primary_lease_ms = 700\nprimary_lease_drift_percent = 5"
+    } else {
+        ""
+    };
+    let _nodes = [
+        group.node_with(dir.path(), 0, None, &env),
+        group.node_with(dir.path(), 1, Some(0), &env),
+        group.node_with(dir.path(), 2, Some(0), &env),
+    ];
+    let mut addresses = group.resp.clone();
+
+    addresses[0] = ports.address_at(0);
+    let _coordinators: Vec<Process> = (0..3)
+        .map(|index| group.coordinator_with(dir.path(), index, extra, &addresses, None))
+        .collect();
+
+    wait_until("the coordinators to agree on node 0", || {
+        group.primary_among(0, &addresses) == Some(0)
+    });
+    // Shard 0 still answers through its proxy; shard 1 no longer does.
+    proxies[1].cut();
+    wait_until("a replica to be promoted", || {
+        matches!(group.primary_among(0, &addresses), Some(1 | 2))
+    });
+    let promoted = group.primary_among(0, &addresses).unwrap();
+
+    wait_until("the promoted replica to take writes on both shards", || {
+        (0..2).all(|offset| {
+            call(&shard(group.resp[promoted], offset).to_string(), &["ROLE"])
+                .is_some_and(|role| role.starts_with("master"))
+        })
+    });
 }
