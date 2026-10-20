@@ -164,7 +164,7 @@ impl Group {
     }
 
     /// A coordinator with `extra` settings that dials the data nodes at `addresses`, its log
-    /// going to `log` when given.
+    /// going to `log` when given. `down_after_ms` is 1000 unless `extra` sets it.
     fn coordinator_with(
         &self,
         dir: &Path,
@@ -184,6 +184,11 @@ impl Group {
             None => Stdio::null(),
         };
         let config = dir.join(format!("coordinator{index}.toml"));
+        let down_after = if extra.contains("down_after_ms") {
+            ""
+        } else {
+            "down_after_ms = 1000\n"
+        };
         let peers = self
             .coordinators
             .iter()
@@ -205,7 +210,7 @@ impl Group {
             &config,
             format!(
                 "id = {}\nlisten = \"{}\"\ndata_dir = \"{}\"\npeers = [{peers}]\nsecret = \"{SECRET}\"\n\
-                 ping_interval_ms = 200\ndown_after_ms = 1000\n{extra}\n\n[[groups]]\nname = \"main\"\n\
+                 ping_interval_ms = 200\n{down_after}{extra}\n\n[[groups]]\nname = \"main\"\n\
                  members = [\n{members}\n]\n",
                 index + 1,
                 self.coordinators[index],
@@ -1762,13 +1767,17 @@ fn a_stalled_member_does_not_hold_up_the_primary_lease() {
     ];
     // Member 2's address: connections are queued by the kernel and never read.
     let _stalled = std::net::TcpListener::bind(group.resp[2]).unwrap();
-    // ping 200 ms, down_after 1000 ms; a look at the stalled member takes a full second.
+    // A look at the stalled member takes a full second (the coordinators' call timeout), so
+    // pings of the group go out about once a second. Renewals come every 200 ms on their own:
+    // with a 1100 ms lease the gate closes 800 ms after a renewal, so a renewal that waited for
+    // the pings would close it for about 200 ms each round, while renewals on time leave 600 ms
+    // to spare for a loaded machine.
     let _coordinators: Vec<Process> = (0..3)
         .map(|index| {
             group.coordinator_with(
                 dir.path(),
                 index,
-                "primary_lease_ms = 700\nprimary_lease_drift_percent = 5",
+                "primary_lease_ms = 1100\nprimary_lease_drift_percent = 5\ndown_after_ms = 1500",
                 &group.resp,
                 None,
             )
