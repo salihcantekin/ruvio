@@ -247,3 +247,72 @@ fn a_committed_change_stream_needs_replication() {
     stop.request();
     join_within(server, PATIENCE).unwrap();
 }
+
+/// A primary told to follow another one ends its change streams before its log takes the new
+/// primary's records: the subscriber resumes there.
+#[test]
+fn a_demoted_primary_ends_its_change_streams() {
+    use crate::config::ReplicationRole::Primary;
+
+    let demoted_dir = tempfile::tempdir().unwrap();
+    let other_dir = tempfile::tempdir().unwrap();
+    let ports = crate::test_ports::reserve();
+    let (demoted_listen, other_listen) = (ports.address_at(0), ports.address_at(1));
+
+    let (demoted_address, demoted_stop, demoted) = serve_with(|config| {
+        config.persistence = persistence(demoted_dir.path());
+        config.replication = replication(Primary, Some(demoted_listen), None);
+    });
+    let (_, other_stop, other) = serve_with(|config| {
+        config.persistence = persistence(other_dir.path());
+        config.replication = replication(Primary, Some(other_listen), None);
+    });
+
+    let mut feed = Client::connect(demoted_address);
+
+    assert!(matches!(
+        feed.call(&[b"CHANGES", b"SUBSCRIBE"]),
+        Value::Bulk(Some(_))
+    ));
+    assert_eq!(
+        command(demoted_address, &[b"SET", b"before", b"1"]),
+        b"+OK\r\n"
+    );
+    let event = next_event(&mut feed);
+
+    assert_eq!(text(&event[0]), "change", "{event:?}");
+    assert_eq!(text(&event[4]), "before", "{event:?}");
+
+    let port = other_listen.port().to_string();
+
+    assert_eq!(
+        command(
+            demoted_address,
+            &[b"REPLICAOF", b"127.0.0.1", port.as_bytes()]
+        ),
+        b"+OK\r\n"
+    );
+    let pushes = read_until_closed(&mut feed);
+    let last = pushes.last().expect("the stream ended without a notice");
+
+    assert_eq!(
+        last,
+        &vec![
+            Value::Bulk(Some(b"resync".to_vec())),
+            Value::Bulk(Some(
+                b"the shard follows another primary; resume on it".to_vec()
+            )),
+        ]
+    );
+    assert!(
+        pushes[..pushes.len() - 1]
+            .iter()
+            .all(|push| text(&push[0]) == "cursor"),
+        "{pushes:?}"
+    );
+
+    demoted_stop.request();
+    join_within(demoted, PATIENCE).unwrap();
+    other_stop.request();
+    join_within(other, PATIENCE).unwrap();
+}

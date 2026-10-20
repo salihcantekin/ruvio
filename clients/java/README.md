@@ -189,8 +189,9 @@ pipelined commands; use `{hashtag}` keys to keep related keys in one slot.
 * **ASK**: `ASKING` and the command are sent to the named node in one write (an unknown node is opened first), the
   `+OK` is dropped and the command's reply is returned; the slot table is not changed, so the next command for the
   slot still goes to its owner. ASK and MOVED share the 3-redirect budget.
-* **TRYAGAIN**: the command is sent again, routed by the current slot table, at most 3 times after waits of 5, 10
-  and 20 ms (scheduled on the background thread, never a sleep); the error is returned after the 3rd retry.
+* **TRYAGAIN**: the command is sent again, routed by the current slot table, at most 7 times after waits of 5, 10,
+  20, 40, 80, 160 and 320 ms (635 ms in all; scheduled on the background thread, never a sleep); the error is
+  returned after the 7th retry.
 * **Connection loss**: only commands in flight on that node fail (`RuvioConnectionException`); nothing is
   replayed, the other nodes keep working, and the node's connection reopens with its next command.
 * **Pipelines** (`pipeline()`): commands are routed when queued and grouped per node; `flush()` sends one write
@@ -298,7 +299,7 @@ RuvioOptions options = RuvioOptions.builder()
   when opening it fails with an I/O error, the plain seed order applies. The command that hit the drop still fails.
 * **On `READONLY`** (the error text is `READONLY` alone or followed by a space): the client runs up to 8 rounds
   (waits of 100 ms doubling to 2 s, on a background thread, never on a reader thread), avoiding the address that
-  answered, moves the shared connection to the primary it finds, and sends the refused command once more. The second
+  answered while it still says `master` (once it says it is a replica, a later round takes it when it is promoted), moves the shared connection to the primary it finds, and sends the refused command once more. The second
   reply, a second `READONLY` included, is the result; there is never a third send. With no primary the original
   `READONLY` error is returned and the connection stays. Other errors (`LOADING`, `MASTERDOWN`, `NOREPLICAS`) and I/O
   errors are never retried.

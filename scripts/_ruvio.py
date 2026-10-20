@@ -154,6 +154,35 @@ def wait_replicas(port: int, replicas: int, host: str = "127.0.0.1", timeout: fl
         time.sleep(0.05)
 
 
+def wait_primary(
+    port: int, master: str, primary: str, host: str = "127.0.0.1", timeout: float = 20.0, pid: int | None = None
+) -> None:
+    """Waits until the coordinator on `host:port` names `primary` (`host:port`) for `master` in
+    `SENTINEL get-master-addr-by-name`. With `pid`, fails as soon as that process exits."""
+    deadline = time.monotonic() + timeout
+    last = "no answer"
+    while True:
+        if not _alive(None, pid):
+            raise RuntimeError(f"the coordinator for {host}:{port} exited before it named a primary")
+        try:
+            with socket.create_connection((host, port), timeout=2) as client:
+                prefix, value = request(
+                    client.makefile("rwb"), b"SENTINEL", b"get-master-addr-by-name", master.encode()
+                )
+                if prefix == b"*" and value and len(value) == 2:
+                    named = f"{value[0][1].decode()}:{value[1][1].decode()}"
+                    if named == primary:
+                        return
+                    last = f"names {named}"
+                else:
+                    last = f"answered {prefix!r} {value!r}"
+        except (OSError, AssertionError, ValueError, TypeError, AttributeError) as error:
+            last = f"{type(error).__name__}: {error}"
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"the coordinator {host}:{port} did not name {primary} within {timeout} s ({last})")
+        time.sleep(0.05)
+
+
 def _serves(stream, data_dir: str) -> bool:
     prefix, value = request(stream, b"CONFIG", b"GET", b"dir")
     if prefix != b"*" or not value or len(value) < 2 or value[1][1] is None:
@@ -177,7 +206,23 @@ def main(argv: list[str]) -> int:
     replicas.add_argument("--port", type=int, required=True)
     replicas.add_argument("--timeout", type=float, default=20.0)
     replicas.add_argument("--replicas", type=int, default=1)
+    primary = commands.add_parser("wait-primary")
+    primary.add_argument("--host", default="127.0.0.1")
+    primary.add_argument("--port", type=int, required=True)
+    primary.add_argument("--timeout", type=float, default=20.0)
+    primary.add_argument("--pid", type=int, help="fail at once when this process exits")
+    primary.add_argument("--master", required=True, help="the group name")
+    primary.add_argument("--primary", required=True, help="the host:port the coordinator must name")
     options = parser.parse_args(argv)
+    if options.command == "wait-primary":
+        try:
+            wait_primary(
+                options.port, options.master, options.primary, host=options.host, timeout=options.timeout, pid=options.pid
+            )
+        except (RuntimeError, TimeoutError) as error:
+            print(error, file=sys.stderr)
+            return 1
+        return 0
     if options.command == "wait-replicas":
         try:
             wait_replicas(options.port, options.replicas, host=options.host, timeout=options.timeout)

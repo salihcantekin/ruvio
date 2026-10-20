@@ -287,9 +287,9 @@ Behaviour worth knowing:
   that is not in the table gets a connection), and its reply is returned. The slot table is not
   changed, so the next command for that slot still goes to the table's owner. `ASK` and `MOVED`
   share the budget of 3 redirects per command; an error reply to `ASKING` is the result.
-- **`-TRYAGAIN`**: the command is sent again, routed by the current table, at most **3 times**,
-  after 5 ms, 10 ms and 20 ms (`asyncio.sleep` in the asyncio client); a fourth `TRYAGAIN` is
-  raised. Redirects during the retries are followed with their own budget.
+- **`-TRYAGAIN`**: the command is sent again, routed by the current table, at most **7 times**,
+  after 5, 10, 20, 40, 80, 160 and 320 ms (635 ms in all; `asyncio.sleep` in the asyncio client); an
+  eighth `TRYAGAIN` is raised. Redirects during the retries are followed with their own budget.
 - **No replay after transport failures.** A dropped node socket fails the command that saw it
   (`ConnectionError`), is closed, and is reopened by the next command for that node. Other nodes
   are not affected. A pipeline/split call that touched several nodes still reads every healthy
@@ -406,7 +406,9 @@ client = Ruvio(seeds=["10.0.0.9:26379"], sentinel_master="main")             # a
   (`SENTINEL get-master-addr-by-name`, confirmed with `ROLE`) and raises `ProtocolError` when none names a primary.
 - **`READONLY`.** A command answered `READONLY` (the text is `READONLY` alone or followed by a space) makes the
   client search for the primary, up to 8 rounds with waits of 100 ms doubling to 2 s (7.1 s in all; the asyncio
-  client waits without blocking other tasks), move to it and send the refused command once more. The retry's reply
+  client waits without blocking other tasks), move to it and send the refused command once more. The node that
+  answered is skipped only while it still says `master`; once it says it is a replica, a later round takes it when
+  it is promoted. The retry's reply
   goes to the caller, a second `READONLY` included; there is never a third send. When no primary is found the
   `READONLY` error is raised and the connection stays where it was.
 - **Not resent.** A command inside a transaction opened with `multi()` (the connection still moves, so the next
