@@ -84,6 +84,7 @@ async fn serve(
         raft: raft.clone(),
         machine: machine.clone(),
         mover: Arc::default(),
+        leadership: Arc::new(raft::Leadership::new(config.id, config.ping_interval)),
     };
     let leader = tokio::spawn(monitor::lead(
         Arc::clone(&config),

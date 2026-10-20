@@ -480,7 +480,10 @@ pub async fn lead(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        if raft.current_leader().await != Some(config.id) {
+        // A leader cut off from the other coordinators keeps `current_leader()` (openraft
+        // does not step it down), so a majority confirms it before anything is done on the
+        // data nodes; until then it only learns, like a follower.
+        if !moves.leadership.confirm(&raft).await {
             // Every coordinator learns what was committed, so a new leader knows it.
             let primaries = machine.primaries();
 
