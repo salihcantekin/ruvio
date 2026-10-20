@@ -190,23 +190,22 @@ fn serve_on_ephemeral() -> (SocketAddr, ShutdownToken, thread::JoinHandle<()>) {
     serve_with(|_| {})
 }
 
+/// Two listeners on consecutive ports from a reserved block (see `crate::test_ports`): a port
+/// next to one the OS picked for `127.0.0.1:0` is in the ephemeral range, where parallel tests'
+/// outbound sockets can take it.
 fn bind_consecutive_pair() -> (std::net::TcpListener, std::net::TcpListener, u16) {
-    for _ in 0..32 {
-        let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = first.local_addr().unwrap();
-        let Some(next) = address.port().checked_add(1) else {
-            continue;
-        };
+    let ports = crate::test_ports::reserve();
+    // Bound under the spawn lock, so no child forked meanwhile keeps a copy of them.
+    let spawning = crate::test_ports::spawn_lock();
+    let first = std::net::TcpListener::bind(ports.address_at(0)).unwrap();
+    let second = std::net::TcpListener::bind(ports.address_at(1)).unwrap();
 
-        if let Ok(second) = std::net::TcpListener::bind((address.ip(), next)) {
-            first.set_nonblocking(true).unwrap();
-            second.set_nonblocking(true).unwrap();
+    drop(spawning);
 
-            return (first, second, address.port());
-        }
-    }
+    first.set_nonblocking(true).unwrap();
+    second.set_nonblocking(true).unwrap();
 
-    panic!("could not bind consecutive ports");
+    (first, second, ports.port())
 }
 
 fn serve_two_shards() -> (
