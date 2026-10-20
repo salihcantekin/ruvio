@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::args::{Args, Num};
-use crate::cluster::{throw_error, ClusterRouter, Connection, Discovery};
+use crate::cluster::{ClusterRouter, Connection, Discovery, throw_error};
 
 use crate::error::Error;
 use crate::value::RespValue;
@@ -2338,7 +2338,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use super::{read_ping, Client, ClientOptions, Durability, Error, RespValue};
+    use super::{Client, ClientOptions, Durability, Error, RespValue, read_ping};
 
     fn bound(stream: TcpStream) -> TcpStream {
         stream
