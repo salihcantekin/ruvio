@@ -6,13 +6,14 @@ coordinators, a TCP proxy between the coordinators and each data node):
   minority    two of three coordinators are down: no failover may happen
   restart     every coordinator restarts; the agreed primary is kept
   loss        a writer runs while the primary is killed: acknowledged writes lost
+  durable     the same with CLIENT DURABILITY REPLICAS 1: no acknowledged write is lost
   client      redis-py's Sentinel client follows the failover (skipped without redis-py)"""
 import os, signal, socket, subprocess, sys, threading, time, shutil
 
 # Usage: scripts/coordinator_faults.py target/debug/ruvio [scenario ...]
 # Every scenario takes a few seconds; all of them well under a minute.
 RUVIO = sys.argv[1]
-SCENARIOS = sys.argv[2:] or ["partition", "leader", "minority", "restart", "loss", "client"]
+SCENARIOS = sys.argv[2:] or ["partition", "leader", "minority", "restart", "loss", "durable", "client"]
 WORK = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"ruvio-coordinator-faults-{os.getpid()}")
 NODES = [(18300, 38300), (18320, 38320), (18340, 38340)]
 PROXY = [18500, 18520, 18540]           # coordinators reach node i through PROXY[i]
@@ -168,16 +169,25 @@ def run(SCEN):
                     return False
             ok = wait(write, 20)
             check(f"redis-py writes to the new primary {time.time()-t0:.2f}s after the kill", ok)
-        elif SCEN == "loss":
+        elif SCEN in ("loss", "durable"):
             acked, stop_flag = [], threading.Event()
             def writer():
                 s = socket.create_connection(("127.0.0.1", NODES[0][0])); f = s.makefile("rb"); i = 0
+                if SCEN == "durable":
+                    s.sendall(b"*4\r\n$6\r\nCLIENT\r\n$10\r\nDURABILITY\r\n$8\r\nREPLICAS\r\n$1\r\n1\r\n")
+                    assert f.readline().startswith(b"+OK")
+                # A durable reply waits for a replica's fsync, so that writer sends batches of 32.
+                batch = 32 if SCEN == "durable" else 1
                 while not stop_flag.is_set():
-                    k = f"w{i}".encode(); s.sendall(b"*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$1\r\nv\r\n" % (len(k), k))
-                    line = f.readline()
-                    if not line: break
-                    if line.startswith(b"+OK"): acked.append(k.decode())
-                    i += 1
+                    ks = [f"w{i + j}".encode() for j in range(batch)]
+                    try: s.sendall(b"".join(b"*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$1\r\nv\r\n" % (len(k), k) for k in ks))
+                    except OSError: return  # the primary was killed
+                    for k in ks:
+                        try: line = f.readline()
+                        except OSError: return
+                        if not line: return
+                        if line.startswith(b"+OK"): acked.append(k.decode())
+                    i += batch
             th = threading.Thread(target=writer, daemon=True); th.start()
             time.sleep(1.0)
             nodes[0].send_signal(signal.SIGKILL); nodes[0].wait(); stop_flag.set(); th.join(timeout=5)
@@ -186,10 +196,17 @@ def run(SCEN):
             keys = subprocess.run(["redis-cli", "-p", str(NODES[new][0])], input="".join(f"EXISTS {k}\n" for k in acked), capture_output=True, text=True).stdout.split()
             lost = keys.count("0")
             print(f"acknowledged writes {len(acked)}, missing on the new primary {lost}")
-            check("lost writes are only the last ones before the crash", lost == 0 or all(k == "0" for k in keys[-lost:]))
+            if SCEN == "durable":
+                check(f"no write acknowledged with CLIENT DURABILITY REPLICAS 1 is lost ({len(acked)} acknowledged)", len(acked) > 0 and lost == 0)
+            else:
+                check("lost writes are only the last ones before the crash", lost == 0 or all(k == "0" for k in keys[-lost:]))
     finally:
         stop(list(coords.values()) + nodes)
-        for p in proxies: p.server.close()
+        for p in proxies:
+            # shutdown wakes the accept thread; close alone leaves the port listening.
+            try: p.server.shutdown(socket.SHUT_RDWR)
+            except OSError: pass
+            p.server.close()
 
 
 for scenario in SCENARIOS:
