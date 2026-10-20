@@ -41,7 +41,7 @@ fn events_arrive_in_write_order_with_their_types() {
 
     assert_eq!(
         subscriber.call(&["CHANGES", "SUBSCRIBE", "FROM", "NOW"]),
-        "0:0"
+        "0:0:0"
     );
 
     writer.call(&["SET", "a", "1"]);
@@ -73,7 +73,7 @@ fn events_arrive_in_write_order_with_their_types() {
 
     let cursors: Vec<u64> = events
         .iter()
-        .map(|e| e[1].split(':').nth(1).unwrap().parse().unwrap())
+        .map(|e| e[1].rsplit(':').next().unwrap().parse().unwrap())
         .collect();
 
     assert!(
