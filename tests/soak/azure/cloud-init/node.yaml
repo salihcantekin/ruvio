@@ -1,0 +1,98 @@
+#cloud-config
+# A data node of a soak run: OS settings and the systemd units only. The binary and every
+# config file come from the controller (tests/soak/ruvio_soak/backends.py, SshBackend.deploy).
+package_update: true
+packages:
+  - chrony
+  - nftables
+  - iproute2
+  - sysstat
+  - python3
+  - jq
+
+write_files:
+  - path: /etc/sysctl.d/90-ruvio.conf
+    content: |
+      vm.swappiness = 1
+      vm.overcommit_memory = 1
+      net.core.somaxconn = 4096
+      net.ipv4.tcp_max_syn_backlog = 4096
+  - path: /etc/systemd/system/disable-thp.service
+    content: |
+      [Unit]
+      Description=Transparent huge pages off
+      Before=ruvio@g1.service ruvio@g2.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/enabled; echo never > /sys/kernel/mm/transparent_hugepage/defrag'
+
+      [Install]
+      WantedBy=multi-user.target
+  # One data node per group: ruvio@g1, ruvio@g2. Restart=no: the controller decides when a
+  # killed process comes back, and an exit it did not cause is reported as a failure.
+  - path: /etc/systemd/system/ruvio@.service
+    content: |
+      [Unit]
+      Description=Ruvio data node %i (soak)
+      After=network-online.target var-lib-ruvio.mount disable-thp.service
+      Wants=network-online.target
+      RequiresMountsFor=/var/lib/ruvio
+
+      [Service]
+      User=ruvio
+      Group=ruvio
+      WorkingDirectory=/var/lib/ruvio
+      EnvironmentFile=/etc/ruvio/%i.env
+      ExecStart=/usr/local/bin/ruvio
+      Restart=no
+      LimitNOFILE=65535
+  - path: /etc/systemd/system/ruvio-coordinator.service
+    content: |
+      [Unit]
+      Description=Ruvio coordinator (soak)
+      After=network-online.target var-lib-ruvio.mount
+      Wants=network-online.target
+      RequiresMountsFor=/var/lib/ruvio
+
+      [Service]
+      User=ruvio
+      Group=ruvio
+      WorkingDirectory=/var/lib/ruvio
+      ExecStart=/usr/local/bin/ruvio coordinator --config /etc/ruvio/coordinator.toml
+      Restart=no
+      LimitNOFILE=65535
+  # The managed data disk (LUN 0): by its Azure link when the image has the udev rules,
+  # otherwise the only whole disk without partitions that is not the local temporary disk.
+  - path: /usr/local/sbin/ruvio-data-disk
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      set -eu
+      disk=""
+      for link in /dev/disk/azure/data/by-lun/0 /dev/disk/azure/scsi1/lun0; do
+        if [ -e "$link" ]; then disk=$(readlink -f "$link"); break; fi
+      done
+      if [ -z "$disk" ]; then
+        disk=$(lsblk -dpno NAME,TYPE,MODEL | awk '$2 == "disk" && $0 !~ /Direct Disk/ {print $1}' | while read -r d; do
+          [ "$(lsblk -no NAME "$d" | wc -l)" = 1 ] && ! findmnt -S "$d" >/dev/null && echo "$d"
+        done | head -n 1)
+      fi
+      [ -n "$disk" ] || { echo "no data disk found" >&2; exit 1; }
+      blkid "$disk" >/dev/null 2>&1 || mkfs.ext4 -q -L ruvio-data "$disk"
+      mkdir -p /var/lib/ruvio
+      grep -q ruvio-data /etc/fstab || echo "LABEL=ruvio-data /var/lib/ruvio ext4 defaults,noatime,nofail 0 2" >> /etc/fstab
+      mount -a
+
+runcmd:
+  - useradd --system --home-dir /var/lib/ruvio --shell /usr/sbin/nologin ruvio || true
+  - /usr/local/sbin/ruvio-data-disk
+  - chown ruvio:ruvio /var/lib/ruvio
+  - install -d -m 0750 -o root -g ruvio /etc/ruvio
+  - sysctl --system
+  # netem lives in the extra modules on Azure kernels.
+  - apt-get install -y "linux-modules-extra-$(uname -r)" || true
+  - modprobe sch_netem || true
+  - systemctl daemon-reload
+  - systemctl enable --now disable-thp.service chrony nftables
+  - touch /var/lib/cloud/ruvio-ready
