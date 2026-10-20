@@ -4,6 +4,7 @@ Notable changes to the Node.js client `ruvio-client` on npm. New entries go unde
 
 ## Unreleased
 
+- **Behavior change:** `StreamEntry.fields` is now an array of `[name, value]` pairs in stored order instead of an object, so a field name written twice is no longer collapsed to its last value and numeric names such as `"2"` and `"1"` keep their order; use `Object.fromEntries(entry.fields)` for the old shape. Applies to `xrange`, `xrevrange`, `xread`, `xreadgroup`, `xclaim` and `xautoclaim`.
 - **Behavior change:** `commandTimeoutMs` is now 30000 by default (was 0, no limit); `0` turns it off. A blocking command gets its own wait on top (`BLPOP k 5` may take 5 s plus the timeout; a wait of 0, or one the client cannot parse, has no deadline; a pipeline takes its largest wait), and a Pub/Sub or `MONITOR` connection never times out while it waits for messages (issue #48 follow-up).
 - The command timeout adds no work per command: only frames whose command may block (`BLPOP`, `XREAD`, `WAIT` and the like) are scanned for their wait; one interval timer per connection does the rest, as before (issue #48 follow-up).
 - `moveSlots(first, last, shard)` and `moveSlotsStatus()` for `RUVIO MOVESLOTS`, which moves a slot range to another shard of the same server.

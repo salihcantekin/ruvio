@@ -52,6 +52,18 @@ def _pairs(r: Any) -> Dict[Any, Any]:
     return dict(zip(it, it))
 
 
+def _pair_list(r: Any) -> List[Tuple[Any, Any]]:
+    # Keeps order and repeated names, which a dict would drop.
+    if r is None:
+        return []
+    if type(r) is dict:
+        return list(r.items())
+    if r and type(r[0]) is list:  # RESP3 nested pairs
+        return [(k, v) for k, v in r]
+    it = iter(r)
+    return list(zip(it, it))
+
+
 def _pairs_text_keys(r: Any) -> Dict[str, Any]:
     if type(r) is dict:
         return {_s(k): v for k, v in r.items()}
@@ -124,7 +136,7 @@ def _set_reply(r: Any) -> bool:
 def _entries(r: Any) -> List[StreamEntry]:
     if r is None:
         return []
-    return [StreamEntry(_s(e[0]), _pairs(e[1]) if e[1] is not None else {}) for e in r]
+    return [StreamEntry(_s(e[0]), _pair_list(e[1])) for e in r]
 
 
 def _xread(r: Any) -> Optional[List[Tuple[Any, List[StreamEntry]]]]:
@@ -163,7 +175,7 @@ def _xinfo_stream(r: Any) -> Dict[str, Any]:
     for k in ("first-entry", "last-entry"):
         e = info.get(k)
         if type(e) is list and len(e) == 2:
-            info[k] = StreamEntry(_s(e[0]), _pairs(e[1]))
+            info[k] = StreamEntry(_s(e[0]), _pair_list(e[1]))
     return info
 
 

@@ -215,10 +215,10 @@ def test_stream_reads_and_reply_shapes():
     r = Rec(reply=None)
     assert r.xread({"s": "0"}) is None
     r.reply = [["s", [["1-0", ["f", "v"]], ["2-0", None]]]]  # RESP2: list of [stream, entries]
-    assert r.xread({"s": "0"}, count=2, block=10) == [("s", [StreamEntry("1-0", {"f": "v"}), StreamEntry("2-0", {})])]
+    assert r.xread({"s": "0"}, count=2, block=10) == [("s", [StreamEntry("1-0", [("f", "v")]), StreamEntry("2-0", [])])]
     assert r.args == ["XREAD", "COUNT", "2", "BLOCK", "10", "STREAMS", "s", "0"]
     r.reply = {"s": [["1-0", ["f", "v"]]]}  # RESP3: map of stream -> entries
-    assert r.xreadgroup("g", "c", {"s": ">"}, count=3, block=0, noack=True) == [("s", [StreamEntry("1-0", {"f": "v"})])]
+    assert r.xreadgroup("g", "c", {"s": ">"}, count=3, block=0, noack=True) == [("s", [StreamEntry("1-0", [("f", "v")])])]
     assert r.args == ["XREADGROUP", "GROUP", "g", "c", "COUNT", "3", "BLOCK", "0", "NOACK", "STREAMS", "s", ">"]
     r.xreadgroup("g", "c", {"s": ">"})
     assert r.args == ["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"]
@@ -229,10 +229,24 @@ def test_stream_reads_and_reply_shapes():
 def test_xinfo_stream_entries_become_stream_entries():
     r = Rec(reply=["length", 2, "first-entry", ["1-0", ["f", "v"]], "last-entry", None, "groups", 0])
     info = r.xinfo_stream("s")
-    assert info["first-entry"] == StreamEntry("1-0", {"f": "v"})
+    assert info["first-entry"] == StreamEntry("1-0", [("f", "v")])
     assert info["last-entry"] is None and info["length"] == 2
     r.reply = {"length": 0, "first-entry": None}
     assert r.xinfo_stream("s")["first-entry"] is None
+
+
+def test_stream_fields_keep_order_and_repeats():
+    r = Rec(reply=[["1-0", ["f", "1", "g", "", "f", "3"]]])
+    assert r.xrange("s", "-", "+")[0].fields == [("f", "1"), ("g", ""), ("f", "3")]
+    r.reply = [["s", [["1-0", ["f", "1", "f", "2"]]]]]
+    assert r.xread({"s": "0"})[0][1][0].fields == [("f", "1"), ("f", "2")]
+
+
+def test_hrandfield_with_values_keeps_repeated_fields():
+    r = Rec(reply=["a", "1", "a", "1"])
+    assert r.hrandfield("h", -2, withvalues=True) == [("a", "1"), ("a", "1")]
+    r.reply = [["a", "1"], ["a", "1"]]  # RESP3 nested pairs
+    assert r.hrandfield("h", -2, withvalues=True) == [("a", "1"), ("a", "1")]
 
 
 def test_bloom_info_accepts_both_reply_shapes():

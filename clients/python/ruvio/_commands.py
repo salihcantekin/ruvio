@@ -82,6 +82,7 @@ from ._converters import (  # noqa: F401
     _mpop,
     _number,
     _ok,
+    _pair_list,
     _pairs,
     _pairs_text_keys,
     _s,
@@ -3083,7 +3084,7 @@ Same as ``lmove(src, dst, "RIGHT", "LEFT")``.
         if count is None:
             return self._c(None, "HRANDFIELD", key)
         if withvalues:
-            return self._c(lambda r: list(_pairs(r).items()), "HRANDFIELD", key, count, "WITHVALUES")
+            return self._c(_pair_list, "HRANDFIELD", key, count, "WITHVALUES")
         return self._c(None, "HRANDFIELD", key, count)
 
     def _hfield_ttl(self, name: str, key: KeyT, amount: int, fields: Sequence[Arg], cond: List[str]) -> Any:
