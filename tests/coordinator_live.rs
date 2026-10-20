@@ -98,6 +98,21 @@ impl Group {
     }
 
     fn coordinator(&self, dir: &Path, index: usize) -> Process {
+        self.coordinator_logging(dir, index, None)
+    }
+
+    /// A coordinator whose log goes to `log` when given.
+    fn coordinator_logging(&self, dir: &Path, index: usize, log: Option<&Path>) -> Process {
+        let output = || match log {
+            Some(path) => Stdio::from(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .unwrap(),
+            ),
+            None => Stdio::null(),
+        };
         let config = dir.join(format!("coordinator{index}.toml"));
         let peers = self
             .coordinators
@@ -134,8 +149,8 @@ impl Group {
                 .arg("coordinator")
                 .arg("--config")
                 .arg(&config)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdout(output())
+                .stderr(output())
                 .spawn()
                 .unwrap(),
         )
@@ -340,7 +355,7 @@ fn coordinators_fail_over_a_dead_primary_and_bring_it_back_as_a_replica() {
 }
 
 #[test]
-fn one_coordinator_without_a_majority_does_not_fail_over() {
+fn a_leader_cut_off_from_the_other_coordinators_does_not_act() {
     let dir = tempfile::tempdir().unwrap();
     let group = Group::new();
     let mut nodes = [
@@ -348,26 +363,73 @@ fn one_coordinator_without_a_majority_does_not_fail_over() {
         group.node(dir.path(), 1, Some(0)),
         group.node(dir.path(), 2, Some(0)),
     ];
-    let mut coordinators: Vec<Process> = (0..3)
-        .map(|index| group.coordinator(dir.path(), index))
+    let mut coordinators: Vec<Option<Process>> = (0..3)
+        .map(|index| Some(group.coordinator(dir.path(), index)))
         .collect();
 
     wait_until("the coordinators to agree on the primary", || {
         (0..3).all(|index| group.primary_by(index) == Some(0))
     });
-    coordinators[1].kill();
-    coordinators[2].kill();
+    let is_leader = |index: usize| {
+        call_with_secret(&group.coordinators[index].to_string(), &["INFO"])
+            .is_some_and(|info| info.contains("is_leader:1"))
+    };
+    let mut leader = None;
+
+    wait_until("a leader", || {
+        leader = (0..3).find(|&index| is_leader(index));
+        leader.is_some()
+    });
+    let leader = leader.unwrap();
+
+    // The leader loses the other coordinators but still reaches every data node. openraft
+    // keeps it leading; only a confirmation by a majority stops it.
+    for (index, coordinator) in coordinators.iter_mut().enumerate() {
+        if index != leader {
+            coordinator.take().unwrap().kill();
+        }
+    }
+    // Longer than a confirmation is trusted (one ping interval).
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(is_leader(leader), "openraft stepped the lone leader down");
+
+    // As if the majority had promoted member 1 meanwhile: the stale leader's record still names
+    // member 0, and acting on it would point member 1 back at member 0.
+    let role = |node: usize| call(&group.resp[node].to_string(), &["ROLE"]).unwrap_or_default();
+
+    assert_eq!(
+        call(&group.resp[1].to_string(), &["REPLICAOF", "NO", "ONE"]).as_deref(),
+        Some("OK")
+    );
+    assert!(role(1).starts_with("master"));
     nodes[0].kill();
-    // Several times down_after_ms: a lone coordinator must not act.
-    std::thread::sleep(Duration::from_secs(4));
-    assert_eq!(group.primary_by(0), Some(0));
-    for node in 1..3 {
+    // Several times down_after_ms: the lone leader neither fails over nor reconciles.
+    let watched = Instant::now();
+
+    while watched.elapsed() < Duration::from_secs(4) {
+        assert_eq!(group.primary_by(leader), Some(0));
         assert!(
-            call(&group.resp[node].to_string(), &["SET", "x", "1"])
+            role(1).starts_with("master"),
+            "the cut-off leader pointed member 1 at its old record: {}",
+            role(1)
+        );
+        assert!(
+            call(&group.resp[2].to_string(), &["SET", "x", "1"])
                 .unwrap()
                 .starts_with("READONLY")
         );
+        std::thread::sleep(Duration::from_millis(100));
     }
+
+    // The majority is back: the coordinators act again, and member 1 is made a replica.
+    for (index, coordinator) in coordinators.iter_mut().enumerate() {
+        if index != leader {
+            *coordinator = Some(group.coordinator(dir.path(), index));
+        }
+    }
+    wait_until("the coordinators to act again with a majority", || {
+        role(1).starts_with("slave")
+    });
 }
 
 /// Several commands on one connection, each reply as `call` gives it.
@@ -496,7 +558,9 @@ fn a_replica_missing_a_committed_record_is_promoted_only_when_forced() {
                 &["COORDINATOR", "FAILOVER", "main", "FORCE"],
             )
             .filter(|reply| {
-                !reply.starts_with("ERR not the leader") && !reply.starts_with("ERR no leader")
+                !reply.starts_with("ERR not the leader")
+                    && !reply.starts_with("ERR no leader")
+                    && !reply.starts_with("ERR the leader is still applying")
             })
         });
         promoted.is_some()
@@ -509,6 +573,164 @@ fn a_replica_missing_a_committed_record_is_promoted_only_when_forced() {
         call(&returned, &["SET", "after", "1"]).as_deref() == Some("OK")
     });
     assert_eq!(call(&returned, &["GET", "kept"]).as_deref(), Some("(nil)"));
+}
+
+/// The committed sequences are in Raft: after the primary and the only replica holding a
+/// committed record die and every coordinator restarts, the new leader still knows the record
+/// and does not promote the replica that lacks it.
+#[test]
+fn restarted_coordinators_keep_the_committed_records_a_failover_must_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let group = Group::new();
+    let mut nodes = [
+        group.node(dir.path(), 0, None),
+        group.node(dir.path(), 1, Some(0)),
+        group.node(dir.path(), 2, Some(0)),
+    ];
+    let primary = group.resp[0].to_string();
+
+    assert_eq!(
+        call(&primary, &["SET", "before", "1"]).as_deref(),
+        Some("OK")
+    );
+    wait_until("the replicas to copy the primary", || {
+        (1..3).all(|node| {
+            call(&group.resp[node].to_string(), &["GET", "before"]).as_deref() == Some("1")
+        })
+    });
+    let mut coordinators: Vec<Process> = (0..3)
+        .map(|index| group.coordinator(dir.path(), index))
+        .collect();
+
+    wait_until("the coordinators to agree on the primary", || {
+        (0..3).all(|index| group.primary_by(index) == Some(0))
+    });
+
+    // Member 2 is down while a durable write is answered: only member 1 holds it.
+    nodes[2].kill();
+    assert_eq!(
+        calls(
+            &primary,
+            &[
+                &["CLIENT", "DURABILITY", "REPLICAS", "1", "TIMEOUT", "10000"],
+                &["SET", "kept", "1"],
+            ],
+        ),
+        Some(vec!["OK".to_owned(), "OK".to_owned()])
+    );
+    let mut committed = 0;
+
+    wait_until("the primary to record the committed sequence", || {
+        committed = info_field(&primary, "replication_committed_sequence").unwrap_or(0);
+        committed > 0
+    });
+    // The leader writes the value through Raft: wait until every coordinator applied it, so
+    // it is in the log of each.
+    let recorded = format!(",recorded={committed},");
+
+    wait_until(
+        "every coordinator to apply the recorded committed sequence",
+        || {
+            group.coordinators.iter().all(|coordinator| {
+                call_with_secret(&coordinator.to_string(), &["INFO"])
+                    .is_some_and(|info| info.contains(&recorded))
+            })
+        },
+    );
+
+    // The primary and member 1 die, every coordinator restarts, and member 2 comes back
+    // without the record. No member that answers knows it was committed.
+    nodes[0].kill();
+    nodes[1].kill();
+    coordinators.clear();
+    nodes[2] = group.node(dir.path(), 2, Some(0));
+    let returned = group.resp[2].to_string();
+
+    assert!(info_field(&returned, "wal_durable_sequence").unwrap() < committed);
+    assert_eq!(
+        info_field(&returned, "replication_committed_sequence"),
+        Some(0)
+    );
+    let logs: Vec<_> = (0..3)
+        .map(|index| dir.path().join(format!("coordinator{index}.log")))
+        .collect();
+    let _coordinators: Vec<Process> = (0..3)
+        .map(|index| group.coordinator_logging(dir.path(), index, Some(&logs[index])))
+        .collect();
+    let learned = format!(",committed={committed}\r\n");
+    // Checked on every poll below, so a wrong promotion fails at once.
+    let not_promoted = || {
+        if let Some(primary) = group.primary_by(0) {
+            assert_eq!(
+                primary, 0,
+                "a replica missing the committed record was promoted"
+            );
+        }
+    };
+
+    wait_until(
+        "the restarted coordinators to know the committed sequence and see member 2",
+        || {
+            not_promoted();
+            group.coordinators.iter().all(|coordinator| {
+                let coordinator = coordinator.to_string();
+
+                call_with_secret(&coordinator, &["INFO"])
+                    .is_some_and(|info| info.contains(&learned) && !info.contains("leader_id:-1"))
+                    && call_with_secret(&coordinator, &["SENTINEL", "replicas", "main"])
+                        .is_some_and(|replicas| {
+                            replicas.split("name ").any(|replica| {
+                                replica.starts_with(&format!("{returned} "))
+                                    && replica.contains(" flags slave ")
+                            })
+                        })
+            })
+        },
+    );
+    // The new leader decided: it waits rather than lose the record.
+    wait_until(
+        "the leader to wait for a replica holding the record",
+        || {
+            not_promoted();
+            logs.iter().any(|log| {
+                std::fs::read_to_string(log).is_ok_and(|text| {
+                    text.contains(
+                        "no replica holds every record a durable reply was released for; waiting",
+                    )
+                })
+            })
+        },
+    );
+    for index in 0..3 {
+        assert_eq!(group.primary_by(index), Some(0));
+    }
+    assert!(
+        call(&returned, &["SET", "x", "1"])
+            .unwrap()
+            .starts_with("READONLY")
+    );
+
+    // Only the operator's FORCE promotes it.
+    let mut promoted = None;
+
+    wait_until("a coordinator to take the forced failover", || {
+        promoted = group.coordinators.iter().find_map(|coordinator| {
+            call_with_secret(
+                &coordinator.to_string(),
+                &["COORDINATOR", "FAILOVER", "main", "FORCE"],
+            )
+            .filter(|reply| {
+                !reply.starts_with("ERR not the leader")
+                    && !reply.starts_with("ERR no leader")
+                    && !reply.starts_with("ERR the leader is still applying")
+            })
+        });
+        promoted.is_some()
+    });
+    assert_eq!(promoted.as_deref(), Some(returned.as_str()));
+    wait_until("every coordinator to name member 2", || {
+        (0..3).all(|index| group.primary_by(index) == Some(2))
+    });
 }
 
 /// Two groups of a multi-node cluster under one coordinator: the coordinator sends every node

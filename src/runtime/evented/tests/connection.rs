@@ -191,8 +191,12 @@ fn evented_memory_pressure_pipeline_and_slow_reader_recover() {
 
     let mut slow = StdTcpStream::connect(address).unwrap();
     slow.set_read_timeout(Some(PATIENCE)).unwrap();
-    let get = b"*2\r\n$3\r\nGET\r\n$10\r\npressure:0\r\n";
-    slow.write_all(&get.repeat(3)).unwrap();
+    // One reply of three values is over the limit on its own, so it is refused whole;
+    // replies the socket takes as they come do not count against the limit.
+    slow.write_all(
+        b"*4\r\n$4\r\nMGET\r\n$10\r\npressure:0\r\n$10\r\npressure:0\r\n$10\r\npressure:0\r\n",
+    )
+    .unwrap();
     slow.shutdown(Shutdown::Write).unwrap();
 
     assert_eq!(
@@ -737,6 +741,28 @@ fn evented_oversized_argument_is_refused_and_the_connection_kept() {
     assert_eq!(rest, b"-ERR protocol error\r\n");
     stop.request();
     join_within(server, PATIENCE).unwrap();
+}
+
+#[test]
+fn evented_pipeline_sends_before_queued_replies_can_reach_the_output_limit() {
+    use super::super::connection::flush_threshold;
+
+    // Whatever is left unsent, the next send comes by half the limit, so a reply of up to
+    // half the limit queued before it never overruns the limit.
+    for maximum in [4 * 1024, 100 * 1024, 1024 * 1024, 512 * 1024 * 1024] {
+        for unsent in [0, 1, maximum / 4, maximum / 2 - 1, maximum / 2] {
+            let threshold = flush_threshold(unsent, maximum);
+
+            assert!(
+                threshold <= maximum / 2,
+                "{unsent} of {maximum}: {threshold}"
+            );
+        }
+    }
+    // Below that, a client that is not reading is retried at doubling sizes.
+    assert_eq!(flush_threshold(0, 1024 * 1024), 64 * 1024);
+    assert_eq!(flush_threshold(100 * 1024, 1024 * 1024), 200 * 1024);
+    assert_eq!(flush_threshold(524_241, 1024 * 1024), 512 * 1024);
 }
 
 #[test]

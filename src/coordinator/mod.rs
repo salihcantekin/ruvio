@@ -45,6 +45,11 @@ async fn serve(
             heartbeat_interval: 250,
             election_timeout_min: 1000,
             election_timeout_max: 2000,
+            // The log is rewritten and synced whole on every append, and grows by up to one
+            // committed sequence record a second: keep it short with frequent small snapshots
+            // (the state is a few kilobytes).
+            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(100),
+            max_in_snapshot_log_to_keep: 20,
             ..openraft::Config::default()
         }
         .validate()
@@ -84,6 +89,7 @@ async fn serve(
         raft: raft.clone(),
         machine: machine.clone(),
         mover: Arc::default(),
+        leadership: Arc::new(raft::Leadership::new(config.id, config.ping_interval)),
     };
     let leader = tokio::spawn(monitor::lead(
         Arc::clone(&config),
@@ -336,6 +342,7 @@ impl Api {
                     u8::from(leader == Some(self.config.id)),
                 );
                 let primaries = self.machine.primaries();
+                let recorded = self.machine.commits();
 
                 for group in &self.config.groups {
                     match primaries.get(&group.name) {
@@ -348,7 +355,18 @@ impl Api {
                         None => text += &format!("group_{}:primary=,epoch=0", group.name),
                     }
                     // Only for groups whose clients use `CLIENT DURABILITY`: per shard, the
-                    // highest record a failover must keep.
+                    // values in the Raft record, then the highest record a failover must keep
+                    // as this coordinator knows it.
+                    let recorded = recorded
+                        .get(&group.name)
+                        .map(|commit| commit.committed.as_slice())
+                        .unwrap_or_default();
+
+                    if recorded.iter().any(|&sequence| sequence > 0) {
+                        let shards: Vec<String> = recorded.iter().map(u64::to_string).collect();
+
+                        text += &format!(",recorded={}", shards.join("/"));
+                    }
                     let committed = self.commits.known(&group.name);
 
                     if committed.iter().any(|&sequence| sequence > 0) {
