@@ -4,7 +4,7 @@ Issues and pull requests are in English.
 
 A pull request is one change that you can explain. Say what behavior changes, how you checked it, and which test covers it. A drive-by that rewrites an unrelated file, restyles a module, or stacks several ideas is closed.
 
-Pull requests target `dev`. Once the required checks pass, a pull request joins the merge queue (`gh pr merge N --merge`, or *Merge when ready*); the queue runs the PR gate again on `dev` plus the pull requests ahead of it and merges only when that passes, so there is no need to update the branch with `dev` by hand.
+Pull requests target `dev`. A pull request merges once the required checks pass; it does not have to be updated with `dev` first. The same checks run again on `dev` after each merge, so a break between two pull requests shows up there.
 
 ## License
 

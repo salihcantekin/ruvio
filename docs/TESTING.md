@@ -17,8 +17,8 @@ before every `git push` from that clone. The toolchain is pinned in `rust-toolch
 
 ## Automated test surface
 
-`.github/workflows/pr-gate.yml` runs automatically for pull requests, for
-each merge-queue group on `dev`, and for pushes to `main` on Linux. It checks Rust formatting and core tests,
+`.github/workflows/pr-gate.yml` runs automatically for pull requests and
+pushes to `main` and `dev` on Linux. It checks Rust formatting and core tests,
 `scripts/check.sh`, hot-path instruction counts, Python benchmark-regression
 units, a real two-shard routing smoke, and every client suite (Rust, C# with the
 .NET integrations, Go on its `go.mod` floor, Node, Python 3.9 and 3.13, Java)
