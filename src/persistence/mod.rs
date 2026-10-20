@@ -968,7 +968,9 @@ fn apply_in_active(
                     .map_err(|error| PersistenceError::Corruption(error.into()))?;
             }
         }
-        OwnedMutation::SlotsMoved { .. } => {}
+        OwnedMutation::SlotsMoved { .. }
+        | OwnedMutation::SlotsIncoming { .. }
+        | OwnedMutation::SlotsGiven { .. } => {}
         OwnedMutation::SwapDatabases { first, second } => shard.swap_databases(*first, *second),
         OwnedMutation::MoveKey { key, destination } => {
             if !shard.move_key(key, *destination) {

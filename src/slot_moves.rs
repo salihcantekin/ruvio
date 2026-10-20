@@ -46,6 +46,30 @@ const MOVE_LEN_V1: usize = 2 * 4 + 8 * 2;
 const MOVE_LEN: usize = MOVE_LEN_V1 + 8;
 const CHECKSUM_LEN: usize = 4;
 
+/// A step of a range arriving from another node, as a `SlotsIncoming` record carries it,
+/// so a replica of the target records the same steps at the same sequences.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum IncomingStep {
+    /// The copy begins at this record's sequence.
+    Begin = 0,
+    /// Every copy up to this record's sequence is durable.
+    Prepared = 1,
+    /// The move was cancelled: the copies are dropped.
+    Cancelled = 2,
+}
+
+impl IncomingStep {
+    pub(crate) fn from_u8(step: u8) -> Option<Self> {
+        match step {
+            0 => Some(Self::Begin),
+            1 => Some(Self::Prepared),
+            2 => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+}
+
 /// One move of the slots `first..=last` from shard `from` to shard `to`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SlotMove {

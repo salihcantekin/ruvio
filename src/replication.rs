@@ -944,7 +944,9 @@ fn transaction_needs_snapshot(shard: &mut KvShard, db: u8, mutations: &[OwnedMut
             // (written on their own, and never while replication is on).
             OwnedMutation::Transaction { .. }
             | OwnedMutation::SlotCopy { .. }
-            | OwnedMutation::SlotsMoved { .. } => {}
+            | OwnedMutation::SlotsMoved { .. }
+            | OwnedMutation::SlotsIncoming { .. }
+            | OwnedMutation::SlotsGiven { .. } => {}
         }
         if missing {
             break;
@@ -1033,6 +1035,8 @@ fn needs_snapshot(shard: &mut KvShard, mutation: &OwnedMutation) -> bool {
         | OwnedMutation::OncePut { .. }
         | OwnedMutation::SlotCopy { .. }
         | OwnedMutation::SlotsMoved { .. }
+        | OwnedMutation::SlotsIncoming { .. }
+        | OwnedMutation::SlotsGiven { .. }
         | OwnedMutation::Transaction { .. } => false,
     }
 }
