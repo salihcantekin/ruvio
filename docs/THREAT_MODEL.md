@@ -269,7 +269,11 @@ the default quota).
    coordinators replaced it, or flood `RUVIO LEASE BEGIN`: a node keeps the
    last 64 BEGIN tokens of all connections together, so the coordinators'
    grants then name forgotten tokens and the lease runs out (writes stop).
-   Allow it only to the coordinators' user.
+   A grant's coordinator id and coordinator count (`voters`) are taken as
+   sent, not checked against the coordinators' `secret`: such a user can
+   grant under several made-up ids to hold a majority alone, or name up to
+   255 coordinators so that no majority is reached until that grant ends (at
+   most 60 seconds per grant). Allow it only to the coordinators' user.
 
 ## Operator checklist
 

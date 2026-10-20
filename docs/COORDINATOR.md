@@ -148,9 +148,12 @@ are off by default.
   never delays it: `RUVIO LEASE BEGIN` (the node notes the instant on its own clock and answers a
   token), then `RUVIO LEASE GRANT token coordinator voters epoch lease_ms`. The lease runs
   `lease_ms` from the BEGIN instant, so a grant that arrives late only shortens it. A grant for an
-  older epoch than one the node already holds is refused, a newer epoch drops the older grants,
-  and a node that is a replica refuses grants. The majority is counted against the largest number
-  of coordinators any grant named since the last new epoch.
+  older epoch than a running grant the node holds is refused, a newer epoch drops the older grants,
+  and a node that is a replica refuses grants. A grant that ended is forgotten and refuses nothing,
+  so coordinators that start over at a lower epoch (a lost `data_dir`, or the Raft files deleted to
+  go back a release) are taken at most one lease later. The majority is counted against the largest
+  number of coordinators (`voters`, at most 255) that a running grant of the current epoch names,
+  each coordinator's latest grant setting its count; a new epoch starts the count again.
 - A writer (a primary, or a node with no replication role) takes writes only while grants from a
   majority of the coordinators run for more than 300 ms more. It checks this on the same 100 ms
   tick as `min-replicas-to-write`, so nothing is added to the commands themselves; otherwise
@@ -159,9 +162,9 @@ are off by default.
   replica, until the first grants arrive (one ping after its promotion). The 300 ms cover the
   writes taken between two checks and a stall of the node of up to about 200 ms.
 - When the leader no longer hears from a primary, it asks every coordinator two questions: does
-  it hear the primary, and has its last grant to it aged past the lease stretched by
-  `primary_lease_drift_percent` (default 10) plus 200 ms (2400 ms for a 2000 ms lease), by that
-  coordinator's own settings. A coordinator that answers "ended" promises not to grant that
+  it hear the primary, and has its last grant to it aged past the lease stretched for clock drift,
+  times (100 + d) / (100 - d) with d the `primary_lease_drift_percent` (default 10), plus 200 ms
+  (2645 ms for a 2000 ms lease), by that coordinator's own settings. A coordinator that answers "ended" promises not to grant that
   member again until the leader confirms that its record still names it; the leader answers
   only after any failover it is deciding is recorded, and only once a majority of coordinators
   confirmed it still leads. A failover goes ahead when a majority no longer hears the primary
@@ -175,12 +178,15 @@ are off by default.
 - `primary_lease_ms` must be at least three times `ping_interval_ms`, at least `ping_interval_ms`
   plus 500, and at most 60000, and the stretched lease plus 200 ms must fit in `down_after_ms`, so
   detection is not delayed: with the defaults (`ping_interval_ms` 500, `down_after_ms` 3000),
-  `primary_lease_ms = 2000`.
+  `primary_lease_ms = 2000`. `primary_lease_drift_percent` must be below 100, and at most 255
+  coordinators can grant a lease.
 
 What it assumes and what it does not cover:
 
-- The clocks of the coordinators and data nodes run at rates that differ by less than
-  `primary_lease_drift_percent`. They need not agree on the time. On Linux a data node measures
+- Every coordinator's and data node's clock runs at most `primary_lease_drift_percent` faster or
+  slower than real time. The stretch covers the worst pair: a node clock that runs slow by d holds
+  the lease for up to `lease / (1 - d)` of real time, which a coordinator clock that runs fast by d
+  measures as `lease * (1 + d) / (1 - d)`. The clocks need not agree on the time. On Linux a data node measures
   the lease with `CLOCK_BOOTTIME` and the coordinators with the monotonic clock, so a data node
   host that is suspended (laptop sleep, VM suspend) counts the suspended time and wakes with its
   lease expired; on other platforms the node's clock may stop while suspended.
@@ -188,8 +194,11 @@ What it assumes and what it does not cover:
   + 0.1 s) are still lost when it rejoins. The lease bounds the window; only `CLIENT DURABILITY
   REPLICAS` equal to the number of replicas keeps acknowledged writes in every shape below.
 - A primary whose process stalls (paused VM, swapping, a long `SIGSTOP`) for longer than the 300 ms
-  margin, with the stall starting just after a check that found the lease running, may apply the
-  writes it reads on resuming before its next check (up to about 100 ms of requests).
+  margin, with the stall starting just after a check that found the lease running, may apply writes
+  on resuming before its next check closes the gate. Each shard checks on its 100 ms maintenance
+  tick, which is due at once after such a stall, but the connections' tasks may run first: the
+  writes already waiting on its connections, and those that arrive before the check runs, can be
+  applied. This is normally one round of reads, but it has no fixed bound in time or count.
 - When a majority of the coordinators are down or cannot reach the primary, every primary stops
   taking writes after its lease: a coordinator outage becomes a write outage.
 - Anyone with `ruvio|lease` on a data node can send `RUVIO LEASE BEGIN`: the node keeps the last 64
@@ -200,14 +209,17 @@ Turning it on:
 
 1. Upgrade the data nodes (they accept `RUVIO LEASE` and ignore grants while `primary-lease` is off).
    The coordinators' data-node user needs `RUVIO` (`ruvio|lease`).
-2. Upgrade every coordinator and set `primary_lease_ms` on all of them, one at a time. A
-   coordinator of an older version neither grants nor answers the new lease query: while one runs,
-   a failover waits for a majority that does (it never promotes on a missing answer), and its
-   missing grants count against the majority. Coordinators with the lease off still ask the others
-   and wait for a lease any of them grants.
-3. Check `INFO replication` on the primary: `primary_lease_grants` should equal the number of
-   coordinators and `primary_lease_remaining_ms` stay well above 300. Then `CONFIG SET primary-lease
-   yes` on every data node (and `primary_lease = true` in their files, or `RUVIO_PRIMARY_LEASE=yes`).
+2. Upgrade all coordinators together (see *Upgrading*), then set `primary_lease_ms` on each and
+   restart them one at a time. Mixed versions do not work with the lease: a coordinator of an older
+   version neither grants nor answers the new lease query, so a failover waits for a majority that
+   does (it never promotes on a missing answer) and its missing grants count against the majority;
+   and an older leader cannot decode the confirmation a newer coordinator asks before it grants, so
+   that coordinator grants nothing. Coordinators with the lease off still ask the others and wait for
+   a lease any of them grants.
+3. Last, the data nodes enforce it. Check `INFO replication` on the primary: `primary_lease_grants`
+   should equal the number of coordinators and `primary_lease_remaining_ms` stay well above 300.
+   Then `CONFIG SET primary-lease yes` on every data node (and `primary_lease = true` in their files,
+   or `RUVIO_PRIMARY_LEASE=yes`).
 
 Done the other way round, the primaries refuse writes until the coordinators grant them.
 
@@ -216,9 +228,17 @@ Turning it off: first `CONFIG SET primary-lease no` on every data node (and in t
 writing once a majority stopped granting.
 
 Changing `primary_lease_ms` or `primary_lease_drift_percent`: each coordinator reports a lease as
-ended by its own settings. To lengthen the lease, change it on every coordinator; to shorten it,
-restart the coordinators one at a time and wait the old lease length after each restart, so no
-coordinator reports a lease ended by the new, shorter length while a grant of the old length runs.
+ended by its own settings. To lengthen the lease (or raise the drift), change it on every
+coordinator; to shorten it (or lower the drift), restart the coordinators one at a time and wait the
+old lease length after each restart, so no coordinator reports a lease ended by the new, shorter
+length while a grant of the old length runs.
+
+Changing the number of coordinators (all restarted with the new `peers`, see *Limits of this
+version*): each grant names its sender's coordinator count, and a primary needs a majority of the
+largest count among its running grants. Adding coordinators raises the bar at once. After removing
+some, the grants of the larger count keep the higher bar until they end, at most `primary_lease_ms`
+after the last one was sent; until then the primary refuses writes unless a majority of the old count
+still grants it. To avoid that pause, turn `primary-lease` off on the data nodes for the change.
 
 Checked with Docker (debug build, `ping_interval_ms` 500, `down_after_ms` 3000, `primary_lease_ms`
 2000, `min-replicas-to-write 1` on every node), the old primary and one replica on one network, the
@@ -240,7 +260,7 @@ the group, `L` the `primary_lease_ms`.
 | Primary and one replica cut off together from the other replicas and the coordinators | The old primary takes writes for the whole partition unless `min-replicas-to-write` = `r`; with `r` it stops within `min-replicas-max-lag` + 0.1 s. Everything it took is lost | It stops at most `L` + 0.1 s after its last grant, before the promotion; the writes it took until then are lost | With `k < r` acknowledged writes can be lost (with the lease, only those taken before it stopped): the replica that stayed acknowledges them, the coordinators never learn the committed value, and the promoted replica lacks them. With `k = r` none: the old primary cannot get a reply released without the cut-off replica | The lease; or `min-replicas-to-write` = `r` with `min-replicas-max-lag` well below `down_after_ms` (for example 2 with `down_after_ms` 4000); `k = r` |
 | A majority of coordinators down, or cut off from the primary | Nothing is lost by it; data nodes keep serving, but a primary that fails meanwhile is not replaced | Every primary they cannot renew stops taking writes after `L`; nothing is lost | Same as without the lease | Run three or five coordinators on different machines; without the lease, promote by hand with `REPLICAOF NO ONE` while none runs; with it, `CONFIG SET primary-lease no` on the primary to write without coordinators |
 | The primary's process or VM paused longer than `down_after_ms` | A replica is promoted; when the old primary resumes it may take writes until it learns it was replaced (as in the rows above), and they are lost | The promotion waits for the lease; on resuming, the old primary may apply what it reads before its next check (about 100 ms), and those writes are lost; a stall shorter than 300 ms loses nothing | None lost with `k = r`: the replicas follow the new primary and do not acknowledge the old one | `min-replicas-to-write` ≥ 1, or the lease |
-| Clocks running at different rates | Timeouts are measured with each process's own monotonic clock, so a rate difference only shifts when a failover starts | The lease is safe while the rates differ by less than `primary_lease_drift_percent`; beyond it both primaries can take writes for a moment | Same as without the lease | Keep clocks synchronized (NTP), also for the wall-clock deadlines of `IDEM`, `ONCE`, `LIMIT`, `LEASE` and `SEMAPHORE` |
+| Clocks running at different rates | Timeouts are measured with each process's own monotonic clock, so a rate difference only shifts when a failover starts | The lease is safe while every clock runs within `primary_lease_drift_percent` of real time; beyond it both primaries can take writes for a moment | Same as without the lease | Keep clocks synchronized (NTP), also for the wall-clock deadlines of `IDEM`, `ONCE`, `LIMIT`, `LEASE` and `SEMAPHORE` |
 | Coordinators of different versions | A newer leader falls back to the older query for coordinators that do not answer the lease query, so failovers work as before | Older coordinators neither grant nor report grants: failovers wait for a majority of the new version, and writes stop if fewer than a majority grant | Same as without the lease | Upgrade every coordinator before turning the lease on |
 
 A `CHANGES SUBSCRIBE` consumer may already have seen records a failover takes back. Its cursor
@@ -276,7 +296,7 @@ ping_interval_ms = 500                  # default 500
 down_after_ms = 3000                    # default 3000
 unclean_failover = false                # default false: wait for a replica with every committed write
 primary_lease_ms = 0                    # default 0 (off); 2000 with the defaults above, see "Primary lease"
-primary_lease_drift_percent = 10        # default 10: how much faster one clock may run than another
+primary_lease_drift_percent = 10        # default 10: how much faster or slower than real time a clock may run; below 100
 auth = "password"                       # how coordinators log in to data nodes; "user password" works too
 
 [[groups]]
@@ -416,7 +436,9 @@ is never slowed down. Nodes need durability `memory`, `everysec` or `always` (no
 Upgrade all coordinators together: stop every one, replace the binary, start them again. A release
 that records committed sequences in Raft writes log entries older coordinators cannot read; an older
 coordinator that receives one cannot follow the log, and one restarted on such a log refuses to start.
-The newer release reads the log, vote and snapshot an older one wrote. Data nodes are not affected.
+The newer release reads the log, vote and snapshot an older one wrote. Data nodes are not affected,
+except that with `primary-lease yes` on them, writes stop once the lease runs out while fewer than a
+majority of coordinators run; turn it off on the nodes first (see *Primary lease*) if that matters.
 
 A rolling upgrade stalls: once a coordinator of the newer release leads and records a committed
 sequence or a failover, the older ones cannot take the entry, and while fewer than a majority run the
