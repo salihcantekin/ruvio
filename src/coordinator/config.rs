@@ -101,6 +101,14 @@ struct FileConfig {
     /// reply was released for; those records are lost.
     #[serde(default)]
     unclean_failover: bool,
+    /// Lease each coordinator grants the agreed primary on every ping (`RUVIO LEASE`); 0, the
+    /// default, grants none. Nodes with `primary-lease` on take writes only under it.
+    #[serde(default)]
+    primary_lease_ms: u64,
+    /// How much faster or slower than real time, in percent, any coordinator's or data
+    /// node's clock may run; below 100.
+    #[serde(default = "default_lease_drift_percent")]
+    primary_lease_drift_percent: u64,
     /// Password (or `username password`) the coordinator logs in to data nodes with.
     #[serde(default)]
     auth: Option<String>,
@@ -121,6 +129,27 @@ fn default_down_after_ms() -> u64 {
     3000
 }
 
+fn default_lease_drift_percent() -> u64 {
+    10
+}
+
+/// How often a data node checks its lease (its maintenance tick).
+const NODE_TICK: Duration = Duration::from_millis(100);
+
+/// How long after its last grant a coordinator counts a primary's lease as ended: the lease
+/// stretched by the clock drift, plus the node's check interval and as much again as margin.
+/// A failover waits until a majority of coordinators passed this.
+///
+/// Each clock runs at most `drift_percent` (d) faster or slower than real time. A node whose
+/// clock runs slow holds the lease for up to `lease / (1 - d)` of real time, and a coordinator
+/// whose clock runs fast measures that as `lease * (1 + d) / (1 - d)`. `drift_percent` must be
+/// below 100.
+pub fn lease_safe_interval(lease: Duration, drift_percent: u64) -> Duration {
+    let stretched = lease.as_millis() as u64 * (100 + drift_percent);
+
+    Duration::from_millis(stretched.div_ceil(100 - drift_percent)) + NODE_TICK * 2
+}
+
 #[derive(Clone, Debug)]
 pub struct CoordinatorConfig {
     pub id: u64,
@@ -130,6 +159,9 @@ pub struct CoordinatorConfig {
     pub ping_interval: Duration,
     pub down_after: Duration,
     pub unclean_failover: bool,
+    /// The lease granted to primaries, and how long after a grant it is counted as ended
+    /// ([`lease_safe_interval`]); `None` when off.
+    pub primary_lease: Option<(Duration, Duration)>,
     pub auth: Option<String>,
     pub secret: Option<String>,
     pub groups: Vec<Group>,
@@ -164,6 +196,49 @@ impl CoordinatorConfig {
         if file.ping_interval_ms == 0 || file.down_after_ms < file.ping_interval_ms {
             return Err("down_after_ms must be at least ping_interval_ms, which is above 0".into());
         }
+        let primary_lease = if file.primary_lease_ms == 0 {
+            None
+        } else {
+            let lease = Duration::from_millis(file.primary_lease_ms);
+
+            // Checked before the safe interval is worked out, which they keep from overflowing.
+            if lease > crate::primary_lease::MAX_LEASE {
+                return Err("primary_lease_ms must be at most 60000".into());
+            }
+            if file.primary_lease_drift_percent >= 100 {
+                return Err("primary_lease_drift_percent must be below 100".into());
+            }
+            if peers.len() > crate::primary_lease::MAX_VOTERS as usize {
+                return Err(format!(
+                    "at most {} coordinators can grant a primary lease",
+                    crate::primary_lease::MAX_VOTERS
+                ));
+            }
+            // A node closes its gate `GATE_MARGIN` before the lease ends, so a renewal every
+            // ping must leave more than that, with room for the round trip.
+            let floor =
+                file.ping_interval_ms
+                    .saturating_mul(3)
+                    .max(file.ping_interval_ms.saturating_add(
+                        crate::primary_lease::GATE_MARGIN.as_millis() as u64 + 200,
+                    ));
+
+            if file.primary_lease_ms < floor {
+                return Err(format!(
+                    "primary_lease_ms must be at least {floor}: three times ping_interval_ms, and ping_interval_ms plus 500"
+                ));
+            }
+            let safe = lease_safe_interval(lease, file.primary_lease_drift_percent);
+
+            if safe.as_millis() as u64 > file.down_after_ms {
+                return Err(format!(
+                    "down_after_ms must be at least {} with this primary_lease_ms: the lease plus {}% drift and 200 ms",
+                    safe.as_millis(),
+                    file.primary_lease_drift_percent
+                ));
+            }
+            Some((lease, safe))
+        };
         for group in &file.groups {
             if group.members.len() < 2 {
                 return Err(format!(
@@ -217,6 +292,7 @@ impl CoordinatorConfig {
             ping_interval: Duration::from_millis(file.ping_interval_ms),
             down_after: Duration::from_millis(file.down_after_ms),
             unclean_failover: file.unclean_failover,
+            primary_lease,
             auth: file.auth.filter(|auth| !auth.is_empty()),
             secret: std::env::var("RUVIO_COORDINATOR_SECRET")
                 .ok()
@@ -399,6 +475,7 @@ members = [
         assert_eq!(config.ping_interval, Duration::from_millis(500));
         assert_eq!(config.down_after, Duration::from_millis(1000));
         assert!(!config.unclean_failover);
+        assert_eq!(config.primary_lease, None);
         assert_eq!(config.group("main").unwrap().members.len(), 2);
         assert!(config.group("other").is_none());
     }
@@ -536,6 +613,96 @@ members = [
             CoordinatorConfig::parse(&text.replace("8192-16383", "8192-16000"))
                 .unwrap_err()
                 .contains("slot 16001")
+        );
+    }
+
+    #[test]
+    fn a_primary_lease_must_end_before_a_failover_starts() {
+        // 2000 ms stretched by 110/90 is 2444.4, rounded up, plus two node ticks.
+        assert_eq!(
+            lease_safe_interval(Duration::from_millis(2000), 10),
+            Duration::from_millis(2645)
+        );
+        assert_eq!(
+            lease_safe_interval(Duration::from_millis(1000), 0),
+            Duration::from_millis(1200)
+        );
+        // The largest drift and lease do not overflow.
+        assert_eq!(
+            lease_safe_interval(Duration::from_millis(60_000), 99),
+            Duration::from_millis(11_940_200)
+        );
+        let lease = |text: &str| {
+            CoordinatorConfig::parse(&SAMPLE.replace("down_after_ms = 1000", text))
+                .map(|config| config.primary_lease)
+        };
+
+        assert_eq!(
+            lease("down_after_ms = 3000\nprimary_lease_ms = 2000").unwrap(),
+            Some((Duration::from_millis(2000), Duration::from_millis(2645)))
+        );
+        for (text, reason) in [
+            (
+                "down_after_ms = 2600\nprimary_lease_ms = 2000",
+                "at least 2645",
+            ),
+            (
+                "down_after_ms = 3000\nprimary_lease_ms = 1000",
+                "at least 1500",
+            ),
+            (
+                "down_after_ms = 3000\nprimary_lease_ms = 2000\nprimary_lease_drift_percent = 100",
+                "below 100",
+            ),
+            (
+                "down_after_ms = 90000\nprimary_lease_ms = 61000",
+                "at most 60000",
+            ),
+            // Out-of-range values are refused, never overflowed.
+            (
+                "down_after_ms = 3000\nprimary_lease_ms = 9223372036854775807",
+                "at most 60000",
+            ),
+            (
+                "down_after_ms = 3000\nprimary_lease_ms = 2000\nprimary_lease_drift_percent = 9223372036854775807",
+                "below 100",
+            ),
+        ] {
+            let error = lease(text).unwrap_err();
+
+            assert!(error.contains(reason), "{text}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_primary_lease_takes_at_most_the_largest_coordinator_count_a_grant_may_name() {
+        let peers = |count: usize| {
+            let list: Vec<String> = (1..=count)
+                .map(|id| format!("\"{id}@127.0.0.1:{}\"", 20_000 + id))
+                .collect();
+
+            SAMPLE
+                .replace(
+                    "\"1@127.0.0.1:26400\", \"2@127.0.0.1:26401\", \"3@127.0.0.1:26402\"",
+                    &list.join(", "),
+                )
+                .replace(
+                    "down_after_ms = 1000",
+                    "down_after_ms = 3000\nprimary_lease_ms = 2000",
+                )
+        };
+        let most = crate::primary_lease::MAX_VOTERS as usize;
+
+        assert!(CoordinatorConfig::parse(&peers(most)).is_ok());
+        assert!(
+            CoordinatorConfig::parse(&peers(most + 1))
+                .unwrap_err()
+                .contains("at most 255 coordinators")
+        );
+        // Without the lease the count is not limited here.
+        assert!(
+            CoordinatorConfig::parse(&peers(most + 1).replace("primary_lease_ms = 2000", ""))
+                .is_ok()
         );
     }
 

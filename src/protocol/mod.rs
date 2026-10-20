@@ -443,6 +443,17 @@ pub struct SlotRangeMove {
     pub shard: u16,
 }
 
+/// `RUVIO LEASE GRANT token coordinator voters epoch lease_ms`: coordinator `coordinator` of
+/// `voters` grants this primary its lease from the `RUVIO LEASE BEGIN` that answered `token`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseGrant {
+    pub token: u64,
+    pub coordinator: u64,
+    pub voters: u32,
+    pub epoch: u64,
+    pub lease_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command<'a> {
     Ping(Option<Bytes<'a>>),
@@ -538,6 +549,9 @@ pub enum Command<'a> {
     /// `RUVIO TOPOLOGY SET map` installs a multi-node cluster map; `RUVIO TOPOLOGY VERSION`
     /// (`None`) reports the version this node serves (0 without a map).
     Topology(Option<Bytes<'a>>),
+    /// `RUVIO LEASE BEGIN` (`None`) and `RUVIO LEASE GRANT ...`: the primary lease
+    /// `ruvio coordinator` renews (see `primary-lease`). Rare, so the grant is boxed.
+    PrimaryLease(Option<Box<LeaseGrant>>),
     /// `RUVIO MIGRATE ...`: the steps of moving a slot range to another node, sent by the
     /// coordinators and by the source node; the runtime reads the arguments.
     Migrate(Vec<Bytes<'a>>),

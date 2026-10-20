@@ -749,6 +749,19 @@ pub enum RpcRequest {
     Observe {
         group: String,
     },
+    /// [`RpcRequest::Observe`], and whether the primary lease of `member` ended by this
+    /// coordinator's own settings. A yes promises no grant to it until the leader confirms it
+    /// again ([`RpcRequest::Confirm`]). Coordinators before the lease cannot decode it; the
+    /// leader then falls back to `Observe`.
+    Leases {
+        group: String,
+        member: usize,
+    },
+    /// To the leader: the primary of `group`, read after any failover decision in progress
+    /// and once a majority confirmed the leader.
+    Confirm {
+        group: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -757,6 +770,15 @@ pub enum RpcResponse {
     Vote(Result<VoteResponse<NodeId>, RaftError<NodeId>>),
     Snapshot(Result<InstallSnapshotResponse<NodeId>, RaftError<NodeId, InstallSnapshotError>>),
     Observe(Vec<Option<u64>>),
+    Leases {
+        heard: Vec<Option<u64>>,
+        /// The lease ended by this coordinator's settings, or it grants none.
+        ended: bool,
+        /// This coordinator grants leases.
+        lease_on: bool,
+    },
+    /// `None` when the leader could not confirm.
+    Confirmed(Option<Primary>),
 }
 
 /// What a coordinator sends on a call: the shared secret, then the request.

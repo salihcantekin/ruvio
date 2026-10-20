@@ -130,7 +130,10 @@ counts (usually acceptable), and an `IDEM` entry or its result may be gone (the
 request runs again). A connection that writes these commands with
 `CLIENT DURABILITY REPLICAS 1` (or more) gets its replies only after that many
 replicas hold the writes on disk, and `ruvio coordinator` promotes only a
-replica that has every such write; see [COORDINATOR.md](COORDINATOR.md). On
+replica that has every such write it learned of. When the old primary is cut off
+together with some of its replicas, the coordinators do not learn of writes those
+replicas acknowledged: only `REPLICAS` equal to the number of replicas keeps them
+in that case. See *What can still lose data* in [COORDINATOR.md](COORDINATOR.md). On
 `-NOREPLICAS` the write is applied but not confirmed: treat it as uncertain.
 Durability is not on by default, because every reply then waits for a replica;
 turn it on for the connections where a lost write matters.
@@ -142,8 +145,11 @@ early. Keep the clocks of the nodes synchronized (NTP or similar).
 
 A lock that stays safe across a failover:
 
-1. `LEASE` on a connection that sent `CLIENT DURABILITY REPLICAS 1`. Tokens are
-   fenced: a later holder always gets a larger token, also after a failover.
+1. `LEASE` on a connection that sent `CLIENT DURABILITY REPLICAS 1` (the number
+   of replicas, to survive the partition above). Tokens are fenced: a later holder
+   always gets a larger token, also after a failover. While an old primary still
+   takes writes after a failover, it can grant the same lock as the new one; the
+   fencing tokens are what keeps the resource safe then.
 2. The holder sends its token with every write to the protected resource.
 3. The resource remembers the highest token it has seen and rejects a lower one.
 

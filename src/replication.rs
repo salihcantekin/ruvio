@@ -54,6 +54,9 @@ pub const READONLY_LINE: &[u8] = b"READONLY You can't write against a read only 
 pub const FENCED_LINE: &[u8] =
     b"READONLY This primary was replaced: a replica has followed a newer epoch.";
 pub const NOREPLICAS_LINE: &[u8] = b"NOREPLICAS Not enough good replicas to write.";
+/// Same code as [`NOREPLICAS_LINE`], so clients treat both alike.
+pub const NOLEASE_LINE: &[u8] =
+    b"NOREPLICAS Primary lease expired: too few coordinators renewed it.";
 /// A replica that has nothing new to acknowledge repeats its last acknowledgement this
 /// often, so a primary can tell a quiet replica from a lost one (`min-replicas-max-lag`).
 pub const ACK_HEARTBEAT: Duration = Duration::from_secs(1);
@@ -72,6 +75,8 @@ pub enum WriteGate {
     Fenced,
     /// A primary with fewer recently acknowledging replicas than `min-replicas-to-write`.
     NoReplicas,
+    /// A primary with `primary-lease` on whose lease from the coordinators is not running.
+    NoLease,
 }
 
 impl WriteGate {
@@ -82,6 +87,7 @@ impl WriteGate {
             Self::Replica => Some(READONLY_LINE),
             Self::Fenced => Some(FENCED_LINE),
             Self::NoReplicas => Some(NOREPLICAS_LINE),
+            Self::NoLease => Some(NOLEASE_LINE),
         }
     }
 }
