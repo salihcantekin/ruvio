@@ -1342,3 +1342,83 @@ fn a_replica_keeps_a_hash_whose_fields_all_expired_hidden_after_the_field_sweep(
     replica.resume_expiration_after_replay(paused);
     assert_eq!(read(&mut replica, &[b"DBSIZE"]), Response::Integer(0));
 }
+
+#[test]
+fn relative_expirations_past_the_signed_clock_are_rejected() {
+    let mut shard = KvShard::new();
+
+    assert_eq!(
+        execute(
+            &mut shard,
+            Command::Set(
+                owned(b"key"),
+                owned(b"value"),
+                SetOptions {
+                    expiry: SetExpiry::RelativeMs(i64::MAX),
+                    ..SetOptions::default()
+                }
+            )
+        ),
+        Response::Error(b"ERR invalid expire time in 'set' command")
+    );
+    assert_eq!(
+        execute(&mut shard, Command::Ttl(owned(b"key"))),
+        Response::Integer(-2)
+    );
+
+    execute(&mut shard, Command::set(owned(b"key"), owned(b"value")));
+
+    for milliseconds in [i64::MAX, 9_223_372_036_854_775_000] {
+        assert_eq!(
+            execute(
+                &mut shard,
+                Command::Expire {
+                    condition: crate::protocol::ExpireCondition::Always,
+                    key: owned(b"key"),
+                    milliseconds,
+                }
+            ),
+            Response::Error(b"ERR invalid expire time")
+        );
+    }
+
+    assert_eq!(
+        execute(&mut shard, Command::Ttl(owned(b"key"))),
+        Response::Integer(-1)
+    );
+}
+
+#[test]
+fn the_latest_absolute_deadline_reports_without_overflow() {
+    let mut shard = KvShard::new();
+
+    assert_eq!(
+        execute(
+            &mut shard,
+            Command::Set(
+                owned(b"key"),
+                owned(b"value"),
+                SetOptions {
+                    expiry: SetExpiry::AbsoluteMs(i64::MAX),
+                    ..SetOptions::default()
+                }
+            )
+        ),
+        Response::Simple(b"OK")
+    );
+    assert_eq!(
+        execute(
+            &mut shard,
+            Command::ExpireTime {
+                key: owned(b"key"),
+                millis: true
+            }
+        ),
+        Response::Integer(i64::MAX)
+    );
+
+    match execute(&mut shard, Command::Ttl(owned(b"key"))) {
+        Response::Integer(seconds) => assert!(seconds > 0),
+        other => panic!("unexpected {other:?}"),
+    }
+}
