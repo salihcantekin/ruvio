@@ -93,10 +93,12 @@ impl Sightings {
 /// When the leader asks whether a primary's lease ended ([`RpcRequest::Leases`]) and this
 /// coordinator answers yes, it promises not to grant that member again until the leader
 /// confirms, after any failover it was deciding, that the record still names it
-/// ([`confirm_locally`]). The leader decides each failover under [`Grants::decision`], and a
-/// confirmation waits for it and reads the record after a majority confirmed the leader. So
-/// a majority that reported the lease ended cannot renew the old primary once the failover is
-/// recorded, and any majority that granted it shares a coordinator with that one.
+/// ([`confirm_locally`]). The leader decides each failover under the group's
+/// [`Grants::decision`] lock, held until the failover is recorded, and a confirmation for the
+/// group waits for it and reads the record after a majority confirmed the leader. So a
+/// majority that reported the lease ended cannot renew the old primary once the failover is
+/// recorded, and any majority that granted it shares a coordinator with that one. Groups do
+/// not wait for each other.
 #[derive(Clone)]
 pub struct Grants(Arc<GrantBook>);
 
@@ -105,8 +107,8 @@ struct GrantBook {
     /// lease as granted at its start.
     started: Instant,
     members: Mutex<HashMap<(String, usize), Granting>>,
-    /// Held by the leader while it decides whether to fail a group over.
-    decision: tokio::sync::Mutex<()>,
+    /// One per group, held by the leader while it decides whether to fail that group over.
+    decisions: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// One member's grants from this coordinator.
@@ -128,7 +130,7 @@ impl Default for Grants {
         Self(Arc::new(GrantBook {
             started: Instant::now(),
             members: Mutex::default(),
-            decision: tokio::sync::Mutex::new(()),
+            decisions: Mutex::default(),
         }))
     }
 }
@@ -190,27 +192,55 @@ impl Grants {
         })
     }
 
-    /// Held by the leader while it decides a failover; [`confirm_locally`] waits for it.
-    pub async fn decision(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.0.decision.lock().await
+    /// Held by the leader while it decides whether to fail `group` over, until the failover
+    /// is recorded; [`confirm_locally`] for that group waits for it.
+    pub async fn decision(&self, group: &str) -> DecisionGuard {
+        let lock = {
+            let mut decisions = self
+                .0
+                .decisions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+
+            Arc::clone(decisions.entry(group.to_owned()).or_default())
+        };
+
+        lock.lock_owned().await
     }
 }
 
-/// [`RpcRequest::Confirm`] on the leader: after any failover decision in progress, and once a
-/// majority confirmed this coordinator still leads (so its record is current), the group's
-/// primary. `None` when it cannot confirm.
+/// A group's [`Grants::decision`] lock.
+pub type DecisionGuard = tokio::sync::OwnedMutexGuard<()>;
+
+/// How long [`confirm_locally`] may take, waiting for a decision included: less than a caller
+/// waits ([`CALL_TIMEOUT`]), so the answer can still reach it, and nothing keeps running for a
+/// caller that gave up.
+const CONFIRM_BUDGET: Duration = Duration::from_millis(750);
+
+/// [`RpcRequest::Confirm`] on the leader: after any failover decision in progress for the
+/// group, and once a majority confirmed this coordinator still leads (so its record is
+/// current), the group's primary. `None` when it cannot confirm within [`CONFIRM_BUDGET`].
 pub async fn confirm_locally(
     raft: &Raft,
     machine: &StateMachine,
     grants: &Grants,
     group: &str,
 ) -> Option<Primary> {
-    let _decided = grants.decision().await;
-
-    match tokio::time::timeout(CALL_TIMEOUT, raft.ensure_linearizable()).await {
-        Ok(Ok(_)) => machine.primaries().get(group).copied(),
-        _ => None,
+    // Nothing recorded, nothing to confirm; also keeps names no group has out of the locks.
+    if !machine.primaries().contains_key(group) {
+        return None;
     }
+    let confirmed = async {
+        let _decided = grants.decision(group).await;
+
+        raft.ensure_linearizable().await.ok()?;
+        machine.primaries().get(group).copied()
+    };
+
+    tokio::time::timeout(CONFIRM_BUDGET, confirmed)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// The group's primary as the current leader confirms it ([`confirm_locally`]).
@@ -905,30 +935,28 @@ pub async fn lead(
             let committed = commits.learn(group, primary, &seen, config.down_after, &recorded);
             let primary_age = seen[primary.member].last_ok.map(|at| at.elapsed());
 
-            // Held through the failover, so no coordinator is confirmed this primary between
-            // reporting its lease ended and the record naming another member.
-            let decided = match primary_age.is_none_or(|age| age > config.down_after) {
-                true => Some(sightings.grants().decision().await),
-                false => None,
-            };
+            // Held until the failover is recorded, so no coordinator is confirmed this primary
+            // between reporting its lease ended and the record naming another member.
+            if primary_age.is_none_or(|age| age > config.down_after) {
+                let decided = sightings.grants().decision(&group.name).await;
 
-            if decided.is_some()
-                && objectively_down(&config, &sightings, group, primary.member)
+                if objectively_down(&config, &sightings, group, primary.member)
                     .await
                     .0
                     == Verdict::Down
-            {
-                let failing = Failing {
-                    group,
-                    primary,
-                    seen: &seen,
-                    committed: &committed,
-                    commits: &commits,
-                };
-                let _ = failover(&config, &raft, &machine, &switches, failing, false).await;
-                continue;
+                {
+                    let failing = Failing {
+                        group,
+                        primary,
+                        seen: &seen,
+                        committed: &committed,
+                        commits: &commits,
+                    };
+                    let _ = failover(&config, &raft, &machine, &switches, failing, false, decided)
+                        .await;
+                    continue;
+                }
             }
-            drop(decided);
 
             reconcile(&config, group, primary, &seen).await;
         }
@@ -1099,6 +1127,7 @@ struct Failing<'a> {
 
 /// Promotes a replica of a group whose primary is down: one that holds every committed record,
 /// or with `force` or `unclean_failover` the best one anyway. The promoted member's address.
+/// `decided` is the group's decision lock, released once the promotion is recorded.
 async fn failover(
     config: &CoordinatorConfig,
     raft: &Raft,
@@ -1106,6 +1135,7 @@ async fn failover(
     switches: &Switches,
     failing: Failing<'_>,
     force: bool,
+    decided: DecisionGuard,
 ) -> Result<String, String> {
     let Failing {
         group,
@@ -1164,6 +1194,9 @@ async fn failover(
     if !propose(raft, group, candidate, primary.epoch + 1, Some(kept)).await {
         return Err("ERR the failover was not recorded; try again".into());
     }
+    // Applied here once recorded: a confirmation waiting for the decision reads the new
+    // primary. The calls to the data nodes below need not hold it up.
+    drop(decided);
 
     let promoted = &group.members[candidate];
 
@@ -1250,7 +1283,7 @@ pub async fn force_failover(force: Force<'_>, group: &Group) -> Result<String, S
     // FORCE overrides the wait for committed records, never the lease: promoting while the
     // old primary may still hold it would let both take writes. Asked even when this
     // coordinator grants no lease, since the others may.
-    let _decided = force.sightings.grants().decision().await;
+    let decided = force.sightings.grants().decision(&group.name).await;
 
     match objectively_down(force.config, force.sightings, group, primary.member).await {
         (Verdict::LeaseRunning, _) => {
@@ -1289,6 +1322,7 @@ pub async fn force_failover(force: Force<'_>, group: &Group) -> Result<String, S
         force.switches,
         failing,
         true,
+        decided,
     )
     .await
 }
@@ -1399,6 +1433,23 @@ mod tests {
 
     fn following(group: &Group, member: usize) -> Role {
         Role::Replica(Some(group.members[member].replication.to_string()))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failover_decision_holds_up_only_its_own_group() {
+        let grants = Grants::default();
+        let deciding = grants.decision("a").await;
+
+        // Another group is not held up.
+        drop(grants.decision("b").await);
+        // The same group waits until the decision is released.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), grants.decision("a"))
+                .await
+                .is_err()
+        );
+        drop(deciding);
+        drop(grants.decision("a").await);
     }
 
     #[test]
