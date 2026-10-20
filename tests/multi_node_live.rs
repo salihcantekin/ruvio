@@ -365,6 +365,12 @@ fn a_slot_range_moves_to_another_node_and_stays_there_after_restarts() {
         on_b.call(&["RUVIO", "MIGRATE", "IMPORT", "m1", "100", "199", "0"]),
         "OK"
     );
+    // The source waits for the target's replicas before it freezes the range; b has none.
+    assert_eq!(on_b.call(&["RUVIO", "MIGRATE", "REPLICAS", "m1"]), "0");
+    assert!(
+        on_b.call(&["RUVIO", "MIGRATE", "REPLICAS", "m2"])
+            .contains("no such move")
+    );
     assert_eq!(
         on_a.call(&[
             "RUVIO",

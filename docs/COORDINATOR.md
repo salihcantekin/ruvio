@@ -407,15 +407,17 @@ receive ranges this way. One move runs at a time.
 
 1. The leader records the move (Raft), then tells the target group's primary to expect the range on that
    shard (`RUVIO MIGRATE IMPORT`) and the source group's primary to send it (`RUVIO MIGRATE EXPORT`).
-2. The source copies the range to the target shard over its client port, in batches, then the keys
-   written meanwhile, until few are left. Clients keep using the source.
+2. The source copies the range to the target shard over its client port, in batches. It then waits
+   until the target's connected replicas hold what was copied (`RUVIO MIGRATE REPLICAS`, at most 10 s),
+   and sends the keys written meanwhile, until few are left. Clients keep using the source.
 3. The source freezes the range: its commands get `TRYAGAIN`, which every Ruvio client retries after 5,
    10 and 20 ms. It sends the last changes and the target syncs them to its log. The source then keeps
    the frozen range on disk (`MIGRATE_OUT`), so a restart cannot serve it again on its own.
-4. The leader waits until the target's connected replicas hold the prepared copy (at most 10 s, or the
-   move is cancelled and started again), commits the move only if neither group failed over since it
-   began, and sends the new map to the target's primary, then the source's, then
-   every other member. The target serves the range; the source answers `MOVED` naming the target and
+4. The leader, asking every 10 ms, waits until the target's connected replicas hold the prepared copy
+   (at most 10 s, or the move is cancelled and started again), commits the move only if neither group
+   failed over since it began, and sends the new map to the target's primary, then the source's, then
+   every other member. The target gets it first because until then it redirects the range back to
+   the source. The target serves the range; the source answers `MOVED` naming the target and
    drops its copy in bounded steps. Each range of the new map names its shard (`"100-199@0"`), so the
    other ranges stay on the shards that hold their data.
 
@@ -430,6 +432,13 @@ times); a new leader takes over a move its predecessor began. After the commit n
 move the range back with another `COORDINATOR MOVE`. The copy rate of a source is capped by
 `migration_max_bytes_per_sec` in its configuration (0, the default, means no cap); the frozen hand-over
 is never slowed down. Nodes need durability `memory`, `everysec` or `always` (not `snapshot`).
+
+The range is frozen from step 3 until the source gets the new map. Measured locally (debug build, one
+Mac running other builds, two groups of a primary and a replica with durability `always`, 303 keys,
+one client writing the range throughout, 5 runs): the writer saw `TRYAGAIN` for 168-237 ms (median
+170 ms). Before the source waited for the target's replicas the same test froze for 1.30-1.73 s, most
+of it the target's replica syncing the copy record by record. The time grows with the keys written
+during the freeze, not with the size of the range. Not measured on release builds or real machines.
 
 ## Upgrading
 
