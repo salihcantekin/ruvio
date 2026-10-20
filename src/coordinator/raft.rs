@@ -27,10 +27,7 @@ use openraft::{
     storage::{LogFlushed, RaftLogStorage, RaftStateMachine},
 };
 use serde::{Deserialize, Serialize};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// A change to the replicated state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -788,7 +785,10 @@ pub struct Envelope {
     pub request: RpcRequest,
 }
 
-pub async fn write_frame<T: Serialize>(stream: &mut TcpStream, value: &T) -> io::Result<()> {
+pub async fn write_frame<T: Serialize>(
+    stream: &mut (impl AsyncWrite + Unpin),
+    value: &T,
+) -> io::Result<()> {
     let body = serde_json::to_vec(value).map_err(io_error)?;
     let length = u32::try_from(body.len()).map_err(io_error)?;
 
@@ -797,7 +797,9 @@ pub async fn write_frame<T: Serialize>(stream: &mut TcpStream, value: &T) -> io:
     stream.flush().await
 }
 
-pub async fn read_frame<T: for<'de> Deserialize<'de>>(stream: &mut TcpStream) -> io::Result<T> {
+pub async fn read_frame<T: for<'de> Deserialize<'de>>(
+    stream: &mut (impl AsyncRead + Unpin),
+) -> io::Result<T> {
     let mut length = [0; 4];
 
     stream.read_exact(&mut length).await?;
@@ -823,9 +825,8 @@ pub async fn call(
     wait: std::time::Duration,
 ) -> io::Result<RpcResponse> {
     tokio::time::timeout(wait, async {
-        let mut stream = TcpStream::connect(address).await?;
+        let mut stream = super::tls::get().dial_peer(address).await?;
 
-        stream.set_nodelay(true)?;
         stream.write_all(&[RPC_MAGIC]).await?;
         write_frame(
             &mut stream,

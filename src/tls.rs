@@ -132,49 +132,8 @@ pub struct ReplicaTlsClient {
 
 impl ReplicaTlsClient {
     pub fn load(ca_path: &Path, client_pair: Option<(&Path, &Path)>) -> io::Result<Self> {
-        install_crypto_provider();
-        let bytes = fs::read(ca_path).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "failed to read replication tls_ca {}: {error}",
-                    ca_path.display()
-                ),
-            )
-        })?;
-        let mut roots = rustls::RootCertStore::empty();
-
-        for certificate in CertificateDer::pem_slice_iter(&bytes) {
-            let certificate = certificate.map_err(|error| {
-                io::Error::other(format!("invalid replication tls_ca PEM: {error}"))
-            })?;
-
-            roots.add(certificate).map_err(|error| {
-                io::Error::other(format!("replication tls_ca was not added: {error}"))
-            })?;
-        }
-
-        if roots.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "replication tls_ca contains no certificates",
-            ));
-        }
-
-        let builder = ClientConfig::builder().with_root_certificates(roots);
-        let config = match client_pair {
-            None => builder.with_no_client_auth(),
-            Some((cert_path, key_path)) => {
-                let (certs, key) = read_pair(cert_path, key_path)?;
-
-                builder.with_client_auth_cert(certs, key).map_err(|error| {
-                    io::Error::other(format!("invalid client certificate: {error}"))
-                })?
-            }
-        };
-
         Ok(Self {
-            config: Arc::new(config),
+            config: Arc::new(client_config(ca_path, client_pair, "replication tls_ca")?),
         })
     }
 
@@ -200,6 +159,123 @@ impl ReplicaTlsClient {
         })?;
 
         Ok(StreamOwned::new(connection, stream))
+    }
+}
+
+/// Client TLS material that is reloaded when its files change, as [`TlsAcceptor`] does: the
+/// coordinator's connections to the other coordinators and to data nodes. Trusts `ca`, and
+/// presents `pair` to a server that asks for a client certificate.
+#[cfg(feature = "coordinator")]
+pub struct TlsDialer {
+    ca: PathBuf,
+    pair: Option<(PathBuf, PathBuf)>,
+    loaded: Mutex<LoadedClient>,
+}
+
+#[cfg(feature = "coordinator")]
+struct LoadedClient {
+    config: Arc<ClientConfig>,
+    mtimes: [Option<SystemTime>; 3],
+}
+
+#[cfg(feature = "coordinator")]
+impl TlsDialer {
+    pub fn load(ca: PathBuf, pair: Option<(PathBuf, PathBuf)>) -> io::Result<Self> {
+        install_crypto_provider();
+        let mtimes = Self::mtimes(&ca, pair.as_ref());
+        let config = Self::build(&ca, pair.as_ref())?;
+
+        Ok(Self {
+            ca,
+            pair,
+            loaded: Mutex::new(LoadedClient {
+                config: Arc::new(config),
+                mtimes,
+            }),
+        })
+    }
+
+    fn build(ca: &Path, pair: Option<&(PathBuf, PathBuf)>) -> io::Result<ClientConfig> {
+        client_config(
+            ca,
+            pair.map(|(cert, key)| (cert.as_path(), key.as_path())),
+            "tls_ca",
+        )
+    }
+
+    fn mtimes(ca: &Path, pair: Option<&(PathBuf, PathBuf)>) -> [Option<SystemTime>; 3] {
+        [
+            mtime(ca),
+            pair.and_then(|(cert, _)| mtime(cert)),
+            pair.and_then(|(_, key)| mtime(key)),
+        ]
+    }
+
+    pub fn current_config(&self) -> io::Result<Arc<ClientConfig>> {
+        let mut loaded = self
+            .loaded
+            .lock()
+            .map_err(|_| io::Error::other("tls reload lock poisoned"))?;
+        let mtimes = Self::mtimes(&self.ca, self.pair.as_ref());
+
+        if mtimes != loaded.mtimes {
+            // As on the accept path: half-rotated files keep the last good material.
+            match Self::build(&self.ca, self.pair.as_ref()) {
+                Ok(fresh) => loaded.config = Arc::new(fresh),
+                Err(error) => {
+                    tracing::warn!(%error, "tls reload failed, keeping the previous certificate");
+                }
+            }
+            loaded.mtimes = mtimes;
+        }
+
+        Ok(Arc::clone(&loaded.config))
+    }
+}
+
+/// A client configuration that trusts the certificates in `ca_path` (`label` names the
+/// setting in errors) and presents `client_pair` when the server asks for a certificate.
+fn client_config(
+    ca_path: &Path,
+    client_pair: Option<(&Path, &Path)>,
+    label: &str,
+) -> io::Result<ClientConfig> {
+    install_crypto_provider();
+    let bytes = fs::read(ca_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to read {label} {}: {error}", ca_path.display()),
+        )
+    })?;
+    let mut roots = rustls::RootCertStore::empty();
+
+    for certificate in CertificateDer::pem_slice_iter(&bytes) {
+        let certificate = certificate
+            .map_err(|error| io::Error::other(format!("invalid {label} PEM: {error}")))?;
+
+        roots
+            .add(certificate)
+            .map_err(|error| io::Error::other(format!("{label} was not added: {error}")))?;
+    }
+
+    if roots.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} contains no certificates"),
+        ));
+    }
+
+    let builder = ClientConfig::builder().with_root_certificates(roots);
+
+    match client_pair {
+        None => Ok(builder.with_no_client_auth()),
+        Some((cert_path, key_path)) => {
+            let (certs, key) = read_pair(cert_path, key_path)?;
+
+            builder
+                .with_client_auth_cert(certs, key)
+                .map_err(|error| io::Error::other(format!("invalid client certificate: {error}")))
+        }
     }
 }
 
