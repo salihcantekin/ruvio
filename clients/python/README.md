@@ -287,9 +287,9 @@ Behaviour worth knowing:
   that is not in the table gets a connection), and its reply is returned. The slot table is not
   changed, so the next command for that slot still goes to the table's owner. `ASK` and `MOVED`
   share the budget of 3 redirects per command; an error reply to `ASKING` is the result.
-- **`-TRYAGAIN`**: the command is sent again, routed by the current table, at most **3 times**,
-  after 5 ms, 10 ms and 20 ms (`asyncio.sleep` in the asyncio client); a fourth `TRYAGAIN` is
-  raised. Redirects during the retries are followed with their own budget.
+- **`-TRYAGAIN`**: the command is sent again, routed by the current table, at most **7 times**,
+  after 5, 10, 20, 40, 80, 160 and 320 ms (635 ms in all; `asyncio.sleep` in the asyncio client); an
+  eighth `TRYAGAIN` is raised. Redirects during the retries are followed with their own budget.
 - **No replay after transport failures.** A dropped node socket fails the command that saw it
   (`ConnectionError`), is closed, and is reopened by the next command for that node. Other nodes
   are not affected. A pipeline/split call that touched several nodes still reads every healthy

@@ -428,11 +428,11 @@ receive ranges this way. One move runs at a time.
 2. The source copies the range to the target shard over its client port, in batches. It then waits
    until the target's connected replicas hold what was copied (`RUVIO MIGRATE REPLICAS`, at most 10 s),
    and sends the keys written meanwhile, until few are left. Clients keep using the source.
-3. The source freezes the range: its commands get `TRYAGAIN`, which every Ruvio client retries after 5,
-   10 and 20 ms. It sends the last changes and the target syncs them to its log. The source then keeps
-   the frozen range on disk (`MIGRATE_OUT`), so a restart cannot serve it again on its own. If the
-   target does not finish within one second of the freeze (a busy disk), the source serves the range
-   again and the leader starts the move again, as after a failover.
+3. The source freezes the range: its commands get `TRYAGAIN`, which every Ruvio client retries for
+   635 ms (7 retries, waits doubling from 5 ms). It sends the last changes and the target syncs them to
+   its log. The source then keeps the frozen range on disk (`MIGRATE_OUT`), so a restart cannot serve
+   it again on its own. If the target does not finish within one second of the freeze (a busy disk),
+   the source serves the range again and the leader starts the move again, as after a failover.
 4. The leader, asking every 10 ms, waits until the target's connected replicas hold the prepared copy
    (at most 10 s, or the move is cancelled and started again), commits the move only if neither group
    failed over since it began, and sends the new map to the target's primary, then the source's, then

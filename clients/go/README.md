@@ -254,9 +254,9 @@ the same command. `-ASK slot host:port`: `ASKING` and the command are sent to th
 one write and its reply is returned; the table is not changed, so the next command for the slot
 still goes to the table's owner. `-MOVED` and `-ASK` share one budget: a command follows at
 most **3** redirects; a fourth is returned to the caller as `*Error`. `-TRYAGAIN` (a slot is
-being handed over; nothing ran) sends the command again, routed by the current table, up to 3
-times after waits of 5, 10 and 20 ms (a cancelled context ends the wait); the third retry's
-`-TRYAGAIN` is returned as `*Error`. The budgets are separate.
+being handed over; nothing ran) sends the command again, routed by the current table, up to 7
+times after waits of 5, 10, 20, 40, 80, 160 and 320 ms (635 ms in all; a cancelled context ends the
+wait); the seventh retry's `-TRYAGAIN` is returned as `*Error`. The budgets are separate.
 
 Pipelines: commands are grouped by node, each group is one pipelined write, groups run
 concurrently, replies come back in the caller's order; `MOVED`, `ASK` and `TRYAGAIN` replies inside a pipeline are

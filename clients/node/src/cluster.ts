@@ -302,8 +302,11 @@ const T_NOREPLICA = 5;
 
 /** MOVED and ASK redirects followed per command (one shared budget) before the redirect error is returned. */
 const MAX_REDIRECTS = 3;
-/** TRYAGAIN retries per command; the wait before retry n (from 0) is `TRYAGAIN_WAIT_MS << n`. */
-const MAX_TRYAGAIN = 3;
+/**
+ * TRYAGAIN retries per command; the wait before retry n (from 0) is `TRYAGAIN_WAIT_MS << n`, 635 ms in
+ * all: a slot range moving between nodes is frozen for a few hundred milliseconds.
+ */
+const MAX_TRYAGAIN = 7;
 const TRYAGAIN_WAIT_MS = 5;
 /** `ASKING`, written before the command a node was asked to serve for a slot it is handing over. */
 const ASKING_FRAME = Buffer.from('*1\r\n$6\r\nASKING\r\n');
@@ -852,8 +855,8 @@ class Router {
    * whole table is reloaded only for an unknown node or a second MOVED for the same command.
    * `ASK slot host:port` sends `ASKING` and the command to the named node in one write and leaves
    * the table alone. MOVED and ASK share `MAX_REDIRECTS`; the redirect after that is returned as
-   * the error. `TRYAGAIN` waits 5, 10, 20 ms and routes the command again by the current table, at
-   * most `MAX_TRYAGAIN` times; the TRYAGAIN after that is returned.
+   * the error. `TRYAGAIN` waits 5, 10, 20, ... 320 ms and routes the command again by the current
+   * table, at most `MAX_TRYAGAIN` times; the TRYAGAIN after that is returned.
    */
   async moved(e: RuvioError, frame: Buffer, tf: Tf | null, fl: number, hop = 1, tries = 0, movedBefore = false): Promise<any> {
     for (;;) {
@@ -1234,8 +1237,8 @@ class ClusterTransactionImpl extends TransactionImpl {
  *   Inside a pipeline the error sits in that command's slot and the rest still runs.
  * - A transaction (`multi()`) must stay in one slot.
  * - On `-MOVED` the slot is re-pointed and the command re-sent; on `-ASK` the command is sent to the named node after `ASKING` and the
- *   slot is left alone. Both share one budget of 3 redirects; the 4th is returned as an error. `-TRYAGAIN` is retried up to 3 times
- *   after 5, 10 and 20 ms, then returned. Ruvio normally forwards a misrouted key instead of answering `MOVED`, so redirects are rare.
+ *   slot is left alone. Both share one budget of 3 redirects; the 4th is returned as an error. `-TRYAGAIN` is retried up to 7 times
+ *   after waits doubling from 5 ms to 320 ms (635 ms in all), then returned. Ruvio normally forwards a misrouted key instead of answering `MOVED`, so redirects are rare.
  * - Blocking commands run on a dedicated connection to the owning node so they do not stall the shared one.
  * - `SCAN` and the `CLIENT *`/`SLOWLOG`/`INFO` family reach one node only; use {@link scanIterator} to walk every node.
  *

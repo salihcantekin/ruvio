@@ -19,11 +19,16 @@ pub const SLOT_COUNT: u16 = 16_384;
 
 const MAX_REDIRECTS: usize = 3;
 
-/// Sleeps before the first, second and third retry of a command answered `TRYAGAIN`.
-const TRYAGAIN_BACKOFF: [Duration; 3] = [
+/// Sleeps before each retry of a command answered `TRYAGAIN`, doubling from 5 ms (635 ms in
+/// all): a slot range moving between nodes is frozen for a few hundred milliseconds.
+const TRYAGAIN_BACKOFF: [Duration; 7] = [
     Duration::from_millis(5),
     Duration::from_millis(10),
     Duration::from_millis(20),
+    Duration::from_millis(40),
+    Duration::from_millis(80),
+    Duration::from_millis(160),
+    Duration::from_millis(320),
 ];
 
 /// What the server answers for a command whose keys span slots; the client answers it the same
