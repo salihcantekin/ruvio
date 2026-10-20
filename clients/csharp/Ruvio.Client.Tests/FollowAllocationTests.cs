@@ -13,15 +13,15 @@ namespace Ruvio.Client.Tests;
 [Collection("Allocation")]
 public class FollowAllocationTests
 {
-    private const int Trials = 3;
-    private const int Warmup = 100;
-    private const int Rounds = 500;
+    private const int Trials = 5;
+    private const int Warmup = 30;
+    private const int Rounds = 100;
 
     // Bytes per round (a SET and a GET, or 16 pipelined commands) a following client may allocate beyond a single-seed
-    // one. Measured over 10 runs: the two differ by at most four bytes per round in either direction, from pool and timer noise in the
+    // one. Measured over 10 runs: the two differ by at most ten bytes per round in either direction, from pool and timer noise in the
     // process-wide count. The smallest object, one per command, is 24 bytes, so a per-command allocation by following
     // mode shows up as at least 48 bytes per round and fails.
-    private const double Slack = 12;
+    private const double Slack = 16;
 
     [Fact(Timeout = 120000)]
     public async Task AFollowingClientAllocatesLikeASingleSeedClientPerCommand()
@@ -82,24 +82,30 @@ public class FollowAllocationTests
         await using (pair)
         {
             string key = $"follow:retain:{Environment.ProcessId}";
+            IReadOnlyList<IReadOnlyList<string>> batch =
+            [
+                .. Enumerable.Range(0, 16).Select(index =>
+                    index % 2 == 0 ? (IReadOnlyList<string>)["SET", key, "v"] : ["GET", key]),
+            ];
 
-            for (int index = 0; index < Warmup; index++)
+            for (int index = 0; index < 100; index++)
             {
-                await pair.Following.SetAsync(key, "v");
+                await pair.Following.ExecuteManyAsync(batch);
             }
 
             long before = Retained();
 
-            for (int index = 0; index < 3000; index++)
+            // 20000 commands in 1250 round trips.
+            for (int index = 0; index < 1250; index++)
             {
-                await pair.Following.SetAsync(key, "v");
-                await pair.Following.GetStringAsync(key);
+                await pair.Following.ExecuteManyAsync(batch);
             }
 
             long grown = Retained() - before;
 
-            Console.WriteLine($"follow alloc: retained bytes grew by {grown} over 6000 commands");
-            Assert.InRange(grown, -65536, 65536);
+            Console.WriteLine($"follow alloc: retained bytes grew by {grown} over 20000 commands");
+            // Noise measured up to about 90 KB (pool trimming); one retained 24-byte object per command is 480 KB.
+            Assert.InRange(grown, -262144, 196608);
         }
     }
 

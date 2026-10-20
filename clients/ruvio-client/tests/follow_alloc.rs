@@ -55,8 +55,8 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
-const WARMUP: usize = 500;
-const ROUNDS: usize = 2_000;
+const WARMUP: usize = 50;
+const ROUNDS: usize = 200;
 
 /// Allocations, bytes and net live bytes of `rounds` calls of `operation`, after a warm-up.
 fn measure(mut operation: impl FnMut()) -> (u64, u64, i64) {

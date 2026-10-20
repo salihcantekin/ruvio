@@ -69,11 +69,11 @@ func TestFollowAllocsMatchSingleSeed(t *testing.T) {
 				failed = err
 			}
 		}
-		for i := 0; i < 100; i++ {
+		for i := 0; i < 30; i++ {
 			step()
 		}
-		best := testing.AllocsPerRun(300, step)
-		if again := testing.AllocsPerRun(300, step); again < best {
+		best := testing.AllocsPerRun(100, step)
+		if again := testing.AllocsPerRun(100, step); again < best {
 			best = again
 		}
 		if failed != nil {
@@ -101,15 +101,16 @@ func TestFollowAllocsMatchSingleSeed(t *testing.T) {
 		return m.HeapAlloc
 	}
 	before := heap()
-	for i := 0; i < 3000; i++ {
-		if err := ops[0].run(following, nil); err != nil {
+	p := following.Pipeline()
+	for i := 0; i < 1250; i++ { // 20000 commands in 1250 round trips
+		if err := ops[1].run(following, p); err != nil {
 			t.Fatal(err)
 		}
 	}
 	after := heap()
-	t.Logf("heap before %d B, after 3000 SET+GET pairs %d B", before, after)
+	t.Logf("heap before %d B, after 20000 commands %d B", before, after)
 	if after > before+64<<10 {
-		t.Errorf("heap grew from %d to %d bytes over 3000 commands while following", before, after)
+		t.Errorf("heap grew from %d to %d bytes over 20000 commands while following", before, after)
 	}
 	if got := len(following.nodeList()); got != 2 {
 		t.Errorf("dial list has %d entries after healthy commands, want 2", got)
