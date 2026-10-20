@@ -492,6 +492,12 @@ pub enum Command<'a> {
     ClientSetName(Bytes<'a>),
     /// `true` is `ON`. `false` is `OFF`.
     ClientTracking(bool),
+    /// `CLIENT DURABILITY REPLICAS n [TIMEOUT ms]`: writes on this connection are answered
+    /// once `replicas` replicas hold them on disk. `0` turns it off.
+    ClientDurability {
+        replicas: u64,
+        timeout_ms: u64,
+    },
     ShardPublish {
         channel: Bytes<'a>,
         message: Bytes<'a>,

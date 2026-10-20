@@ -62,6 +62,16 @@ def test_set_with_a_non_text_key_takes_the_generic_path():
     assert r.set("k", "v", nx=True) is False  # NX refused: nil reply
 
 
+def test_client_durability_encoding():
+    r = Rec(reply="OK")
+    assert r.client_durability(1) is True
+    assert r.frame == encode("CLIENT DURABILITY", ("REPLICAS", 1))
+    assert r.client_durability(2, 750) is True
+    assert r.frame == encode("CLIENT DURABILITY", ("REPLICAS", 2, "TIMEOUT", 750))
+    assert r.client_durability(0) is True
+    assert r.args == ["CLIENT", "DURABILITY", "REPLICAS", "0"]
+
+
 def test_delete_variants():
     r = Rec()
     r.delete("a", "b")

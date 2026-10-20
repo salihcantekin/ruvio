@@ -171,6 +171,7 @@ fn methods_exist() {
     let _ = Client::client_list;
     let _ = Client::client_setname;
     let _ = Client::client_tracking;
+    let _ = Client::client_durability;
     let _ = Client::cluster_info;
     let _ = Client::cluster_keyslot;
     let _ = Client::cluster_myid;

@@ -18,7 +18,7 @@ import (
 //
 // The connection settings are applied, in this order, on every connection the client
 // opens (the shared one, dedicated ones and Pub/Sub ones, also after a reconnect):
-// HELLO 3 / AUTH, SELECT, then CLIENT SETNAME.
+// HELLO 3 / AUTH, SELECT, CLIENT SETNAME, then CLIENT DURABILITY.
 type Options struct {
 	// Addr is host:port. Default 127.0.0.1:6379. With Cluster it is the seed: the
 	// address of any shard.
@@ -42,6 +42,14 @@ type Options struct {
 	DB int
 	// ClientName sends CLIENT SETNAME on every new connection.
 	ClientName string
+	// DurabilityReplicas, when above 0, sends CLIENT DURABILITY REPLICAS n on every new
+	// connection: the server holds that connection's replies until n replicas have the
+	// writes on disk, and a connect fails if the server refuses it (for example without
+	// replication). Default 0: nothing is sent.
+	DurabilityReplicas int
+	// DurabilityTimeout is the TIMEOUT sent with DurabilityReplicas (whole milliseconds).
+	// Default 0: no TIMEOUT is sent and the server uses its own (5 seconds).
+	DurabilityTimeout time.Duration
 	// Protocol 3 sends HELLO 3 on connect; 0 or 2 stays on RESP2 (nothing is sent).
 	// RESP3 is needed for ClientTracking and OnPush.
 	Protocol int
@@ -333,6 +341,13 @@ func (c *Client) dialAddr(ctx context.Context, onPush func(Value), idx int, addr
 	return cn, nil
 }
 
+func durabilityReq(o Options) *request {
+	if o.DurabilityTimeout > 0 {
+		return newCmd(6, cCLIENT).t(tDURABILITY).t(tREPLICAS).i(int64(o.DurabilityReplicas)).t(tTIMEOUT).i(ms(o.DurabilityTimeout))
+	}
+	return newCmd(4, cCLIENT).t(tDURABILITY).t(tREPLICAS).i(int64(o.DurabilityReplicas))
+}
+
 func (c *Client) handshake(ctx context.Context, cn *conn) error {
 	o := c.opts
 	if o.Protocol == 3 {
@@ -369,6 +384,11 @@ func (c *Client) handshake(ctx context.Context, cn *conn) error {
 	}
 	if o.ClientName != "" {
 		if _, err := cn.exec(ctx, newCmd(3, cCLIENT).t(tSETNAME).s(o.ClientName)); err != nil {
+			return err
+		}
+	}
+	if o.DurabilityReplicas > 0 {
+		if _, err := cn.exec(ctx, durabilityReq(o)); err != nil {
 			return err
 		}
 	}

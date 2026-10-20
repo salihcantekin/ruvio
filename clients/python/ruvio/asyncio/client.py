@@ -279,6 +279,10 @@ class Ruvio(Commands):
         password: Password for ``AUTH``, sent on every (re)connect.
         username: ACL user for ``AUTH``; omit for the default user.
         client_name: Name sent with ``CLIENT SETNAME`` on connect.
+        durability_replicas: When set (above 0), ``CLIENT DURABILITY REPLICAS n`` is sent on every connect: the server
+            holds each reply until ``n`` replicas have the writes on disk. Needs a server with replication.
+        durability_timeout_ms: Milliseconds the server waits for the replicas (its default is 5000); used only with
+            ``durability_replicas``.
         connect_timeout: Seconds allowed to open the connection (default 5.0, ``None`` for no limit). There is
             no per-command socket timeout; wrap calls in :func:`asyncio.wait_for` instead.
         decode_responses: ``True`` (default) returns ``str``, ``False`` returns ``bytes``.
@@ -324,6 +328,8 @@ class Ruvio(Commands):
         password: Optional[str] = None,
         username: Optional[str] = None,
         client_name: Optional[str] = None,
+        durability_replicas: Optional[int] = None,
+        durability_timeout_ms: Optional[int] = None,
         connect_timeout: Optional[float] = 5.0,
         decode_responses: bool = True,
         unix_socket_path: Optional[str] = None,
@@ -342,6 +348,8 @@ class Ruvio(Commands):
             password: Password for ``AUTH``.
             username: ACL user for ``AUTH``.
             client_name: Connection name set on connect.
+            durability_replicas: Replicas that must have the writes on disk before a reply (``CLIENT DURABILITY``).
+            durability_timeout_ms: Milliseconds to wait for them; ``None`` keeps the server default.
             connect_timeout: Seconds to open the connection; ``None`` for no limit.
             decode_responses: Return ``str`` (``True``) or ``bytes`` (``False``).
             unix_socket_path: Unix socket to use instead of host/port.
@@ -370,6 +378,8 @@ class Ruvio(Commands):
                 password=password,
                 username=username,
                 client_name=client_name,
+                durability_replicas=durability_replicas,
+                durability_timeout_ms=durability_timeout_ms,
                 connect_timeout=connect_timeout,
                 unix_socket_path=unix_socket_path,
                 parser=parser,
@@ -412,7 +422,7 @@ class Ruvio(Commands):
         return await self._x(conv, data, decode)
 
     async def connect(self) -> "Ruvio":
-        """Opens the connection (and runs ``AUTH``/``SELECT``/``CLIENT SETNAME``) if it is not open yet.
+        """Opens the connection (and runs ``AUTH``/``SELECT``/``CLIENT SETNAME``/``CLIENT DURABILITY``) if it is not open yet.
 
         Safe to call from several tasks at once; one of them opens it.
 

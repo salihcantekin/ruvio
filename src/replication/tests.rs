@@ -270,7 +270,7 @@ fn handshake_status_codes_and_limits_match_the_contract() {
     assert_eq!(SHIPPER_POLL, Duration::from_millis(10));
     assert_eq!(
         (VERSION_RESUME, VERSION_RESYNC, VERSION_RESYNC_INCOMPLETE),
-        (12, 13, 14)
+        (15, 16, 17)
     );
 
     let handshake = Handshake {
@@ -286,7 +286,7 @@ fn handshake_status_codes_and_limits_match_the_contract() {
 
     let bytes = encode_handshake(&handshake).unwrap();
 
-    assert_eq!(&bytes[8..10], &12u16.to_le_bytes());
+    assert_eq!(&bytes[8..10], &15u16.to_le_bytes());
     assert_eq!(&bytes[10..14], &2u32.to_le_bytes());
     assert_eq!(&bytes[14..22], &40u64.to_le_bytes());
     assert_eq!(&bytes[22..24], &6u16.to_le_bytes());
@@ -950,6 +950,7 @@ fn gap_handshake_leaves_the_live_generation() {
             snapshot_requests: Arc::new(AtomicU64::new(0)),
             announce: None,
             tls: None,
+            durable_replies: Default::default(),
         },
     )
     .unwrap();
@@ -1056,6 +1057,7 @@ fn two_replicas_receive_the_same_appended_frame() {
             snapshot_requests: Arc::new(AtomicU64::new(0)),
             announce: None,
             tls: None,
+            durable_replies: Default::default(),
         },
     )
     .unwrap();
@@ -1119,6 +1121,7 @@ fn closing_one_replica_leaves_the_other_streaming() {
             snapshot_requests: Arc::new(AtomicU64::new(0)),
             announce: None,
             tls: None,
+            durable_replies: Default::default(),
         },
     )
     .unwrap();
@@ -1180,6 +1183,7 @@ fn replica_limit_closes_the_extra_connection() {
             snapshot_requests: Arc::new(AtomicU64::new(0)),
             announce: None,
             tls: None,
+            durable_replies: Default::default(),
         },
     )
     .unwrap();
@@ -1254,6 +1258,7 @@ fn a_replica_that_hangs_up_on_an_idle_primary_frees_its_slot() {
             snapshot_requests: Arc::new(AtomicU64::new(0)),
             announce: None,
             tls: None,
+            durable_replies: Default::default(),
         },
     )
     .unwrap();
@@ -1335,6 +1340,7 @@ fn primary_refuses_a_replica_from_another_history_or_shard_layout() {
             snapshot_requests: Arc::new(AtomicU64::new(0)),
             announce: None,
             tls: None,
+            durable_replies: Default::default(),
         },
     )
     .unwrap();
@@ -1502,6 +1508,22 @@ fn copied_publish_round_trips_and_rejects_a_wal_frame() {
     assert_eq!(decode_copied_publish(&frame), None);
 }
 
+#[test]
+fn control_frames_round_trip_and_are_not_publish_or_wal_frames() {
+    let mut frame = encode_control(41, true);
+
+    assert_eq!(frame.len(), 32);
+    assert_eq!(decode_control(&frame), Some((41, true)));
+    assert_eq!(decode_control(&encode_control(7, false)), Some((7, false)));
+    assert_eq!(decode_copied_publish(&frame), None);
+    assert_eq!(
+        decode_control(&encode_copied_publish(false, b"news", b"hello")),
+        None
+    );
+    frame[20] = 0;
+    assert_eq!(decode_control(&frame), None, "the checksum covers the flag");
+}
+
 fn idle_shipment(data_dir: &Path, history: HistoryId) -> Shipment {
     Shipment {
         listen: "127.0.0.1:0".parse().unwrap(),
@@ -1522,6 +1544,7 @@ fn idle_shipment(data_dir: &Path, history: HistoryId) -> Shipment {
         snapshot_requests: Arc::new(AtomicU64::new(0)),
         announce: None,
         tls: None,
+        durable_replies: Default::default(),
     }
 }
 
@@ -1799,6 +1822,32 @@ fn primary_refuses_older_and_newer_handshake_versions_at_once() {
             "refusal waited for a timeout"
         );
         assert_eq!(decode_reply(&reply).unwrap().0, HandshakeStatus::Version);
+    }
+
+    // A build whose stream had no control frames speaks this handshake: read in full, then
+    // refused in this build's reply format.
+    for no_control in [12u16, 14] {
+        let mut stream = connect_replication(address);
+
+        stream
+            .write_all(
+                &encode_handshake(&Handshake {
+                    version: no_control,
+                    shard_id: 0,
+                    after_sequence: 0,
+                    password: Vec::new(),
+                    history: [0; HISTORY_LEN],
+                    shard_count: 1,
+                    epoch: 0,
+                    announce: None,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            decode_reply(&read_reply_bytes(&mut stream)).unwrap().0,
+            HandshakeStatus::Version
+        );
     }
 
     // A newer build gets a refusal in this build's reply format.

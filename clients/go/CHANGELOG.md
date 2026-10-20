@@ -4,6 +4,7 @@ Notable changes to the Go client `github.com/salihcantekin/ruvio/clients/go`. A 
 
 ## Unreleased
 
+- `Options.DurabilityReplicas` / `Options.DurabilityTimeout` and `ClientDurability(ctx, replicas, timeout)` for `CLIENT DURABILITY REPLICAS n [TIMEOUT ms]`: the server holds a connection's replies until `n` replicas have the writes on disk. The option is sent on every new connection; nothing is sent by default.
 - A cluster client now follows `-ASK slot host:port` (sends `ASKING` and the command to the named node, slot map unchanged) and retries `-TRYAGAIN` up to 3 times after 5, 10 and 20 ms. `-ASK` shares the 3-redirect budget with `-MOVED`; pipelines repair both the same way. The plain client is unchanged.
 - **Behavior change:** `Options.CommandTimeout` is now 30 seconds when left 0 (was no limit); a negative value turns it off. A blocking command gets its own wait on top (`BLPOP k 5` may take 5 s plus the timeout; a wait of 0, or one the client cannot parse, has no deadline; a pipeline takes its largest wait), and a Pub/Sub or `MONITOR` connection never times out while it waits for messages (issue #48 follow-up).
 - The command timeout costs no allocation per call: the socket read deadline is set once per connection and the reader fails overdue requests (their late replies are still read and dropped), instead of `context.WithTimeout` per call. Measured: a GET with the default on went from 6 allocations (448 B) to 1 (64 B, the same as off), a SET from 5 (384 B) to 0. A cluster pipeline that spans nodes now gets the timeout too (issue #48 follow-up).

@@ -1366,7 +1366,10 @@ pub fn command_acl_name(command: &Command<'_>) -> &'static str {
         Command::PTtl(_) => "pttl",
         Command::Persist(_) => "persist",
         Command::Hello { .. } => "hello",
-        Command::ClientGetName | Command::ClientSetName(_) | Command::ClientTracking(_) => "client",
+        Command::ClientGetName
+        | Command::ClientSetName(_)
+        | Command::ClientTracking(_)
+        | Command::ClientDurability { .. } => "client",
         Command::Publish { .. } => "publish",
         Command::Subscribe(_) => "subscribe",
         Command::Unsubscribe(_) => "unsubscribe",

@@ -522,6 +522,13 @@ fn databases_transactions_and_scripts() {
 fn server_commands_and_pubsub() {
     let Some(mut db) = connect(7) else { return };
 
+    // Every database of the live server is taken, so the refusal is checked here.
+    let error = db.client_durability(1, Some(5000)).unwrap_err();
+
+    assert!(
+        matches!(&error, ruvio_client::Error::Server(m) if m.contains("needs replication")),
+        "{error:?}"
+    );
     assert!(db.info(None).unwrap().contains("ruvio"));
     assert!(!db.info(Some("server")).unwrap().is_empty());
     assert!(!db.config_get("databases").unwrap().is_empty());

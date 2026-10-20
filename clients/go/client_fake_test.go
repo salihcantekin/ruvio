@@ -38,6 +38,8 @@ func TestHandshakeCommandsFollowTheOptions(t *testing.T) {
 		{"resp3 auth with user", Options{Protocol: 3, Username: "bob", Password: "pw"}, []string{"HELLO 3 AUTH bob pw", "PING"}},
 		{"database", Options{DB: 4}, []string{"SELECT 4", "PING"}},
 		{"client name", Options{ClientName: "svc"}, []string{"CLIENT SETNAME svc", "PING"}},
+		{"durability", Options{DurabilityReplicas: 2}, []string{"CLIENT DURABILITY REPLICAS 2", "PING"}},
+		{"durability with timeout", Options{DurabilityReplicas: 1, DurabilityTimeout: 1500 * time.Millisecond}, []string{"CLIENT DURABILITY REPLICAS 1 TIMEOUT 1500", "PING"}},
 		{"everything", Options{Password: "pw", DB: 2, ClientName: "svc"}, []string{"AUTH pw", "SELECT 2", "CLIENT SETNAME svc", "PING"}},
 	}
 	for _, c := range cases {
@@ -88,6 +90,16 @@ func TestConnectFailures(t *testing.T) {
 	})
 	if _, err := Connect(context.Background(), Options{Addr: badName.addr, ClientName: "x"}); err == nil {
 		t.Fatal("CLIENT SETNAME failure must fail Connect")
+	}
+
+	noReplication := newFakeNode(t, func(f *fakeNode, args []string) string {
+		if args[0] == "CLIENT" {
+			return "-ERR CLIENT DURABILITY needs replication on this server\r\n"
+		}
+		return "+OK\r\n"
+	})
+	if _, err := Connect(context.Background(), Options{Addr: noReplication.addr, DurabilityReplicas: 1}); err == nil {
+		t.Fatal("CLIENT DURABILITY failure must fail Connect")
 	}
 
 	badHello := newFakeNode(t, func(f *fakeNode, args []string) string { return "-ERR unknown command 'HELLO'\r\n" })
@@ -287,5 +299,28 @@ func TestLimitModesSendTheirKeywordsAndReadTheirReplies(t *testing.T) {
 	reply = "*1\r\n:1\r\n"
 	if _, err = cl.LimitTokensWithRetry(ctx, "k", 10, time.Second, 1); err == nil {
 		t.Fatal("a one-element reply must be an error")
+	}
+}
+
+func TestClientDurabilitySendsTheCommand(t *testing.T) {
+	f := okFake(t)
+	cl, err := Connect(context.Background(), Options{Addr: f.addr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	ctx := context.Background()
+	if err := cl.ClientDurability(ctx, 2, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.ClientDurability(ctx, 1, 250*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.ClientDurability(ctx, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	want := "PING|CLIENT DURABILITY REPLICAS 2|CLIENT DURABILITY REPLICAS 1 TIMEOUT 250|CLIENT DURABILITY REPLICAS 0"
+	if got := strings.Join(f.commands(), "|"); got != want {
+		t.Fatalf("got %v want %v", got, want)
 	}
 }

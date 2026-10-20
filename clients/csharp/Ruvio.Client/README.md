@@ -62,7 +62,7 @@ keys must share one slot, or the call fails with `CROSSSLOT` before anything is 
 Cluster transactions are deliberately not supported by this API; unsupported commands fail
 explicitly. Existing string APIs are unchanged.
 
-RESP2 client for [Ruvio](https://ruviodb.com/). Connecting does not send `CLIENT SETINFO` or `HELLO`. The typed methods cover every command in `docs/compatibility-matrix.json` (298/298) and the options that change what Ruvio does; `MatrixCoverageTests` fails when a matrix command has no typed method, and `LiveCommandTests` sends every one of them to a real server. `FLUSHDB ASYNC` (it runs synchronously) and `HELLO AUTH`/`SETNAME` have no typed form. Anything else can go through `ExecuteAsync` with the same argument lists as `redis-cli`.
+RESP2 client for [Ruvio](https://ruviodb.com/). Connecting does not send `CLIENT SETINFO` or `HELLO`. The typed methods cover every command in `docs/compatibility-matrix.json` (299/299) and the options that change what Ruvio does; `MatrixCoverageTests` fails when a matrix command has no typed method, and `LiveCommandTests` sends every one of them to a real server. `FLUSHDB ASYNC` (it runs synchronously) and `HELLO AUTH`/`SETNAME` have no typed form. Anything else can go through `ExecuteAsync` with the same argument lists as `redis-cli`.
 
 ## Command coverage
 
@@ -515,6 +515,8 @@ Connect tries the seeds in order, one attempt each, and keeps the first that ans
 On a cluster, `CLUSTER SLOTS` comes from the first reachable seed. A slot map reload (after a `MOVED` to an unknown node, or when a node cannot be opened again) asks the nodes with an open socket first; when none answers, it opens every other known node and then every seed, one attempt each, until one returns a slot map. The command goes to the owner the new map names, and a command without a key goes to the first reachable node of the new map. Seeds are never asked while the known nodes answer. A pipeline that hits a node that cannot be opened fails; the next command reloads the map.
 
 ### Reads from replicas
+
+`RuvioClientOptions.DurabilityReplicas` (with an optional `DurabilityTimeout`) makes every connection the client opens send `CLIENT DURABILITY REPLICAS n [TIMEOUT ms]` right after `AUTH`, so the server holds that connection's replies until `n` replicas have the writes on disk; a write the replicas do not confirm in time fails with `NOREPLICAS` and stays applied. A server without replication refuses it and the connect fails. The default sends nothing. `SetDurabilityAsync(replicas, timeout)` sets or clears it on one connection.
 
 `RuvioClientOptions.ReadPolicy` (`ReadPolicy.Primary`, `PreferReplica` or `Replica`) chooses where a cluster client sends reads. A standalone connection ignores it. `CLUSTER SLOTS` lists each shard's replicas after its primary; when the slot map is loaded, the client picks one replica per shard at random and keeps it until the next load. Each replica socket sends `READONLY` once, right after it is opened.
 

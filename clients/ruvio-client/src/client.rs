@@ -111,6 +111,23 @@ pub struct ClientOptions {
     /// Where a cluster client sends read-only commands; see [`ReadPolicy`]. Ignored by a
     /// standalone connection. Defaults to [`ReadPolicy::Primary`].
     pub read_policy: ReadPolicy,
+    /// When set, every connection this client opens (the first one, reconnects, per-shard and
+    /// replica sockets) sends `CLIENT DURABILITY REPLICAS n [TIMEOUT ms]` right after `AUTH`, and
+    /// the connect fails with [`Error::Server`] when the server refuses it (for example on a
+    /// server without replication). Replies are then held until that many replicas have the
+    /// writes on disk. Defaults to `None` (nothing is sent).
+    pub durability: Option<Durability>,
+}
+
+/// The replicas a connection waits for before its replies are released; see
+/// [`ClientOptions::durability`] and [`Client::client_durability`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Durability {
+    /// How many replicas must have each write on disk. 0 turns the wait off.
+    pub replicas: u32,
+    /// How long the server waits for them, in milliseconds. `None` keeps the server default
+    /// (5000); `TIMEOUT` is then not sent.
+    pub timeout_ms: Option<u32>,
 }
 
 /// Where a cluster client sends read-only commands (those the server flags `readonly`, such as
@@ -186,6 +203,7 @@ impl Default for ClientOptions {
             reconnect_base_delay: Duration::from_millis(100),
             reconnect_max_delay: Duration::from_secs(2),
             read_policy: ReadPolicy::Primary,
+            durability: None,
         }
     }
 }
@@ -1965,7 +1983,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use super::{Client, ClientOptions, RespValue, read_ping};
+    use super::{Client, ClientOptions, Durability, Error, RespValue, read_ping};
 
     fn bound(stream: TcpStream) -> TcpStream {
         stream
@@ -2167,6 +2185,62 @@ mod tests {
         server.write_all(b"+OK\r\n").unwrap();
         reply_standalone_cluster(&mut server);
         connecting.join().unwrap();
+    }
+
+    #[test]
+    fn durability_is_sent_after_auth_with_and_without_timeout() {
+        let cases = [
+            (
+                Durability {
+                    replicas: 2,
+                    timeout_ms: None,
+                },
+                &b"*4\r\n$6\r\nCLIENT\r\n$10\r\nDURABILITY\r\n$8\r\nREPLICAS\r\n$1\r\n2\r\n"[..],
+            ),
+            (
+                Durability {
+                    replicas: 1,
+                    timeout_ms: Some(250),
+                },
+                &b"*6\r\n$6\r\nCLIENT\r\n$10\r\nDURABILITY\r\n$8\r\nREPLICAS\r\n$1\r\n1\r\n$7\r\nTIMEOUT\r\n$3\r\n250\r\n"[..],
+            ),
+        ];
+
+        for (durability, expected) in cases {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let accepted = thread::spawn(move || bound(crate::test_support::accept(&listener).0));
+            let connecting = thread::spawn(move || {
+                Client::connect_with(ClientOptions {
+                    host: "127.0.0.1".to_owned(),
+                    port,
+                    password: Some("secret".to_owned()),
+                    durability: Some(durability),
+                    ..ClientOptions::default()
+                })
+            });
+
+            let mut server = accepted.join().unwrap();
+            let auth = b"*2\r\n$4\r\nAUTH\r\n$6\r\nsecret\r\n";
+            let mut got = vec![0_u8; auth.len()];
+
+            server.read_exact(&mut got).unwrap();
+            assert_eq!(got, auth);
+            server.write_all(b"+OK\r\n").unwrap();
+            got = vec![0_u8; expected.len()];
+            server.read_exact(&mut got).unwrap();
+            assert_eq!(got, expected);
+            server
+                .write_all(b"-ERR CLIENT DURABILITY needs replication on this server\r\n")
+                .unwrap();
+
+            let error = connecting.join().unwrap().err().unwrap();
+
+            assert!(
+                matches!(error, Error::Server(ref m) if m.contains("needs replication")),
+                "{error:?}"
+            );
+        }
     }
 
     #[test]

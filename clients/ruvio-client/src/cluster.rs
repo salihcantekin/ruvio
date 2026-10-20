@@ -413,6 +413,25 @@ impl Connection {
                         throw_error(reply)?;
                     }
 
+                    if let Some(durability) = options.durability {
+                        let replicas = durability.replicas.to_string();
+                        let reply = match durability.timeout_ms {
+                            Some(timeout) => connection.send(&[
+                                "CLIENT",
+                                "DURABILITY",
+                                "REPLICAS",
+                                &replicas,
+                                "TIMEOUT",
+                                &timeout.to_string(),
+                            ])?,
+                            None => {
+                                connection.send(&["CLIENT", "DURABILITY", "REPLICAS", &replicas])?
+                            }
+                        };
+
+                        throw_error(reply)?;
+                    }
+
                     return Ok(connection);
                 }
 

@@ -22,7 +22,7 @@
 
 ---
 
-Blocking RESP2 client for [Ruvio](https://ruviodb.com/). Connecting does not send `CLIENT SETINFO` or `HELLO`. Give the client one address; it sends `CLUSTER SLOTS` and, on a sharded server, opens one socket per shard and routes by hash slot. `MOVED` is followed up to three times per command. `MGET` / `MSET` / `DEL` / `EXISTS` / `UNLINK` / `TOUCH` split across slots; other commands whose keys span slots fail with `CROSSSLOT` before anything is sent. Methods take `&mut self` and are named after the command they send. They cover every command in [`docs/compatibility-matrix.json`](../../docs/compatibility-matrix.json) (298/298, checked by `tests/coverage.rs`) plus the options that change what Ruvio does. `execute` and `execute_many` send any argument list, as `redis-cli` would; `execute_binary` does the same with raw byte arguments.
+Blocking RESP2 client for [Ruvio](https://ruviodb.com/). Connecting does not send `CLIENT SETINFO` or `HELLO`. Give the client one address; it sends `CLUSTER SLOTS` and, on a sharded server, opens one socket per shard and routes by hash slot. `MOVED` is followed up to three times per command. `MGET` / `MSET` / `DEL` / `EXISTS` / `UNLINK` / `TOUCH` split across slots; other commands whose keys span slots fail with `CROSSSLOT` before anything is sent. Methods take `&mut self` and are named after the command they send. They cover every command in [`docs/compatibility-matrix.json`](../../docs/compatibility-matrix.json) (299/299, checked by `tests/coverage.rs`) plus the options that change what Ruvio does. `execute` and `execute_many` send any argument list, as `redis-cli` would; `execute_binary` does the same with raw byte arguments.
 
 ```rust
 use std::time::Duration;
@@ -97,6 +97,8 @@ let mut secured = Client::connect_with(ClientOptions {
 ```
 
 `select` switches the same connection, and `into_database` does the same and returns the client. `flushdb`, `flushall`, `swapdb`, and `move_key` send `FLUSHDB`, `FLUSHALL`, `SWAPDB`, and `MOVE`.
+
+`ClientOptions::durability` (`Some(Durability { replicas, timeout_ms })`) makes every connection the client opens, including reconnects and the per-shard sockets of a cluster client, send `CLIENT DURABILITY REPLICAS n [TIMEOUT ms]` right after `AUTH`. The server then holds that connection's replies until `n` replicas have the writes on disk, and answers `-NOREPLICAS` after the timeout (writes stay applied). A refusal, such as on a server without replication, fails the connect with `Error::Server`. The default `None` sends nothing. `client_durability(replicas, timeout_ms)` sets it on one connection; 0 turns it off.
 
 A password is sent as `AUTH` only when `ClientOptions::password` is set. A server error reply leaves the connection usable. A broken read or write does not.
 

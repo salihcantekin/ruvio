@@ -27,7 +27,7 @@ dependencies and needs Python 3.9 or newer. It ships type information (`py.typed
 - `ruvio.Ruvio` is the synchronous client. It uses one socket and a reusable `recv_into` buffer.
 - `ruvio.asyncio.Ruvio` is the asyncio client. It keeps one multiplexed, pipelined connection
   that all coroutines share.
-- There is a typed method for each of the **298** commands in `docs/compatibility-matrix.json`.
+- There is a typed method for each of the **299** commands in `docs/compatibility-matrix.json`.
   The methods also cover the options that change Ruvio's behaviour: `SET … IFEQ`,
   `INCRBY … MAX`, `FILLGET … WAIT`, `FILLSET … SWR`, `GETEX` in milliseconds,
   `DELEX key IFEQ v`, `LPUSHCAP`/`RPUSHCAP`, `BF.*`, `JSON.*` (including `JSON.INDEX` and
@@ -350,6 +350,19 @@ client.get("user:1")          # a replica; may not have the write yet
   `REPLICA` raises (`ConnectionError`, or the `LOADING` `ResponseError`), and a `RuvioError` saying "no replica"
   when none is known. A socket that drops after a command was sent fails the command, as for every node.
 
+## Durable replies
+
+`durability_replicas=n` (and optionally `durability_timeout_ms=`) on `Ruvio`, `asyncio.Ruvio` and the cluster
+clients sends `CLIENT DURABILITY REPLICAS n [TIMEOUT ms]` right after the handshake of every connection,
+reconnects included. The server then holds each reply until `n` replicas have the writes on disk; on a timeout
+(default 5000 ms) the replies of that batch are `-NOREPLICAS` errors and the writes stay applied. A server
+without replication refuses it and the connect fails. Without the option nothing is sent.
+`client.client_durability(n, timeout_ms=None)` sets it on the current connection only (`0` turns it off).
+
+```python
+r = Ruvio("127.0.0.1", 6379, durability_replicas=1, durability_timeout_ms=5000)
+```
+
 ## Seed addresses
 
 `seeds=` takes the place of `host`/`port` (both clients, plain and `cluster=True`): `"host:port"` strings
@@ -393,7 +406,7 @@ RUVIO_TEST_FLUSHALL=1 ...                                               # also r
   has no typed method on the sync or the async client. It also fails when a typed method is
   never called by a live test.
 - `tests/test_cluster_unit.py` needs no Ruvio server: slot vectors and hashtags, key
-  extraction through the typed methods, a check that **all 298 matrix commands have a routing
+  extraction through the typed methods, a check that **all 299 matrix commands have a routing
   rule**, topology / `MOVED` / scan-cursor parsing, and the router against scripted fake servers
   (`tests/fakecluster.py`) on both clients: owner-only routing, fail-fast `CROSSSLOT` (no byte
   sent), split reassembly order, `MOVED` patch / refresh / unknown node / at most 3 redirects, no

@@ -11,6 +11,16 @@ public sealed class LiveHelperTests
     private const int Db = 12;
 
     [LiveFact(Timeout = 30000)]
+    public async Task SetDurabilityIsRefusedOnAServerWithoutReplication()
+    {
+        await using RuvioConnection connection = await LiveServer.ConnectAsync(Db);
+        RuvioClient db = await connection.GetDefaultDatabaseAsync();
+
+        RuvioException error = await Assert.ThrowsAsync<RuvioException>(async () => await db.SetDurabilityAsync(1));
+        Assert.Contains("needs replication", error.Message);
+    }
+
+    [LiveFact(Timeout = 30000)]
     public async Task Lock_is_exclusive_renewable_and_never_releases_another_owner()
     {
         await using RuvioConnection connection = await LiveServer.ConnectAsync(Db);

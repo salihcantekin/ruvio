@@ -218,14 +218,14 @@ public final class Link implements AutoCloseable {
     }
 
     /**
-     * Sends {@code AUTH}, {@code SELECT} and {@code CLIENT SETNAME}, pipelined in one write.
+     * Sends {@code AUTH}, {@code SELECT}, {@code CLIENT SETNAME} and {@code CLIENT DURABILITY}, pipelined in one write.
      *
      * @param c the connection
      * @param o the settings
      * @param database the database to select
      */
     public static void handshake(Connection c, RuvioOptions o, int database) {
-        if (o.password == null && database == 0 && o.clientName == null) {
+        if (o.password == null && database == 0 && o.clientName == null && o.durabilityReplicas == 0) {
             return;
         }
         Raw raw = new Raw(c);
@@ -239,6 +239,11 @@ public final class Link implements AutoCloseable {
         }
         if (o.clientName != null) {
             last = raw.send(Reply.OK, "CLIENT", "SETNAME", o.clientName);
+        }
+        if (o.durabilityReplicas != 0) {
+            last = o.durabilityTimeoutMillis != 0
+                    ? raw.send(Reply.OK, "CLIENT", "DURABILITY", "REPLICAS", (long) o.durabilityReplicas, "TIMEOUT", (long) o.durabilityTimeoutMillis)
+                    : raw.send(Reply.OK, "CLIENT", "DURABILITY", "REPLICAS", (long) o.durabilityReplicas);
         }
         if (last != null) {
             await(last, o.connectTimeoutMillis);

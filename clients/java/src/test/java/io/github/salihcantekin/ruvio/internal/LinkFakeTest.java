@@ -59,6 +59,29 @@ class LinkFakeTest {
     }
 
     @Test
+    void durabilityIsSentOnConnectAndByTheMethod() throws Exception {
+        try (FakeNode n = new FakeNode(LinkFakeTest::ok)) {
+            RuvioClient.connect(to(n).durability(2).build()).close();
+            assertEquals(List.of("CLIENT", "DURABILITY", "REPLICAS", "2"), n.received.get(0));
+        }
+        try (FakeNode n = new FakeNode(LinkFakeTest::ok)) {
+            RuvioClient.connect(to(n).database(1).durability(1, 250).build()).close();
+            assertEquals(List.of("SELECT", "1"), n.received.get(0));
+            assertEquals(List.of("CLIENT", "DURABILITY", "REPLICAS", "1", "TIMEOUT", "250"), n.received.get(1));
+        }
+        try (FakeNode n = new FakeNode(LinkFakeTest::ok); RuvioClient<String, String> c = RuvioClient.connect(to(n).build())) {
+            c.clientDurability(3);
+            c.clientDurability(0, 100);
+            assertEquals(List.of("CLIENT", "DURABILITY", "REPLICAS", "3"), n.received.get(0));
+            assertEquals(List.of("CLIENT", "DURABILITY", "REPLICAS", "0", "TIMEOUT", "100"), n.received.get(1));
+        }
+        try (FakeNode n = new FakeNode(a -> a.get(0).equals("CLIENT") ? "-ERR CLIENT DURABILITY needs replication on this server\r\n" : "+OK\r\n")) {
+            RuvioServerException e = assertThrows(RuvioServerException.class, () -> RuvioClient.connect(to(n).durability(1).build()));
+            assertTrue(e.getMessage().contains("needs replication"));
+        }
+    }
+
+    @Test
     void aRefusedHandshakeFailsTheConnectWithTheServerMessage() throws Exception {
         try (FakeNode n = new FakeNode(a -> a.get(0).equals("AUTH") ? "-WRONGPASS invalid username-password pair\r\n" : "+OK\r\n")) {
             RuvioServerException e = assertThrows(RuvioServerException.class, () -> RuvioClient.connect(to(n).password("bad").build()));

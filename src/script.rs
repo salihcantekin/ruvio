@@ -1370,6 +1370,7 @@ fn scriptable(command: &Command<'_>) -> bool {
                 | Command::ClientGetName
                 | Command::ClientSetName(_)
                 | Command::ClientTracking(_)
+                | Command::ClientDurability { .. }
                 | Command::ShardPublish { .. }
                 | Command::ShardSubscribe(_)
                 | Command::ShardUnsubscribe(_)

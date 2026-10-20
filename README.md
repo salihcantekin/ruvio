@@ -53,7 +53,7 @@ The shard that owns a key parses, records, applies, and replies. The hot path do
 | **Owner-per-shard engine** | One owner per shard, no lock on apply. A feature allocates only when a key uses it: twenty thousand leases added about 3.6 MB, twenty thousand versioned 64-byte strings about 7.2 MB, body included. |
 | **Durability you name** | `memory`, `snapshot`, `everysec` or `always`, chosen at startup. A write is checked, appended, then applied. If the log cannot take the record, the key stays as it was and later writes return `MISCONF`. |
 | **Wire compatible** | RESP2 subset; `redis-cli` and existing RESP clients connect. The command list that CI checks is [docs/compatibility-matrix.json](docs/compatibility-matrix.json). |
-| **Six first-party clients** | Rust, C#, Go, Java, Python and Node.js, each with a typed method for every one of the 298 listed commands and cluster routing from one seed address. |
+| **Six first-party clients** | Rust, C#, Go, Java, Python and Node.js, each with a typed method for every one of the 299 listed commands and cluster routing from one seed address. |
 | **Operator UI** | A browser view of one running server: data, command forms, Pub/Sub and ACL users. |
 
 ## Quick start

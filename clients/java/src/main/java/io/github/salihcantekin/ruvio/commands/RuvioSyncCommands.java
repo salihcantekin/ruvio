@@ -5461,6 +5461,27 @@ public abstract class RuvioSyncCommands<K, V> {
     }
 
     /**
+     * Sends {@code CLIENT DURABILITY REPLICAS n}. While set, the server holds this connection's replies until {@code replicas} replicas have every earlier write on disk. After the default 5000 ms the replies of the batch become {@code NOREPLICAS} errors and the writes stay applied. The options' {@code durability} sets it on every (re)connect.
+     *
+     * @param replicas the replicas that must hold each write; 0 turns it off
+     * @throws RuvioServerException {@code ERR} on a server without replication or inside {@code MULTI}
+     */
+    public void clientDurability(long replicas) {
+        await(async.clientDurability(replicas));
+    }
+
+    /**
+     * Sends {@code CLIENT DURABILITY REPLICAS n TIMEOUT ms}. Same as {@link #clientDurability(long)} with a longest wait.
+     *
+     * @param replicas the replicas that must hold each write; 0 turns it off
+     * @param timeoutMillis the longest wait in milliseconds
+     * @throws RuvioServerException {@code ERR} on a server without replication or inside {@code MULTI}
+     */
+    public void clientDurability(long replicas, long timeoutMillis) {
+        await(async.clientDurability(replicas, timeoutMillis));
+    }
+
+    /**
      * Sends {@code CLIENT ID}.
      *
      * @return the id the server gave this connection

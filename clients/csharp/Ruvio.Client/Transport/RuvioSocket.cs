@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
+using System.Globalization;
 using System.Net.Sockets;
 
 namespace Ruvio.Client;
@@ -49,7 +50,7 @@ internal sealed class RuvioSocket : IDisposable
 
     public bool IsBroken => _broken || _disposed || _multiplexer?.IsBroken == true;
 
-    /// <summary>Connects, then sends <c>AUTH</c> when the options ask for it. <c>SELECT</c> is left to the caller.</summary>
+    /// <summary>Connects, then sends <c>AUTH</c> and <c>CLIENT DURABILITY</c> when the options ask for them. <c>SELECT</c> is left to the caller.</summary>
     // subscriber: a Pub/Sub socket, which keeps async I/O whatever the options say.
     public static async Task<RuvioSocket> OpenAsync(
         string host,
@@ -93,7 +94,7 @@ internal sealed class RuvioSocket : IDisposable
 
         var connection = new RuvioSocket(tcp, host, port, options.MaxInFlightRequests, dedicatedReader, options.CommandTimeout);
 
-        if (options.Password is null)
+        if (options.Password is null && options.DurabilityReplicas <= 0)
         {
             connection._initialized = true;
 
@@ -102,21 +103,18 @@ internal sealed class RuvioSocket : IDisposable
 
         try
         {
-            IReadOnlyList<string> auth = options.Username is null
-                ? ["AUTH", options.Password]
-                : ["AUTH", options.Username, options.Password];
+            if (options.Password is not null)
+            {
+                IReadOnlyList<string> auth = options.Username is null
+                    ? ["AUTH", options.Password]
+                    : ["AUTH", options.Username, options.Password];
 
-            if (dedicatedReader)
-            {
-                // The blocking stream ignores tokens: run AUTH off the caller's thread, and let the
-                // token close the socket so a server that never answers cannot hang the connect.
-                using CancellationTokenRegistration abort = cancellationToken.Register(connection.Dispose);
-                ThrowOnError(await Task.Run(() => connection.SendAsync(auth, CancellationToken.None).AsTask(), CancellationToken.None).ConfigureAwait(false));
-                cancellationToken.ThrowIfCancellationRequested();
+                await HandshakeAsync(connection, auth, dedicatedReader, cancellationToken);
             }
-            else
+
+            if (options.DurabilityReplicas > 0)
             {
-                ThrowOnError(await connection.SendAsync(auth, cancellationToken));
+                await HandshakeAsync(connection, DurabilityCommand(options), dedicatedReader, cancellationToken);
             }
         }
         catch (Exception) when (dedicatedReader && cancellationToken.IsCancellationRequested)
@@ -133,6 +131,39 @@ internal sealed class RuvioSocket : IDisposable
         connection._initialized = true;
 
         return connection;
+    }
+
+    /// <summary>The <c>CLIENT DURABILITY</c> command the options ask for, with <c>TIMEOUT</c> only when one is set.</summary>
+    private static IReadOnlyList<string> DurabilityCommand(RuvioClientOptions options)
+    {
+        string replicas = options.DurabilityReplicas.ToString(CultureInfo.InvariantCulture);
+
+        if (options.DurabilityTimeout is not { } timeout)
+        {
+            return ["CLIENT", "DURABILITY", "REPLICAS", replicas];
+        }
+
+        return ["CLIENT", "DURABILITY", "REPLICAS", replicas, "TIMEOUT", ((long)timeout.TotalMilliseconds).ToString(CultureInfo.InvariantCulture)];
+    }
+
+    private static async Task HandshakeAsync(
+        RuvioSocket connection,
+        IReadOnlyList<string> command,
+        bool dedicatedReader,
+        CancellationToken cancellationToken)
+    {
+        if (dedicatedReader)
+        {
+            // The blocking stream ignores tokens: run the command off the caller's thread, and let the
+            // token close the socket so a server that never answers cannot hang the connect.
+            using CancellationTokenRegistration abort = cancellationToken.Register(connection.Dispose);
+            ThrowOnError(await Task.Run(() => connection.SendAsync(command, CancellationToken.None).AsTask(), CancellationToken.None).ConfigureAwait(false));
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+        else
+        {
+            ThrowOnError(await connection.SendAsync(command, cancellationToken));
+        }
     }
 
     /// <summary>

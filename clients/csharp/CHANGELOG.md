@@ -4,6 +4,7 @@ Notable changes to the C# packages `Ruvio.Client` and `Ruvio.Client.AspNetCore`,
 
 ## Unreleased
 
+- `SetDurabilityAsync(replicas, timeout)` sends `CLIENT DURABILITY REPLICAS n [TIMEOUT ms]`, and the `RuvioClientOptions.DurabilityReplicas` / `DurabilityTimeout` options send it on every connection the client opens (reconnects, pooled and per-node connections included); nothing is sent by default.
 - A cluster client follows `-ASK slot host:port` (sends `ASKING` and the command to the named node, without changing the slot map) and retries `-TRYAGAIN` up to 3 times after 5, 10 and 20 ms. `ASK` shares the 3-redirect budget with `MOVED`; replies that are neither cost nothing extra. Pipelines follow them like `MOVED`.
 - Fixed: stream reads (`XRANGE`, `XREVRANGE`, `XREAD`, `XREADGROUP` and `XCLAIM`) preserve repeated field names and their order instead of keeping only the last value for each name. Contributed by @ertugrulakdag (#88).
 - **Behavior change:** `RuvioClientOptions.CommandTimeout` is now 30 seconds by default (was no limit); `TimeSpan.Zero` turns it off. A blocking command gets its own wait on top (`BLPOP k 5` may take 5 s plus the timeout; a wait of 0, or one the client cannot parse, has no deadline; a pipeline takes its largest wait), and a Pub/Sub or `MONITOR` connection never times out while it waits for messages (issue #48 follow-up).

@@ -71,6 +71,7 @@ COMPOSITE = {
         "CLIENT GETNAME",
         "CLIENT SETNAME",
         "CLIENT TRACKING",
+        "CLIENT DURABILITY",
     ),
 }
 DATA_TYPE_FAMILIES = {

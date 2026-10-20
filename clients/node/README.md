@@ -30,7 +30,7 @@ npm install ruvio-client
 ```ts
 import { createClient } from 'ruvio-client';
 
-const c = createClient('redis://127.0.0.1:6379/0');   // or { host, port, db, username, password, tls }
+const c = createClient('redis://127.0.0.1:6379/0');   // or { host, port, db, username, password, tls, durability }
 await c.set('k', 'v', { px: 5000 });
 console.log(await c.get('k'));                          // 'v'
 console.log(await c.binary.get('k'));                   // Buffer
@@ -55,7 +55,7 @@ await c.quit();
 
 ## API
 
-Typed methods for every command in `docs/compatibility-matrix.json` (298/298, enforced by `test/coverage.test.ts`),
+Typed methods for every command in `docs/compatibility-matrix.json` (299/299, enforced by `test/coverage.test.ts`),
 including the Ruvio options: `set(k, v, { ifEq })`, `set(k, n, { ifGt })` / `{ ifLt }`, `incrbyMax`, `fillget`/`fillset` (`WAIT`, `SWR`), `getex(k, ms)`,
 `delex(k, ifEq)`, `lpushcap`/`rpushcap`, `bf*`, `json*` (incl. `jsonIndexCreate`, `jsonFind`), `idemBegin`/`idemComplete`,
 `lease`/`semaphore`/`release`, `once`, `take`, `transfer`, `htransfer`, `setv`, `changes*`, `limit`. Anything else: `c.call('CMD', ...args)`.
@@ -66,6 +66,9 @@ including the Ruvio options: `set(k, v, { ifEq })`, `set(k, n, { ifGt })` / `{ i
 - **Pub/Sub:** `const s = c.subscriber(); s.on('message', m => ...)` or `for await (const m of s)`; a dedicated socket,
   re-subscribes after a drop. Supports `psubscribe`, `ssubscribe`, `binary: true` payloads.
 - **Blocking commands** (`blpop`, `xread block`, `fillget ... WAIT`, `wait`) park the shared socket: use `c.duplicate()`.
+- **Durable replies:** `createClient({ durability: { replicas: 1, timeoutMs: 5000 } })` sends `CLIENT DURABILITY REPLICAS 1 TIMEOUT 5000` on every
+  (re)connect, so each reply waits until that many replicas have the data on disk (otherwise `NOREPLICAS`; the write stays applied).
+  `c.clientDurability(n, timeoutMs?)` sets it on one connection; `0` turns it off. Needs a server with replication.
 - **Errors:** server errors reject with `RuvioError` (`.code` = `ERR`, `WRONGTYPE`...); a lost connection rejects pending calls with `ConnectionError`,
   and the next call reconnects (database and name are re-applied). Nil replies are `null`.
 

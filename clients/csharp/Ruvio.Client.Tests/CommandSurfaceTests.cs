@@ -1124,6 +1124,18 @@ public partial class CommandSurfaceTests
         await session.Reply("+OK\r\n");
         await tracking;
 
+        ValueTask durability = session.Client.SetDurabilityAsync(2);
+
+        await session.Expect("CLIENT", "DURABILITY", "REPLICAS", "2");
+        await session.Reply("+OK\r\n");
+        await durability;
+
+        ValueTask durabilityWithTimeout = session.Client.SetDurabilityAsync(1, TimeSpan.FromMilliseconds(250));
+
+        await session.Expect("CLIENT", "DURABILITY", "REPLICAS", "1", "TIMEOUT", "250");
+        await session.Reply("+OK\r\n");
+        await durabilityWithTimeout;
+
         ValueTask<RespValue> config = session.Client.GetConfigAsync("requirepass");
 
         await session.Expect("CONFIG", "GET", "requirepass");

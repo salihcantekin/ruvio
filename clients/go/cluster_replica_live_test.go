@@ -99,3 +99,27 @@ func TestLiveReplicaReads(t *testing.T) {
 		})
 	}
 }
+
+func TestLiveDurabilityOnReplicatedPrimary(t *testing.T) {
+	primary := os.Getenv("RUVIO_REPLICATED_ADDR")
+	if primary == "" {
+		t.Skip("RUVIO_REPLICATED_ADDR not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for _, cluster := range []bool{false, true} {
+		c, err := Connect(ctx, Options{Addr: primary, Cluster: cluster, DurabilityReplicas: 1, DurabilityTimeout: 5 * time.Second})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// the key is on the first shard (slot below 8192) so the plain client reaches it too
+		key := "go:durable:{b}"
+		if err := c.Set(ctx, key, "v"); err != nil {
+			t.Fatal(err)
+		}
+		if v, ok, err := c.Get(ctx, key); err != nil || !ok || v != "v" {
+			t.Fatalf("GET = %q, %v, %v", v, ok, err)
+		}
+		c.Close()
+	}
+}
