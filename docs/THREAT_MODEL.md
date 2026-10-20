@@ -266,7 +266,10 @@ the default quota).
    for a multi-node cluster or `primary_lease_ms`).
 9. Anyone allowed `ruvio|lease` (`@admin`) can renew a primary's lease with
    `primary-lease` on, keeping an old primary taking writes after the
-   coordinators replaced it. Allow it only to the coordinators' user.
+   coordinators replaced it, or flood `RUVIO LEASE BEGIN`: a node keeps the
+   last 64 BEGIN tokens of all connections together, so the coordinators'
+   grants then name forgotten tokens and the lease runs out (writes stop).
+   Allow it only to the coordinators' user.
 
 ## Operator checklist
 
