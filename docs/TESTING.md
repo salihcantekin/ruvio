@@ -24,7 +24,10 @@ units, a real two-shard routing smoke, and every client suite (Rust, C# with the
 .NET integrations, Go on its `go.mod` floor, Node, Python 3.9 and 3.13, Java)
 against live servers started by `scripts/run_with_servers.sh`. Live client
 tests skip themselves without `RUVIO_TEST_ADDR`, so a suite run without a
-server proves only the offline tests. The extended workflow at
+server proves only the offline tests. The script also starts three
+`ruvio coordinator` processes over a two-node group, and each client has one
+live test that kills that group's primary and follows the failover; it adds
+about 5-8 s to each client suite (see `docs/CLIENT_BEHAVIOR.md`, *Tests*). The extended workflow at
 `.github/workflows/ci.yml` is **manual-dispatch only**. When dispatched, it
 defines these additional checks:
 
@@ -51,6 +54,25 @@ re-run of the principal Rust suite is:
 ```bash
 cargo test --lib --bins --tests
 ```
+
+## Nightly fault scenarios
+
+`.github/workflows/nightly.yml` (every night at 02:17 UTC from `main`, and by manual dispatch) runs the coordinator fault scenarios on real
+processes and real network partitions, each scenario three times by default (`runs` input):
+
+- `scripts/coordinator_faults.py ./ruvio partition leader minority restart loss durable stall coord-partition`:
+  three data nodes, three coordinators and TCP proxies on one machine. `durable` expects no
+  acknowledged write lost; `loss` allows only the last writes before the crash to be lost.
+- `scripts/docker_partition.sh ./ruvio leader lease-off lease-on`: Docker networks cut with
+  `docker network disconnect`. `lease-on` asserts that the old primary refuses writes before the
+  other side promotes a replica and acknowledges none after its first refusal; `lease-off` prints the
+  same numbers without asserting them.
+
+Each job has a 25-minute limit and builds nothing but `--profile release-fast --bin ruvio`. A
+failed scheduled run opens one issue labelled `nightly-failure` (later failures comment on it).
+Both scripts run locally with the same arguments; the Docker one needs `docker`, `redis-cli` and
+`python3`, and runs the binary in `ubuntu:24.04` (`RUVIO_DOCKER_IMAGE`), so build it on a glibc no
+newer than that image's.
 
 ## Test rules
 

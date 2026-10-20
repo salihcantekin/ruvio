@@ -365,8 +365,10 @@ support connects to the coordinators with the group name as the service name:
 
 Checked with redis-py's `Sentinel` (5.2): it discovers the primary, writes through it, and writes to
 the new primary about 1.2 seconds after the old one is killed (`scripts/coordinator_faults.py client`).
-Other libraries were not tried. Ruvio's own clients do not speak Sentinel yet; after a failover they reach the new primary through their
-seed addresses (see [CLIENT_BEHAVIOR.md](CLIENT_BEHAVIOR.md)) and `ROLE`.
+Other libraries were not tried. Ruvio's own six clients ask the coordinators through their coordinator
+option (`sentinel_master`, see [CLIENT_BEHAVIOR.md](CLIENT_BEHAVIOR.md#following-a-failover)); their live tests kill a
+primary under three coordinators, and the first write through the coordinators lands on the new primary about
+0.9-1.6 seconds later (Mac, debug server).
 
 ## Security
 
@@ -569,4 +571,17 @@ releases side by side, so the refused handshake itself was not part of the run. 
   and each data node; `partition` (primary cut from the coordinators only), `leader` (the coordinator
   leader killed, then the primary), `minority`, `restart`, `loss` (acknowledged writes lost under load),
   `durable` (the same writer with `CLIENT DURABILITY REPLICAS 1`, batches of 32: none may be lost),
-  `client` (redis-py's Sentinel client; skipped when redis-py is not installed).
+  `client` (redis-py's Sentinel client; skipped when redis-py is not installed), `stall` (a replica
+  frozen with `SIGSTOP`: for 30 s the coordinators keep the healthy primary and it takes every write;
+  the thawed replica catches up) and `coord-partition` (the coordinator leader cut from the other two
+  while it still reaches the data nodes, then the primary killed: the majority fails over, the epoch
+  goes up exactly once and the new primary stays primary for 30 s). `RUVIO_FAULTS_HOLD_SECS` shortens
+  the 30 s.
+- `scripts/docker_partition.sh path/to/ruvio [leader|lease-off|lease-on]`: real network partitions with
+  Docker networks. `leader`: the coordinator leader leaves the coordinators' network only, the primary
+  is killed, the new primary stays primary and the old leader agrees after the heal. `lease-off` and
+  `lease-on`: {old primary + one replica} | {other replica + coordinators} while a client writes to the
+  old primary; without the lease it keeps acknowledging writes the heal throws away, with it the old
+  primary refuses writes before the other replica is promoted and acknowledges none after its first
+  refusal.
+- `.github/workflows/nightly.yml` runs both scripts, every scenario three times.

@@ -15,8 +15,13 @@
 # (the primary) / RUVIO_REPLICA_ADDR (the replica) / RUVIO_MULTINODE_A_ADDR /
 # RUVIO_MULTINODE_B_ADDR / RUVIO_MULTINODE_STALE_ADDR / RUVIO_FAILOVER_ADDRS
 # (the failover pair, comma separated, primary first) / RUVIO_FAILOVER_REPLICATION (their
-# replication addresses, same order), and RUVIO_TEST_CONFIG_REWRITE=1,
-# for the command, and stops every server afterwards.
+# replication addresses, same order), RUVIO_COORDINATOR_ADDRS / RUVIO_COORDINATOR_MASTER /
+# RUVIO_COORDINATOR_GROUP_ADDRS / RUVIO_COORDINATOR_GROUP_PIDS (see the coordinated group below),
+# and RUVIO_TEST_CONFIG_REWRITE=1, for the command, and stops every server afterwards.
+# A coordinated group "main": two single-shard nodes (client ports <base-port>+90, +91;
+# replication ports +92, +93), node 1 the primary, watched by three `ruvio coordinator`
+# processes (+94, +95, +96, no secret) that fail it over. A test may kill a member: the group is
+# meant for one failover per run of this script.
 # The repository ruvio.example.toml is copied, never edited.
 #
 # Each port must answer PING with PONG from the server this script started
@@ -147,6 +152,42 @@ RUVIO_REPLICATION_ROLE=replica RUVIO_REPLICATION_LISTEN="127.0.0.1:$((base + 83)
   "$binary" --config "$work/standalone.toml" --address "127.0.0.1:$((base + 81))" --durability always --data-dir "$work/failover-2" >"$work/failover-2.log" 2>&1 &
 pids+=("$!")
 
+# The coordinated group: data nodes as the coordinator tests start them, then three coordinators
+# with their settings (ping every 200 ms, down after 1 s).
+group_nodes=()
+for index in 0 1; do
+  port=$((base + 90 + index))
+  listen="127.0.0.1:$((base + 92 + index))"
+  if [ "$index" = 0 ]; then
+    RUVIO_REPLICATION_ROLE=primary RUVIO_REPLICATION_LISTEN="$listen" \
+      "$binary" --config "$work/standalone.toml" --address "127.0.0.1:$port" --durability always --data-dir "$work/group-$index" >"$work/group-$index.log" 2>&1 &
+  else
+    RUVIO_REPLICATION_ROLE=replica RUVIO_REPLICATION_LISTEN="$listen" RUVIO_REPLICATION_PRIMARY="127.0.0.1:$((base + 92))" \
+      "$binary" --config "$work/standalone.toml" --address "127.0.0.1:$port" --durability always --data-dir "$work/group-$index" >"$work/group-$index.log" 2>&1 &
+  fi
+  pids+=("$!")
+  group_nodes+=("$!")
+done
+for index in 0 1 2; do
+  cat >"$work/coordinator-$index.toml" <<CONFIG
+id = $((index + 1))
+listen = "127.0.0.1:$((base + 94 + index))"
+data_dir = "$work/coordinator-$index"
+peers = ["1@127.0.0.1:$((base + 94))", "2@127.0.0.1:$((base + 95))", "3@127.0.0.1:$((base + 96))"]
+ping_interval_ms = 200
+down_after_ms = 1000
+
+[[groups]]
+name = "main"
+members = [
+  { address = "127.0.0.1:$((base + 90))", replication = "127.0.0.1:$((base + 92))" },
+  { address = "127.0.0.1:$((base + 91))", replication = "127.0.0.1:$((base + 93))" },
+]
+CONFIG
+  "$binary" coordinator --config "$work/coordinator-$index.toml" >"$work/coordinator-$index.log" 2>&1 &
+  pids+=("$!")
+done
+
 ready() {
   python3 "$root/scripts/_ruvio.py" wait-ready --timeout 30 --port "$@"
 }
@@ -171,6 +212,12 @@ ready "$((base + 70))" --pid "${pids[6]}" --data-dir "$work/node-stale"
 ready "$((base + 80))" --pid "${pids[7]}" --data-dir "$work/failover-1"
 ready "$((base + 81))" --pid "${pids[8]}" --data-dir "$work/failover-2"
 python3 "$root/scripts/_ruvio.py" wait-replicas --timeout 30 --port "$((base + 20))" --replicas 1
+ready "$((base + 90))" --pid "${pids[9]}" --data-dir "$work/group-0"
+ready "$((base + 91))" --pid "${pids[10]}" --data-dir "$work/group-1"
+for index in 0 1 2; do
+  python3 "$root/scripts/_ruvio.py" wait-primary --timeout 30 --port "$((base + 94 + index))" \
+    --pid "${pids[$((11 + index))]}" --master main --primary "127.0.0.1:$((base + 90))"
+done
 
 export RUVIO_ADDR="127.0.0.1:$base"
 export RUVIO_TEST_ADDR="127.0.0.1:$base"
@@ -182,6 +229,10 @@ export RUVIO_MULTINODE_B_ADDR="127.0.0.1:$((base + 60))"
 export RUVIO_FAILOVER_REPLICATION="127.0.0.1:$((base + 82)),127.0.0.1:$((base + 83))"
 export RUVIO_FAILOVER_ADDRS="127.0.0.1:$((base + 80)),127.0.0.1:$((base + 81))"
 export RUVIO_MULTINODE_STALE_ADDR="127.0.0.1:$((base + 70))"
+export RUVIO_COORDINATOR_ADDRS="127.0.0.1:$((base + 94)),127.0.0.1:$((base + 95)),127.0.0.1:$((base + 96))"
+export RUVIO_COORDINATOR_MASTER=main
+export RUVIO_COORDINATOR_GROUP_ADDRS="127.0.0.1:$((base + 90)),127.0.0.1:$((base + 91))"
+export RUVIO_COORDINATOR_GROUP_PIDS="${group_nodes[0]},${group_nodes[1]}"
 # The servers run on throwaway copies of the config file, so live tests may rewrite it.
 export RUVIO_TEST_CONFIG_REWRITE=1
 "$@"

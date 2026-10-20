@@ -455,7 +455,11 @@ one failover) with `ERR change cursor generation is unknown to this server`: rel
 `FROM NOW`. The older two-part form `<shard>:<seq>` is still accepted and read as the shard's
 current generation, which is how it behaved before; it cannot detect a rewind. Two replicas
 promoted at once from the same primary (split brain without a coordinator) get the same
-generation, and a cursor cannot tell their logs apart.
+generation, and a cursor cannot tell their logs apart. A primary told to follow another one
+(`REPLICAOF host port`, also by a coordinator) ends its streams with `["resync", "the shard
+follows another primary; resume on it"]` before its log takes the new primary's records; here the
+client does not reload: it subscribes on the new primary with its last cursor, where the rewind
+rule above applies.
 
 `COMMITTED` streams only records at or below the shard's committed sequence
 (`replication_committed_sequence`, the highest record a `CLIENT DURABILITY` reply was released
