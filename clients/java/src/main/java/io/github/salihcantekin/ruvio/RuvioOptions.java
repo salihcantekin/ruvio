@@ -40,6 +40,10 @@ public final class RuvioOptions {
     public final int database;
     /** Connection name set with {@code CLIENT SETNAME} on every (re)connect, or {@code null}. */
     public final String clientName;
+    /** Replicas that must hold each write before its reply, set with {@code CLIENT DURABILITY} on every (re)connect; 0 sends nothing. */
+    public final int durabilityReplicas;
+    /** Longest wait for those replicas in milliseconds; 0 leaves the server default. */
+    public final int durabilityTimeoutMillis;
     /** Timeout for opening the socket, in milliseconds (default 5000). */
     public final int connectTimeoutMillis;
     /** How long blocking calls wait for a reply, in milliseconds (default 30000, plus a blocking command's own wait); 0 waits forever. */
@@ -61,6 +65,8 @@ public final class RuvioOptions {
         this.password = b.password;
         this.database = b.database;
         this.clientName = b.clientName;
+        this.durabilityReplicas = b.durabilityReplicas;
+        this.durabilityTimeoutMillis = b.durabilityTimeoutMillis;
         this.connectTimeoutMillis = b.connectTimeoutMillis;
         this.commandTimeoutMillis = b.commandTimeoutMillis;
         this.maxInFlight = b.maxInFlight;
@@ -155,6 +161,8 @@ public final class RuvioOptions {
         b.password = password;
         b.database = database;
         b.clientName = clientName;
+        b.durabilityReplicas = durabilityReplicas;
+        b.durabilityTimeoutMillis = durabilityTimeoutMillis;
         b.connectTimeoutMillis = connectTimeoutMillis;
         b.commandTimeoutMillis = commandTimeoutMillis;
         b.maxInFlight = maxInFlight;
@@ -177,6 +185,8 @@ public final class RuvioOptions {
         private String password;
         private int database;
         private String clientName;
+        private int durabilityReplicas;
+        private int durabilityTimeoutMillis;
         private int connectTimeoutMillis = 5_000;
         private long commandTimeoutMillis = 30_000;
         private int maxInFlight = 16_384;
@@ -278,6 +288,31 @@ public final class RuvioOptions {
          */
         public Builder clientName(String name) {
             this.clientName = name;
+            return this;
+        }
+
+        /**
+         * Makes the server hold every reply of each connection until {@code replicas} replicas have the writes on disk,
+         * by sending {@code CLIENT DURABILITY REPLICAS n} on every (re)connect, also on the per-node connections of a cluster client.
+         * Needs replication on the server; without it the connect fails.
+         *
+         * @param replicas the replicas that must hold each write; 0 sends nothing (default)
+         * @return this builder
+         */
+        public Builder durability(int replicas) {
+            return durability(replicas, 0);
+        }
+
+        /**
+         * Same as {@link #durability(int)} with a longest wait: after that the replies of the batch become {@code NOREPLICAS} errors.
+         *
+         * @param replicas the replicas that must hold each write; 0 sends nothing
+         * @param timeoutMillis the longest wait in milliseconds; 0 leaves the server default (5000)
+         * @return this builder
+         */
+        public Builder durability(int replicas, int timeoutMillis) {
+            this.durabilityReplicas = replicas;
+            this.durabilityTimeoutMillis = timeoutMillis;
             return this;
         }
 

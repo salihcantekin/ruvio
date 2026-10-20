@@ -175,6 +175,7 @@ SPEC.update({b"CLIENT": _COND, b"SCRIPT": _COND, b"FUNCTION": _COND})
 _FAN_SUB = frozenset(
     (
         (b"CLIENT", b"SETNAME"),
+        (b"CLIENT", b"DURABILITY"),
         (b"SCRIPT", b"LOAD"),
         (b"SCRIPT", b"FLUSH"),
         (b"FUNCTION", b"LOAD"),

@@ -3179,6 +3179,29 @@ impl Client {
         self.ok(["CLIENT", "TRACKING", if enabled { "ON" } else { "OFF" }])
     }
 
+    /// Sends `CLIENT DURABILITY REPLICAS replicas [TIMEOUT ms]` for this shard's connection:
+    /// replies are held until `replicas` replicas have every earlier write on disk, and become
+    /// `-NOREPLICAS` after `timeout_ms` (server default 5000 when `None`); the writes stay
+    /// applied. 0 turns it off. Refused inside `MULTI` and on a server without replication.
+    /// Use [`ClientOptions::durability`] to set it on every connection.
+    pub fn client_durability(
+        &mut self,
+        replicas: u32,
+        timeout_ms: Option<u32>,
+    ) -> Result<(), Error> {
+        match timeout_ms {
+            Some(timeout) => self.ok(args![
+                "CLIENT",
+                "DURABILITY",
+                "REPLICAS",
+                replicas,
+                "TIMEOUT",
+                timeout
+            ]),
+            None => self.ok(args!["CLIENT", "DURABILITY", "REPLICAS", replicas]),
+        }
+    }
+
     /// Sends `HELLO protocol` (2 or 3). Connecting does not send it, and this client only
     /// decodes RESP2 replies, so do not switch to 3. Returns the server info map as a raw value.
     pub fn hello(&mut self, protocol: u8) -> Result<RespValue, Error> {

@@ -65,3 +65,15 @@ test('live replica reads: replica policy reads from the replica', { skip: SKIP }
 test('live replica reads: primary policy keeps reads on the primary', { skip: SKIP }, async () => {
   assert.equal(await replicaGets('primary', 'node:replica-reads:primary', 'v3'), 0);
 });
+
+test('durability option: a write is acknowledged once a replica has it on disk', { skip: SKIP }, async () => {
+  const c = new RuvioClient({ ...split(PRIMARY!), durability: { replicas: 1, timeoutMs: 5000 } });
+  try {
+    const key = 'durable:' + Date.now();
+    assert.equal(await c.set(key, 'v'), 'OK');
+    assert.equal(await c.get(key), 'v');
+    assert.equal(await c.del(key), 1);
+  } finally {
+    c.disconnect();
+  }
+});

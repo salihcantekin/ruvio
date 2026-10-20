@@ -131,6 +131,31 @@ def test_sync_handshake_runs_on_every_connect(node_factory):
     c.close()
 
 
+def test_sync_durability_option_is_sent_after_the_handshake(node_factory):
+    n = node_factory()
+    c = ruvio.Ruvio(*host_port(n), db=4, client_name="nm", durability_replicas=1, durability_timeout_ms=250)
+    c.ping()
+    assert n.log[1:3] == [["CLIENT", "SETNAME", "nm"], ["CLIENT", "DURABILITY", "REPLICAS", "1", "TIMEOUT", "250"]]
+    c.close()
+    c.ping()  # a reconnect sends it again
+    assert n.log[-2] == ["CLIENT", "DURABILITY", "REPLICAS", "1", "TIMEOUT", "250"]
+    plain = node_factory()
+    d = ruvio.Ruvio(*host_port(plain), durability_replicas=2)
+    d.ping()
+    assert plain.log[0] == ["CLIENT", "DURABILITY", "REPLICAS", "2"]
+    off = node_factory()
+    ruvio.Ruvio(*host_port(off)).ping()
+    assert off.commands("CLIENT") == []  # not set: nothing is sent
+
+
+def test_sync_durability_refused_on_connect_fails_the_connect(node_factory):
+    n = node_factory({"CLIENT DURABILITY": err("ERR CLIENT DURABILITY needs replication on this server")})
+    c = ruvio.Ruvio(*host_port(n), durability_replicas=1)
+    with pytest.raises(ResponseError, match="needs replication"):
+        c.ping()
+    assert c._conn.sock is None
+
+
 def test_sync_handshake_error_closes_the_socket(node_factory):
     n = node_factory({"AUTH": err("WRONGPASS invalid username-password pair")})
     c = ruvio.Ruvio(*host_port(n), password="bad")
@@ -780,6 +805,26 @@ def test_sync_pubsub_connection_loss_and_resubscribe(node_factory):
 
 
 # --------------------------------------------------------------------------- asyncio: connecting
+
+
+async def test_async_durability_option_is_sent_after_the_handshake(node_factory):
+    n = node_factory()
+    c = ruvio.asyncio.Ruvio(*host_port(n), client_name="nm", durability_replicas=1, durability_timeout_ms=250)
+    await c.ping()
+    assert n.log[:2] == [["CLIENT", "SETNAME", "nm"], ["CLIENT", "DURABILITY", "REPLICAS", "1", "TIMEOUT", "250"]]
+    await c.aclose()
+    await c.ping()
+    assert n.log[-2] == ["CLIENT", "DURABILITY", "REPLICAS", "1", "TIMEOUT", "250"]
+    plain = node_factory()
+    d = ruvio.asyncio.Ruvio(*host_port(plain), durability_replicas=2)
+    await d.ping()
+    assert plain.log[0] == ["CLIENT", "DURABILITY", "REPLICAS", "2"]
+    await d.aclose()
+    refused = node_factory({"CLIENT DURABILITY": err("ERR CLIENT DURABILITY needs replication on this server")})
+    e = ruvio.asyncio.Ruvio(*host_port(refused), durability_replicas=1)
+    with pytest.raises(ResponseError, match="needs replication"):
+        await e.ping()
+    await c.aclose()
 
 
 async def test_async_handshake_and_reconnect(node_factory):

@@ -4,6 +4,7 @@ Notable changes to the Node.js client `ruvio-client` on npm. New entries go unde
 
 ## Unreleased
 
+- `clientDurability(replicas, timeoutMs?)` for `CLIENT DURABILITY`, and a `durability` connection option (`{ replicas, timeoutMs? }`) that sends it on every (re)connect, so replies wait until that many replicas have the data on disk. Nothing is sent when the option is not set.
 - `ClusterClient` follows `-ASK slot host:port` (sends `ASKING` and the command to the named node in one write; the slot map is not changed) and retries `-TRYAGAIN` up to 3 times after 5, 10 and 20 ms. `MOVED` and `ASK` share the 3-redirect limit per command; only error replies are checked, so normal replies cost nothing extra.
 - **Behavior change:** `StreamEntry.fields` is now an array of `[name, value]` pairs in stored order instead of an object, so a field name written twice is no longer collapsed to its last value and numeric names such as `"2"` and `"1"` keep their order; use `Object.fromEntries(entry.fields)` for the old shape. Applies to `xrange`, `xrevrange`, `xread`, `xreadgroup`, `xclaim` and `xautoclaim`.
 - **Behavior change:** `commandTimeoutMs` is now 30000 by default (was 0, no limit); `0` turns it off. A blocking command gets its own wait on top (`BLPOP k 5` may take 5 s plus the timeout; a wait of 0, or one the client cannot parse, has no deadline; a pipeline takes its largest wait), and a Pub/Sub or `MONITOR` connection never times out while it waits for messages (issue #48 follow-up).

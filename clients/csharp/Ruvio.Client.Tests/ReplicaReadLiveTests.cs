@@ -38,6 +38,23 @@ public class ReplicaReadLiveTests
     public Task PrimaryPolicyKeepsReadsOnThePrimary() =>
         ReadsCount(ReadPolicy.Primary, "csharp:replica-reads:primary", expected: 0);
 
+    [ReplicatedFact(Timeout = 30000)]
+    public async Task DurabilityOptionLetsWritesThroughOnAReplicatedPrimary()
+    {
+        (string host, int port) = Primary!.Value;
+        await using RuvioConnection connection = await RuvioConnection.ConnectAsync(new RuvioClientOptions
+        {
+            Host = host,
+            Port = port,
+            DurabilityReplicas = 1,
+            DurabilityTimeout = TimeSpan.FromMilliseconds(5000),
+        });
+        RuvioClient db = await connection.GetDefaultDatabaseAsync();
+
+        Assert.True(await db.SetAsync("csharp:durability", "v1"));
+        Assert.Equal("v1", await db.GetStringAsync("csharp:durability"));
+    }
+
     private static async Task ReadsCount(ReadPolicy policy, string key, int expected)
     {
         (string host, int port) = Primary!.Value;

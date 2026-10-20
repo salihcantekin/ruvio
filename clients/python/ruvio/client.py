@@ -125,6 +125,8 @@ class _Options:
         "username",
         "password",
         "client_name",
+        "durability_replicas",
+        "durability_timeout_ms",
         "socket_timeout",
         "connect_timeout",
         "unix_socket_path",
@@ -148,6 +150,13 @@ class _Options:
             cmds.append((None, encode("SELECT", (self.db,))))
         if self.client_name:
             cmds.append((None, encode("CLIENT SETNAME", (self.client_name,))))
+        if self.durability_replicas:
+            if self.durability_timeout_ms is None:
+                cmds.append((None, encode("CLIENT DURABILITY", ("REPLICAS", self.durability_replicas))))
+            else:
+                cmds.append(
+                    (None, encode("CLIENT DURABILITY", ("REPLICAS", self.durability_replicas, "TIMEOUT", self.durability_timeout_ms)))
+                )
         return cmds
 
     def as_dict(self) -> Dict[str, Any]:
@@ -282,6 +291,10 @@ class Ruvio(Commands):
         password: Password for ``AUTH``, sent on every (re)connect.
         username: ACL user for ``AUTH``; omit for the default user.
         client_name: Name sent with ``CLIENT SETNAME`` on connect.
+        durability_replicas: When set (above 0), ``CLIENT DURABILITY REPLICAS n`` is sent on every connect: the server
+            holds each reply until ``n`` replicas have the writes on disk. Needs a server with replication.
+        durability_timeout_ms: Milliseconds the server waits for the replicas (its default is 5000); used only with
+            ``durability_replicas``.
         socket_timeout: Seconds a send or receive may take (default 30.0); ``None`` waits forever. On
             expiry the socket is closed and :class:`ruvio.TimeoutError` is raised. A blocking command gets
             its own wait on top (``blpop(k, 5)`` may take 5 s plus this), and one that waits forever
@@ -334,6 +347,8 @@ class Ruvio(Commands):
         password: Optional[str] = None,
         username: Optional[str] = None,
         client_name: Optional[str] = None,
+        durability_replicas: Optional[int] = None,
+        durability_timeout_ms: Optional[int] = None,
         socket_timeout: Optional[float] = 30.0,
         connect_timeout: Optional[float] = 5.0,
         decode_responses: bool = True,
@@ -354,6 +369,8 @@ class Ruvio(Commands):
             password: Password for ``AUTH``.
             username: ACL user for ``AUTH``.
             client_name: Connection name set on connect.
+            durability_replicas: Replicas that must have the writes on disk before a reply (``CLIENT DURABILITY``).
+            durability_timeout_ms: Milliseconds to wait for them; ``None`` keeps the server default.
             socket_timeout: Seconds for a send/receive (default 30.0, plus a blocking command's own wait);
                 ``None`` waits forever.
             connect_timeout: Seconds to open the socket; ``None`` for no limit.
@@ -385,6 +402,8 @@ class Ruvio(Commands):
             password=password,
             username=username,
             client_name=client_name,
+            durability_replicas=durability_replicas,
+            durability_timeout_ms=durability_timeout_ms,
             socket_timeout=socket_timeout,
             connect_timeout=connect_timeout,
             unix_socket_path=unix_socket_path,

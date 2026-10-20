@@ -98,7 +98,7 @@ mod test_support;
 mod ttl;
 mod value;
 
-pub use client::{Client, ClientOptions, ConnectionNotice, ReadPolicy, SetMode};
+pub use client::{Client, ClientOptions, ConnectionNotice, Durability, ReadPolicy, SetMode};
 
 pub use cluster::{hash_slot, hash_slot_bytes};
 

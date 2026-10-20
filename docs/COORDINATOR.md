@@ -40,7 +40,10 @@ with the coordinator leader killed first, 3.2–4 seconds.
 Replication is asynchronous. Writes the old primary acknowledged but had not yet shipped are not on the
 new primary. In a test that wrote continuously while the primary was killed, 0–1 of about 225
 acknowledged writes were missing afterwards, always the last ones. A client that cannot lose a write
-waits for it with `WAIT 1 timeout_ms`.
+turns on `CLIENT DURABILITY REPLICAS 1` for its connection: every reply then waits until a replica
+holds the writes before it on disk, and becomes `NOREPLICAS` if none does within the timeout (default
+5000 ms; the writes stay applied). The client libraries have a connect option that sends it on every
+connection. `WAIT 1 timeout_ms` after a write does the same for one write at a time.
 
 A primary cut off from the coordinators but still reachable by clients keeps taking writes until it
 learns it was replaced. Two settings on the data nodes bound that window:

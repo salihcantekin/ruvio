@@ -97,7 +97,7 @@ Anything without a typed method: `c.async().execute("COMMAND", arg, ...)`.
 
 ## Coverage
 
-All 298 commands of `docs/compatibility-matrix.json` have a typed method (`CoverageTest` maps every
+All 299 commands of `docs/compatibility-matrix.json` have a typed method (`CoverageTest` maps every
 matrix name to a method and fails otherwise), including the Ruvio options: `SET ... IFEQ`, `SET ... IFGT/IFLT` (`setIfGreater`, `setIfLess`),
 `INCRBY ... MAX`, `FILLGET ... WAIT`, `FILLSET ... SWR`, `GETEX`, `DELEX key IFEQ v`, `LPUSHCAP/RPUSHCAP`,
 `BF.*`, `JSON.*` incl. `JSON.INDEX/FIND`, `IDEM BEGIN/COMPLETE`, `LEASE/RELEASE`, `SEMAPHORE`, `ONCE`,
@@ -167,7 +167,7 @@ client, including `database(n)`. In cluster mode the database option is ignored 
 database 0). Every node gets its own lazily opened multiplexed connection with the same fast path as
 the standalone one; the standalone path itself only pays one `router == null` check per command.
 
-How it routes (the key table covers all 298 matrix commands, `CoverageTest` fails when one has no rule):
+How it routes (the key table covers all 299 matrix commands, `CoverageTest` fails when one has no rule):
 
 | Command shape | Routing |
 | --- | --- |
@@ -210,6 +210,14 @@ pipelined commands; use `{hashtag}` keys to keep related keys in one slot.
 * **Helpers** (locks, leases, semaphores, rate limit, `getOrCreate`, idempotency, capped list, Bloom, typed JSON)
   only issue single-key commands, so they work unchanged; `ClusterLiveTest` runs them on the cluster.
 * `ASK` redirects and `CLUSTERDOWN` handling: not implemented. Reads from replicas: see below.
+
+## Durable replies
+
+`RuvioOptions.Builder.durability(replicas)` or `durability(replicas, timeoutMillis)` makes the server hold every reply of a connection until that many replicas have the earlier writes on disk. Every connection the client opens (reconnects, Pub/Sub, and the per-node connections of a cluster client) sends `CLIENT DURABILITY REPLICAS n [TIMEOUT ms]` after its other connect commands, and the connect fails if the server refuses (for example without replication). Nothing is sent by default. After the timeout (5000 ms unless set) the replies of the batch become `NOREPLICAS` errors and the writes stay applied. `clientDurability(n)` / `clientDurability(n, timeoutMillis)` set it on one connection; `0` turns it off.
+
+```java
+RuvioOptions options = RuvioOptions.builder().host("10.0.0.1").durability(1, 5000).build();
+```
 
 ## Reads from replicas
 

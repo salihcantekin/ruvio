@@ -665,7 +665,8 @@ pub(super) fn validate_command_payloads(
         | Command::ScriptKill
         | Command::FunctionList
         | Command::ClientGetName
-        | Command::ClientTracking(_) => {}
+        | Command::ClientTracking(_)
+        | Command::ClientDurability { .. } => {}
         Command::Hello {
             client_name, auth, ..
         } => {

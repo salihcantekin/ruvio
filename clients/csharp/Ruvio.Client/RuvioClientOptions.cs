@@ -70,6 +70,19 @@ public sealed class RuvioClientOptions
     public int Database { get; set; }
 
     /// <summary>
+    /// When above zero, every connection the client opens (reconnects, pooled and per-node connections
+    /// included) sends <c>CLIENT DURABILITY REPLICAS n</c> after <c>AUTH</c>, so the server holds its replies until
+    /// <c>n</c> replicas have the writes on disk. A refused command fails the connect. Zero (the default) sends nothing.
+    /// </summary>
+    public int DurabilityReplicas { get; set; }
+
+    /// <summary>
+    /// How long the server waits for the replicas before it answers <c>NOREPLICAS</c>, sent as <c>TIMEOUT</c> in
+    /// milliseconds. Null (the default) leaves the server's own limit. Used only with <see cref="DurabilityReplicas"/>.
+    /// </summary>
+    public TimeSpan? DurabilityTimeout { get; set; }
+
+    /// <summary>
     /// Serializer settings the typed JSON methods (<c>JsonSetValueAsync</c>, <c>JsonGetValueAsync</c>, ...)
     /// use when a call passes none. Null means <see cref="System.Text.Json.JsonSerializerOptions.Default"/>.
     /// </summary>

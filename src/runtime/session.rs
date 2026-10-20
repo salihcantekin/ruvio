@@ -58,6 +58,7 @@ fn admit<'a>(ctx: &mut SessionCtx<'_>, command: &Command<'a>) -> SessionAction<'
                 | Command::ClientGetName
                 | Command::ClientSetName(_)
                 | Command::ClientTracking(_)
+                | Command::ClientDurability { .. }
                 | Command::Select(_)
         )
     {
@@ -232,6 +233,27 @@ fn admit<'a>(ctx: &mut SessionCtx<'_>, command: &Command<'a>) -> SessionAction<'
         }
 
         ctx.tx.tracking = *on;
+
+        return SessionAction::Reply(Response::Simple(b"OK"));
+    }
+
+    if let Command::ClientDurability {
+        replicas,
+        timeout_ms,
+    } = *command
+    {
+        if replicas > 0 && !ctx.replication {
+            return SessionAction::Reply(Response::Error(
+                b"ERR CLIENT DURABILITY needs replication on this server",
+            ));
+        }
+
+        ctx.tx.durability = (replicas > 0).then_some(crate::transaction::Durability {
+            replicas,
+            timeout_ms,
+        });
+        // The first replies under it wait for every record written before them.
+        ctx.tx.durable_mark = 0;
 
         return SessionAction::Reply(Response::Simple(b"OK"));
     }

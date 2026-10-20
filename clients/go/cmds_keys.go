@@ -549,6 +549,20 @@ func (c *cmds) ClientTracking(ctx context.Context, on bool) error {
 	return c.ok(ctx, newCmd(3, cCLIENT).t(tTRACKING).t(tOFF))
 }
 
+// ClientDurability holds this connection's replies until replicas replicas have on disk
+// every record written before them (CLIENT DURABILITY REPLICAS n [TIMEOUT ms]). It is
+// checked once per batch of replies. When timeout is not met, every reply of that batch
+// is the error NOREPLICAS and the writes stay applied. A timeout of 0 or less sends no
+// TIMEOUT (the server default, 5 seconds); replicas 0 turns it off. It applies to one
+// connection only and is refused inside MULTI and on a server without replication;
+// Options.DurabilityReplicas sets it on every connection the client opens.
+func (c *cmds) ClientDurability(ctx context.Context, replicas int, timeout time.Duration) error {
+	if timeout > 0 {
+		return c.ok(ctx, newCmd(6, cCLIENT).t(tDURABILITY).t(tREPLICAS).i(int64(replicas)).t(tTIMEOUT).i(ms(timeout)))
+	}
+	return c.ok(ctx, newCmd(4, cCLIENT).t(tDURABILITY).t(tREPLICAS).i(int64(replicas)))
+}
+
 // ---- server ------------------------------------------------------------------
 
 // Info returns the INFO text (INFO [section ...]) as "name:value" lines. With no

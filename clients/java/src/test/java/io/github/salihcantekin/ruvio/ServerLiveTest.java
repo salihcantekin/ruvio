@@ -28,6 +28,13 @@ class ServerLiveTest {
     }
 
     @Test
+    void durabilityNeedsReplicationOnAStandaloneServer() {
+        RuvioServerException e = assertThrows(RuvioServerException.class, () -> c.clientDurability(1));
+        assertTrue(e.getMessage().contains("needs replication"), e.getMessage());
+        assertThrows(RuvioServerException.class, () -> c.clientDurability(1, 1000));
+    }
+
+    @Test
     void connection() {
         assertEquals("PONG", c.ping());
         assertEquals("hi", c.ping("hi"));

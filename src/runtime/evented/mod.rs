@@ -64,6 +64,7 @@ mod cdc;
 mod checkpoint;
 mod clients;
 mod connection;
+mod durable;
 mod forward;
 mod hot;
 mod info;
@@ -190,6 +191,8 @@ struct ShardState {
     /// Copies of `PUBLISH` for replicas; fed only while the shard is a primary.
     publish_fanout: Arc<crate::replication::PublishFanout>,
     durable_acks: Arc<crate::replication::DurableAcks>,
+    /// Committed sequence and waiting durable replies, shipped to replicas.
+    durable_replies: Arc<crate::replication::DurableReplies>,
 }
 
 impl ShardState {
@@ -1281,6 +1284,7 @@ async fn serve_async(
         hot_store,
         publish_fanout: Arc::new(crate::replication::PublishFanout::new()),
         durable_acks: Arc::new(crate::replication::DurableAcks::new()),
+        durable_replies: Arc::default(),
     });
 
     // A replica that starts with an unfinished copy acknowledges nothing until it has one.
@@ -1313,6 +1317,7 @@ async fn serve_async(
             ShardDurability {
                 wal: Arc::clone(&state.persistence),
                 acks: Arc::clone(&state.durable_acks),
+                replies: Arc::clone(&state.durable_replies),
             },
         );
         tokio::task::spawn_local(remote_loop(Rc::clone(&state), shutdown.clone()));
