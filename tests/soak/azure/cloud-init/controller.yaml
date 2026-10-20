@@ -1,0 +1,31 @@
+#cloud-config
+# The controller of a soak run: builds the server once, runs tests/soak/run.py with the ssh
+# backend against the data nodes, and uploads status.json. Nothing secret is set here: the
+# run's SSH key and the blob SAS URL are copied in by the operator (tests/soak/README.md).
+package_update: true
+packages:
+  - python3
+  - redis-tools
+  - git
+  - build-essential
+  - pkg-config
+  - cmake
+  - clang
+  - chrony
+  - sysstat
+  - tmux
+  - jq
+
+write_files:
+  - path: /etc/sysctl.d/90-ruvio.conf
+    content: |
+      net.ipv4.ip_local_port_range = 10240 65000
+      net.core.somaxconn = 4096
+
+runcmd:
+  - sysctl --system
+  - systemctl enable --now chrony
+  # Rust for the admin user, to build the server once on this machine (one binary for every
+  # node; its sha256 goes into the run directory).
+  - su - soak -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none'
+  - touch /var/lib/cloud/ruvio-ready

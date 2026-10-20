@@ -151,6 +151,21 @@ The live groups (`tests/*_live.rs`) start the real `ruvio` binary on free local 
 finish in seconds. A test marked `#[ignore]` names a known gap in its reason; run it with
 `cargo test -- --ignored <name>`.
 
+## Long runs on a multi-node cluster
+
+[`tests/soak/`](../tests/soak/README.md) runs a two-group cluster (three hosts, each with one
+coordinator and one member of each group) for minutes locally or hours on four Azure VMs built
+from Bicep. Workers write counters, lists and registers with and without `CLIENT DURABILITY`
+and record every operation; faults (killed or frozen primaries and replicas, a killed
+coordinator leader, a whole host killed, a host cut off with nftables, netem delay and loss)
+come on a schedule, and after the run every key is read back and the history is checked for
+lost acknowledged writes, duplicates, values never written, order violations and stale reads.
+A run writes `status.json` (and uploads it to Azure Blob when a SAS URL is configured). The
+checker's unit tests run in the PR gate (`python3 tests/soak/test_soak.py`); the runs themselves
+are started by hand. Local, debug build: `plans/local-smoke.json` (60 s, every local fault kind) ends with
+no durable write lost (lost `default` writes around a killed primary are counted as warnings); `plans/local-restart-as-configured.json` reproduces
+[#142](https://github.com/salihcantekin/ruvio/issues/142). The Azure path is not measured yet.
+
 ## Long model-check sessions
 
 What these runs cover and what they found is summarized in [RESILIENCE.md](RESILIENCE.md).
@@ -326,7 +341,7 @@ published production-hardware latency or durability evidence.
 | Evidence gap | What remains |
 | --- | --- |
 | Host and device failure | Power-loss testing and validation of flush behavior on production-like Linux filesystems and storage |
-| Long-duration stability | A 24-hour mixed-workload soak with resource and recovery evidence |
+| Long-duration stability | A 24-hour mixed-workload soak with resource and recovery evidence; the tooling is in `tests/soak/`, no long run yet |
 | Native macOS faults | Process/filesystem fault scenarios against a Ruvio process running directly on macOS, rather than inside Docker's Linux VM |
 | Production performance | Published Linux bare-metal p50/p95/p99 latency and repeatable throughput measurements |
 | Failure operations | Repeated failover/promotion drills with measured recovery time and client behavior; promotion is currently manual |

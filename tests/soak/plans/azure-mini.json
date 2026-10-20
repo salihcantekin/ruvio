@@ -1,0 +1,37 @@
+{
+  "name": "azure-mini",
+  "seed": 1,
+  "duration_s": 10800,
+  "warmup_s": 300,
+  "restart_as": "replica",
+  "cluster": { "ping_interval_ms": 500, "down_after_ms": 3000, "primary_lease_ms": 0 },
+  "load": {
+    "rate_per_worker": 50,
+    "keys_per_worker": 8,
+    "counters": 2,
+    "appenders": 2,
+    "registers": 2,
+    "readers_per_register": 2,
+    "profiles": { "default": {}, "durable": { "replicas": 2 } }
+  },
+  "faults": {
+    "interval_s": [300, 600],
+    "down_s": [5, 30],
+    "recovery_timeout_s": 120,
+    "netem": "delay 50ms 20ms loss 2%",
+    "kinds": [
+      "kill-primary",
+      "kill-replica",
+      "stall-replica",
+      "kill-coordinator-leader",
+      "kill-host",
+      "isolate-host",
+      "netem"
+    ]
+  },
+  "metrics_interval_s": 10,
+  "status_interval_s": 60,
+  "rss_min_window_s": 1800,
+  "rss_warn_percent_per_hour": 1.0,
+  "startup_timeout_s": 120
+}
