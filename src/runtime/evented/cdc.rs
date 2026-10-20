@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::{
-    changes::{self, ChangeCursor, ChangeSubscription},
+    changes::{self, ChangeCursor, ChangeFork, ChangeLineage, ChangeStart, ChangeSubscription},
     persistence::{FrameCursor, FrameRead, decode_record, read_frames_resuming},
 };
 
@@ -36,21 +36,28 @@ pub(super) fn start(
     if !profile.uses_wal() {
         return Err(b"ERR CHANGES SUBSCRIBE needs a durability profile that keeps a WAL");
     }
+    // Only a primary with replicas commits records (`CLIENT DURABILITY`); anywhere else a
+    // committed stream would never deliver anything.
+    let committed = if subscription.committed {
+        if state.role.get() != crate::config::ReplicationRole::Primary {
+            return Err(b"ERR CHANGES SUBSCRIBE COMMITTED needs replication on this server");
+        }
+        Some(Arc::clone(&state.durable_replies))
+    } else {
+        None
+    };
 
+    let lineage = lineage(&state.published_config.persistence.data_dir, shard);
     let now = durable.load(Ordering::Acquire);
     let start = match subscription.from {
-        None => ChangeCursor {
+        None => ChangeStart::Resume(ChangeCursor {
+            generation: Some(lineage.generation),
             shard,
             sequence: now,
-        },
-        Some(cursor) if cursor.shard != shard => {
-            return Err(b"ERR change cursor belongs to a different shard");
-        }
-        Some(cursor) if cursor.sequence > now => {
-            return Err(b"ERR change cursor is ahead of this server");
-        }
-        Some(cursor) => cursor,
+        }),
+        Some(cursor) => lineage.resume(cursor, shard, now)?,
     };
+    let (ChangeStart::Resume(cursor) | ChangeStart::Rewound(cursor)) = start;
 
     tokio::task::spawn_local(stream(
         Rc::clone(state),
@@ -58,11 +65,49 @@ pub(super) fn start(
         subscription,
         resp3,
         start,
-        durable,
+        Feed { durable, committed },
         shutdown,
     ));
 
-    Ok(start)
+    Ok(cursor)
+}
+
+/// What a stream may read up to: the durable log, and for `COMMITTED` the shard's committed
+/// sequence as well.
+struct Feed {
+    durable: Arc<AtomicU64>,
+    committed: Option<Arc<crate::replication::DurableReplies>>,
+}
+
+impl Feed {
+    fn through(&self) -> u64 {
+        let durable = self.durable.load(Ordering::Acquire);
+
+        match &self.committed {
+            Some(replies) => durable.min(replies.committed()),
+            None => durable,
+        }
+    }
+}
+
+/// The history shard `shard`'s log continues, from its lineage file. A shard that never
+/// replicated has none: its log is the root history, generation zero.
+fn lineage(data_dir: &std::path::Path, shard: u32) -> ChangeLineage {
+    let Some(lineage) = crate::replication::read_lineage(data_dir, shard) else {
+        return ChangeLineage {
+            generation: 0,
+            fork: None,
+        };
+    };
+
+    ChangeLineage {
+        generation: lineage.origin.epoch,
+        // A promotion forks one epoch above the history it followed.
+        fork: (lineage.parent != [0; crate::replication::HISTORY_LEN]).then(|| ChangeFork {
+            generation: lineage.origin.epoch.saturating_sub(1),
+            sequence: lineage.fork_sequence,
+        }),
+    }
 }
 
 async fn stream(
@@ -70,13 +115,35 @@ async fn stream(
     outbound: Outbound,
     subscription: ChangeSubscription,
     resp3: bool,
-    start: ChangeCursor,
-    durable: Arc<AtomicU64>,
+    start: ChangeStart,
+    feed: Feed,
     shutdown: ShutdownToken,
 ) {
     let data_dir = state.published_config.persistence.data_dir.clone();
     let limits = state.published_config.protocol;
+    let start = match start {
+        ChangeStart::Resume(cursor) => cursor,
+        ChangeStart::Rewound(fork) => {
+            let mut frame = Vec::new();
+
+            changes::encode_rewound(&mut frame, resp3, fork);
+            if !outbound.try_push(frame.into()) {
+                outbound.close();
+                return;
+            }
+            fork
+        }
+    };
     let shard = start.shard;
+    let generation = start.generation;
+    // A move names a shard of this server; another shard's generation is read when one is seen.
+    let generation_of = |to: u32| {
+        if to == shard {
+            generation.unwrap_or(0)
+        } else {
+            lineage(&data_dir, to).generation
+        }
+    };
     let mut position = start.sequence;
     let mut reported = position;
     // Where the last chunk stopped in the log, so the next one does not rescan the segment.
@@ -88,7 +155,7 @@ async fn stream(
             return;
         }
 
-        let through = durable.load(Ordering::Acquire);
+        let through = feed.through();
 
         if position >= through || outbound.queue.borrow().len() >= QUEUE_HIGH_WATER {
             if position != reported && last_report.elapsed() >= HEARTBEAT {
@@ -98,6 +165,7 @@ async fn stream(
                     &mut frame,
                     resp3,
                     ChangeCursor {
+                        generation,
                         shard,
                         sequence: position,
                     },
@@ -161,11 +229,12 @@ async fn stream(
                 return;
             };
             let cursor = ChangeCursor {
+                generation,
                 shard,
                 sequence: record.sequence,
             };
 
-            changes::describe(&record.mutation, &mut |event| {
+            changes::describe(&record.mutation, &generation_of, &mut |event| {
                 if subscription.accepts(event.kind, event.key) {
                     // A move's value is the cursor to continue from, never optional.
                     let value = (subscription.values || event.kind == changes::ChangeKind::Moved)

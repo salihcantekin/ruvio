@@ -426,9 +426,9 @@ the ladder. `SAVE` walks in one go and is not affected.
 
 ### Change stream
 
-`CHANGES SUBSCRIBE [FROM <shard>:<seq>|NOW] [MATCH glob] [TYPES a,b] [VALUES]` turns this
-shard's WAL into a push stream (RESP3 `>`; RESP2 clients get plain arrays). The reply is the
-cursor the stream starts after. Each event is
+`CHANGES SUBSCRIBE [FROM <generation>:<shard>:<seq>|NOW] [MATCH glob] [TYPES a,b] [VALUES]
+[COMMITTED]` turns this shard's WAL into a push stream (RESP3 `>`; RESP2 clients get plain
+arrays). The reply is the cursor the stream starts after. Each event is
 `["change", cursor, db, type, key|nil, value|nil]`; `type` is one of `put`, `json`, `del`,
 `expire`, `rename`, `list`, `set`, `hash`, `zset`, `stream`, `flush`, `other`. `value` is filled
 only with `VALUES`, and only for string and JSON writes. A record with several keys produces one
@@ -437,6 +437,32 @@ event it processed and passes it as `FROM` after a disconnect or restart: no eve
 repeated. Filtered-out records still move the cursor (`["cursor", c]` about once a second).
 Only durable records are streamed. A shard is its own sequence, so a cluster client subscribes on
 each shard it needs; the cursor names its shard and a wrong one is refused.
+
+A cursor is `<generation>:<shard>:<seq>`. The generation is the replication epoch the shard's log
+was written under (`replication_epoch` in `INFO`; 0 on a server that never replicated), so it
+changes only when a replica is promoted. A promoted replica continues its old primary's sequence
+numbers only up to the fork, the last record it had received; after that the same numbers name
+other records. On the promoted shard, a cursor of the old primary's generation at or before the
+fork resumes as usual. One past the fork names records the new primary never had: the stream
+first sends `["rewound", cursor]`, where `cursor` is the fork in the new generation, then
+continues from the fork. The client must undo or reload whatever it applied after that cursor.
+A cursor of a newer generation is refused with `ERR change cursor generation is newer than this
+server`, and one of a generation older than the one the shard forked from (it missed more than
+one failover) with `ERR change cursor generation is unknown to this server`: reload fully, then
+`FROM NOW`. The older two-part form `<shard>:<seq>` is still accepted and read as the shard's
+current generation, which is how it behaved before; it cannot detect a rewind. Two replicas
+promoted at once from the same primary (split brain without a coordinator) get the same
+generation, and a cursor cannot tell their logs apart.
+
+`COMMITTED` streams only records at or below the shard's committed sequence
+(`replication_committed_sequence`, the highest record a `CLIENT DURABILITY` reply was released
+for), so the consumer never sees a record a failover could take back; later records wait until a
+durable write commits past them. Only `CLIENT DURABILITY` writes advance it: on a primary whose
+clients never use it, a `COMMITTED` stream delivers nothing new. A newly promoted primary starts
+with nothing committed, so its stream waits for the first durable write there. `COMMITTED` is
+refused on a shard that does not replicate (`ERR CHANGES SUBSCRIBE COMMITTED needs replication
+on this server`), where nothing is ever committed. A subscriber without `COMMITTED` pays nothing
+for it.
 
 `cdc_retain_bytes` (environment `RUVIO_CDC_RETAIN_BYTES`, default `0`) is how much WAL a
 checkpoint keeps for subscribers, rounded to whole segments, whether or not anyone is

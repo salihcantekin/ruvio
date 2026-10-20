@@ -525,6 +525,12 @@ pub fn resolve_lineage(data_dir: &Path, shard_id: u32, last_sequence: u64) -> io
     Ok(lineage)
 }
 
+/// The lineage writer shard `shard_id` recorded, without deciding one; `None` for a shard that
+/// never replicated (its log is the root history, epoch zero).
+pub fn read_lineage(data_dir: &Path, shard_id: u32) -> Option<Lineage> {
+    read_lineage_file(&data_dir.join(lineage_file_name(shard_id)))
+}
+
 fn read_lineage_file(path: &Path) -> Option<Lineage> {
     let bytes = std::fs::read(path).ok()?;
 
@@ -1275,6 +1281,12 @@ impl DurableReplies {
 
     pub fn commit(&self, sequence: u64) {
         self.committed.fetch_max(sequence, Ordering::AcqRel);
+    }
+
+    /// Forgets what was committed: the shard follows another primary, and its log is no
+    /// longer the one those sequence numbers named.
+    pub fn reset(&self) {
+        self.committed.store(0, Ordering::Release);
     }
 
     /// While at least one durable reply waits, replicas sync and acknowledge every batch.

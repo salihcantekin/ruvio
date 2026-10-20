@@ -123,6 +123,16 @@ const POOL: &[&str] = &[
 const STRUCTURED: &[&[&str]] = &[
     &["IDEM", "k", "BEGIN", "fingerprint", "owner", "1000"],
     &["CLIENT", "DURABILITY", "REPLICAS", "1", "TIMEOUT", "5000"],
+    &["CHANGES", "SUBSCRIBE", "FROM", "1:0:42", "COMMITTED"],
+    &[
+        "CHANGES",
+        "SUBSCRIBE",
+        "FROM",
+        "0:42",
+        "MATCH",
+        "user:*",
+        "VALUES",
+    ],
     &["HEXPIRE", "h", "10", "FIELDS", "1", "f"],
     &["HEXPIRE", "h", "10", "NX", "FIELDS", "2", "f", "g"],
     &["HPEXPIRE", "h", "10", "FIELDS", "1", "f"],
