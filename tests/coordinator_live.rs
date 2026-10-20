@@ -98,6 +98,21 @@ impl Group {
     }
 
     fn coordinator(&self, dir: &Path, index: usize) -> Process {
+        self.coordinator_logging(dir, index, None)
+    }
+
+    /// A coordinator whose log goes to `log` when given.
+    fn coordinator_logging(&self, dir: &Path, index: usize, log: Option<&Path>) -> Process {
+        let output = || match log {
+            Some(path) => Stdio::from(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .unwrap(),
+            ),
+            None => Stdio::null(),
+        };
         let config = dir.join(format!("coordinator{index}.toml"));
         let peers = self
             .coordinators
@@ -134,8 +149,8 @@ impl Group {
                 .arg("coordinator")
                 .arg("--config")
                 .arg(&config)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdout(output())
+                .stderr(output())
                 .spawn()
                 .unwrap(),
         )
@@ -496,7 +511,9 @@ fn a_replica_missing_a_committed_record_is_promoted_only_when_forced() {
                 &["COORDINATOR", "FAILOVER", "main", "FORCE"],
             )
             .filter(|reply| {
-                !reply.starts_with("ERR not the leader") && !reply.starts_with("ERR no leader")
+                !reply.starts_with("ERR not the leader")
+                    && !reply.starts_with("ERR no leader")
+                    && !reply.starts_with("ERR the leader is still applying")
             })
         });
         promoted.is_some()
@@ -560,18 +577,19 @@ fn restarted_coordinators_keep_the_committed_records_a_failover_must_hold() {
         committed = info_field(&primary, "replication_committed_sequence").unwrap_or(0);
         committed > 0
     });
-    // The leader writes the value through Raft: wait until every coordinator's log holds it.
-    let entry = format!("\"committed\":[{committed}]");
+    // The leader writes the value through Raft: wait until every coordinator applied it, so
+    // it is in the log of each.
+    let recorded = format!(",recorded={committed},");
 
-    wait_until("every coordinator to log the committed sequence", || {
-        (0..3).all(|index| {
-            let state = dir.path().join(format!("coordinator{index}"));
-
-            ["raft-log.json", "raft-snapshot.json"].iter().any(|file| {
-                std::fs::read_to_string(state.join(file)).is_ok_and(|text| text.contains(&entry))
+    wait_until(
+        "every coordinator to apply the recorded committed sequence",
+        || {
+            group.coordinators.iter().all(|coordinator| {
+                call_with_secret(&coordinator.to_string(), &["INFO"])
+                    .is_some_and(|info| info.contains(&recorded))
             })
-        })
-    });
+        },
+    );
 
     // The primary and member 1 die, every coordinator restarts, and member 2 comes back
     // without the record. No member that answers knows it was committed.
@@ -586,14 +604,27 @@ fn restarted_coordinators_keep_the_committed_records_a_failover_must_hold() {
         info_field(&returned, "replication_committed_sequence"),
         Some(0)
     );
+    let logs: Vec<_> = (0..3)
+        .map(|index| dir.path().join(format!("coordinator{index}.log")))
+        .collect();
     let _coordinators: Vec<Process> = (0..3)
-        .map(|index| group.coordinator(dir.path(), index))
+        .map(|index| group.coordinator_logging(dir.path(), index, Some(&logs[index])))
         .collect();
     let learned = format!(",committed={committed}\r\n");
+    // Checked on every poll below, so a wrong promotion fails at once.
+    let not_promoted = || {
+        if let Some(primary) = group.primary_by(0) {
+            assert_eq!(
+                primary, 0,
+                "a replica missing the committed record was promoted"
+            );
+        }
+    };
 
     wait_until(
         "the restarted coordinators to know the committed sequence and see member 2",
         || {
+            not_promoted();
             group.coordinators.iter().all(|coordinator| {
                 let coordinator = coordinator.to_string();
 
@@ -609,8 +640,20 @@ fn restarted_coordinators_keep_the_committed_records_a_failover_must_hold() {
             })
         },
     );
-    // Several times down_after_ms: the group waits rather than lose the record.
-    std::thread::sleep(Duration::from_secs(4));
+    // The new leader decided: it waits rather than lose the record.
+    wait_until(
+        "the leader to wait for a replica holding the record",
+        || {
+            not_promoted();
+            logs.iter().any(|log| {
+                std::fs::read_to_string(log).is_ok_and(|text| {
+                    text.contains(
+                        "no replica holds every record a durable reply was released for; waiting",
+                    )
+                })
+            })
+        },
+    );
     for index in 0..3 {
         assert_eq!(group.primary_by(index), Some(0));
     }
@@ -630,7 +673,9 @@ fn restarted_coordinators_keep_the_committed_records_a_failover_must_hold() {
                 &["COORDINATOR", "FAILOVER", "main", "FORCE"],
             )
             .filter(|reply| {
-                !reply.starts_with("ERR not the leader") && !reply.starts_with("ERR no leader")
+                !reply.starts_with("ERR not the leader")
+                    && !reply.starts_with("ERR no leader")
+                    && !reply.starts_with("ERR the leader is still applying")
             })
         });
         promoted.is_some()
