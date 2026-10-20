@@ -484,6 +484,14 @@ impl SlotMoves {
         })
     }
 
+    /// The newest gain when the map has not completed it: arriving, prepared or cancelled.
+    pub(crate) fn unfinished_gain(&self) -> Option<SlotMove> {
+        self.moves
+            .last()
+            .copied()
+            .filter(|entry| entry.gained() && !entry.completed())
+    }
+
     /// The prepared gain the cluster map has not decided yet.
     pub(crate) fn pending_gain(&self) -> Option<SlotMove> {
         self.moves.last().copied().filter(SlotMove::pending)

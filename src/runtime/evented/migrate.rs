@@ -531,6 +531,10 @@ fn cancel(state: &Rc<ShardState>, id: &[u8]) -> Reply {
         }
         export.cancel.notify_one();
     }
+    // A primary promoted during a move followed its copies from the log, but never took
+    // the import itself: the coordinators cancel it by an id it does not know.
+    let import = import.or_else(|| orphan_import(state, id));
+
     if let Some(import) = import {
         if import.shard != forwarding.me {
             fabric.send(
@@ -543,6 +547,32 @@ fn cancel(state: &Rc<ShardState>, id: &[u8]) -> Reply {
         }
     }
     Ok(Response::Simple(b"OK"))
+}
+
+/// The unfinished gain of a primary that holds no import, as an import with `id`.
+fn orphan_import(state: &ShardState, id: &[u8]) -> Option<Arc<Import>> {
+    let forwarding = state.forwarding.as_ref()?;
+
+    if state.role.get() == crate::config::ReplicationRole::Replica
+        || forwarding.fabric.migrations.lock().import.is_some()
+    {
+        return None;
+    }
+    let gain = forwarding
+        .fabric
+        .mover
+        .with_history(|history, _| history.unfinished_gain())
+        .flatten()?;
+
+    Some(Arc::new(Import {
+        id: id.to_vec(),
+        first: gain.first,
+        last: gain.last,
+        shard: usize::from(gain.to),
+        keys: AtomicU64::new(0),
+        started: Instant::now(),
+        prepared: AtomicU64::new(gain.prepared),
+    }))
 }
 
 /// Target shard: drops an import that will not complete.

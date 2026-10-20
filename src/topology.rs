@@ -239,7 +239,7 @@ impl Topology {
             return Err("no groups".into());
         }
         // Group indices are `u16`, and a node's slot table holds `local_shards + groups`.
-        if local_shards + file.groups.len() > usize::from(u16::MAX) {
+        if local_shards + file.groups.len() > crate::routing::FROZEN_BASE {
             return Err("too many groups".into());
         }
 

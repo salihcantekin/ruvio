@@ -230,24 +230,111 @@ impl CoordinatorConfig {
     }
 
     /// The cluster map the data nodes get with `RUVIO TOPOLOGY SET`, and its version: each
-    /// group named by its agreed primary. The version is 1 plus the sum of the groups'
-    /// epochs, so every failover raises it. `None` without shards, or before every group
-    /// has an agreed primary.
-    pub fn cluster_map(&self, primaries: &super::raft::Primaries) -> Option<(u64, String)> {
+    /// group named by its agreed primary, with the ranges `moved` between groups. The
+    /// version is 1 plus the sum of the groups' epochs plus the moves, so every failover and
+    /// every move raises it. `None` without shards, or before every group has an agreed
+    /// primary.
+    pub fn cluster_map(
+        &self,
+        primaries: &super::raft::Primaries,
+        moved: &[super::raft::MovedRange],
+    ) -> Option<(u64, String)> {
         self.groups.first()?.shards?;
-        let mut version = 1;
+        let mut version = 1 + moved.len() as u64;
 
         for group in &self.groups {
             version += primaries.get(&group.name)?.epoch;
         }
-        let text = cluster_map_text(&self.groups, version, |group| {
+        let primary = |group: &Group| {
             primaries
                 .get(&group.name)
                 .map_or(0, |primary| primary.member)
-        });
+        };
+        let text = if moved.is_empty() {
+            cluster_map_text(&self.groups, version, primary)
+        } else {
+            placed_map_text(&self.groups, version, primary, &self.owners(moved))
+        };
 
         Some((version, text))
     }
+
+    /// Every slot's group (an index into `groups`) and shard after the moves `moved`. The
+    /// configured slots are split over each group's shards as its nodes split them.
+    pub fn owners(&self, moved: &[super::raft::MovedRange]) -> Vec<(usize, usize)> {
+        let base = cluster_map_text(&self.groups, 1, |_| 0);
+        let first = &self.groups[0];
+        let mut owners = vec![(0, 0); crate::routing::HASH_SLOT_COUNT];
+
+        // Checked when the configuration was read: the groups cover every slot once.
+        if let Ok(topology) =
+            crate::topology::Topology::parse(&base, &first.name, first.shards.unwrap_or(1))
+        {
+            for (index, group) in topology.groups.iter().enumerate() {
+                for &(first, last) in &group.ranges {
+                    for slot in first..=last {
+                        owners[usize::from(slot)] = (index, group.shard_of(slot).unwrap_or(0));
+                    }
+                }
+            }
+        }
+        for range in moved {
+            if let Some(index) = self
+                .groups
+                .iter()
+                .position(|group| group.name == range.group)
+            {
+                for slot in range.first..=range.last {
+                    owners[usize::from(slot)] = (index, range.shard);
+                }
+            }
+        }
+
+        owners
+    }
+}
+
+/// The map once ranges moved between groups: every range names its shard (`"a-b@s"`), so
+/// a node keeps each slot on the shard that holds its data whatever else moved.
+fn placed_map_text(
+    groups: &[Group],
+    version: u64,
+    primary: impl Fn(&Group) -> usize,
+    owners: &[(usize, usize)],
+) -> String {
+    let mut text = format!("version = {version}\n");
+
+    for (index, group) in groups.iter().enumerate() {
+        let address = group
+            .members
+            .get(primary(group))
+            .map_or_else(String::new, |member| member.address.to_string());
+        let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+
+        for (slot, &(owner, shard)) in owners.iter().enumerate() {
+            if owner != index {
+                continue;
+            }
+            match runs.last_mut() {
+                Some((_, last, known)) if *last + 1 == slot && *known == shard => *last = slot,
+                _ => runs.push((slot, slot, shard)),
+            }
+        }
+        let slots: Vec<String> = runs
+            .iter()
+            .map(|(first, last, shard)| format!("\"{first}-{last}@{shard}\""))
+            .collect();
+
+        text.push_str(&format!(
+            "\n[[groups]]\nname = {:?}\naddress = {:?}\nshards = {}\nslots = [{}]\n",
+            group.name,
+            address,
+            group.shards.unwrap_or(1),
+            slots.join(", ")
+        ));
+    }
+
+    text
 }
 
 /// The map in the format of a node's `cluster_topology` file.
@@ -373,7 +460,7 @@ members = [
             },
         );
         assert!(
-            config.cluster_map(&primaries).is_none(),
+            config.cluster_map(&primaries, &[]).is_none(),
             "b has no primary yet"
         );
         primaries.insert(
@@ -384,12 +471,44 @@ members = [
             },
         );
 
-        let (version, map) = config.cluster_map(&primaries).unwrap();
+        let (version, map) = config.cluster_map(&primaries, &[]).unwrap();
         let topology = crate::topology::Topology::parse(&map, "b", 1).unwrap();
 
         assert_eq!((version, topology.version), (5, 5));
         assert_eq!(topology.groups[1].host, "10.0.0.3");
         assert_eq!(topology.groups[0].port, 6379);
+
+        // A moved range raises the version and names its shard; the rest of each group
+        // stays on the shards it had.
+        let moved = [super::super::raft::MovedRange {
+            first: 100,
+            last: 199,
+            group: "b".into(),
+            shard: 0,
+        }];
+        let (version, map) = config.cluster_map(&primaries, &moved).unwrap();
+        let before = crate::topology::Topology::parse(
+            &config.cluster_map(&primaries, &[]).unwrap().1,
+            "main",
+            2,
+        )
+        .unwrap();
+        let after = crate::topology::Topology::parse(&map, "main", 2).unwrap();
+
+        assert_eq!(version, 6);
+        assert!(map.contains("\"100-199@0\""), "{map}");
+        assert!(
+            map.contains("\"0-99@0\", \"200-4095@0\", \"4096-8191@1\""),
+            "{map}"
+        );
+        for slot in (0..100).chain(200..16384) {
+            assert_eq!(
+                before.groups[0].shard_of(slot),
+                after.groups[0].shard_of(slot),
+                "slot {slot}"
+            );
+        }
+        assert_eq!(after.groups[1].shard_of(150), Some(0));
         assert!(
             CoordinatorConfig::parse(&text.replace("shards = 1\n", ""))
                 .unwrap_err()

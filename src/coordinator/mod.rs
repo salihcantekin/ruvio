@@ -5,6 +5,7 @@
 //! beyond what they already serve (`ROLE`, `INFO`, `CONFIG GET`, `REPLICAOF`).
 
 pub mod config;
+mod migrate;
 mod monitor;
 mod raft;
 mod resp;
@@ -77,12 +78,19 @@ async fn serve(
 
     info!(id = config.id, listen = %config.listen, groups = config.groups.len(), "coordinator listening");
     let watcher = tokio::spawn(monitor::watch(Arc::clone(&config), sightings.clone()));
+    let moves = migrate::Context {
+        config: Arc::clone(&config),
+        raft: raft.clone(),
+        machine: machine.clone(),
+        mover: Arc::default(),
+    };
     let leader = tokio::spawn(monitor::lead(
         Arc::clone(&config),
         raft.clone(),
         machine.clone(),
         sightings.clone(),
         switches.clone(),
+        moves.clone(),
     ));
     let api = Api {
         config: Arc::clone(&config),
@@ -90,6 +98,7 @@ async fn serve(
         machine,
         sightings,
         switches,
+        moves,
     };
 
     loop {
@@ -132,6 +141,7 @@ struct Api {
     machine: StateMachine,
     sightings: Sightings,
     switches: Switches,
+    moves: migrate::Context,
 }
 
 impl Api {
@@ -201,8 +211,13 @@ impl Api {
                 return self.subscribe(&words, &mut write).await;
             }
             let mut out = Vec::new();
+            let reply = if words.first().map(String::as_str) == Some("coordinator") {
+                self.coordinator(&words).await
+            } else {
+                self.command(&words, &args)
+            };
 
-            self.command(&words, &args).encode(&mut out);
+            reply.encode(&mut out);
             write.write_all(&out).await?;
         }
 
@@ -221,6 +236,44 @@ impl Api {
                     .group(&group)
                     .map(|group| self.sightings.ages(group))
                     .unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// `COORDINATOR MOVE first last group shard`, `COORDINATOR STATUS`, `COORDINATOR CANCEL`:
+    /// moving slot ranges between groups.
+    async fn coordinator(&self, words: &[String]) -> Value {
+        let word = |index: usize| words.get(index).map(String::as_str);
+
+        match (word(1), words.len()) {
+            (Some("move"), 6) => {
+                let (Ok(first), Ok(last), Ok(shard)) = (
+                    words[2].parse::<u16>(),
+                    words[3].parse::<u16>(),
+                    words[5].parse::<usize>(),
+                ) else {
+                    return Value::Error("ERR slots and shard must be numbers".into());
+                };
+                // Group names keep their case; `words` are lowercased.
+                let group = self
+                    .config
+                    .groups
+                    .iter()
+                    .find(|group| group.name.eq_ignore_ascii_case(&words[4]))
+                    .map_or(words[4].clone(), |group| group.name.clone());
+
+                match migrate::start(&self.moves, first, last, &group, shard).await {
+                    Ok(id) => Value::bulk(id),
+                    Err(error) => Value::Error(error),
+                }
+            }
+            (Some("status"), 2) => migrate::status(&self.moves),
+            (Some("cancel"), 2) => match migrate::cancel(&self.moves).await {
+                Ok(()) => Value::Simple("OK".into()),
+                Err(error) => Value::Error(error),
+            },
+            _ => Value::Error(
+                "ERR COORDINATOR expects MOVE first last group shard, STATUS or CANCEL".into(),
             ),
         }
     }

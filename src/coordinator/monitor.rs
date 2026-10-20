@@ -295,6 +295,7 @@ pub async fn lead(
     machine: StateMachine,
     sightings: Sightings,
     switches: Switches,
+    moves: super::migrate::Context,
 ) {
     let mut tick = tokio::time::interval(config.ping_interval);
 
@@ -340,6 +341,8 @@ pub async fn lead(
         }
 
         push_cluster_map(&config, &machine, &sightings).await;
+        // A move the previous leader began continues here.
+        super::migrate::resume(&moves);
     }
 }
 
@@ -356,7 +359,8 @@ async fn push_cluster_map(
     static WARNED: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
     const WARN_EVERY: Duration = Duration::from_secs(60);
 
-    let Some((version, map)) = config.cluster_map(&machine.primaries()) else {
+    let Some((version, map)) = config.cluster_map(&machine.primaries(), &machine.moves().moved)
+    else {
         return;
     };
     let map: Arc<[u8]> = map.into_bytes().into();

@@ -472,3 +472,245 @@ fn a_failover_in_one_group_moves_the_redirects_of_the_others() {
         call(&resp[3].to_string(), &["SET", key, "1"]).as_deref() == Some("OK")
     });
 }
+
+/// Group `a` (nodes 0 and 1) owns slots 0-8191, group `b` (nodes 2 and 3) the rest; one
+/// shard each, node 1 and 3 replicas; one coordinator.
+struct TwoGroups {
+    resp: Vec<SocketAddr>,
+    coordinator: String,
+    _processes: Vec<Process>,
+    _ports: (test_ports::PortBlock, test_ports::PortBlock),
+}
+
+impl TwoGroups {
+    fn start(dir: &Path) -> Self {
+        let data = test_ports::reserve();
+        let replication = test_ports::reserve();
+        let resp: Vec<SocketAddr> = (0..4).map(|index| data.address_at(index)).collect();
+        let repl: Vec<SocketAddr> = (0..4).map(|index| replication.address_at(index)).collect();
+        let coordinator = data.address_at(4);
+        let topology = dir.join("topology.toml");
+
+        std::fs::write(
+            &topology,
+            [("a", "0-8191", 0), ("b", "8192-16383", 2)].iter().fold(
+                "version = 1\n".to_owned(),
+                |text, (name, slots, node)| {
+                    format!(
+                        "{text}[[groups]]\nname = \"{name}\"\naddress = \"{}\"\nshards = 1\nslots = [\"{slots}\"]\n",
+                        resp[*node]
+                    )
+                },
+            ),
+        )
+        .unwrap();
+        let mut processes: Vec<Process> = (0..4)
+            .map(|index| {
+                let group = if index < 2 { "a" } else { "b" };
+                let mut command = Command::new(env!("CARGO_BIN_EXE_ruvio"));
+
+                command
+                    .args(["--address", &resp[index].to_string()])
+                    .args(["--durability", "always", "--data-dir"])
+                    .arg(dir.join(format!("node{index}")))
+                    .env("RUVIO_REPLICATION_LISTEN", repl[index].to_string())
+                    .env("RUVIO_CLUSTER_TOPOLOGY", &topology)
+                    .env("RUVIO_CLUSTER_GROUP", group)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                if index % 2 == 1 {
+                    command
+                        .env("RUVIO_REPLICATION_ROLE", "replica")
+                        .env("RUVIO_REPLICATION_PRIMARY", repl[index - 1].to_string());
+                } else {
+                    command.env("RUVIO_REPLICATION_ROLE", "primary");
+                }
+                let process = Process(command.spawn().unwrap());
+
+                wait_until("a data node to answer", || ping(&resp[index].to_string()));
+                process
+            })
+            .collect();
+        let members = |first: usize| {
+            (first..first + 2)
+                .map(|index| {
+                    format!(
+                        "{{ address = \"{}\", replication = \"{}\" }}",
+                        resp[index], repl[index]
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let config = dir.join("coordinator.toml");
+
+        std::fs::write(
+            &config,
+            format!(
+                "id = 1\nlisten = \"{coordinator}\"\ndata_dir = \"{}\"\npeers = [\"1@{coordinator}\"]\n\
+                 secret = \"{SECRET}\"\nping_interval_ms = 200\ndown_after_ms = 1000\n\n\
+                 [[groups]]\nname = \"a\"\nshards = 1\nslots = [\"0-8191\"]\nmembers = [{}]\n\n\
+                 [[groups]]\nname = \"b\"\nshards = 1\nslots = [\"8192-16383\"]\nmembers = [{}]\n",
+                dir.join("coordinator").display(),
+                members(0),
+                members(2),
+            ),
+        )
+        .unwrap();
+        processes.push(Process(
+            Command::new(env!("CARGO_BIN_EXE_ruvio"))
+                .arg("coordinator")
+                .arg("--config")
+                .arg(&config)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        ));
+
+        let groups = Self {
+            resp,
+            coordinator: coordinator.to_string(),
+            _processes: processes,
+            _ports: (data, replication),
+        };
+
+        wait_until("every node to get the coordinator's map", || {
+            (0..4).all(|index| groups.version(index).as_deref() == Some("3"))
+        });
+        groups
+    }
+
+    fn node(&self, index: usize) -> String {
+        self.resp[index].to_string()
+    }
+
+    fn version(&self, index: usize) -> Option<String> {
+        call(&self.node(index), &["RUVIO", "TOPOLOGY", "VERSION"])
+    }
+}
+
+/// A key whose slot is in `range`.
+fn key_in(range: std::ops::Range<u16>, label: &str) -> String {
+    (0..)
+        .map(|n| format!("{label}:{n}"))
+        .find(|key| range.contains(&ruvio::routing::hash_slot(key.as_bytes())))
+        .unwrap()
+}
+
+#[test]
+fn a_slot_range_moves_between_groups_while_a_client_keeps_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let groups = TwoGroups::start(dir.path());
+    let keys: Vec<String> = (0..)
+        .map(|n| format!("moving:{n}"))
+        .filter(|key| (100..200).contains(&ruvio::routing::hash_slot(key.as_bytes())))
+        .take(300)
+        .collect();
+
+    for key in &keys {
+        assert_eq!(
+            call(&groups.node(0), &["SET", key, key]).as_deref(),
+            Some("OK")
+        );
+    }
+
+    // A client writes one key of the range throughout, following MOVED and TRYAGAIN as a
+    // cluster client does; every write it saw acknowledged must be on the new owner.
+    let busy = key_in(100..200, "busy");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let (busy, stop) = (busy.clone(), std::sync::Arc::clone(&stop));
+        let mut address = groups.node(0);
+        let b = groups.node(2);
+
+        std::thread::spawn(move || {
+            let (mut acked, mut retried) = (0u64, 0u64);
+
+            for value in 1u64.. {
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                loop {
+                    match call(&address, &["SET", &busy, &value.to_string()]).as_deref() {
+                        Some("OK") => {
+                            acked = value;
+                            break;
+                        }
+                        Some(reply) if reply.starts_with("MOVED") => address = b.clone(),
+                        Some(reply) if reply.starts_with("TRYAGAIN") => {
+                            retried += 1;
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        other => panic!("unexpected reply {other:?}"),
+                    }
+                }
+            }
+            (acked, retried, address)
+        })
+    };
+
+    std::thread::sleep(Duration::from_millis(200));
+    let id = call_with_secret(
+        &groups.coordinator,
+        &["COORDINATOR", "MOVE", "100", "199", "b", "0"],
+    )
+    .unwrap();
+
+    assert!(id.starts_with('m'), "{id}");
+    assert!(
+        call_with_secret(
+            &groups.coordinator,
+            &["COORDINATOR", "MOVE", "300", "399", "b", "0"]
+        )
+        .unwrap()
+        .contains("another move")
+    );
+    wait_until("the move to finish", || {
+        call_with_secret(&groups.coordinator, &["COORDINATOR", "STATUS"])
+            .is_some_and(|status| status.starts_with("state done"))
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let (acked, _retried, address) = writer.join().unwrap();
+
+    assert_eq!(address, groups.node(2), "the writer followed the range");
+    assert_eq!(
+        call(&groups.node(2), &["GET", &busy]),
+        Some(acked.to_string())
+    );
+
+    // Every node has the new map; the range is served by b and redirected by a.
+    wait_until("every node to get the map with the move", || {
+        (0..4).all(|index| groups.version(index).as_deref() == Some("4"))
+    });
+    let b_port = groups.resp[2].port();
+
+    for key in &keys {
+        let slot = ruvio::routing::hash_slot(key.as_bytes());
+
+        assert_eq!(
+            call(&groups.node(2), &["GET", key]).as_deref(),
+            Some(key.as_str())
+        );
+        assert_eq!(
+            call(&groups.node(0), &["GET", key]),
+            Some(format!("MOVED {slot} 127.0.0.1:{b_port}"))
+        );
+    }
+    // The replicas follow: b's copies the range, a's drops it.
+    wait_until("b's replica to hold the range", || {
+        keys.iter()
+            .all(|key| call(&groups.node(3), &["GET", key]).as_deref() == Some(key.as_str()))
+    });
+    wait_until("group a to drop its copy", || {
+        [0, 1]
+            .iter()
+            .all(|&node| call(&groups.node(node), &["DBSIZE"]).as_deref() == Some("0"))
+    });
+    assert!(
+        call_with_secret(&groups.coordinator, &["COORDINATOR", "STATUS"])
+            .unwrap()
+            .contains("moved_ranges 1")
+    );
+}
