@@ -75,10 +75,19 @@ which, per shard):
 After a failover to a replica that held every committed record, the values still apply, so the next
 failover also waits for a replica that caught up. After an unclean one those records are gone and the
 new primary reuses their sequence numbers: the old values are dropped, and the stale ones replicas keep
-reporting are ignored until the new primary commits past them. The values are held in memory: a
-coordinator that restarts while the primary is down learns only what the remaining members report.
-Coordinators' `INFO` shows them as `committed=` on the group's line. Groups whose clients never use
-`CLIENT DURABILITY` report 0 everywhere and fail over as before.
+reporting are ignored until the new primary commits past them. Which of the two applies is decided
+once, by the leader that promotes, and recorded in Raft with the promotion. The leader also writes
+the values through Raft when they rise: at most once a second, one entry for all groups, only the
+shards that rose. Every coordinator starts from that record, and a new leader acts only once it has
+applied the log of its own term, so a new leader, or coordinators that all restarted while the
+primary and the replica holding the records are down, still wait for a replica that has them. A value
+that rose in the last second before the leader died may not be recorded yet; the other coordinators
+also learn the values from the members on every ping. A recorded value that can never be reached
+again (for example a primary restarted at the same epoch with durability `memory`, whose sequences
+start over) stays until a failover with `FORCE` or `unclean_failover`, also across coordinator
+restarts. Coordinators' `INFO` shows the recorded values as `recorded=` and the known ones as
+`committed=` on the group's line. Groups whose clients never use `CLIENT DURABILITY` report 0
+everywhere, write nothing, and fail over as before.
 
 The coordinators learn committed values only from the members they reach: the primary, and the replicas
 following it (the primary passes the value on to them). A write acknowledged with `CLIENT DURABILITY
@@ -320,7 +329,7 @@ support connects to the coordinators with the group name as the service name:
 | `SENTINEL sentinels group` | The other coordinators |
 | `SUBSCRIBE +switch-master` | `group old-host old-port new-host new-port` on every failover |
 | `ROLE` | `["sentinel", [groups]]` |
-| `INFO` | `coordinator_id`, `leader_id`, `is_leader`, and `group_<name>:primary=…,epoch=…` (with `,committed=…` per shard, joined by `/`, once a durable reply was released) |
+| `INFO` | `coordinator_id`, `leader_id`, `is_leader`, and `group_<name>:primary=…,epoch=…` (with `,recorded=…` (the Raft record) and `,committed=…` (what this coordinator knows) per shard, joined by `/`, once a durable reply was released) |
 | `AUTH secret` | Required first when `secret` is set; `NOAUTH` otherwise |
 
 Checked with redis-py's `Sentinel` (5.2): it discovers the primary, writes through it, and writes to
@@ -402,20 +411,40 @@ move the range back with another `COORDINATOR MOVE`. The copy rate of a source i
 `migration_max_bytes_per_sec` in its configuration (0, the default, means no cap); the frozen hand-over
 is never slowed down. Nodes need durability `memory`, `everysec` or `always` (not `snapshot`).
 
+## Upgrading
+
+Upgrade all coordinators together: stop every one, replace the binary, start them again. A release
+that records committed sequences in Raft writes log entries older coordinators cannot read; an older
+coordinator that receives one cannot follow the log, and one restarted on such a log refuses to start.
+The newer release reads the log, vote and snapshot an older one wrote. Data nodes are not affected.
+
+A rolling upgrade stalls: once a coordinator of the newer release leads and records a committed
+sequence or a failover, the older ones cannot take the entry, and while fewer than a majority run the
+newer release nothing more is agreed (no failover, no move) until the rest are upgraded.
+
+To go back to an older release, roll forward if at all possible. Otherwise, only for groups without a
+cluster map (no `shards`/`slots`, no moved ranges): stop every coordinator, delete `raft-log.json`,
+`raft-vote.json` and `raft-snapshot.json` from each one's `data_dir`, and start the older release
+while every group has exactly one member answering as primary. The coordinators then start as on a
+first start: they record that member at epoch 1 and lose the committed sequences (they learn them again
+from the members). With a cluster map do not do this: the map's version and the moved ranges are in
+the same state, and starting it over sends nodes an older map than they hold.
+
 ## Limits of this version
 
 - Groups are declared in the file; replicas are not discovered from the primary yet.
 - The coordinators do not change membership at run time (adding a coordinator means restarting all of
   them with the new `peers`).
 - Ranges move only when an operator asks (`COORDINATOR MOVE`); nothing rebalances by load yet.
-- The committed sequences a failover must keep live in the coordinators' memory, not in Raft.
 
 ## Tests
 
 - `tests/coordinator_live.rs`: three data nodes and three coordinators as real processes: failover after
   the primary is killed, the old primary returning as a replica, agreement kept across a restart of every
-  coordinator, a leader cut off from the other coordinators that neither fails over nor
-  corrects a member while it still reaches the data nodes, and the secret; and two groups of a multi-node cluster,
+  coordinator, no failover without a majority, a leader cut off from the other coordinators that
+  neither fails over nor corrects a member while it still reaches the data nodes, and the secret; the
+  committed sequences kept across a restart of every coordinator while the primary and the replica
+  holding them are down (only `FORCE` promotes the other replica); and two groups of a multi-node cluster,
   where a failover in one changes the other's `MOVED` answers, and a range moves from one to the other
   while a client keeps writing a key of it (every acknowledged write is on the new owner). A primary
   cut off from the coordinators by a proxy while a client keeps writing to it: with the lease it
