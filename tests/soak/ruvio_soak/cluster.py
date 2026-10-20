@@ -146,6 +146,7 @@ class Cluster:
         g = self.group(group)
         env = {
             "RUVIO_ADDR": self.address(host, group),
+            "RUVIO_ADVERTISE_HOST": self.hosts[host],
             "RUVIO_SHARDS": str(g.shards),
             "RUVIO_DURABILITY": g.durability,
             "RUVIO_DATA_DIR": data_dir,
