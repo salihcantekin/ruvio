@@ -214,10 +214,10 @@ coordinator reports a lease ended by the new, shorter length while a grant of th
 Checked with Docker (debug build, `ping_interval_ms` 500, `down_after_ms` 3000, `primary_lease_ms`
 2000, `min-replicas-to-write 1` on every node), the old primary and one replica on one network, the
 other replica and the coordinators on another, a client writing to the old primary throughout. Without
-the lease the old primary took writes for the whole partition and about 520 acknowledged writes were
-lost when it rejoined. With it, the old primary refused writes 1.5 seconds after the second
-coordinator lost it, the replica was promoted 1 second after that, and the writes taken before the
-refusal (about 180, including the two seconds the cut took to set up) were lost.
+the lease the old primary took writes for the whole partition and about 475 acknowledged writes were
+lost when it rejoined. With it, the old primary refused writes about 1.5 seconds after the second
+coordinator lost it, the replica was promoted 0.8 to 1.3 seconds after that, and the writes taken
+before the refusal (about 100) were lost.
 
 ### What can still lose data
 
