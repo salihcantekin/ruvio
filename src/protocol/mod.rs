@@ -529,6 +529,9 @@ pub enum Command<'a> {
     /// `RUVIO MOVESLOTS first-last shard` moves a slot range to another shard of this
     /// process; `RUVIO MOVESLOTS STATUS` (`None`) reports the current or last move.
     MoveSlots(Option<SlotRangeMove>),
+    /// `RUVIO TOPOLOGY SET map` installs a multi-node cluster map; `RUVIO TOPOLOGY VERSION`
+    /// (`None`) reports the version this node serves (0 without a map).
+    Topology(Option<Bytes<'a>>),
     Info(Option<Bytes<'a>>),
     Save,
     Bgsave,

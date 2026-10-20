@@ -28,6 +28,9 @@ pub struct Sighting {
     pub durable: u64,
     /// It answered `LOADING`: still copying its primary, never a candidate.
     pub loading: bool,
+    /// The cluster map version it serves (`RUVIO TOPOLOGY VERSION`), read only when the
+    /// coordinators manage a multi-node cluster.
+    pub topology: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,7 +81,7 @@ pub type Switches = broadcast::Sender<String>;
 const CALL_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// Pings one member and reads its role and synced sequence.
-async fn look(member: &Member, auth: Option<&str>) -> Option<Sighting> {
+async fn look(member: &Member, auth: Option<&str>, cluster: bool) -> Option<Sighting> {
     let mut client = NodeClient::connect(&member.address, auth, CALL_TIMEOUT)
         .await
         .ok()?;
@@ -113,6 +116,19 @@ async fn look(member: &Member, auth: Option<&str>) -> Option<Sighting> {
             };
         }
         _ => return None,
+    }
+
+    if cluster {
+        sighting.topology = match client
+            .call(&[b"RUVIO", b"TOPOLOGY", b"VERSION"], CALL_TIMEOUT)
+            .await
+            .ok()?
+        {
+            Value::Integer(version) => u64::try_from(version).ok(),
+            // Refused (an ACL without `ruvio|topology`, a release without the command): pushed
+            // anyway, so the refusal shows in the coordinator's log.
+            _ => Some(0),
+        };
     }
 
     // Every shard's synced sequence: shard i answers on the address's port plus i.
@@ -210,6 +226,7 @@ pub async fn watch(config: Arc<CoordinatorConfig>, sightings: Sightings) {
     loop {
         tick.tick().await;
         let mut looks = Vec::new();
+        let cluster = config.groups.iter().any(|group| group.shards.is_some());
 
         for group in &config.groups {
             for (index, member) in group.members.iter().enumerate() {
@@ -218,7 +235,7 @@ pub async fn watch(config: Arc<CoordinatorConfig>, sightings: Sightings) {
                 let name = group.name.clone();
 
                 looks.push(tokio::spawn(async move {
-                    (name, index, look(&member, auth.as_deref()).await)
+                    (name, index, look(&member, auth.as_deref(), cluster).await)
                 }));
             }
         }
@@ -320,6 +337,90 @@ pub async fn lead(
             }
 
             reconcile(&config, group, primary, &seen).await;
+        }
+
+        push_cluster_map(&config, &machine, &sightings).await;
+    }
+}
+
+/// Sends the cluster map to every answering member that serves an older one, so `MOVED`
+/// names each group's agreed primary.
+async fn push_cluster_map(
+    config: &CoordinatorConfig,
+    machine: &StateMachine,
+    sightings: &Sightings,
+) {
+    // Members a push is still running for, so a slow one never holds up the failover loop or
+    // gets a second push meanwhile; and when each member's failure was last logged.
+    static PUSHING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static WARNED: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
+    const WARN_EVERY: Duration = Duration::from_secs(60);
+
+    let Some((version, map)) = config.cluster_map(&machine.primaries()) else {
+        return;
+    };
+    let map: Arc<[u8]> = map.into_bytes().into();
+
+    for group in &config.groups {
+        for (index, member) in group.members.iter().enumerate() {
+            let sighting = sightings.get(&group.name, index);
+
+            if sighting
+                .last_ok
+                .is_none_or(|at| at.elapsed() > config.down_after)
+                || sighting.topology.is_none_or(|served| served >= version)
+            {
+                continue;
+            }
+            let key = member.address.to_string();
+            {
+                let mut pushing = PUSHING.lock().unwrap_or_else(|error| error.into_inner());
+
+                if pushing.contains(&key) {
+                    continue;
+                }
+                pushing.push(key.clone());
+            }
+            let (member, auth, map, name) = (
+                member.clone(),
+                config.auth.clone(),
+                Arc::clone(&map),
+                group.name.clone(),
+            );
+
+            tokio::spawn(async move {
+                let result = command(
+                    &member,
+                    auth.as_deref(),
+                    &[b"RUVIO", b"TOPOLOGY", b"SET", &map],
+                )
+                .await;
+
+                match result {
+                    Ok(()) => {
+                        info!(group = %name, member = %member.address, version, "sent the cluster map")
+                    }
+                    Err(error) => {
+                        let mut warned = WARNED.lock().unwrap_or_else(|error| error.into_inner());
+                        let last = warned.iter_mut().find(|(known, _)| *known == key);
+
+                        if last
+                            .as_ref()
+                            .is_none_or(|(_, at)| at.elapsed() > WARN_EVERY)
+                        {
+                            warn!(group = %name, member = %member.address, %error, "could not send the cluster map (repeated at most once a minute)");
+                            match last {
+                                Some((_, at)) => *at = Instant::now(),
+                                None => warned.push((key.clone(), Instant::now())),
+                            }
+                        }
+                    }
+                }
+                PUSHING
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .retain(|known| *known != key);
+            });
         }
     }
 }
@@ -469,6 +570,8 @@ mod tests {
                     .unwrap(),
                 })
                 .collect(),
+            shards: None,
+            slots: Vec::new(),
         }
     }
 
@@ -478,6 +581,7 @@ mod tests {
             role: Some(Role::Replica(None)),
             durable,
             loading: false,
+            topology: None,
         }
     }
 

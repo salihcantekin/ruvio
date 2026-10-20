@@ -136,19 +136,53 @@ refuses calls from coordinators that do not send it, and clients must `AUTH` wit
 anyone who reaches the port can read the topology and send votes: always set it, and keep the port on a
 private network. The secret travels in clear text; use a private network or a tunnel between machines.
 
+## A multi-node cluster
+
+Several groups can share the hash slots, each group on its own machines (see `cluster_topology` in
+[CONFIGURATION.md](CONFIGURATION.md)). Give each group its `shards` and `slots` in `coordinator.toml`:
+
+```toml
+[[groups]]
+name = "a"
+shards = 2
+slots = ["0-8191"]
+members = [ { address = "a1:6379", replication = "a1:26379" }, { address = "a2:6379", replication = "a2:26379" } ]
+
+[[groups]]
+name = "b"
+shards = 2
+slots = ["8192-16383"]
+members = [ { address = "b1:6379", replication = "b1:26379" }, { address = "b2:6379", replication = "b2:26379" } ]
+```
+
+Either every group has `shards` or none does, every slot belongs to one group, and a group may
+have no slots yet (`slots = []`). Start every data node
+with a `cluster_topology` file holding the same groups and slots (version 1, each group named by its
+first member) and its own `cluster_group`. Once every group has an agreed primary the coordinators send
+each member the map with `RUVIO TOPOLOGY SET`, each group named by its agreed primary; its version is 1
+plus the sum of the groups' epochs, so every failover raises it. A node keeps the newest map it received
+in its data directory (`TOPOLOGY`) and starts from the newer of that file and `cluster_topology`. After
+a failover in one group, the other groups' nodes answer that group's keys with `MOVED` naming the new
+primary within a ping or two. A map that would change a node's own slots is refused: slots do not move
+between groups yet. The data-node user in `auth` also needs `RUVIO` for this; a member that refuses
+the map is logged at most once a minute. The version only counts failovers, so an edit of the groups in
+`coordinator.toml` (an address, the order) does not reach nodes that already serve that version; this
+version of the coordinator does not handle such edits.
+
 ## Limits of this version
 
 - Groups are declared in the file; replicas are not discovered from the primary yet.
 - The coordinators do not change membership at run time (adding a coordinator means restarting all of
   them with the new `peers`).
 - No primary leases: an isolated primary is stopped by `min-replicas-to-write`, not by the coordinators.
-- Failover only. Coordinators do not place data across machines or move slots.
+- Coordinators keep a multi-node cluster's map current but do not move slots between groups.
 
 ## Tests
 
 - `tests/coordinator_live.rs`: three data nodes and three coordinators as real processes: failover after
   the primary is killed, the old primary returning as a replica, agreement kept across a restart of every
-  coordinator, no failover without a majority, and the secret.
+  coordinator, no failover without a majority, and the secret; and two groups of a multi-node cluster,
+  where a failover in one changes the other's `MOVED` answers.
 - `scripts/coordinator_faults.py target/debug/ruvio [scenario ...]`: a TCP proxy between the coordinators
   and each data node; `partition` (primary cut from the coordinators only), `leader` (the coordinator
   leader killed, then the primary), `minority`, `restart`, `loss` (acknowledged writes lost under load),

@@ -404,6 +404,9 @@ RUVIO_TEST_FLUSHALL=1 ...                                               # also r
   live suites (database 11) are not run on the cluster.
 - `tests/test_replica_reads_live.py` needs `RUVIO_REPLICATED_ADDR` (a 2-shard primary) and `RUVIO_REPLICA_ADDR` (its
   2-shard replica, shard i on port + i); `scripts/run_with_servers.sh` starts both. Without them it is skipped.
+- `tests/test_multi_node_live.py` needs `RUVIO_MULTINODE_A_ADDR`, `RUVIO_MULTINODE_B_ADDR` and
+  `RUVIO_MULTINODE_STALE_ADDR` (a two-node cluster and a node with an older map, started by
+  `scripts/run_with_servers.sh`) and checks that the client follows `MOVED`. Without them it is skipped.
 - Without `RUVIO_TEST_ADDR` the live tests are skipped. Live tests use database 11 and run
   `FLUSHDB`. `test_keys` also uses database 12. `JSON.INDEX` only works in database 0, so
   that test uses unique keys there and cleans up after itself.

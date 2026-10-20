@@ -1399,6 +1399,29 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         dropped
     }
 
+    /// How many keys, in every database, live in a slot marked in `slots`, and the lowest
+    /// such slot. Reads only; walks every key once.
+    pub(crate) fn count_in_slots(&mut self, slots: &[bool]) -> (usize, Option<u16>) {
+        let active = self.active;
+        let mut count = 0;
+        let mut lowest: Option<u16> = None;
+
+        for database in self.database_ids() {
+            self.enter(database);
+            for (key, _) in self.entries.entries() {
+                let slot = crate::routing::hash_slot(key);
+
+                if slots[usize::from(slot)] {
+                    count += 1;
+                    lowest = Some(lowest.map_or(slot, |known| known.min(slot)));
+                }
+            }
+        }
+
+        self.enter(active);
+        (count, lowest)
+    }
+
     /// Moves `key` from the active database to `target`. False when the key is missing
     /// or `target` already has it.
     pub(crate) fn move_key(&mut self, key: &[u8], target: u8) -> bool {

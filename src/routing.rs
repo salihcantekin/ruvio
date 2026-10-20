@@ -136,6 +136,7 @@ pub fn command_slot(command: &Command<'_>) -> Result<Option<u16>, CrossSlot> {
         | Command::ConfigRewrite
         | Command::ReplicaOf { .. }
         | Command::MoveSlots(_)
+        | Command::Topology(_)
         | Command::Role
         | Command::Bgsave
         | Command::Scan { .. }
@@ -450,6 +451,7 @@ pub fn command_keys<'a>(command: &'a Command<'_>) -> Vec<&'a [u8]> {
         | Command::ConfigRewrite
         | Command::ReplicaOf { .. }
         | Command::MoveSlots(_)
+        | Command::Topology(_)
         | Command::Role
         | Command::Bgsave
         | Command::Scan { .. }

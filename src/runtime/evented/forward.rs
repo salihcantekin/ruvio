@@ -211,6 +211,8 @@ pub(crate) struct Fabric {
     pub(super) config: Mutex<super::live::ConfigAuthority>,
     /// Slot moves between these shards.
     pub(super) mover: super::moveslots::SlotMover,
+    /// The cluster map when this node is one of several; set before any shard serves.
+    topology: std::sync::OnceLock<crate::topology::SharedTopology>,
 }
 
 #[derive(Clone)]
@@ -238,7 +240,35 @@ impl Fabric {
             slots: SlotTable::from_formula(count),
             config: Mutex::new(super::live::ConfigAuthority::default()),
             mover: super::moveslots::SlotMover::default(),
+            topology: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Makes this node one of a multi-node cluster: the slots of other groups point past
+    /// the local shards (see [`crate::topology::Topology::apply`]).
+    pub(crate) fn set_topology(&self, topology: crate::topology::Topology) {
+        match self.topology.get() {
+            // A newer map keeps this node's slots (and the moves between its shards); only
+            // the other groups' entries are rewritten.
+            Some(shared) => {
+                for (slot, owner) in topology.placement(self.count).into_iter().enumerate() {
+                    if usize::from(owner) >= self.count {
+                        self.slots.assign(slot as u16, usize::from(owner));
+                    }
+                }
+                shared.replace(topology);
+            }
+            None => {
+                topology.apply(&self.slots, self.count);
+                let _ = self
+                    .topology
+                    .set(crate::topology::SharedTopology::new(topology));
+            }
+        }
+    }
+
+    pub(crate) fn topology(&self) -> Option<&crate::topology::SharedTopology> {
+        self.topology.get()
     }
 
     pub(super) fn register_durability(&self, shard: usize, durability: ShardDurability) {
@@ -1325,6 +1355,8 @@ pub(super) fn forward_refusal(
 pub(super) enum Owner {
     Local,
     Remote(usize),
+    /// Another node of a multi-node cluster owns this slot: the answer is `MOVED`.
+    Node(u16),
     /// Keys live on different shards.
     Split,
 }
@@ -1369,8 +1401,10 @@ pub(super) fn command_owner(
                 return (
                     if found == forwarding.me {
                         Owner::Local
-                    } else {
+                    } else if found < forwarding.fabric.count {
                         Owner::Remote(found)
+                    } else {
+                        Owner::Node(slot)
                     },
                     true,
                 );
@@ -1386,7 +1420,12 @@ pub(super) fn command_owner(
         if hot && crate::hot_store::matches_hot_key(&state.published_config.hot_keys, key) {
             continue;
         }
-        let found = forwarding.fabric.owner_of(key);
+        let slot = hash_slot(key);
+        let found = forwarding.fabric.slot_owner(slot);
+
+        if found >= forwarding.fabric.count {
+            return (Owner::Node(slot), one_slot);
+        }
 
         match owner {
             None => owner = Some(found),
@@ -1409,11 +1448,34 @@ pub(super) fn command_owner(
 pub(super) fn hot_remote_owner(
     forwarding: &Forwarding,
     command: &crate::protocol::HotCommand<'_>,
-) -> Option<usize> {
+) -> Option<(usize, u16)> {
     let slot = hot_command_slot(command)?;
     let owner = forwarding.fabric.slot_owner(slot);
 
-    (owner != forwarding.me).then_some(owner)
+    (owner != forwarding.me).then_some((owner, slot))
+}
+
+/// Answers `MOVED` when another node of the cluster owns `slot` (`owner` is the slot
+/// table entry); `false` when the owner is a shard of this process.
+pub(super) fn redirect_to_node(
+    forwarding: &Forwarding,
+    output: &mut impl std::io::Write,
+    slot: u16,
+    owner: usize,
+) -> io::Result<bool> {
+    let count = forwarding.fabric.count;
+
+    if owner < count {
+        return Ok(false);
+    }
+    match forwarding.fabric.topology() {
+        Some(topology) => {
+            crate::runtime::cluster::write_moved(output, &topology.get(), slot, owner, count)?
+        }
+        None => output.write_all(b"-CLUSTERDOWN Hash slot not served\r\n")?,
+    }
+
+    Ok(true)
 }
 
 /// Sends queued foreign commands and splices their replies into `output`.
@@ -1937,6 +1999,11 @@ pub(super) async fn forward_special(
 
         _ => match owner {
             Owner::Local => Ok(false),
+            Owner::Node(slot) => {
+                let owner = forwarding.fabric.slot_owner(*slot);
+
+                redirect_to_node(forwarding, output, *slot, owner)
+            }
             Owner::Split => {
                 output.write_all(SPLIT_REPLY)?;
 
@@ -2184,6 +2251,7 @@ mod tests {
         "ConfigSet",
         "ReplicaOf",
         "MoveSlots",
+        "Topology",
         "Role",
         "Discard",
         "Echo",

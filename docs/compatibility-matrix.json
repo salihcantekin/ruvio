@@ -40,7 +40,7 @@
       "family": "connection",
       "status": "supported",
       "same_slot": false,
-      "limitations": "No arguments replies PONG is taken. OWNER names the shard rule. Any other argument is an error.",
+      "limitations": "No arguments replies PONG is taken. OWNER names the shard rule. RUVIO TOPOLOGY VERSION returns the cluster map version the node serves (0 without cluster_topology); RUVIO TOPOLOGY SET map installs a newer map (sent by ruvio coordinator; @admin @dangerous; the node's own slots may not change). Any other argument is an error.",
       "coverage": [
         "src/protocol/",
         "src/engine/"
@@ -2087,7 +2087,7 @@
       "family": "cluster",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Topology of the shards in one process, including ranges moved with RUVIO MOVESLOTS. Hosts and ports come from advertised_host and advertised_port. Each range lists the primary shard, then its replicas that announced an address and finished copying; a replica lists the primary it follows first and itself second. Node ids are the SHA-1 of the announced host:port.",
+      "limitations": "Topology of the shards in one process, including ranges moved with RUVIO MOVESLOTS, and with cluster_topology the other groups of a multi-node cluster (by their primary). Hosts and ports come from advertised_host and advertised_port. Each range lists the primary shard, then its replicas that announced an address and finished copying; a replica lists the primary it follows first and itself second. Node ids are the SHA-1 of the announced host:port.",
       "coverage": [
         "scripts/cluster_smoke.py"
       ]

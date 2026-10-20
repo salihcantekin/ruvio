@@ -107,6 +107,7 @@ impl<'a> Command<'a> {
             ),
             Self::ConfigRewrite => Command::ConfigRewrite,
             Self::MoveSlots(target) => Command::MoveSlots(target),
+            Self::Topology(map) => Command::Topology(map.map(owned)),
             Self::ReplicaOf { primary, force } => Command::ReplicaOf {
                 primary: primary.map(|(host, port)| (owned(host), owned(port))),
                 force,
@@ -1261,6 +1262,7 @@ pub(crate) fn command_mutates_store(command: &Command<'_>) -> bool {
             | Command::ConfigRewrite
             | Command::ReplicaOf { .. }
             | Command::MoveSlots(_)
+            | Command::Topology(_)
             | Command::Role
             | Command::Bgsave
             | Command::Get(_)

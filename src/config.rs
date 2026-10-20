@@ -163,6 +163,11 @@ pub struct AppConfig {
     /// Original `notify-keyspace-events` letters. Empty disables the feature.
     pub notify_keyspace_events: String,
     pub replication: ReplicationConfig,
+    /// A multi-node cluster map (`cluster_topology` in `docs/CONFIGURATION.md`). `None`
+    /// keeps every slot on this node.
+    pub cluster_topology: Option<PathBuf>,
+    /// This node's group in `cluster_topology`.
+    pub cluster_group: String,
     /// The file this configuration was read from, where `CONFIG REWRITE` writes. Not a
     /// setting: `None` (tests, embedded servers) refuses `CONFIG REWRITE`.
     pub config_file: Option<PathBuf>,
@@ -489,6 +494,11 @@ impl AppConfig {
             self.set_notify_keyspace_events(value)?;
         }
 
+        if let Some(value) = get("RUVIO_CLUSTER_TOPOLOGY") {
+            self.cluster_topology = (!value.is_empty()).then(|| PathBuf::from(value));
+        }
+        apply_string(&get, "RUVIO_CLUSTER_GROUP", &mut self.cluster_group);
+
         if let Some(value) = get("RUVIO_METRICS_ADDR") {
             self.metrics_address = if value.is_empty() { None } else { Some(value) };
         }
@@ -667,6 +677,18 @@ impl AppConfig {
         self.memory.validate().map_err(str::to_owned)?;
         self.validate_shard_memory_budget()?;
         self.scripts.validate().map_err(str::to_owned)?;
+
+        if self.cluster_topology.is_some() {
+            if self.cluster_group.is_empty() {
+                return Err("cluster_topology needs cluster_group (this node's group)".into());
+            }
+            if self.port_mode == PortMode::Single {
+                return Err("cluster_topology needs port_mode = \"per-shard\"".into());
+            }
+            if !self.hot_keys.is_empty() {
+                return Err("cluster_topology cannot be combined with hot_keys".into());
+            }
+        }
 
         if self.address.parse::<std::net::SocketAddr>().is_err() {
             return Err("address must be a numeric socket address".into());
@@ -901,6 +923,14 @@ impl AppConfig {
                 "notify-keyspace-events".into(),
                 self.notify_keyspace_events.clone(),
             ),
+            (
+                "cluster-topology".into(),
+                self.cluster_topology
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+            ),
+            ("cluster-group".into(), self.cluster_group.clone()),
             (
                 "hash-max-compact-entries".into(),
                 self.memory.hash_max_compact_entries.to_string(),
@@ -1161,6 +1191,8 @@ impl Default for AppConfig {
             hot_keys: Vec::new(),
             notify_keyspace_events: String::new(),
             replication: ReplicationConfig::default(),
+            cluster_topology: None,
+            cluster_group: String::new(),
             config_file: None,
         }
     }
@@ -1202,6 +1234,8 @@ struct FileConfig {
     hot_keys: Option<Vec<String>>,
     notify_keyspace_events: Option<String>,
     replication: ReplicationFileConfig,
+    cluster_topology: Option<PathBuf>,
+    cluster_group: Option<String>,
 }
 
 impl FileConfig {
@@ -1257,6 +1291,14 @@ impl FileConfig {
 
         if let Some(value) = self.notify_keyspace_events {
             config.set_notify_keyspace_events(value)?;
+        }
+
+        if let Some(value) = self.cluster_topology {
+            config.cluster_topology = (!value.as_os_str().is_empty()).then_some(value);
+        }
+
+        if let Some(value) = self.cluster_group {
+            config.cluster_group = value;
         }
 
         self.replication.apply(&mut config.replication)?;
@@ -2653,6 +2695,20 @@ fn overlay_config(table: &mut toml::Table, loaded: &AppConfig, effective: &AppCo
             &["notify_keyspace_events"],
             text(&effective.notify_keyspace_events),
         );
+    }
+
+    if loaded.cluster_topology != effective.cluster_topology {
+        let path = effective
+            .cluster_topology
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+
+        set_toml(table, &["cluster_topology"], text(&path));
+    }
+
+    if loaded.cluster_group != effective.cluster_group {
+        set_toml(table, &["cluster_group"], text(&effective.cluster_group));
     }
 }
 

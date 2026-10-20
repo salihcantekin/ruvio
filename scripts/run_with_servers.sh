@@ -6,9 +6,13 @@
 # Starts a standalone server on <base-port>, a 3-shard server (per-shard
 # ports <base-port>+10 .. +12), and a 2-shard primary (<base-port>+20, +21) with a
 # 2-shard replica (<base-port>+30, +31) that is listed in the primary's CLUSTER SLOTS.
+# A multi-node cluster: node a (<base-port>+50, +51, slots 0-8191) and node b (+60, +61,
+# slots 8192-16383), two shards each, plus a one-shard node (+70) whose older map gives every
+# slot to node a, so a client seeded with it is answered MOVED by node a for node b's keys.
 # Exports RUVIO_TEST_ADDR / RUVIO_ADDR / RUVIO_CLUSTER_ADDR / RUVIO_REPLICATED_ADDR
-# (the primary) / RUVIO_REPLICA_ADDR (the replica), and RUVIO_TEST_CONFIG_REWRITE=1, for
-# the command, and stops every server afterwards.
+# (the primary) / RUVIO_REPLICA_ADDR (the replica) / RUVIO_MULTINODE_A_ADDR /
+# RUVIO_MULTINODE_B_ADDR / RUVIO_MULTINODE_STALE_ADDR, and RUVIO_TEST_CONFIG_REWRITE=1,
+# for the command, and stops every server afterwards.
 # The repository ruvio.example.toml is copied, never edited.
 #
 # Each port must answer PING with PONG from the server this script started
@@ -88,6 +92,49 @@ pids+=("$!")
 "$binary" --config "$work/replica.toml" --address "127.0.0.1:$((base + 30))" --data-dir "$work/replica" >"$work/replica.log" 2>&1 &
 pids+=("$!")
 
+# The multi-node cluster's maps (see `cluster_topology` in docs/CONFIGURATION.md).
+sed 's/^shards = 1/shards = 2/' "$work/standalone.toml" >"$work/multinode.toml"
+cat >"$work/topology.toml" <<MAP
+version = 2
+
+[[groups]]
+name = "a"
+address = "127.0.0.1:$((base + 50))"
+shards = 2
+slots = ["0-8191"]
+
+[[groups]]
+name = "b"
+address = "127.0.0.1:$((base + 60))"
+shards = 2
+slots = ["8192-16383"]
+MAP
+cat >"$work/stale-topology.toml" <<MAP
+version = 1
+
+[[groups]]
+name = "a"
+address = "127.0.0.1:$((base + 50))"
+shards = 2
+slots = ["0-16383"]
+
+[[groups]]
+name = "stale"
+address = "127.0.0.1:$((base + 70))"
+shards = 1
+slots = []
+MAP
+for node in a b; do
+  port=$((base + 50))
+  [ "$node" = b ] && port=$((base + 60))
+  RUVIO_CLUSTER_TOPOLOGY="$work/topology.toml" RUVIO_CLUSTER_GROUP="$node" \
+    "$binary" --config "$work/multinode.toml" --address "127.0.0.1:$port" --data-dir "$work/node-$node" >"$work/node-$node.log" 2>&1 &
+  pids+=("$!")
+done
+RUVIO_CLUSTER_TOPOLOGY="$work/stale-topology.toml" RUVIO_CLUSTER_GROUP=stale \
+  "$binary" --config "$work/standalone.toml" --address "127.0.0.1:$((base + 70))" --data-dir "$work/node-stale" >"$work/node-stale.log" 2>&1 &
+pids+=("$!")
+
 ready() {
   python3 "$root/scripts/_ruvio.py" wait-ready --timeout 30 --port "$@"
 }
@@ -102,6 +149,13 @@ done
 for port in $((base + 30)) $((base + 31)); do
   ready "$port" --pid "${pids[3]}" --data-dir "$work/replica"
 done
+for port in $((base + 50)) $((base + 51)); do
+  ready "$port" --pid "${pids[4]}" --data-dir "$work/node-a"
+done
+for port in $((base + 60)) $((base + 61)); do
+  ready "$port" --pid "${pids[5]}" --data-dir "$work/node-b"
+done
+ready "$((base + 70))" --pid "${pids[6]}" --data-dir "$work/node-stale"
 python3 "$root/scripts/_ruvio.py" wait-replicas --timeout 30 --port "$((base + 20))" --replicas 1
 
 export RUVIO_ADDR="127.0.0.1:$base"
@@ -109,6 +163,9 @@ export RUVIO_TEST_ADDR="127.0.0.1:$base"
 export RUVIO_CLUSTER_ADDR="127.0.0.1:$((base + 10))"
 export RUVIO_REPLICATED_ADDR="127.0.0.1:$((base + 20))"
 export RUVIO_REPLICA_ADDR="127.0.0.1:$((base + 30))"
+export RUVIO_MULTINODE_A_ADDR="127.0.0.1:$((base + 50))"
+export RUVIO_MULTINODE_B_ADDR="127.0.0.1:$((base + 60))"
+export RUVIO_MULTINODE_STALE_ADDR="127.0.0.1:$((base + 70))"
 # The servers run on throwaway copies of the config file, so live tests may rewrite it.
 export RUVIO_TEST_CONFIG_REWRITE=1
 "$@"

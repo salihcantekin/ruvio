@@ -228,6 +228,8 @@ Each variable overrides one file setting, and a command-line flag, where there i
 | `RUVIO_PORT_MODE` | no | | `port_mode` | |
 | `RUVIO_ADVERTISE_HOST` | no | `--advertised-host` | `advertised_host` | |
 | `RUVIO_ADVERTISE_PORT` | no | `--advertised-port` | `advertised_port` | |
+| `RUVIO_CLUSTER_TOPOLOGY` | no | | `cluster_topology` | Path of the cluster map; empty = none |
+| `RUVIO_CLUSTER_GROUP` | no | | `cluster_group` | This node's group in the map |
 | `RUVIO_CPUSET` | no | `--cpu-set` | `cpu_set` | |
 | `RUVIO_CORE` | no | | `cpu_set` | Older name; read only when `RUVIO_CPUSET` is unset |
 | `RUVIO_SHUTDOWN_GRACE_MS` | no | `--shutdown-grace-ms` | `shutdown_grace_ms` | |
@@ -797,6 +799,53 @@ port they name for shard 0; shard `i` is that port plus `i`. Leave it unset
 when clients reach the bind ports directly. Set both when a container or load
 balancer publishes the shards elsewhere, for example `-p 7000-7003:6379-6382`
 with `RUVIO_ADVERTISE_HOST=<host clients use>` and `RUVIO_ADVERTISE_PORT=7000`.
+
+`cluster_topology` (`RUVIO_CLUSTER_TOPOLOGY`) makes this node one of a multi-node
+cluster: the path of a map that gives every hash slot to one group, where a group
+is a primary and its replicas. `cluster_group` (`RUVIO_CLUSTER_GROUP`) names this
+node's group in it. Both are read at startup only; without a map the node owns
+every slot, as before.
+
+```toml
+version = 1                    # increases with every change; CLUSTER INFO cluster_current_epoch
+
+[[groups]]
+name = "a"
+address = "10.0.0.1:7000"      # client address of the group primary's shard 0
+shards = 2                     # must equal `shards` on that group's nodes
+slots = ["0-8191"]
+
+[[groups]]
+name = "b"
+address = "10.0.0.2:7000"
+shards = 4                     # groups may differ in shard count
+slots = ["8192-16383"]
+```
+
+Every slot must belong to exactly one group, and the node's own group must list its
+`shards`. A group's slots, in order, are split into equal runs over its shards (shard
+`i` of group `b` above listens on port 7000 + `i`); a group that owns every slot
+places them exactly as a node without a map does. A command whose key belongs to
+another group is answered `-MOVED slot host:port` with the address of the shard
+that holds it (inside `MULTI` the transaction is then aborted), so cluster-aware
+clients reach the owner directly; local keys are forwarded between this node's
+shards as before. `CLUSTER SLOTS`, `CLUSTER SHARDS` and `CLUSTER NODES` describe
+the whole map, other groups by their primary only. Keyless commands (`DBSIZE`,
+`KEYS`, `SCAN`, `FLUSHALL`), `WAIT` and classic `PUBLISH`/`SUBSCRIBE` stay on the
+node that receives them; use `SPUBLISH`/`SSUBSCRIBE` for channels the whole
+cluster shares. The map is fixed: start a group with its slots empty, or as the
+only group of a node that already holds data; data is not moved between groups
+yet. A node that holds keys in slots the map serves elsewhere (or on another of its
+own shards) refuses to start and names the first such slot; the check walks the
+keys once at startup, only when a map is set. With `ruvio coordinator` managing the
+groups, the coordinators send each node a newer map after every failover (`RUVIO
+TOPOLOGY SET`, see `docs/COORDINATOR.md`); the node keeps it in `TOPOLOGY` in its data
+directory and starts from the newer of that file and `cluster_topology`. A one-shard
+node with a map answers the `CLUSTER` commands too. A map needs `port_mode = "per-shard"` and cannot be combined with `hot_keys`.
+`RUVIO MOVESLOTS` still moves this group's slots between the node's own shards, starting
+from the map's placement; another group's range cannot be moved. The layout the moves
+started from is kept next to them (`SLOTS_BASE`), and a node whose moves were made with
+another layout (no map, or a map with other slots for this group) refuses to start.
 `cpu_set` (`RUVIO_CPUSET`, `--cpu-set`) pins shard threads on Linux. It takes a
 CPU list such as `2`, `0-3` or `0,2,4-5`; shard `i` runs on the `i`th listed
 core and the list wraps when there are more shards than cores. Unset means no

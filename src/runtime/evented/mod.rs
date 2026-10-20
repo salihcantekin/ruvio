@@ -76,6 +76,7 @@ mod pubsub;
 mod replica;
 #[cfg(all(test, not(miri)))]
 mod tests;
+mod topology;
 mod wal_group;
 
 use checkpoint::*;
@@ -485,7 +486,9 @@ pub fn run_with_force(config: &AppConfig, shutdown: ShutdownToken, force: bool) 
     )
     .map_err(|error| io::Error::other(error.to_string()))?;
 
-    if config.shards <= 1 {
+    // A one-shard node of a multi-node cluster still routes (to answer `MOVED`) and
+    // answers the cluster commands, so it runs as a cluster of one shard.
+    if config.shards <= 1 && config.cluster_topology.is_none() {
         let bind: SocketAddr = config
             .address
             .parse()
@@ -578,14 +581,37 @@ fn run_cluster(config: &AppConfig, shutdown: ShutdownToken, force: bool) -> io::
     // Before any shard serves: every route reads the table the moves left, and new moves
     // are recorded next to the log.
     if let Some(fabric) = &fabric {
-        let moves = load_slot_moves(config, config.shards)?;
+        // The cluster map places this group's slots on its shards first; moves between
+        // the shards apply on top of it.
+        if let Some(path) = &config.cluster_topology {
+            let topology = crate::topology::Topology::load_newest(
+                path,
+                &config.persistence.data_dir,
+                &config.cluster_group,
+                config.shards,
+            )
+            .map_err(io::Error::other)?;
+
+            fabric.set_topology(topology);
+        }
+        let base = fabric
+            .topology()
+            .map(|shared| shared.get().placement(config.shards).into());
+        let moves = load_slot_moves(config, config.shards, base.clone())?;
 
         if let Some(moves) = &moves {
             moves.apply(&fabric.slot_table());
         }
         if config.persistence.profile.uses_wal() {
             fabric.mover.set_durable(
-                moves.unwrap_or_else(|| crate::slot_moves::SlotMoves::new(config.shards)),
+                moves.unwrap_or_else(|| {
+                    let moves = crate::slot_moves::SlotMoves::new(config.shards);
+
+                    match base {
+                        Some(base) => moves.with_base(base),
+                        None => moves,
+                    }
+                }),
                 config.persistence.data_dir.clone(),
             );
         }
@@ -637,6 +663,9 @@ fn run_cluster(config: &AppConfig, shutdown: ShutdownToken, force: bool) -> io::
                 || crate::routing::SlotTable::from_formula(config.shards),
                 |fabric| fabric.slot_table(),
             ),
+            topology: fabric
+                .as_ref()
+                .and_then(|fabric| fabric.topology().cloned()),
         };
 
         let cfg = config.clone();
@@ -766,12 +795,21 @@ pub fn serve(
 fn load_slot_moves(
     config: &AppConfig,
     shard_count: usize,
+    base: Option<std::sync::Arc<[u16]>>,
 ) -> io::Result<Option<crate::slot_moves::SlotMoves>> {
     if config.persistence.profile == crate::DurabilityProfile::Memory {
         return Ok(None);
     }
 
     let moves = crate::slot_moves::SlotMoves::load(&config.persistence.data_dir, shard_count)?;
+
+    if moves.is_some() {
+        crate::slot_moves::SlotMoves::check_base(
+            &config.persistence.data_dir,
+            shard_count,
+            base.as_deref(),
+        )?;
+    }
 
     if moves.is_some() && config.replication.role != crate::config::ReplicationRole::Off {
         return Err(io::Error::new(
@@ -781,7 +819,11 @@ fn load_slot_moves(
         ));
     }
 
-    Ok(moves)
+    // With a cluster map, moves were recorded against the map's placement.
+    Ok(match base {
+        Some(base) => moves.map(|moves| moves.with_base(base)),
+        None => moves,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -899,7 +941,14 @@ async fn serve_async(
     }
 
     let slot_moves = match &route {
-        Some(route) => load_slot_moves(&config, route.shard_count)?,
+        Some(route) => load_slot_moves(
+            &config,
+            route.shard_count,
+            route
+                .topology
+                .as_ref()
+                .map(|shared| shared.get().placement(route.shard_count).into()),
+        )?,
         None => None,
     };
     let mut slot_filter = slot_moves
@@ -931,6 +980,22 @@ async fn serve_async(
 
     store.apply_memory_limits(config.shard_memory_limits());
 
+    // With a cluster map, the lowest slot of another group a replay filter skipped: such
+    // keys refuse the start, as they do on a shard without a filter (below).
+    let other_group = |slot: u16| {
+        route.as_ref().is_some_and(|route| {
+            route.topology.is_some() && route.slots.owner(slot) >= route.shard_count
+        })
+    };
+    let mut skipped_foreign: Option<u16> = None;
+    let mut note_foreign = |key: &[u8]| {
+        let slot = crate::routing::hash_slot(key);
+
+        if other_group(slot) {
+            skipped_foreign = Some(skipped_foreign.map_or(slot, |known| known.min(slot)));
+        }
+    };
+
     // Entries go from the decoder straight into the store, so recovery holds one
     // shard's file and its store, not a second copy of the data.
     if let Some(plan) = &plan {
@@ -939,6 +1004,7 @@ async fn serve_async(
                 .as_mut()
                 .is_some_and(|filter| !filter.keeps_entry(&entry.key))
             {
+                note_foreign(&entry.key);
                 return Ok(());
             }
 
@@ -990,6 +1056,7 @@ async fn serve_async(
                 store.drop_slots(slots);
             })
         {
+            mutation.for_each_write_key(&mut |key| note_foreign(key));
             continue;
         }
 
@@ -1022,6 +1089,28 @@ async fn serve_async(
             shard_id,
             dropped, "dropped keys of slots another shard owns"
         );
+    }
+    // A node of a multi-node cluster must not hold keys the map serves elsewhere: they
+    // would be unreachable here and missing there. One walk, only with a map.
+    if let Some(slot) = skipped_foreign {
+        return Err(io::Error::other(format!(
+            "shard {shard_id} recorded keys in slots another group serves under \
+             cluster_topology (first: slot {slot}); start with a map that gives this group \
+             those slots, or with an empty data directory"
+        )));
+    }
+    if let Some(route) = route.as_ref().filter(|route| route.topology.is_some()) {
+        let foreign: Vec<bool> = (0..crate::routing::HASH_SLOT_COUNT as u16)
+            .map(|slot| route.slots.owner(slot) != shard_id as usize)
+            .collect();
+
+        if let (count @ 1.., Some(slot)) = store.count_in_slots(&foreign) {
+            return Err(io::Error::other(format!(
+                "shard {shard_id} holds {count} keys in slots it does not serve under \
+                 cluster_topology (first: slot {slot}; expired keys count too); start with a \
+                 map that gives this group those slots, or with an empty data directory"
+            )));
+        }
     }
     store.resume_expiration_after_replay(replay_clock);
     store.json_index_load_definitions();

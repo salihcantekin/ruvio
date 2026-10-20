@@ -307,6 +307,9 @@ fn start(
     if (target.first..=target.last).any(|slot| fabric.slot_owner(slot) != from) {
         return Err(b"ERR RUVIO MOVESLOTS range has more than one owner; move each part");
     }
+    if from >= fabric.shard_count() {
+        return Err(b"ERR RUVIO MOVESLOTS range belongs to another node of the cluster");
+    }
     if from == to {
         return Err(b"ERR RUVIO MOVESLOTS range is already on that shard");
     }

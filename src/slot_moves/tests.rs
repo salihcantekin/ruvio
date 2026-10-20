@@ -235,3 +235,63 @@ fn cross_slot_records_follow_their_first_key_and_keyless_records_always_apply() 
     assert!(filter.keeps_record(200, &OwnedMutation::FlushAll, &mut none));
     assert!(filter.stale_slots().unwrap()[100]);
 }
+
+/// Moves are refused on a restart with another starting table than they were recorded
+/// against: an old (formula) `SLOTS` file under a new cluster map, and moves recorded under a
+/// map on a restart without it or with other local slots.
+#[test]
+fn moves_saved_against_another_starting_table_are_refused() {
+    let formula: Vec<u16> = (0..HASH_SLOT_COUNT)
+        .map(|slot| shard_for_slot(slot as u16, 2) as u16)
+        .collect();
+    // A map: this node serves 0-8191 over two shards, 8192 and up is another node (entry 3).
+    let map: Vec<u16> = (0..HASH_SLOT_COUNT)
+        .map(|slot| {
+            if slot < 4096 {
+                0
+            } else if slot < 8192 {
+                1
+            } else {
+                3
+            }
+        })
+        .collect();
+    let other_map: Vec<u16> = (0..HASH_SLOT_COUNT)
+        .map(|slot| {
+            if slot < 2048 {
+                0
+            } else if slot < 8192 {
+                1
+            } else {
+                4
+            }
+        })
+        .collect();
+
+    // Saved against the formula.
+    let dir = tempfile::tempdir().unwrap();
+
+    moved_once().save(dir.path()).unwrap();
+    assert!(!dir.path().join(BASE_FILE_NAME).exists());
+    SlotMoves::check_base(dir.path(), 2, None).unwrap();
+    SlotMoves::check_base(dir.path(), 2, Some(&formula)).unwrap();
+    assert!(SlotMoves::check_base(dir.path(), 2, Some(&map)).is_err());
+
+    // Saved against a map: only the same local layout passes (other nodes' entries may differ).
+    let dir = tempfile::tempdir().unwrap();
+    let mut remapped = map.clone();
+
+    remapped[9000] = 7;
+    moved_once()
+        .with_base(map.clone().into())
+        .save(dir.path())
+        .unwrap();
+    SlotMoves::check_base(dir.path(), 2, Some(&map)).unwrap();
+    SlotMoves::check_base(dir.path(), 2, Some(&remapped)).unwrap();
+    assert!(SlotMoves::check_base(dir.path(), 2, None).is_err());
+    assert!(SlotMoves::check_base(dir.path(), 2, Some(&other_map)).is_err());
+
+    // Saved again without a map: the base file goes away.
+    moved_once().save(dir.path()).unwrap();
+    assert!(!dir.path().join(BASE_FILE_NAME).exists());
+}

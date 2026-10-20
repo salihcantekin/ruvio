@@ -706,8 +706,11 @@ pub(super) async fn handle_client(
                     }
 
                     if let Some(forwarding) = state.forwarding.as_ref()
-                        && let Some(owner) = hot_remote_owner(forwarding, &command)
+                        && let Some((owner, slot)) = hot_remote_owner(forwarding, &command)
                     {
+                        if redirect_to_node(forwarding, &mut output, slot, owner)? {
+                            continue;
+                        }
                         forwarder.push(
                             owner,
                             &input[consumed - frame_length..consumed],
@@ -828,6 +831,21 @@ pub(super) async fn handle_client(
                                         write_response(&mut output, refusal)?;
                                         continue;
                                     }
+
+                                    // Another node of the cluster owns the slot. Inside MULTI
+                                    // the transaction is aborted, as Redis Cluster does.
+                                    if let Owner::Node(slot) = owner {
+                                        consumed += frame_length;
+                                        batch_commands += 1;
+                                        session.mark_queue_error();
+                                        redirect_to_node(
+                                            forwarding,
+                                            &mut output,
+                                            slot,
+                                            forwarding.fabric.slot_owner(slot),
+                                        )?;
+                                        continue;
+                                    }
                                 }
 
                                 // SWAPDB would swap the home shard's databases only, and a
@@ -869,7 +887,7 @@ pub(super) async fn handle_client(
                                             batch_commands += 1;
                                             continue;
                                         }
-                                        Owner::Split => {
+                                        Owner::Node(_) | Owner::Split => {
                                             consumed += frame_length;
                                             batch_commands += 1;
                                             output.write_all(SPLIT_REPLY)?;
@@ -1453,6 +1471,7 @@ fn plain_command(command: &Command<'_>) -> bool {
                 | Command::ConfigRewrite
                 | Command::ReplicaOf { .. }
                 | Command::MoveSlots(_)
+                | Command::Topology(_)
                 | Command::Role
                 | Command::Bgsave
                 | Command::ChangesSubscribe(_)
@@ -1799,6 +1818,12 @@ async fn dispatch_inner<'s>(
 
             Command::MoveSlots(target) => {
                 write_response(output, super::moveslots::command(state, *target))?;
+
+                return Ok(());
+            }
+
+            Command::Topology(map) => {
+                super::topology::command(state, map.as_deref(), output)?;
 
                 return Ok(());
             }

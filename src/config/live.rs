@@ -60,6 +60,8 @@ pub const RESTART_ONLY_SETTINGS: &[&str] = &[
     "allow-unauthenticated-public",
     "appendonly",
     "cdc-retain-bytes",
+    "cluster-group",
+    "cluster-topology",
     "cpu-set",
     "data-dir",
     "databases",

@@ -76,6 +76,13 @@ pub struct Group {
     pub name: String,
     /// The first member is the primary when the coordinators start for the first time.
     pub members: Vec<Member>,
+    /// Multi-node cluster: the group's shard count and the hash slots it owns
+    /// (`"first-last"` or one slot; none for a group that joins empty). Either every group
+    /// has `shards` or none does.
+    #[serde(default)]
+    pub shards: Option<usize>,
+    #[serde(default)]
+    pub slots: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -170,6 +177,33 @@ impl CoordinatorConfig {
             }
         }
 
+        let clustered = file
+            .groups
+            .iter()
+            .filter(|group| group.shards.is_some())
+            .count();
+
+        if file
+            .groups
+            .iter()
+            .any(|group| group.shards.is_none() && !group.slots.is_empty())
+        {
+            return Err("a group with slots needs shards".into());
+        }
+        if clustered != 0 {
+            if clustered != file.groups.len() {
+                return Err("with shards, every group needs shards".into());
+            }
+            // The map the nodes will receive, checked as they check it.
+            let text = cluster_map_text(&file.groups, 1, |_| 0);
+
+            crate::topology::Topology::parse(
+                &text,
+                &file.groups[0].name,
+                file.groups[0].shards.unwrap_or(1),
+            )?;
+        }
+
         Ok(Self {
             id: file.id,
             listen: file.listen,
@@ -194,6 +228,53 @@ impl CoordinatorConfig {
     pub fn group(&self, name: &str) -> Option<&Group> {
         self.groups.iter().find(|group| group.name == name)
     }
+
+    /// The cluster map the data nodes get with `RUVIO TOPOLOGY SET`, and its version: each
+    /// group named by its agreed primary. The version is 1 plus the sum of the groups'
+    /// epochs, so every failover raises it. `None` without shards, or before every group
+    /// has an agreed primary.
+    pub fn cluster_map(&self, primaries: &super::raft::Primaries) -> Option<(u64, String)> {
+        self.groups.first()?.shards?;
+        let mut version = 1;
+
+        for group in &self.groups {
+            version += primaries.get(&group.name)?.epoch;
+        }
+        let text = cluster_map_text(&self.groups, version, |group| {
+            primaries
+                .get(&group.name)
+                .map_or(0, |primary| primary.member)
+        });
+
+        Some((version, text))
+    }
+}
+
+/// The map in the format of a node's `cluster_topology` file.
+fn cluster_map_text(groups: &[Group], version: u64, primary: impl Fn(&Group) -> usize) -> String {
+    let mut text = format!("version = {version}\n");
+
+    for group in groups {
+        let address = group
+            .members
+            .get(primary(group))
+            .map_or_else(String::new, |member| member.address.to_string());
+        let slots: Vec<String> = group
+            .slots
+            .iter()
+            .map(|range| format!("{range:?}"))
+            .collect();
+
+        text.push_str(&format!(
+            "\n[[groups]]\nname = {:?}\naddress = {:?}\nshards = {}\nslots = [{}]\n",
+            group.name,
+            address,
+            group.shards.unwrap_or(1),
+            slots.join(", ")
+        ));
+    }
+
+    text
 }
 
 #[cfg(test)]
@@ -274,6 +355,62 @@ members = [
         );
         assert!(Endpoint::parse("6379").is_err());
         assert!(Endpoint::parse(":6379").is_err());
+    }
+
+    #[test]
+    fn a_cluster_map_names_each_group_by_its_agreed_primary() {
+        let text = format!(
+            "{SAMPLE}shards = 2\nslots = [\"0-8191\"]\n\n[[groups]]\nname = \"b\"\nshards = 1\nslots = [\"8192-16383\"]\nmembers = [\n  {{ address = \"10.0.0.2:7000\", replication = \"10.0.0.2:27000\" }},\n  {{ address = \"10.0.0.3:7000\", replication = \"10.0.0.3:27000\" }},\n]\n"
+        );
+        let config = CoordinatorConfig::parse(&text).unwrap();
+        let mut primaries = super::super::raft::Primaries::new();
+
+        primaries.insert(
+            "main".into(),
+            super::super::raft::Primary {
+                member: 0,
+                epoch: 1,
+            },
+        );
+        assert!(
+            config.cluster_map(&primaries).is_none(),
+            "b has no primary yet"
+        );
+        primaries.insert(
+            "b".into(),
+            super::super::raft::Primary {
+                member: 1,
+                epoch: 3,
+            },
+        );
+
+        let (version, map) = config.cluster_map(&primaries).unwrap();
+        let topology = crate::topology::Topology::parse(&map, "b", 1).unwrap();
+
+        assert_eq!((version, topology.version), (5, 5));
+        assert_eq!(topology.groups[1].host, "10.0.0.3");
+        assert_eq!(topology.groups[0].port, 6379);
+        assert!(
+            CoordinatorConfig::parse(&text.replace("shards = 1\n", ""))
+                .unwrap_err()
+                .contains("needs shards")
+        );
+        // A group may join with no slots, as long as the others cover every slot.
+        let empty = text
+            .replace("[\"0-8191\"]", "[\"0-16383\"]")
+            .replace("[\"8192-16383\"]", "[]");
+
+        assert!(CoordinatorConfig::parse(&empty).is_ok());
+        assert!(
+            CoordinatorConfig::parse(&text.replace("slots = [\"8192-16383\"]\n", ""))
+                .unwrap_err()
+                .contains("slot 8192")
+        );
+        assert!(
+            CoordinatorConfig::parse(&text.replace("8192-16383", "8192-16000"))
+                .unwrap_err()
+                .contains("slot 16001")
+        );
     }
 
     #[test]

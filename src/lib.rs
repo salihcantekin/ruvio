@@ -58,6 +58,7 @@ mod stream;
 mod test_ports;
 pub mod time;
 mod tls;
+pub mod topology;
 mod transaction;
 
 mod script;

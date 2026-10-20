@@ -237,6 +237,8 @@ Replication is asynchronous, so a read from a replica may miss recent writes, in
   fails. A connection that drops after a command was sent still fails the command; nothing is replayed.
 * `ReplicaReadsFakeTest` covers the routing against scripted nodes; `ReplicaReadsLiveTest` runs against
   `RUVIO_REPLICATED_ADDR` / `RUVIO_REPLICA_ADDR` (set by `scripts/run_with_servers.sh`) and skips without them.
+* `MultiNodeLiveTest` follows `MOVED` across a two-node cluster (`RUVIO_MULTINODE_A_ADDR`, `RUVIO_MULTINODE_B_ADDR`,
+  `RUVIO_MULTINODE_STALE_ADDR`, set by `scripts/run_with_servers.sh`) and skips without them.
 
 ## Seed addresses
 

@@ -354,3 +354,121 @@ fn one_coordinator_without_a_majority_does_not_fail_over() {
         );
     }
 }
+
+/// Two groups of a multi-node cluster under one coordinator: the coordinator sends every node
+/// the map, and after a failover in one group the other group's nodes redirect its keys to
+/// the new primary.
+#[test]
+fn a_failover_in_one_group_moves_the_redirects_of_the_others() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = test_ports::reserve();
+    let replication = test_ports::reserve();
+    let resp: Vec<SocketAddr> = (0..4).map(|index| data.address_at(index)).collect();
+    let repl: Vec<SocketAddr> = (0..4).map(|index| replication.address_at(index)).collect();
+    let coordinator = data.address_at(4);
+    let topology = dir.path().join("topology.toml");
+    let groups = [("a", "0-8191", 0), ("b", "8192-16383", 2)];
+
+    std::fs::write(
+        &topology,
+        groups.iter().fold("version = 1\n".to_owned(), |text, (name, slots, node)| {
+            format!(
+                "{text}[[groups]]\nname = \"{name}\"\naddress = \"{}\"\nshards = 1\nslots = [\"{slots}\"]\n",
+                resp[*node]
+            )
+        }),
+    )
+    .unwrap();
+
+    let node = |index: usize| {
+        let (group, follow) = match index {
+            0 => ("a", None),
+            1 => ("a", Some(0)),
+            2 => ("b", None),
+            _ => ("b", Some(2)),
+        };
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ruvio"));
+
+        command
+            .args(["--address", &resp[index].to_string()])
+            .args(["--durability", "always", "--data-dir"])
+            .arg(dir.path().join(format!("node{index}")))
+            .env("RUVIO_REPLICATION_LISTEN", repl[index].to_string())
+            .env("RUVIO_CLUSTER_TOPOLOGY", &topology)
+            .env("RUVIO_CLUSTER_GROUP", group)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        match follow {
+            Some(primary) => command
+                .env("RUVIO_REPLICATION_ROLE", "replica")
+                .env("RUVIO_REPLICATION_PRIMARY", repl[primary].to_string()),
+            None => command.env("RUVIO_REPLICATION_ROLE", "primary"),
+        };
+        let process = Process(command.spawn().unwrap());
+
+        wait_until("a data node to answer", || ping(&resp[index].to_string()));
+        process
+    };
+    let mut nodes: Vec<Process> = (0..4).map(node).collect();
+    let members = |first: usize| {
+        (first..first + 2)
+            .map(|index| {
+                format!(
+                    "{{ address = \"{}\", replication = \"{}\" }}",
+                    resp[index], repl[index]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let config = dir.path().join("coordinator.toml");
+
+    std::fs::write(
+        &config,
+        format!(
+            "id = 1\nlisten = \"{coordinator}\"\ndata_dir = \"{}\"\npeers = [\"1@{coordinator}\"]\n\
+             secret = \"{SECRET}\"\nping_interval_ms = 200\ndown_after_ms = 1000\n\n\
+             [[groups]]\nname = \"a\"\nshards = 1\nslots = [\"0-8191\"]\nmembers = [{}]\n\n\
+             [[groups]]\nname = \"b\"\nshards = 1\nslots = [\"8192-16383\"]\nmembers = [{}]\n",
+            dir.path().join("coordinator").display(),
+            members(0),
+            members(2),
+        ),
+    )
+    .unwrap();
+    let _coordinator = Process(
+        Command::new(env!("CARGO_BIN_EXE_ruvio"))
+            .arg("coordinator")
+            .arg("--config")
+            .arg(&config)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let version = |index: usize| call(&resp[index].to_string(), &["RUVIO", "TOPOLOGY", "VERSION"]);
+
+    // Each group's first primary is recorded at epoch 1: version 1 + 1 + 1.
+    wait_until("every node to get the coordinator's map", || {
+        (0..4).all(|index| version(index).as_deref() == Some("3"))
+    });
+
+    // Slot 12182 belongs to group b; node a0 redirects it to b's primary.
+    let key = "foo";
+    let moved = |port: u16| format!("MOVED 12182 127.0.0.1:{port}");
+
+    assert_eq!(
+        call(&resp[0].to_string(), &["GET", key]).unwrap(),
+        moved(resp[2].port())
+    );
+
+    nodes[2].kill();
+    wait_until(
+        "node a0 to redirect group b's keys to its new primary",
+        || call(&resp[0].to_string(), &["GET", key]).as_deref() == Some(&moved(resp[3].port())),
+    );
+    assert_eq!(version(0).as_deref(), Some("4"));
+    wait_until("the new primary of group b to take the key", || {
+        call(&resp[3].to_string(), &["SET", key, "1"]).as_deref() == Some("OK")
+    });
+}

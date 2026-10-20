@@ -104,6 +104,9 @@ pub fn execute_in_database<'a, C: Clock, I: StorageIndex, S: MutationSink, W: Li
         Command::MoveSlots(_) => Ok(Response::Error(
             b"ERR RUVIO MOVESLOTS needs more than one shard",
         )),
+        Command::Topology(_) => Ok(Response::Error(
+            b"ERR RUVIO TOPOLOGY is handled by the server",
+        )),
 
         Command::Multi
         | Command::Exec

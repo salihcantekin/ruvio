@@ -1,6 +1,8 @@
 //! Slot ranges moved between the shards of one process, kept in the `SLOTS` file.
 //!
-//! Without the file every shard owns the slots the formula gives it ([`shard_for_slot`]).
+//! Without the file every shard owns the slots the formula gives it ([`shard_for_slot`]), or
+//! with a multi-node cluster map the slots the map places on it ([`SlotMoves::with_base`]):
+//! moves are recorded against that starting table.
 //! Each move appends one entry: the range, the shard it left and the shard it went to, the
 //! target's log sequence where its copy began (`since`) and the source's first sequence
 //! after the hand-over (`until`). An entry whose `until` is 0 was never completed: a move
@@ -20,6 +22,11 @@ use crate::routing::{HASH_SLOT_COUNT, SlotTable, hash_slot, shard_for_slot};
 
 /// Name of the file in the data directory.
 pub(crate) const FILE_NAME: &str = "SLOTS";
+/// The starting table the moves were recorded against when it is not the formula (a
+/// cluster map's placement): one little-endian `u16` per slot, the local shard or
+/// [`NOT_LOCAL`]. Absent means the formula.
+pub(crate) const BASE_FILE_NAME: &str = "SLOTS_BASE";
+const NOT_LOCAL: u16 = u16::MAX;
 
 const MAGIC: &[u8; 8] = b"RVSLOTS1";
 const HEADER_LEN: usize = MAGIC.len() + 4 + 4;
@@ -54,6 +61,9 @@ impl SlotMove {
 pub(crate) struct SlotMoves {
     shard_count: u16,
     moves: Vec<SlotMove>,
+    /// The owner of every slot before any move, when it is not the formula: a cluster map's
+    /// placement, with other nodes' slots past the local shards. Not saved; the map is.
+    base: Option<std::sync::Arc<[u16]>>,
 }
 
 impl SlotMoves {
@@ -61,6 +71,22 @@ impl SlotMoves {
         Self {
             shard_count: shard_count as u16,
             moves: Vec::new(),
+            base: None,
+        }
+    }
+
+    /// Records moves against `base` (an owner per slot) instead of the formula.
+    pub(crate) fn with_base(mut self, base: std::sync::Arc<[u16]>) -> Self {
+        debug_assert_eq!(base.len(), HASH_SLOT_COUNT);
+        self.base = Some(base);
+        self
+    }
+
+    /// The owner of `slot` before any move.
+    fn base_owner(&self, slot: u16) -> u16 {
+        match &self.base {
+            Some(base) => base[usize::from(slot)],
+            None => shard_for_slot(slot, usize::from(self.shard_count)) as u16,
         }
     }
 
@@ -95,14 +121,73 @@ impl SlotMoves {
 
     /// Replaces the file in `data_dir` with these moves, durably.
     pub(crate) fn save(&self, data_dir: &Path) -> io::Result<()> {
+        // The starting table first: a crash before `SLOTS` is replaced leaves moves that
+        // were recorded against the same table (a restart refuses any other).
+        match &self.base {
+            Some(base) => crate::replication::write_durably(
+                &data_dir.join(BASE_FILE_NAME),
+                &encode_base(base, self.shard_count),
+            )?,
+            None => match std::fs::remove_file(data_dir.join(BASE_FILE_NAME)) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+                _ => {}
+            },
+        }
         crate::replication::write_durably(&data_dir.join(FILE_NAME), &self.encode())
+    }
+
+    /// Refuses moves saved against another starting table than `base` (`None`: the
+    /// formula): their replay would keep the wrong slots on each shard.
+    pub(crate) fn check_base(
+        data_dir: &Path,
+        shard_count: usize,
+        base: Option<&[u16]>,
+    ) -> io::Result<()> {
+        let saved = match std::fs::read(data_dir.join(BASE_FILE_NAME)) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let formula: Vec<u16>;
+        let current = match base {
+            Some(base) => base,
+            None => {
+                formula = (0..HASH_SLOT_COUNT)
+                    .map(|slot| shard_for_slot(slot as u16, shard_count) as u16)
+                    .collect();
+                &formula
+            }
+        };
+        let expected = encode_base(current, shard_count as u16);
+        let matches = match &saved {
+            Some(saved) => *saved == expected,
+            // Saved against the formula.
+            None => (0..HASH_SLOT_COUNT)
+                .all(|slot| current[slot] == shard_for_slot(slot as u16, shard_count) as u16),
+        };
+
+        if matches {
+            return Ok(());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "slots were moved between shards ({FILE_NAME} file) with another slot layout \
+                 ({}), or {BASE_FILE_NAME} is damaged; start with the cluster_topology this \
+                 node had then",
+                if saved.is_some() {
+                    "an earlier cluster_topology"
+                } else {
+                    "no cluster_topology"
+                }
+            ),
+        ))
     }
 
     /// The owner of every slot after the completed moves.
     pub(crate) fn owners(&self) -> Vec<u16> {
-        let count = usize::from(self.shard_count);
         let mut owners: Vec<u16> = (0..HASH_SLOT_COUNT)
-            .map(|slot| shard_for_slot(slot as u16, count) as u16)
+            .map(|slot| self.base_owner(slot as u16))
             .collect();
 
         for entry in self.moves.iter().filter(|entry| entry.completed()) {
@@ -180,7 +265,7 @@ impl SlotMoves {
     }
 
     /// What recovery of `shard` keeps, or `None` when no move concerns it (it then owns
-    /// what the formula gives it, for its whole log).
+    /// what the starting table gives it, for its whole log).
     pub(crate) fn replay_filter(
         &self,
         shard: usize,
@@ -196,9 +281,8 @@ impl SlotMoves {
             return None;
         }
 
-        let count = usize::from(self.shard_count);
         let mut owned: Vec<bool> = (0..HASH_SLOT_COUNT)
-            .map(|slot| shard_for_slot(slot as u16, count) == usize::from(shard))
+            .map(|slot| self.base_owner(slot as u16) == shard)
             .collect();
         // A shard's own sequences increase with time, so its gains and losses are in
         // order; the sort only makes that explicit.
@@ -307,6 +391,7 @@ impl SlotMoves {
         valid.then_some(Self {
             shard_count: shard_count as u16,
             moves,
+            base: None,
         })
     }
 }
@@ -405,6 +490,20 @@ impl ReplayFilter {
             self.next += 1;
         }
     }
+}
+
+/// A starting table as [`BASE_FILE_NAME`] holds it: other nodes' slots as [`NOT_LOCAL`].
+fn encode_base(base: &[u16], shard_count: u16) -> Vec<u8> {
+    base.iter()
+        .flat_map(|&owner| {
+            if owner < shard_count {
+                owner
+            } else {
+                NOT_LOCAL
+            }
+            .to_le_bytes()
+        })
+        .collect()
 }
 
 #[cfg(test)]

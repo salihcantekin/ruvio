@@ -27,6 +27,8 @@ pub(crate) struct ClusterRoute {
     pub advertised_port: u16,
     /// Which shard owns each slot, shared by every shard of the process.
     pub slots: SlotTable,
+    /// The other groups of a multi-node cluster; `None` on a node that owns every slot.
+    pub topology: Option<crate::topology::SharedTopology>,
 }
 
 /// The other nodes serving one shard's slots, as this node knows them: a primary's
@@ -89,6 +91,85 @@ fn shard_nodes(route: &ClusterRoute, peers: &[ShardPeers], shard_id: usize) -> V
     nodes
 }
 
+/// Who serves a slot range: a shard of this node, or shard `shard` of another group's
+/// primary (multi-node cluster).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Holder {
+    Local(usize),
+    Remote { group: usize, shard: usize },
+}
+
+/// Consecutive slots of one holder as `(first, last, index into the holders)`, and the
+/// holders: this node's shards first (index = shard id), then the other groups' shards.
+/// Without a topology this is [`SlotTable::ranges`] and the local shards.
+fn holder_ranges(route: &ClusterRoute) -> (Vec<(u16, u16, usize)>, Vec<Holder>) {
+    let mut holders: Vec<Holder> = (0..route.shard_count).map(Holder::Local).collect();
+    let Some(topology) = route.topology.as_ref().map(|shared| shared.get()) else {
+        return (route.slots.ranges(), holders);
+    };
+    let mut ranges: Vec<(u16, u16, usize)> = Vec::new();
+    let mut known: std::collections::HashMap<Holder, usize> = holders
+        .iter()
+        .enumerate()
+        .map(|(index, holder)| (*holder, index))
+        .collect();
+
+    for slot in 0..crate::routing::HASH_SLOT_COUNT as u16 {
+        let owner = route.slots.owner(slot);
+        let holder = if owner < route.shard_count {
+            Holder::Local(owner)
+        } else {
+            let group = owner - route.shard_count;
+
+            Holder::Remote {
+                group,
+                shard: topology
+                    .groups
+                    .get(group)
+                    .and_then(|known| known.shard_of(slot))
+                    .unwrap_or(0),
+            }
+        };
+        let index = *known.entry(holder).or_insert_with(|| {
+            holders.push(holder);
+            holders.len() - 1
+        });
+
+        match ranges.last_mut() {
+            Some((_, last, previous)) if *previous == index => *last = slot,
+            _ => ranges.push((slot, slot, index)),
+        }
+    }
+
+    (ranges, holders)
+}
+
+/// The nodes that serve a holder's slots, primary first. Another group is listed by its
+/// primary only: this node does not know that group's replicas.
+fn holder_nodes(route: &ClusterRoute, peers: &[ShardPeers], holder: Holder) -> Vec<Node> {
+    match holder {
+        Holder::Local(shard_id) => shard_nodes(route, peers, shard_id),
+        Holder::Remote { group, shard } => {
+            let Some(group) = route
+                .topology
+                .as_ref()
+                .and_then(|shared| shared.get().groups.get(group).cloned())
+            else {
+                return Vec::new();
+            };
+            let port = group.port.wrapping_add(shard as u16);
+
+            vec![Node {
+                id: node_id(&group.host, port),
+                host: group.host.clone(),
+                port,
+                primary: true,
+                offset: 0,
+            }]
+        }
+    }
+}
+
 pub(crate) fn write_cluster_slots(
     output: &mut impl Write,
     route: Option<&ClusterRoute>,
@@ -100,9 +181,10 @@ pub(crate) fn write_cluster_slots(
         return Ok(());
     };
 
-    let ranges = route.slots.ranges();
-    let nodes: Vec<Vec<Node>> = (0..route.shard_count)
-        .map(|shard_id| shard_nodes(route, peers, shard_id))
+    let (ranges, holders) = holder_ranges(route);
+    let nodes: Vec<Vec<Node>> = holders
+        .iter()
+        .map(|holder| holder_nodes(route, peers, *holder))
         .collect();
 
     write!(output, "*{}\r\n", ranges.len())?;
@@ -135,10 +217,10 @@ pub(crate) fn write_cluster_nodes(
     };
 
     let mut lines = Vec::new();
-    let ranges = route.slots.ranges();
+    let (ranges, holders) = holder_ranges(route);
     let myself = my_id(route);
 
-    for shard_id in 0..route.shard_count {
+    for (shard_id, holder) in holders.iter().enumerate() {
         let slots = shard_ranges(&ranges, shard_id)
             .map(|(start, end)| {
                 if start == end {
@@ -148,8 +230,10 @@ pub(crate) fn write_cluster_nodes(
                 }
             })
             .collect::<String>();
-        let nodes = shard_nodes(route, peers, shard_id);
-        let primary_id = nodes[0].id.clone();
+        let nodes = holder_nodes(route, peers, *holder);
+        let Some(primary_id) = nodes.first().map(|node| node.id.clone()) else {
+            continue;
+        };
 
         for node in nodes {
             let bus_port = u32::from(node.port) + 10_000;
@@ -190,13 +274,13 @@ pub(crate) fn write_cluster_shards(
         return Ok(());
     };
 
-    let ranges = route.slots.ranges();
+    let (ranges, holders) = holder_ranges(route);
 
-    write!(output, "*{}\r\n", route.shard_count)?;
+    write!(output, "*{}\r\n", holders.len())?;
 
-    for shard_id in 0..route.shard_count {
+    for (shard_id, holder) in holders.iter().enumerate() {
         let owned: Vec<(u16, u16)> = shard_ranges(&ranges, shard_id).collect();
-        let nodes = shard_nodes(route, peers, shard_id);
+        let nodes = holder_nodes(route, peers, *holder);
 
         write!(output, "*4\r\n$5\r\nslots\r\n*{}\r\n", owned.len() * 2)?;
         for (start, end) in owned {
@@ -244,12 +328,18 @@ pub(crate) fn write_cluster_info(
         return Ok(());
     };
 
-    let size = route.shard_count;
-    let known: usize = (0..size)
-        .map(|shard_id| shard_nodes(route, peers, shard_id).len())
+    let (_, holders) = holder_ranges(route);
+    let size = holders.len();
+    let known: usize = holders
+        .iter()
+        .map(|holder| holder_nodes(route, peers, *holder).len())
         .sum();
+    let epoch = route
+        .topology
+        .as_ref()
+        .map_or(size as u64, |shared| shared.get().version);
     let info = format!(
-        "cluster_enabled:1\r\ncluster_state:ok\r\ncluster_slots_assigned:16384\r\ncluster_slots_ok:16384\r\ncluster_slots_pfail:0\r\ncluster_slots_fail:0\r\ncluster_known_nodes:{known}\r\ncluster_size:{size}\r\ncluster_current_epoch:{size}\r\ncluster_my_epoch:{}\r\n",
+        "cluster_enabled:1\r\ncluster_state:ok\r\ncluster_slots_assigned:16384\r\ncluster_slots_ok:16384\r\ncluster_slots_pfail:0\r\ncluster_slots_fail:0\r\ncluster_known_nodes:{known}\r\ncluster_size:{size}\r\ncluster_current_epoch:{epoch}\r\ncluster_my_epoch:{}\r\n",
         route.shard_id + 1
     );
 
@@ -344,10 +434,31 @@ pub(crate) fn redirect_if_remote(
         return Ok(false);
     }
 
+    if owner >= route.shard_count
+        && let Some(topology) = &route.topology
+    {
+        return write_moved(output, &topology.get(), slot, owner, route.shard_count).map(|()| true);
+    }
+
     let port = route.advertised_port + owner as u16;
 
     write!(output, "-MOVED {slot} {}:{port}\r\n", route.advertised_host)?;
     Ok(true)
+}
+
+/// `-MOVED slot host:port` for a slot another group of the cluster owns (`owner` is the
+/// slot table entry, past the local shards).
+pub(crate) fn write_moved(
+    output: &mut impl Write,
+    topology: &crate::topology::Topology,
+    slot: u16,
+    owner: usize,
+    local_shards: usize,
+) -> io::Result<()> {
+    match topology.remote(slot, owner, local_shards) {
+        Some((host, port)) => write!(output, "-MOVED {slot} {host}:{port}\r\n"),
+        None => output.write_all(b"-CLUSTERDOWN Hash slot not served\r\n"),
+    }
 }
 
 struct ClusterCheckpointState {
@@ -996,6 +1107,7 @@ mod tests {
             advertised_host: "127.0.0.1".into(),
             advertised_port: 6379,
             slots: SlotTable::from_formula(2),
+            topology: None,
         }
     }
 
@@ -1577,6 +1689,7 @@ mod tests {
                 advertised_host: "10.0.0.7".into(),
                 advertised_port: 7000,
                 slots: SlotTable::from_formula(count),
+                topology: None,
             };
             let (slots, nodes, shards) = formula_answers(&route);
             let mut written = Vec::new();

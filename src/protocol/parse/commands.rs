@@ -33,6 +33,17 @@ pub(in crate::protocol) fn cmd_ruvio<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
     if args.len() >= 1 && args.bytes(0).eq_ignore_ascii_case(b"MOVESLOTS") {
         return parse_moveslots(args);
     }
+    if args.len() >= 1 && args.bytes(0).eq_ignore_ascii_case(b"TOPOLOGY") {
+        let is = |word: &[u8]| args.bytes(1).eq_ignore_ascii_case(word);
+
+        return match args.len() {
+            2 if is(b"VERSION") => Ok(Command::Topology(None)),
+            3 if is(b"SET") => Ok(Command::Topology(Some(args.arg(2)))),
+            _ => Err(ProtocolError::Invalid(
+                "RUVIO TOPOLOGY expects VERSION, or SET map",
+            )),
+        };
+    }
 
     match args.len() {
         0 => Ok(Command::Ruvio(None)),
