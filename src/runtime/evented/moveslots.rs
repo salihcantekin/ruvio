@@ -302,11 +302,6 @@ pub(super) enum MoveMessage {
     CancelImport(Arc<super::migrate::Import>),
     /// A newer cluster map was installed: settle this shard's ranges with it.
     Settle,
-    /// Drops the keys of a range this shard no longer holds, in bounded steps.
-    Forget {
-        first: u16,
-        last: u16,
-    },
 }
 
 /// `RUVIO MOVESLOTS ...` on any shard of a multi-shard process.
@@ -485,11 +480,6 @@ pub(super) fn on_message(state: &Rc<ShardState>, message: MoveMessage) {
         MoveMessage::Export(export) => super::migrate::start_export(state, export),
         MoveMessage::CancelImport(import) => super::migrate::cancel_import(state, import),
         MoveMessage::Settle => super::migrate::settle(state),
-        MoveMessage::Forget { first, last } => {
-            let state = Rc::clone(state);
-
-            tokio::task::spawn_local(async move { drop_slots(&state, first, last).await });
-        }
     }
 }
 
@@ -1020,9 +1010,10 @@ async fn forget_range(state: Rc<ShardState>, session: Arc<MoveSession>, ended: &
     finish(&state, &session, ended);
 }
 
-/// Removes this shard's keys of `first..=last` in bounded steps, without logging it.
 /// [`drop_slots`] in one go, for a replica that must drop a range's copies before the next
-/// record of its log applies (its copies of a later range may follow at once).
+/// record of its log applies (a later move of the same slots may follow at once). Not
+/// bounded: it walks the shard's keys without yielding, so a large shard stalls for that
+/// time; it runs only when a replica's range is cancelled or given away.
 pub(super) fn drop_slots_now(state: &ShardState, first: u16, last: u16) {
     let databases = state.store.borrow().database_ids();
 
@@ -1052,6 +1043,7 @@ pub(super) fn drop_slots_now(state: &ShardState, first: u16, last: u16) {
     }
 }
 
+/// Removes this shard's keys of `first..=last` in bounded steps, without logging it.
 pub(super) async fn drop_slots(state: &ShardState, first: u16, last: u16) {
     let databases = state.store.borrow().database_ids();
 

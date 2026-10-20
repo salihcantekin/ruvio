@@ -654,8 +654,9 @@ releases side by side, so the refused handshake itself was not part of the run. 
   while moves into two of its shards run can get the second range's start before the first range's end
   when it catches up; it then refuses the second range and every newer map (`gives this node slot ...,
   whose data is not here` in its log). So can a replica that gets a full copy of its primary (a
-  snapshot, not the log) during a move into its group. Give such a replica a full copy again with an
-  empty data directory once the moves are done.
+  snapshot, not the log) during a move into its group, or one that crashed between writing a range's
+  record to its log and saving its `SLOTS` file. Give such a replica a full copy again with an empty
+  data directory once the moves are done.
 
 ## Tests
 

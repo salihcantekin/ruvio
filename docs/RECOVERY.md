@@ -210,7 +210,11 @@ An upgrade keeps the data directory and replaces the `ruvio` binary. Shard
 count, durability profile, and format major must stay the same. A data directory whose
 shards moved slots (`RUVIO MOVESLOTS`) has WAL format minor 4 records and a `SLOTS` file, so
 it cannot go back to a release before slot moves. One that took part in a move between groups has
-format minor 5 records and cannot go back to a release before such moves. Changing
+format minor 5 records and cannot go back to a release before such moves; one that received a range
+from another group after an upgrade to a release with the `SlotsArrived` record (format minor 6)
+cannot go back to a release before that record: the older release refuses the newer log segment at
+start. To go back, restore the backup taken before the upgrade (step 2 below), or give the node a
+full copy from a primary of the older release with an empty data directory. Changing
 `shards` is a new directory, not an in-place upgrade.
 
 1. Stop `ruvio`. `backup` takes an exclusive `LOCK` and fails immediately if the

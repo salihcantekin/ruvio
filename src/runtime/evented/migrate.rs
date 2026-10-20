@@ -358,7 +358,6 @@ fn record_incoming(
         return Ok(None);
     };
     let shard = forwarding.me as u16;
-    let replica = state.role.get() == crate::config::ReplicationRole::Replica;
 
     forwarding
         .fabric
@@ -368,20 +367,7 @@ fn record_incoming(
             let mut ended = None;
 
             match step {
-                IncomingStep::Begin => {
-                    // The primary begins a range only once the one before it on this shard
-                    // ended, and this shard's log is in order: a prepared gain of this shard
-                    // still open here lost its end (a crash before it was saved). It is
-                    // cancelled so its copies never serve; the caller drops them before the
-                    // new range's copies apply.
-                    if replica
-                        && let Some(open) = next.pending_gain().filter(|gain| gain.to == shard)
-                    {
-                        warn!(first = open.first, last = open.last, "an earlier range from another node had no end recorded here; dropping its copies");
-                        ended = next.end_gain(open.first, open.last, shard, None)?;
-                    }
-                    next.begin_gain(first, last, shard, sequence)?
-                }
+                IncomingStep::Begin => next.begin_gain(first, last, shard, sequence)?,
                 IncomingStep::Prepared => {
                     // A replica that missed the begin (a crash before it saved it) still
                     // keeps the range's records from the start of its log.
@@ -1455,15 +1441,6 @@ pub(super) fn replicated(state: &ShardState, mutation: &crate::OwnedMutation, se
     let Some(forwarding) = state.forwarding.as_ref() else {
         return;
     };
-    // The keys go in bounded steps on this shard's own loop.
-    let forget = |first, last| {
-        forwarding.fabric.send(
-            forwarding.me,
-            forwarding.me,
-            Message::Move(super::moveslots::MoveMessage::Forget { first, last }),
-        );
-    };
-
     match *mutation {
         crate::OwnedMutation::SlotsIncoming { first, last, step } => {
             let Some(step) = IncomingStep::from_u8(step) else {
@@ -1490,15 +1467,10 @@ pub(super) fn replicated(state: &ShardState, mutation: &crate::OwnedMutation, se
                     warn!(%error, "a replica could not record a range arriving from another node")
                 }
             }
-            // Dropped before the next record applies: the next range's copies, maybe of the
-            // same slots, can follow at once.
+            // Copies of a cancelled range never stay, whatever the history held, unless this
+            // shard serves the range (it ended here before the cancel came). Dropped before
+            // the next record applies: a new move of the same slots can follow at once.
             match recorded {
-                // Copies of an earlier range that never ended here.
-                Ok(Some(gain)) if step == IncomingStep::Begin => {
-                    super::moveslots::drop_slots_now(state, gain.first, gain.last)
-                }
-                // Copies of a cancelled range never stay, whatever the history held, unless
-                // this shard serves the range (it ended here before the cancel came).
                 _ if step == IncomingStep::Cancelled
                     && !forwarding
                         .fabric
@@ -1549,7 +1521,8 @@ pub(super) fn replicated(state: &ShardState, mutation: &crate::OwnedMutation, se
             }
             forwarding.fabric.mover.mark_moved();
             release_clients(state, first, last);
-            forget(first, last);
+            // Before the next record applies: the range may come back at once.
+            super::moveslots::drop_slots_now(state, first, last);
         }
         _ => {}
     }
