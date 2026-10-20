@@ -276,11 +276,11 @@ impl Api {
                 RpcResponse::Snapshot(self.raft.install_snapshot(rpc).await)
             }
             RpcRequest::Observe { group, member } => {
-                RpcResponse::Observe(self.sightings.age(&group, &member))
+                RpcResponse::Observe(Some(self.sightings.age(&group, &member)))
             }
             RpcRequest::Leases { group, member } => match self.config.group(&group) {
                 Some(group) => RpcResponse::Leases {
-                    heard: self.sightings.age(&group.name, &member),
+                    heard: Some(self.sightings.age(&group.name, &member)),
                     ended: self.config.primary_lease.is_none_or(|(_, safe)| {
                         self.sightings.grants().report(&group.name, &member, safe)
                     }),
