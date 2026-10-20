@@ -18,6 +18,10 @@ public class CoordinatorFailoverLiveTests(ITestOutputHelper output)
     // The coordinators notice the kill after down_after_ms (1 s) and promote within a few ticks.
     private static readonly TimeSpan Patience = TimeSpan.FromSeconds(15);
 
+    // Each client's first write after the kill comes within this, the seeds client included: the replica that
+    // refused is taken once it is promoted, not after the rounds run out (about 7 s).
+    private static readonly TimeSpan FollowBound = TimeSpan.FromSeconds(5);
+
     [Fact(Timeout = 60000)]
     public async Task ClientsReachTheNewPrimaryAfterTheCoordinatorsFailOver()
     {
@@ -99,6 +103,11 @@ public class CoordinatorFailoverLiveTests(ITestOutputHelper output)
         TimeSpan[] took = await Task.WhenAll(clients.Select(pair => WriteUntilItSucceedsAsync(pair.Key, pair.Value)));
 
         output.WriteLine($"first write after the kill: {string.Join(", ", clients.Keys.Zip(took, (name, time) => $"{name} {time.TotalMilliseconds:F0} ms"))}");
+
+        foreach ((string name, TimeSpan time) in clients.Keys.Zip(took))
+        {
+            Assert.True(time < FollowBound, $"{name}: the first write took {time}");
+        }
 
         Assert.True(await IsMasterAsync(onMember[next]), "the surviving member is not the primary");
 

@@ -10,6 +10,9 @@ use ruvio_client::{Client, ClientOptions, RespValue};
 
 /// The coordinators notice the kill after `down_after_ms` (1 s) and promote within a few ticks.
 const PATIENCE: Duration = Duration::from_secs(15);
+/// Each client's first write after the kill comes within this, the seeds client included: the
+/// replica that refused is taken once it is promoted, not after the rounds run out (about 7 s).
+const FOLLOW_BOUND: Duration = Duration::from_secs(5);
 
 struct Group {
     coordinators: Vec<(String, u16)>,
@@ -160,6 +163,9 @@ fn clients_reach_the_new_primary_after_the_coordinators_fail_over() {
         "first write after the kill: sentinel_master {:?}, seeds {:?}",
         took[0], took[1]
     );
+    for took in &took {
+        assert!(*took < FOLLOW_BOUND, "a first write took {took:?}");
+    }
     assert!(is_master(&mut members[new]));
     for key in &keys {
         assert_eq!(

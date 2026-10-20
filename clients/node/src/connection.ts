@@ -685,7 +685,7 @@ export class Connection extends EventEmitter {
     const coords = this.coords;
     const seeds = (coords ?? this.addrs!).slice();
     const start = coords !== null ? 0 : this.start % seeds.length;
-    findPrimary(seeds, start, null, this.opts, this.opts.sentinelMaster, dial.scope).then(
+    findPrimary(seeds, start, { addr: null }, this.opts, this.opts.sentinelMaster, dial.scope).then(
       (found) => {
         if (this.current() !== dial || dial.dead) return;
         if (found !== null) this.dialNext(dial, 0, this.locate(found));
@@ -943,7 +943,9 @@ export class Connection extends EventEmitter {
     const coords = this.coords;
     const sentinel = this.opts.sentinelMaster;
     const rounds = this.opts.reconnect === false ? 1 : 8;
-    const refusing = this.here();
+    // Kept across rounds: cleared once the refusing node says it is a replica, so its promotion a moment later is
+    // taken instead of waiting out every round.
+    const refusing: { addr: SeedAddr | null } = { addr: this.here() };
     const run = async (): Promise<SeedAddr | null> => {
       for (let attempt = 1; ; attempt++) {
         const seeds = (coords ?? this.addrs!).slice();

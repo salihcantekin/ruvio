@@ -1,4 +1,5 @@
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 
 namespace Ruvio.Client;
 
@@ -16,13 +17,15 @@ internal static class PrimaryProbe
     /// One round: the address of a node that answers <c>ROLE</c> with <c>master</c>, asking <paramref name="seeds"/>
     /// in order from <paramref name="start"/>, or null. A replica's reported primary is asked after the seeds,
     /// once per address. With <see cref="RuvioClientOptions.SentinelMaster"/> the seeds are coordinators: each
-    /// names a primary and the first that <c>ROLE</c> confirms wins. <paramref name="avoid"/> is never returned.
+    /// names a primary and the first that <c>ROLE</c> confirms wins. The address in <paramref name="avoid"/> (the
+    /// one that just answered <c>READONLY</c>) is not returned while it still says <c>master</c>: a replaced primary
+    /// does. It is cleared once it answers <c>ROLE</c> as a replica, so a later round takes it when it is promoted.
     /// Every question is bounded; a refused <c>AUTH</c> is thrown.
     /// </summary>
     public static async Task<(string Host, int Port)?> FindAsync(
         IReadOnlyList<(string Host, int Port)> seeds,
         int start,
-        (string Host, int Port)? avoid,
+        StrongBox<(string Host, int Port)?>? avoid,
         RuvioClientOptions options,
         CancellationToken cancellationToken)
     {
@@ -38,12 +41,19 @@ internal static class PrimaryProbe
         {
             foreach ((string Host, int Port) coordinator in queue)
             {
-                if (await AskSentinelAsync(coordinator, name, probe, cancellationToken).ConfigureAwait(false) is { } named
-                    && !Same(named, avoid)
-                    && await AskRoleAsync(named, probe, cancellationToken).ConfigureAwait(false) is { Primary: true })
+                if (await AskSentinelAsync(coordinator, name, probe, cancellationToken).ConfigureAwait(false) is not { } named)
+                {
+                    continue;
+                }
+
+                Role? namedRole = await AskRoleAsync(named, probe, cancellationToken).ConfigureAwait(false);
+
+                if (namedRole is { Primary: true } && !Same(named, avoid?.Value))
                 {
                     return named;
                 }
+
+                Forget(avoid, named, namedRole);
             }
 
             return null;
@@ -55,10 +65,12 @@ internal static class PrimaryProbe
         {
             Role? role = await AskRoleAsync(address, probe, cancellationToken).ConfigureAwait(false);
 
-            if (role is { Primary: true } && !Same(address, avoid))
+            if (role is { Primary: true } && !Same(address, avoid?.Value))
             {
                 return address;
             }
+
+            Forget(avoid, address, role);
 
             if (role is { Primary: false, Reported: { } reported } && !seen.Exists(known => Same(known, reported)))
             {
@@ -68,6 +80,15 @@ internal static class PrimaryProbe
         }
 
         return null;
+    }
+
+    /// <summary>The avoided address said it is a replica: from now on it may be taken once it says <c>master</c>.</summary>
+    private static void Forget(StrongBox<(string Host, int Port)?>? avoid, (string Host, int Port) address, Role? role)
+    {
+        if (avoid is not null && role is { Primary: false } && Same(address, avoid.Value))
+        {
+            avoid.Value = null;
+        }
     }
 
     /// <summary>

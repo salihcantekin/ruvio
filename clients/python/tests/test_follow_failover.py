@@ -24,7 +24,7 @@ WRITES = ("SET", "INCR", "DEL")
 
 def handle(node: FakeNode, args: List[str]) -> object:
     """``node.store["mode"]`` is ``master``, ``replica`` (``store["primary"]`` is the port it reports),
-    ``liar`` (says master, refuses writes) or ``names`` (a coordinator; ``store["primary"]`` is the port)."""
+    ``liar`` (says master, refuses writes), ``promoted`` (a replica promoted right after its first ``ROLE``) or ``names`` (a coordinator; ``store["primary"]`` is the port)."""
     name = args[0].upper()
     mode = node.store.get("mode", "master")
     primary = node.store.get("primary", "0")
@@ -33,10 +33,12 @@ def handle(node: FakeNode, args: List[str]) -> object:
     if name == "ROLE":
         if mode in ("master", "liar", "names"):
             return array([bulk("master"), integer(0), array([])])
+        if mode == "promoted":
+            node.store["mode"] = "master"
         return array([bulk("slave"), bulk("127.0.0.1"), integer(int(primary)), bulk("connected"), integer(0)])
     if name == "SENTINEL":
         return array([bulk("127.0.0.1"), bulk(primary)]) if mode == "names" and primary != "0" else b"*-1\r\n"
-    if name in WRITES and mode in ("replica", "liar"):
+    if name in WRITES and mode in ("replica", "liar", "promoted"):
         return err("READONLY You can't write against a read only replica.")
     if name == "GET":
         return bulk("v")
@@ -322,6 +324,51 @@ async def test_a_master_that_just_refused_is_not_taken_again(build):
     finally:
         liar.close()
         real.close()
+
+
+async def test_the_refusing_replica_is_taken_once_it_is_promoted(build):
+    """The first round finds it a replica and no other primary; the next round finds it promoted and the
+    write is sent there again."""
+    n, other = node("master"), node("replica")
+    try:
+        c = build(seeds(n, other))
+        assert await c.ping()
+        become(n, "promoted")
+        assert await c.set("k", "v") is True
+        assert (seen(n, "SET"), seen(other, "SET")) == (2, 0)
+        assert (seen(n, "ROLE"), seen(other, "ROLE")) == (2, 2)
+    finally:
+        n.close()
+        other.close()
+
+
+async def test_a_refusing_node_that_still_says_master_is_never_taken(build):
+    liar, other = node("master"), node("replica")
+    try:
+        c = build(seeds(liar, other))
+        assert await c.ping()
+        become(liar, "liar")
+        with pytest.raises(ruvio.ResponseError) as info:
+            await c.set("k", "v")
+        assert_readonly(info)
+        assert (seen(liar, "SET"), seen(liar, "ROLE")) == (1, 8)
+    finally:
+        liar.close()
+        other.close()
+
+
+async def test_a_coordinator_naming_the_refusing_replica_is_followed_once_it_is_promoted(build):
+    coordinator, n = node("names"), node("master")
+    try:
+        become(coordinator, "names", n)
+        c = build(seeds(coordinator), sentinel_master="main")
+        assert await c.ping()
+        become(n, "promoted")
+        assert await c.set("k", "v") is True
+        assert seen(n, "SET") == 2
+    finally:
+        coordinator.close()
+        n.close()
 
 
 async def test_a_write_refused_inside_a_transaction_follows_but_is_not_sent_again(build):

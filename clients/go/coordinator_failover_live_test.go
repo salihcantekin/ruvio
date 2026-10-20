@@ -22,6 +22,10 @@ import (
 // The coordinators notice the kill after down_after_ms (1 s) and promote within a few ticks.
 const coordinatedPatience = 15 * time.Second
 
+// Each client's first write after the kill comes within this, the seeds client included: the
+// replica that refused is taken once it is promoted, not after the rounds run out (about 7 s).
+const coordinatedFollowBound = 5 * time.Second
+
 func TestLiveClientsReachTheNewPrimaryAfterTheCoordinatorsFailOver(t *testing.T) {
 	list := func(name string) []string {
 		value := os.Getenv(name)
@@ -115,6 +119,11 @@ func TestLiveClientsReachTheNewPrimaryAfterTheCoordinatorsFailOver(t *testing.T)
 		}
 	}
 	t.Logf("first write after the kill: SentinelMaster %v, seeds %v", took[0], took[1])
+	for i, d := range took {
+		if d >= coordinatedFollowBound {
+			t.Fatalf("the first write through client %d took %v", i, d)
+		}
+	}
 
 	if !rawIsMaster(rawCmd(t, members[next], "ROLE")) {
 		t.Fatal("the surviving member is not the primary")

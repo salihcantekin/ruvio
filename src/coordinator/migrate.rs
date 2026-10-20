@@ -21,14 +21,17 @@ use super::{
     resp::{NodeClient, Value},
 };
 
-/// How often the leader asks the source how the copy is going.
-const POLL: Duration = Duration::from_millis(50);
+/// How often the leader asks the source how the copy is going. Short: the range is frozen
+/// on the source from the end of the copy until the map reaches it, and every poll the
+/// leader waits adds to that.
+const POLL: Duration = Duration::from_millis(10);
 /// The longest one call to a data node may take.
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Starts of one move (the first and the ones a failover forces).
 const ATTEMPTS: usize = 3;
-/// Polls the leader waits for the target's replicas to hold a prepared copy (10 s).
-const REPLICA_WAIT_POLLS: usize = 200;
+/// Polls the leader waits for the target's replicas to hold a prepared copy, and for a node
+/// to drop a cancelled move before it takes the next (10 s each).
+const WAIT_POLLS: usize = (10_000 / POLL.as_millis()) as usize;
 
 /// The leader's side of the moves: which one it drives, a cancel asked for, and how the
 /// last one ended.
@@ -326,7 +329,7 @@ async fn attempt_move(context: &Context, migration: &Migration) -> Ended {
     // A move cancelled just before may still be dropping its copy on the target.
     while let Err(error) = expect_ok(call(config, &target, &import).await) {
         tries += 1;
-        if !error.contains("another range is arriving") || tries >= 200 {
+        if !error.contains("another range is arriving") || tries >= WAIT_POLLS {
             return Ended::Aborted {
                 reason: format!("the target refused the range: {error}"),
                 again: false,
@@ -358,7 +361,7 @@ async fn attempt_move(context: &Context, migration: &Migration) -> Ended {
     // A move the source missed the end of is cancelled there first.
     while let Err(error) = expect_ok(call(config, &source, &export).await) {
         tries += 1;
-        if !error.contains("another range is leaving") || tries >= 200 {
+        if !error.contains("another range is leaving") || tries >= WAIT_POLLS {
             return Ended::Aborted {
                 reason: format!("the source refused the range: {error}"),
                 again: false,
@@ -372,16 +375,17 @@ async fn attempt_move(context: &Context, migration: &Migration) -> Ended {
 
     // The source reports `prepared` once the target holds the whole range and the source
     // has kept the frozen range on disk; only then may the move commit.
+    let mut source_status = StatusLink::new(config, &source);
+
     loop {
         tokio::time::sleep(POLL).await;
         if let Some(ended) = interrupted(context, migration).await {
             return ended;
         }
-        let Ok(reply) = call(config, &source, &[b"RUVIO", b"MIGRATE", b"STATUS"]).await else {
+        let Ok(pairs) = source_status.pairs().await else {
             // The source may be restarting; a failover ends the move above.
             continue;
         };
-        let pairs = pairs(&reply);
         let field = |name: &str| {
             pairs
                 .iter()
@@ -414,34 +418,31 @@ async fn attempt_move(context: &Context, migration: &Migration) -> Ended {
     // The target's replicas must hold the copy too: a failover of the target right after
     // the commit would otherwise promote a replica without the range.
     let mut waited = 0;
+    let mut target_status = StatusLink::new(config, &target);
 
     loop {
         if let Some(ended) = interrupted(context, migration).await {
             return ended;
         }
-        let behind = call(config, &target, &[b"RUVIO", b"MIGRATE", b"STATUS"])
-            .await
-            .ok()
-            .map(|reply| pairs(&reply))
-            .and_then(|pairs| {
-                let field = |name: &str| {
-                    pairs
-                        .iter()
-                        .find(|(known, _)| known == name)
-                        .map(|(_, value)| value.clone())
-                };
+        let behind = target_status.pairs().await.ok().and_then(|pairs| {
+            let field = |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(known, _)| known == name)
+                    .map(|(_, value)| value.clone())
+            };
 
-                (field("id").as_deref() == Some(migration.id.as_str())
-                    && field("state").as_deref() == Some("prepared"))
-                .then(|| field("replicas_behind"))
-                .flatten()
-            });
+            (field("id").as_deref() == Some(migration.id.as_str())
+                && field("state").as_deref() == Some("prepared"))
+            .then(|| field("replicas_behind"))
+            .flatten()
+        });
 
         if behind.as_deref() == Some("0") {
             break;
         }
         waited += 1;
-        if waited >= REPLICA_WAIT_POLLS {
+        if waited >= WAIT_POLLS {
             return Ended::Aborted {
                 reason: format!(
                     "the target's replicas did not get the copy in time ({} behind)",
@@ -616,6 +617,47 @@ async fn call(
         .call(args, CALL_TIMEOUT)
         .await
         .map_err(|error| format!("{address}: {error}"))
+}
+
+/// `RUVIO MIGRATE STATUS` on one node, asked every [`POLL`] over one connection that is
+/// opened again after an error.
+struct StatusLink<'a> {
+    config: &'a CoordinatorConfig,
+    address: &'a Endpoint,
+    client: Option<NodeClient>,
+}
+
+impl<'a> StatusLink<'a> {
+    fn new(config: &'a CoordinatorConfig, address: &'a Endpoint) -> Self {
+        Self {
+            config,
+            address,
+            client: None,
+        }
+    }
+
+    async fn pairs(&mut self) -> Result<Vec<(String, String)>, String> {
+        let address = self.address;
+        let client = match &mut self.client {
+            Some(client) => client,
+            None => self.client.insert(
+                NodeClient::connect(address, self.config.auth.as_deref(), CALL_TIMEOUT)
+                    .await
+                    .map_err(|error| format!("{address}: {error}"))?,
+            ),
+        };
+
+        match client
+            .call(&[b"RUVIO", b"MIGRATE", b"STATUS"], CALL_TIMEOUT)
+            .await
+        {
+            Ok(reply) => Ok(pairs(&reply)),
+            Err(error) => {
+                self.client = None;
+                Err(format!("{address}: {error}"))
+            }
+        }
+    }
 }
 
 fn expect_ok(reply: Result<Value, String>) -> Result<(), String> {

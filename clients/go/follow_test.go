@@ -22,10 +22,11 @@ import (
 type nodeMode int
 
 const (
-	modeMaster  nodeMode = iota
-	modeReplica          // reports roleHint as its primary
-	modeLiar             // says master but refuses writes anyway
-	modeNames            // a coordinator that names roleHint
+	modeMaster   nodeMode = iota
+	modeReplica           // reports roleHint as its primary
+	modeLiar              // says master but refuses writes anyway
+	modeNames             // a coordinator that names roleHint
+	modePromoted          // a replica promoted right after it answers its first ROLE
 )
 
 type roleNode struct {
@@ -92,6 +93,9 @@ func (n *roleNode) serve(nc net.Conn) {
 		n.mu.Lock()
 		n.got = append(n.got, args)
 		mode, hint := n.mode, n.hint
+		if mode == modePromoted && strings.EqualFold(args[0], "ROLE") {
+			n.mode = modeMaster
+		}
 		n.mu.Unlock()
 		if _, err := io.WriteString(nc, roleAnswer(args, mode, hint)); err != nil {
 			return
@@ -105,12 +109,14 @@ func roleAnswer(args []string, mode nodeMode, hint int) string {
 	switch {
 	case name == "ROLE" && (mode == modeMaster || mode == modeLiar):
 		return "*3\r\n$6\r\nmaster\r\n:0\r\n*0\r\n"
+	case name == "ROLE" && mode == modePromoted:
+		return "*5\r\n$5\r\nslave\r\n$9\r\n127.0.0.1\r\n:0\r\n$9\r\nconnected\r\n:0\r\n"
 	case name == "ROLE" && mode == modeReplica:
 		return fmt.Sprintf("*5\r\n$5\r\nslave\r\n$9\r\n127.0.0.1\r\n:%d\r\n$9\r\nconnected\r\n:0\r\n", hint)
 	case name == "SENTINEL" && mode == modeNames:
 		p := fmt.Sprint(hint)
 		return fmt.Sprintf("*2\r\n$9\r\n127.0.0.1\r\n$%d\r\n%s\r\n", len(p), p)
-	case writes && (mode == modeReplica || mode == modeLiar):
+	case writes && (mode == modeReplica || mode == modeLiar || mode == modePromoted):
 		return "-READONLY You can't write against a read only replica.\r\n"
 	case name == "PING":
 		return "+PONG\r\n"
@@ -356,6 +362,61 @@ func TestAWriteRefusedTwiceIsNotSentAThirdTime(t *testing.T) {
 
 	wantReadonly(t, c.Set(ctx, "k", "v"))
 	wantCounts(t, "SET", []int{1, 1}, old, liar)
+}
+
+func TestTheRefusingReplicaIsTakenOnceItIsPromoted(t *testing.T) {
+	node := newRoleNode(t, modeMaster)
+	other := newRoleNode(t, modeReplica)
+	c, ctx := followClient(t, followOptions(node, other))
+
+	if err := c.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	node.become(modePromoted, 0)
+
+	// The first round finds it a replica and no other primary; the next round finds it
+	// promoted and sends the write there again.
+	if err := c.Set(ctx, "k", "v"); err != nil {
+		t.Fatal(err)
+	}
+	wantCounts(t, "SET", []int{2, 0}, node, other)
+	wantCounts(t, "ROLE", []int{2, 2}, node, other)
+}
+
+func TestARefusingNodeThatStillSaysMasterIsNotTakenAgain(t *testing.T) {
+	liar := newRoleNode(t, modeMaster)
+	other := newRoleNode(t, modeReplica)
+	c, ctx := followClient(t, followOptions(liar, other))
+	c.followRounds = 3
+
+	if err := c.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	liar.become(modeLiar, 0)
+
+	wantReadonly(t, c.Set(ctx, "k", "v"))
+	wantCounts(t, "SET", []int{1, 0}, liar, other)
+	wantCounts(t, "ROLE", []int{3, 3}, liar, other)
+}
+
+func TestACoordinatorNamingTheRefusingReplicaIsFollowedOnceItIsPromoted(t *testing.T) {
+	coord := newRoleNode(t, modeNames)
+	node := newRoleNode(t, modeMaster)
+	coord.become(modeNames, node.port)
+
+	o := followOptions(coord)
+	o.SentinelMaster = "main"
+	c, ctx := followClient(t, o)
+
+	if err := c.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	node.become(modePromoted, 0)
+
+	if err := c.Set(ctx, "k", "v"); err != nil {
+		t.Fatal(err)
+	}
+	wantCounts(t, "SET", []int{2}, node)
 }
 
 func TestAWriteRefusedInsideATransactionFollowsButIsNotSentAgain(t *testing.T) {
