@@ -3,7 +3,7 @@
 
 use std::{fmt, net::SocketAddr, path::PathBuf, time::Duration};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// A `host:port` the coordinator dials. The host may be a name (a container or DNS name); it
 /// is resolved again on every connection, so a node that moves keeps working.
@@ -51,6 +51,12 @@ impl fmt::Display for Endpoint {
     }
 }
 
+impl Serialize for Endpoint {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
 impl<'de> Deserialize<'de> for Endpoint {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
@@ -60,7 +66,7 @@ impl<'de> Deserialize<'de> for Endpoint {
 }
 
 /// One data node of a replication group.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Member {
     /// Its RESP address (shard 0's port in per-shard mode), the one clients use.
@@ -281,7 +287,7 @@ impl CoordinatorConfig {
                 return Err("with shards, every group needs shards".into());
             }
             // The map the nodes will receive, checked as they check it.
-            let text = cluster_map_text(&file.groups, 1, |_| 0);
+            let text = cluster_map_text(&file.groups, 1, first_member);
 
             crate::topology::Topology::parse(
                 &text,
@@ -338,7 +344,7 @@ impl CoordinatorConfig {
         let primary = |group: &Group| {
             primaries
                 .get(&group.name)
-                .map_or(0, |primary| primary.member)
+                .map_or_else(String::new, |primary| primary.member.clone())
         };
         let text = if moved.is_empty() {
             cluster_map_text(&self.groups, version, primary)
@@ -352,7 +358,7 @@ impl CoordinatorConfig {
     /// Every slot's group (an index into `groups`) and shard after the moves `moved`. The
     /// configured slots are split over each group's shards as its nodes split them.
     pub fn owners(&self, moved: &[super::raft::MovedRange]) -> Vec<(usize, usize)> {
-        let base = cluster_map_text(&self.groups, 1, |_| 0);
+        let base = cluster_map_text(&self.groups, 1, first_member);
         let first = &self.groups[0];
         let mut owners = vec![(0, 0); crate::routing::HASH_SLOT_COUNT];
 
@@ -389,16 +395,13 @@ impl CoordinatorConfig {
 fn placed_map_text(
     groups: &[Group],
     version: u64,
-    primary: impl Fn(&Group) -> usize,
+    primary: impl Fn(&Group) -> String,
     owners: &[(usize, usize)],
 ) -> String {
     let mut text = format!("version = {version}\n");
 
     for (index, group) in groups.iter().enumerate() {
-        let address = group
-            .members
-            .get(primary(group))
-            .map_or_else(String::new, |member| member.address.to_string());
+        let address = primary(group);
         let mut runs: Vec<(usize, usize, usize)> = Vec::new();
 
         for (slot, &(owner, shard)) in owners.iter().enumerate() {
@@ -428,14 +431,19 @@ fn placed_map_text(
 }
 
 /// The map in the format of a node's `cluster_topology` file.
-fn cluster_map_text(groups: &[Group], version: u64, primary: impl Fn(&Group) -> usize) -> String {
+/// The first member's client address: what a map names before any primary is agreed.
+fn first_member(group: &Group) -> String {
+    group
+        .members
+        .first()
+        .map_or_else(String::new, |member| member.address.to_string())
+}
+
+fn cluster_map_text(groups: &[Group], version: u64, primary: impl Fn(&Group) -> String) -> String {
     let mut text = format!("version = {version}\n");
 
     for group in groups {
-        let address = group
-            .members
-            .get(primary(group))
-            .map_or_else(String::new, |member| member.address.to_string());
+        let address = primary(group);
         let slots: Vec<String> = group
             .slots
             .iter()
@@ -547,7 +555,7 @@ members = [
         primaries.insert(
             "main".into(),
             super::super::raft::Primary {
-                member: 0,
+                member: "127.0.0.1:6379".into(),
                 epoch: 1,
             },
         );
@@ -558,7 +566,7 @@ members = [
         primaries.insert(
             "b".into(),
             super::super::raft::Primary {
-                member: 1,
+                member: "10.0.0.3:7000".into(),
                 epoch: 3,
             },
         );

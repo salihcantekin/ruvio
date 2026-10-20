@@ -27,6 +27,8 @@ use openraft::{
     storage::{LogFlushed, RaftLogStorage, RaftStateMachine},
 };
 use serde::{Deserialize, Serialize};
+
+use super::config::{Group, Member};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -35,11 +37,11 @@ use tokio::{
 /// A change to the replicated state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
-    /// `member` (an index into the group's configured members) is the group's primary from
-    /// `epoch` on. Applied only above the epoch already recorded, so a retry is harmless.
+    /// `member` (a member's client address, `host:port`) is the group's primary from `epoch`
+    /// on. Applied only above the epoch already recorded, so a retry is harmless.
     SetPrimary {
         group: String,
-        member: usize,
+        member: String,
         epoch: u64,
         /// The committed sequences that hold under the new primary, decided when it was chosen
         /// (an unclean promotion drops the ones it lacks). Absent on the first record of a
@@ -57,6 +59,9 @@ pub enum Request {
     /// not). Coordinators older than this request cannot read a log that holds it: all
     /// coordinators are upgraded together.
     Commit(BTreeMap<String, Raised>),
+    /// The group's members from now on: the configured ones and the replicas discovered
+    /// following its primary, less those forgotten (`COORDINATOR FORGET`).
+    SetMembers { group: String, members: Vec<Member> },
 }
 
 /// One group's committed sequences that rose under the primary of `epoch`.
@@ -192,10 +197,21 @@ pub type NodeId = u64;
 pub type Raft = openraft::Raft<TypeConfig>;
 
 /// The primary of one replication group.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Primary {
-    pub member: usize,
+    /// The member's client address (`host:port`), as the group lists it.
+    pub member: String,
     pub epoch: u64,
+}
+
+impl Primary {
+    /// Where the primary is in `group`'s members; `None` when it is not listed.
+    pub fn index(&self, group: &Group) -> Option<usize> {
+        group
+            .members
+            .iter()
+            .position(|member| member.address.to_string() == self.member)
+    }
 }
 
 /// Every group's primary, as the coordinators agreed on it.
@@ -397,6 +413,10 @@ struct MachineState {
     /// Absent in snapshots written before committed sequences were recorded.
     #[serde(default)]
     commits: Recorded,
+    /// Each group's members once the leader recorded them; absent until then (the file's
+    /// list holds).
+    #[serde(default)]
+    members: BTreeMap<String, Vec<Member>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -451,6 +471,25 @@ impl StateMachine {
             .clone()
     }
 
+    /// `configured` with its members as recorded: the recorded list, then any member of the
+    /// file it does not hold (added to the file since). The file's list until one is recorded.
+    pub fn group(&self, configured: &Group) -> Group {
+        let state = self.state.read().unwrap_or_else(|error| error.into_inner());
+        let mut group = configured.clone();
+
+        if let Some(recorded) = state.members.get(&configured.name) {
+            let mut members = recorded.clone();
+
+            for member in &configured.members {
+                if !members.iter().any(|known| known.address == member.address) {
+                    members.push(member.clone());
+                }
+            }
+            group.members = members;
+        }
+        group
+    }
+
     pub fn commits(&self) -> Recorded {
         self.state
             .read()
@@ -498,8 +537,24 @@ pub fn apply_move(moves: &mut Moves, primaries: &Primaries, request: &Request) -
             true
         }
         Request::EndMove { id } => moves.current.take_if(|current| current.id == *id).is_some(),
-        Request::SetPrimary { .. } | Request::Commit(_) => false,
+        Request::SetPrimary { .. } | Request::Commit(_) | Request::SetMembers { .. } => false,
     }
+}
+
+/// Applies a members record; returns whether it changed anything.
+pub fn apply_members(members: &mut BTreeMap<String, Vec<Member>>, request: &Request) -> bool {
+    let Request::SetMembers {
+        group,
+        members: listed,
+    } = request
+    else {
+        return false;
+    };
+    if members.get(group) == Some(listed) {
+        return false;
+    }
+    members.insert(group.clone(), listed.clone());
+    true
 }
 
 /// After a `SetPrimary` that applied: the group's committed sequences under the new primary.
@@ -559,7 +614,8 @@ pub fn apply_request(primaries: &mut Primaries, request: &Request) -> bool {
         Request::BeginMove(_)
         | Request::CommitMove { .. }
         | Request::EndMove { .. }
-        | Request::Commit(_) => false,
+        | Request::Commit(_)
+        | Request::SetMembers { .. } => false,
         Request::SetPrimary {
             group,
             member,
@@ -575,7 +631,7 @@ pub fn apply_request(primaries: &mut Primaries, request: &Request) -> bool {
             primaries.insert(
                 group.clone(),
                 Primary {
-                    member: *member,
+                    member: member.clone(),
                     epoch: *epoch,
                 },
             );
@@ -665,6 +721,7 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
                     } else {
                         apply_move(&mut state.moves, &state.primaries, &request)
                             || apply_commit(&mut state.commits, &state.primaries, &request)
+                            || apply_members(&mut state.members, &request)
                     }
                 }
                 EntryPayload::Membership(membership) => {
@@ -744,10 +801,11 @@ pub enum RpcRequest {
     Append(AppendEntriesRequest<TypeConfig>),
     Vote(VoteRequest<NodeId>),
     Snapshot(InstallSnapshotRequest<TypeConfig>),
-    /// How long ago this coordinator last heard from each member of `group`, in
-    /// milliseconds; `None` for never.
+    /// How long ago this coordinator last heard from `member` (a client address) of
+    /// `group`, in milliseconds; `None` for never.
     Observe {
         group: String,
+        member: String,
     },
     /// [`RpcRequest::Observe`], and whether the primary lease of `member` ended by this
     /// coordinator's own settings. A yes promises no grant to it until the leader confirms it
@@ -755,7 +813,7 @@ pub enum RpcRequest {
     /// leader then falls back to `Observe`.
     Leases {
         group: String,
-        member: usize,
+        member: String,
     },
     /// To the leader: the primary of `group`, read after any failover decision in progress
     /// and once a majority confirmed the leader.
@@ -769,9 +827,9 @@ pub enum RpcResponse {
     Append(Result<AppendEntriesResponse<NodeId>, RaftError<NodeId>>),
     Vote(Result<VoteResponse<NodeId>, RaftError<NodeId>>),
     Snapshot(Result<InstallSnapshotResponse<NodeId>, RaftError<NodeId, InstallSnapshotError>>),
-    Observe(Vec<Option<u64>>),
+    Observe(Option<u64>),
     Leases {
-        heard: Vec<Option<u64>>,
+        heard: Option<u64>,
         /// The lease ended by this coordinator's settings, or it grants none.
         ended: bool,
         /// This coordinator grants leases.
@@ -1049,11 +1107,62 @@ mod tests {
     }
 
     #[test]
+    fn recorded_members_replace_the_files_and_keep_members_added_to_it_since() {
+        let member = |port: u16| Member {
+            address: super::super::config::Endpoint::parse(&format!("127.0.0.1:{port}")).unwrap(),
+            replication: super::super::config::Endpoint::parse(&format!("127.0.0.1:2{port}"))
+                .unwrap(),
+        };
+        let configured = Group {
+            name: "main".into(),
+            members: vec![member(6379), member(6380)],
+            shards: None,
+            slots: Vec::new(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let machine = StateMachine::open(dir.path()).unwrap();
+
+        // Nothing recorded: the file's list.
+        assert_eq!(machine.group(&configured), configured);
+        let mut members = BTreeMap::new();
+        let found = Request::SetMembers {
+            group: "main".into(),
+            members: vec![member(6379), member(6380), member(6381)],
+        };
+
+        assert!(apply_members(&mut members, &found));
+        assert!(!apply_members(&mut members, &found));
+        machine.state.write().unwrap().members = members;
+        let listed = |group: &Group| -> Vec<u16> {
+            group
+                .members
+                .iter()
+                .map(|member| member.address.port)
+                .collect()
+        };
+
+        assert_eq!(listed(&machine.group(&configured)), [6379, 6380, 6381]);
+        // A member added to the file later is kept after the recorded ones.
+        let mut grown = configured.clone();
+
+        grown.members.push(member(6390));
+        assert_eq!(listed(&machine.group(&grown)), [6379, 6380, 6381, 6390]);
+        assert_eq!(
+            Primary {
+                member: "127.0.0.1:6381".into(),
+                epoch: 1
+            }
+            .index(&machine.group(&configured)),
+            Some(2)
+        );
+    }
+
+    #[test]
     fn set_primary_applies_only_above_the_recorded_epoch() {
         let mut primaries = Primaries::new();
-        let set = |member, epoch| Request::SetPrimary {
+        let set = |member: usize, epoch| Request::SetPrimary {
             group: "main".into(),
-            member,
+            member: format!("127.0.0.1:{}", 6379 + member),
             epoch,
             commit: None,
         };
@@ -1066,7 +1175,7 @@ mod tests {
         assert_eq!(
             primaries["main"],
             Primary {
-                member: 2,
+                member: "127.0.0.1:6381".into(),
                 epoch: 2
             }
         );
@@ -1081,7 +1190,7 @@ mod tests {
             primaries.insert(
                 group.into(),
                 Primary {
-                    member: 0,
+                    member: "127.0.0.1:6379".into(),
                     epoch: 1,
                 },
             );
@@ -1172,9 +1281,9 @@ mod tests {
                 },
             )]))
         };
-        let promote = |member, epoch, commit| Request::SetPrimary {
+        let promote = |member: usize, epoch, commit| Request::SetPrimary {
             group: "main".into(),
-            member,
+            member: format!("127.0.0.1:{}", 6379 + member),
             epoch,
             commit,
         };
@@ -1302,7 +1411,7 @@ mod tests {
         // An entry of about the earlier size, to time a log of such entries.
         let padded = Request::SetPrimary {
             group: "g".into(),
-            member: 0,
+            member: "127.0.0.1:6379".into(),
             epoch: 7,
             commit: Some(Commit {
                 epoch: 7,

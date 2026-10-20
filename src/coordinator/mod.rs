@@ -106,7 +106,11 @@ async fn serve(
     let (switches, _) = tokio::sync::broadcast::channel(64);
 
     info!(id = config.id, listen = %config.listen, groups = config.groups.len(), "coordinator listening");
-    let watcher = tokio::spawn(monitor::watch(Arc::clone(&config), sightings.clone()));
+    let watcher = tokio::spawn(monitor::watch(
+        Arc::clone(&config),
+        machine.clone(),
+        sightings.clone(),
+    ));
     let renewer = tokio::spawn(monitor::renew_leases(
         Arc::clone(&config),
         raft.clone(),
@@ -271,22 +275,19 @@ impl Api {
             RpcRequest::Snapshot(rpc) => {
                 RpcResponse::Snapshot(self.raft.install_snapshot(rpc).await)
             }
-            RpcRequest::Observe { group } => RpcResponse::Observe(
-                self.config
-                    .group(&group)
-                    .map(|group| self.sightings.ages(group))
-                    .unwrap_or_default(),
-            ),
+            RpcRequest::Observe { group, member } => {
+                RpcResponse::Observe(self.sightings.age(&group, &member))
+            }
             RpcRequest::Leases { group, member } => match self.config.group(&group) {
                 Some(group) => RpcResponse::Leases {
-                    heard: self.sightings.ages(group),
+                    heard: self.sightings.age(&group.name, &member),
                     ended: self.config.primary_lease.is_none_or(|(_, safe)| {
-                        self.sightings.grants().report(&group.name, member, safe)
+                        self.sightings.grants().report(&group.name, &member, safe)
                     }),
                     lease_on: self.config.primary_lease.is_some(),
                 },
                 None => RpcResponse::Leases {
-                    heard: Vec::new(),
+                    heard: None,
                     ended: false,
                     lease_on: self.config.primary_lease.is_some(),
                 },
@@ -369,6 +370,12 @@ impl Api {
                 };
                 self.add_coordinator(id, address).await
             }
+            (Some("forget"), 4) => {
+                if !self.moves.leading().await {
+                    return Value::Error(self.moves.not_leader().await);
+                }
+                self.forget(&words[2], &words[3]).await
+            }
             (Some("remove"), 3) => {
                 if !self.moves.leading().await {
                     return Value::Error(self.moves.not_leader().await);
@@ -389,10 +396,10 @@ impl Api {
         }
     }
 
-    /// The agreed primary of `group` and the group itself.
-    fn primary(&self, group: &str) -> Option<(&config::Group, usize)> {
-        let group = self.config.group(group)?;
-        let primary = self.machine.primaries().get(&group.name)?.member;
+    /// `group` with its members as recorded, and the index of its agreed primary.
+    fn primary(&self, group: &str) -> Option<(config::Group, usize)> {
+        let group = self.machine.group(self.config.group(group)?);
+        let primary = self.machine.primaries().get(&group.name)?.index(&group)?;
 
         Some((group, primary))
     }
@@ -427,11 +434,13 @@ impl Api {
                 let recorded = self.machine.commits();
 
                 for group in &self.config.groups {
+                    let group = &self.machine.group(group);
+
                     match primaries.get(&group.name) {
                         Some(primary) => {
                             text += &format!(
                                 "group_{}:primary={},epoch={}",
-                                group.name, group.members[primary.member].address, primary.epoch
+                                group.name, primary.member, primary.epoch
                             )
                         }
                         None => text += &format!("group_{}:primary=,epoch=0", group.name),
@@ -451,7 +460,7 @@ impl Api {
                         let age = self
                             .sightings
                             .grants()
-                            .last(&group.name, primary.member)
+                            .last(&group.name, &primary.member)
                             .map_or(-1, |at| at.elapsed().as_millis() as i64);
 
                         text += &format!(",lease_grant_ms={age}");
@@ -506,18 +515,18 @@ impl Api {
                     .groups
                     .iter()
                     .filter_map(|group| self.primary(&group.name))
-                    .map(|(group, primary)| self.describe(group, primary, true))
+                    .map(|(group, primary)| self.describe(&group, primary, true))
                     .collect(),
             ),
             (Some("sentinel"), Some("master")) => match self.primary(&name()) {
-                Some((group, primary)) => self.describe(group, primary, true),
+                Some((group, primary)) => self.describe(&group, primary, true),
                 None => Value::Error("ERR No such master with that name".into()),
             },
             (Some("sentinel"), Some("replicas" | "slaves")) => match self.primary(&name()) {
                 Some((group, primary)) => Value::array(
                     (0..group.members.len())
                         .filter(|&member| member != primary)
-                        .map(|member| self.describe(group, member, false))
+                        .map(|member| self.describe(&group, member, false))
                         .collect(),
                 ),
                 None => Value::Error("ERR No such master with that name".into()),
@@ -602,6 +611,64 @@ impl Api {
         self.change_membership(members).await
     }
 
+    /// `COORDINATOR FORGET group host:port` on the leader: drops a member that is gone for
+    /// good. Refused for the primary and for a member the file lists.
+    async fn forget(&self, group: &str, address: &str) -> Value {
+        let Some(configured) = self
+            .config
+            .groups
+            .iter()
+            .find(|known| known.name.eq_ignore_ascii_case(group))
+        else {
+            return Value::Error(format!("ERR no group named {group}"));
+        };
+        let Ok(address) = config::Endpoint::parse(address) else {
+            return Value::Error("ERR COORDINATOR FORGET needs group host:port".into());
+        };
+        if configured
+            .members
+            .iter()
+            .any(|member| member.address == address)
+        {
+            return Value::Error(format!(
+                "ERR {address} is listed in the file; remove it there and restart the coordinators"
+            ));
+        }
+        let group = self.machine.group(configured);
+
+        if self
+            .machine
+            .primaries()
+            .get(&group.name)
+            .is_some_and(|primary| primary.member == address.to_string())
+        {
+            return Value::Error(format!("ERR {address} is the primary of {}", group.name));
+        }
+        let members: Vec<config::Member> = group
+            .members
+            .iter()
+            .filter(|member| member.address != address)
+            .cloned()
+            .collect();
+
+        if members.len() == group.members.len() {
+            return Value::Error(format!("ERR {address} is not a member of {}", group.name));
+        }
+        let request = raft::Request::SetMembers {
+            group: group.name.clone(),
+            members,
+        };
+
+        match tokio::time::timeout(MEMBERSHIP_WAIT, self.raft.client_write(request)).await {
+            Ok(Ok(_)) => {
+                info!(group = %group.name, member = %address, "forgot a member");
+                Value::Simple("OK".into())
+            }
+            Ok(Err(error)) => Value::Error(format!("ERR {error}")),
+            Err(_) => Value::Error("ERR the change was not committed in time".into()),
+        }
+    }
+
     async fn change_membership(&self, members: std::collections::BTreeSet<u64>) -> Value {
         match tokio::time::timeout(
             MEMBERSHIP_WAIT,
@@ -623,7 +690,7 @@ impl Api {
     /// One member as `SENTINEL masters` / `replicas` list it: a flat field-value array.
     fn describe(&self, group: &config::Group, member: usize, primary: bool) -> Value {
         let address = &group.members[member].address;
-        let sighting = self.sightings.get(&group.name, member);
+        let sighting = self.sightings.get(&group.name, &address.to_string());
         let down = sighting
             .last_ok
             .is_none_or(|at| at.elapsed() > self.config.down_after);

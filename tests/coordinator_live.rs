@@ -43,6 +43,8 @@ struct Group {
     coordinators: Vec<SocketAddr>,
     /// A free address for a coordinator that joins later.
     spare: SocketAddr,
+    /// How many of the data nodes the coordinators' file lists (the first ones).
+    listed: usize,
     /// Shards per data node; shard i of a node listens on its ports plus i.
     shards: u16,
     _ports: (test_ports::PortBlock, test_ports::PortBlock),
@@ -68,6 +70,7 @@ impl Group {
                 .map(|index| data.address_at(3 * shards + index))
                 .collect(),
             spare: data.address_at(3 * shards + 3),
+            listed: 3,
             shards,
             _ports: (data, replication),
         }
@@ -162,7 +165,7 @@ impl Group {
             .map(|(id, address)| format!("\"{}@{address}\"", id + 1))
             .collect::<Vec<_>>()
             .join(", ");
-        let members = (0..3)
+        let members = (0..self.listed)
             .map(|node| {
                 format!(
                     "  {{ address = \"{}\", replication = \"{}\" }}",
@@ -1820,4 +1823,60 @@ fn coordinators_are_added_and_removed_while_they_run() {
             .primary_by(3)
             .is_some_and(|node| node != 0 && node != first)
     });
+}
+
+/// A replica the coordinators' file does not list is found through its primary's `INFO
+/// replication`, watched, and promoted when it is the only one left; a member the file lists
+/// cannot be forgotten.
+#[test]
+fn a_replica_started_later_is_found_and_can_be_promoted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut group = Group::new();
+
+    group.listed = 2;
+    let mut nodes = vec![
+        group.node(dir.path(), 0, None),
+        group.node(dir.path(), 1, Some(0)),
+    ];
+    let _coordinators: Vec<Process> = (0..3)
+        .map(|index| group.coordinator(dir.path(), index))
+        .collect();
+
+    wait_until("the coordinators to agree on the primary", || {
+        (0..3).all(|index| group.primary_by(index) == Some(0))
+    });
+    // Node 2 is started following node 0; nobody tells the coordinators.
+    nodes.push(group.node(dir.path(), 2, Some(0)));
+    let third = group.resp[2].to_string();
+
+    wait_until("every coordinator to list node 2 as a replica", || {
+        group.coordinators.iter().all(|coordinator| {
+            call_with_secret(&coordinator.to_string(), &["SENTINEL", "replicas", "main"])
+                .is_some_and(|replicas| replicas.contains(&format!("name {third} ")))
+        })
+    });
+    assert_eq!(
+        call(&group.resp[0].to_string(), &["SET", "found", "1"]).as_deref(),
+        Some("OK")
+    );
+    wait_until("node 2 to copy the write", || {
+        call(&third, &["GET", "found"]).as_deref() == Some("1")
+    });
+
+    // Only node 2 is left: it takes over.
+    nodes[0].kill();
+    nodes[1].kill();
+    wait_until("node 2 to be promoted", || {
+        (0..3).all(|index| group.primary_by(index) == Some(2))
+    });
+    wait_until("node 2 to take writes", || {
+        call(&third, &["SET", "after", "1"]).as_deref() == Some("OK")
+    });
+
+    let first = group.resp[0].to_string();
+    let refused = group
+        .on_leader(&["COORDINATOR", "FORGET", "main", &first])
+        .unwrap();
+
+    assert!(refused.contains("listed in the file"), "{refused}");
 }

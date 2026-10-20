@@ -442,6 +442,24 @@ move the range back with another `COORDINATOR MOVE`. The copy rate of a source i
 `migration_max_bytes_per_sec` in its configuration (0, the default, means no cap); the frozen hand-over
 is never slowed down. Nodes need durability `memory`, `everysec` or `always` (not `snapshot`).
 
+## Replicas the file does not list
+
+The file's `members` are where a group starts. The leader also adds every replica that the agreed
+primary lists in `INFO replication` (`slaveN:ip=…,port=…`, the address the replica announces to
+clients) and that the group does not have yet, under any name that resolves to the same address. Its
+replication address comes from the replica's own `CONFIG GET replication-listen`, with the listed host
+when it listens on every interface. The list is recorded in Raft, so every coordinator watches the
+new replica, `SENTINEL replicas` shows it, and it can be promoted. To add a replica, start it
+following the primary (`replication.role = "replica"` and `replication.primary`, or `REPLICAOF`); no
+coordinator restart is needed.
+
+Members are known by their client address (`host:port` as listed): the Raft record names the primary
+by it. A member that stops answering stays in the list as down. `COORDINATOR FORGET group host:port`
+on the leader removes one for good; it is refused for the primary and for a member the file lists
+(remove it there and restart the coordinators). A replica that still follows the primary is found
+again, so stop it or point it elsewhere first. A member added to the file later is added to the
+recorded list when the coordinators restart.
+
 ## Adding and removing coordinators
 
 The coordinators that vote are the ones in the Raft record; `peers` in the file is only the first
@@ -487,7 +505,6 @@ the same state, and starting it over sends nodes an older map than they hold.
 
 ## Limits of this version
 
-- Groups are declared in the file; replicas are not discovered from the primary yet.
 - Ranges move only when an operator asks (`COORDINATOR MOVE`); nothing rebalances by load yet.
 
 ## Tests
