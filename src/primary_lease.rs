@@ -56,10 +56,16 @@ pub fn now() -> Duration {
     ORIGIN.get_or_init(std::time::Instant::now).elapsed()
 }
 
+/// The most coordinators a grant may name. The coordinators refuse a larger `peers` list
+/// when they grant leases.
+pub const MAX_VOTERS: u32 = 255;
+
 /// One coordinator's running grant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Grant {
     coordinator: u64,
+    /// How many coordinators its sender counts, as of its latest grant.
+    voters: u32,
     epoch: u64,
     until: Duration,
 }
@@ -97,10 +103,8 @@ impl Refused {
 pub struct Leases {
     next_token: u64,
     begins: VecDeque<(u64, Duration)>,
+    /// Running grants only: one that ended is dropped at the next grant, and never counts.
     grants: Vec<Grant>,
-    /// The most coordinators any grant named since the node became a primary: a majority of
-    /// it is needed, so a grant naming fewer cannot lower the bar.
-    voters: u32,
 }
 
 impl Leases {
@@ -125,7 +129,7 @@ impl Leases {
         lease: Duration,
         now: Duration,
     ) -> Result<(), Refused> {
-        if voters == 0 || lease.is_zero() || lease > MAX_LEASE {
+        if voters == 0 || voters > MAX_VOTERS || lease.is_zero() || lease > MAX_LEASE {
             return Err(Refused::Invalid);
         }
         let at = self
@@ -139,22 +143,31 @@ impl Leases {
         if until <= now {
             return Err(Refused::Stale);
         }
+        // A grant that ended can no longer open the gate, so it may not refuse others either:
+        // coordinators that start over (a lost `data_dir`, Raft files deleted to go back a
+        // release) record the primary at a lower epoch, and their grants are taken once the
+        // grants of the newer epoch ran out, at most one lease later.
+        self.grants.retain(|grant| grant.until > now);
         let newest = self.grants.iter().map(|grant| grant.epoch).max();
 
         if newest.is_some_and(|newest| epoch < newest) {
             return Err(Refused::OldEpoch);
         }
-        // A newer epoch supersedes the grants of older ones.
+        // A newer epoch supersedes the grants of older ones, and the coordinator counts they
+        // named with them.
         self.grants.retain(|grant| grant.epoch == epoch);
-        self.voters = self.voters.max(voters);
         match self
             .grants
             .iter_mut()
             .find(|grant| grant.coordinator == coordinator)
         {
-            Some(grant) => grant.until = grant.until.max(until),
+            Some(grant) => {
+                grant.until = grant.until.max(until);
+                grant.voters = voters;
+            }
             None => self.grants.push(Grant {
                 coordinator,
+                voters,
                 epoch,
                 until,
             }),
@@ -162,10 +175,17 @@ impl Leases {
         Ok(())
     }
 
-    /// How many grants run at `now`, and how many make a majority (0 when none came yet).
+    /// How many grants run at `now`, and how many make a majority (0 when none runs). The
+    /// majority is of the largest coordinator count a running grant names, so a grant naming
+    /// fewer does not lower the bar while one naming more runs.
     pub fn count(&self, now: Duration) -> (usize, usize) {
-        let running = self.grants.iter().filter(|grant| grant.until > now).count();
-        let voters = self.voters as usize;
+        let (running, voters) = self
+            .grants
+            .iter()
+            .filter(|grant| grant.until > now)
+            .fold((0, 0), |(running, voters), grant| {
+                (running + 1, voters.max(grant.voters as usize))
+            });
 
         (running, if voters == 0 { 0 } else { voters / 2 + 1 })
     }
@@ -199,7 +219,6 @@ impl Leases {
     pub fn clear(&mut self) {
         self.grants.clear();
         self.begins.clear();
-        self.voters = 0;
     }
 }
 
@@ -328,6 +347,86 @@ mod tests {
         // Five named once: three needed from then on.
         assert_eq!(leases.count(start), (3, 3));
         assert!(leases.holds(start));
+    }
+
+    #[test]
+    fn grants_that_ended_do_not_refuse_coordinators_that_start_over_at_a_lower_epoch() {
+        let start = ms(10_000);
+        let mut leases = Leases::default();
+
+        for coordinator in [1, 2] {
+            let token = leases.begin(start);
+            leases
+                .grant(token, coordinator, 3, 7, LEASE, start)
+                .unwrap();
+        }
+        // While the epoch 7 grants run, a lower epoch is refused.
+        let token = leases.begin(start + ms(1000));
+        assert_eq!(
+            leases.grant(token, 1, 3, 1, LEASE, start + ms(1000)),
+            Err(Refused::OldEpoch)
+        );
+        // Once they ended, the re-initialised coordinators' epoch 1 is taken.
+        let later = start + LEASE;
+        for coordinator in [1, 2] {
+            let token = leases.begin(later);
+            leases
+                .grant(token, coordinator, 3, 1, LEASE, later)
+                .unwrap();
+        }
+        assert!(leases.holds(later));
+        assert_eq!(leases.count(later), (2, 2));
+    }
+
+    #[test]
+    fn the_majority_follows_the_running_grants_of_the_current_epoch() {
+        let start = ms(10_000);
+        let mut leases = Leases::default();
+
+        for coordinator in [1, 2, 3] {
+            let token = leases.begin(start);
+            leases
+                .grant(token, coordinator, 5, 1, LEASE, start)
+                .unwrap();
+        }
+        assert_eq!(leases.count(start), (3, 3));
+        // A new epoch drops the old grants and the count they named.
+        for coordinator in [1, 2] {
+            let token = leases.begin(start);
+            leases
+                .grant(token, coordinator, 3, 2, LEASE, start)
+                .unwrap();
+        }
+        assert_eq!(leases.count(start), (2, 2));
+        assert!(leases.holds(start));
+
+        // A coordinator still counting five keeps the bar at three while its grant runs; once
+        // it stops (the set shrank) and its grant ends, two of three hold again.
+        let token = leases.begin(start);
+        leases.grant(token, 4, 5, 2, ms(1000), start).unwrap();
+        assert_eq!(leases.count(start), (3, 3));
+        let later = start + ms(1000);
+        assert_eq!(leases.count(later), (2, 2));
+        assert!(leases.holds(later));
+        // A coordinator's latest grant sets its count.
+        let token = leases.begin(later);
+        leases.grant(token, 1, 5, 2, LEASE, later).unwrap();
+        assert_eq!(leases.count(later), (2, 3));
+        let token = leases.begin(later);
+        leases.grant(token, 1, 3, 2, LEASE, later).unwrap();
+        assert_eq!(leases.count(later), (2, 2));
+
+        // Absurd counts are refused.
+        for voters in [MAX_VOTERS + 1, u32::MAX] {
+            let token = leases.begin(later);
+            assert_eq!(
+                leases.grant(token, 1, voters, 2, LEASE, later),
+                Err(Refused::Invalid)
+            );
+        }
+        let token = leases.begin(later);
+        leases.grant(token, 1, MAX_VOTERS, 2, LEASE, later).unwrap();
+        assert_eq!(leases.count(later), (2, MAX_VOTERS as usize / 2 + 1));
     }
 
     #[test]
