@@ -306,6 +306,7 @@ impl Api {
                     sightings: &self.sightings,
                     commits: &self.commits,
                     switches: &self.switches,
+                    leadership: &self.moves.leadership,
                 };
 
                 match monitor::force_failover(force, group).await {

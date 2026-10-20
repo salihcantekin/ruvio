@@ -880,19 +880,31 @@ fn a_failover_in_one_group_moves_the_redirects_of_the_others() {
 struct TwoGroups {
     resp: Vec<SocketAddr>,
     coordinator: String,
-    processes: Vec<Process>,
+    processes: Vec<Option<Process>>,
+    _stand_ins: Vec<StandIn>,
     _ports: (test_ports::PortBlock, test_ports::PortBlock),
 }
 
 impl TwoGroups {
     /// `env`: extra settings of every data node.
     fn start(dir: &Path, env: &[(&str, &str)]) -> Self {
+        Self::start_with(dir, env, |_, _| None)
+    }
+
+    /// Like [`TwoGroups::start`], but node `index` is whatever `stand_in(index, address)`
+    /// starts when it returns `Some`.
+    fn start_with(
+        dir: &Path,
+        env: &[(&str, &str)],
+        stand_in: impl Fn(usize, SocketAddr) -> Option<StandIn>,
+    ) -> Self {
         let data = test_ports::reserve();
         let replication = test_ports::reserve();
         let resp: Vec<SocketAddr> = (0..4).map(|index| data.address_at(index)).collect();
         let repl: Vec<SocketAddr> = (0..4).map(|index| replication.address_at(index)).collect();
         let coordinator = data.address_at(4);
         let topology = dir.join("topology.toml");
+        let mut stand_ins = Vec::new();
 
         std::fs::write(
             &topology,
@@ -907,8 +919,12 @@ impl TwoGroups {
             ),
         )
         .unwrap();
-        let mut processes: Vec<Process> = (0..4)
+        let mut processes: Vec<Option<Process>> = (0..4)
             .map(|index| {
+                if let Some(stand_in) = stand_in(index, resp[index]) {
+                    stand_ins.push(stand_in);
+                    return None;
+                }
                 let group = if index < 2 { "a" } else { "b" };
                 let mut command = Command::new(env!("CARGO_BIN_EXE_ruvio"));
 
@@ -932,7 +948,7 @@ impl TwoGroups {
                 let process = Process(command.spawn().unwrap());
 
                 wait_until("a data node to answer", || ping(&resp[index].to_string()));
-                process
+                Some(process)
             })
             .collect();
         let members = |first: usize| {
@@ -961,7 +977,7 @@ impl TwoGroups {
             ),
         )
         .unwrap();
-        processes.push(Process(
+        processes.push(Some(Process(
             Command::new(env!("CARGO_BIN_EXE_ruvio"))
                 .arg("coordinator")
                 .arg("--config")
@@ -970,12 +986,13 @@ impl TwoGroups {
                 .stderr(Stdio::null())
                 .spawn()
                 .unwrap(),
-        ));
+        )));
 
         let groups = Self {
             resp,
             coordinator: coordinator.to_string(),
             processes,
+            _stand_ins: stand_ins,
             _ports: (data, replication),
         };
 
@@ -1173,7 +1190,7 @@ fn a_failover_of_the_source_during_a_move_starts_it_again_with_the_new_primary()
         call(&groups.node(0), &["RUVIO", "MIGRATE", "STATUS"])
             .is_some_and(|status| status.contains("state copying"))
     });
-    groups.processes[0].kill();
+    groups.processes[0].as_mut().unwrap().kill();
 
     wait_until("the move to finish with a's new primary", || {
         call_with_secret(&groups.coordinator, &["COORDINATOR", "STATUS"])
@@ -1492,4 +1509,116 @@ fn a_stalled_member_does_not_hold_up_the_primary_lease() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(writes > 20, "only {writes} writes in four seconds");
+}
+
+/// A data node that answers what the coordinators ask when they look at it (`ROLE` as a
+/// replica of nobody in the group, one shard, map version 3) and never answers anything else,
+/// such as `REPLICAOF`: a member stuck after it was seen.
+struct StandIn {
+    address: SocketAddr,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl StandIn {
+    fn start(address: SocketAddr) -> Self {
+        let listener = std::net::TcpListener::bind(address).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = std::sync::Arc::clone(&stop);
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                let Ok(stream) = stream else { continue };
+                let stopped = std::sync::Arc::clone(&stopped);
+
+                std::thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                    let mut writer = stream.try_clone().unwrap();
+                    let mut reader = BufReader::new(stream);
+
+                    while !stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                        let Some(words) = read_command(&mut reader) else {
+                            continue;
+                        };
+                        let words: Vec<String> =
+                            words.iter().map(|word| word.to_ascii_uppercase()).collect();
+                        let reply: &[u8] = match words.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+                            ["PING"] => b"+PONG\r\n",
+                            ["ROLE"] => {
+                                b"*5\r\n$5\r\nslave\r\n$9\r\n127.0.0.1\r\n:1\r\n$9\r\nconnected\r\n:0\r\n"
+                            }
+                            ["CONFIG", "GET", "SHARDS"] => b"*2\r\n$6\r\nshards\r\n$1\r\n1\r\n",
+                            ["INFO", ..] => b"$0\r\n\r\n",
+                            ["RUVIO", "TOPOLOGY", "VERSION"] => b":3\r\n",
+                            // Stuck: read on, answer nothing.
+                            _ => continue,
+                        };
+                        if writer.write_all(reply).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        Self { address, stop }
+    }
+}
+
+impl Drop for StandIn {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Wakes the accept loop so it sees the flag and drops the listener.
+        let _ = std::net::TcpStream::connect_timeout(&self.address, Duration::from_millis(300));
+    }
+}
+
+/// One RESP command (an array of bulk strings); `None` on a timeout or anything else.
+fn read_command(reader: &mut impl BufRead) -> Option<Vec<String>> {
+    let mut line = String::new();
+
+    reader.read_line(&mut line).ok()?;
+    let count: usize = line.trim_end().strip_prefix('*')?.parse().ok()?;
+    let mut words = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        line.clear();
+        reader.read_line(&mut line).ok()?;
+        let length: usize = line.trim_end().strip_prefix('$')?.parse().ok()?;
+        let mut word = vec![0; length + 2];
+
+        reader.read_exact(&mut word).ok()?;
+        word.truncate(length);
+        words.push(String::from_utf8_lossy(&word).into_owned());
+    }
+    Some(words)
+}
+
+/// Each group is tended on its own task: a member of group `a` that answers the coordinator's
+/// looks but never its `REPLICAOF` holds up only group `a`, and group `b` still fails over
+/// within about `down_after`. Before, one such member held every group for ten seconds a tick.
+#[test]
+fn a_stuck_member_of_one_group_does_not_delay_a_failover_in_another() {
+    let dir = tempfile::tempdir().unwrap();
+    // Node 1, group a's replica, is stuck.
+    let mut groups = TwoGroups::start_with(dir.path(), &[], |index, address| {
+        (index == 1).then(|| StandIn::start(address))
+    });
+
+    // A few ticks in which the leader tries to point the stuck member at group a's primary.
+    std::thread::sleep(Duration::from_millis(600));
+    let killed = Instant::now();
+
+    groups.processes[2].as_mut().unwrap().kill();
+    wait_until("group b's replica to take over", || {
+        call(&groups.node(3), &["ROLE"]).is_some_and(|role| role.starts_with("master"))
+    });
+    let took = killed.elapsed();
+
+    // down_after is 1 s; a tick, the coordinators' verdict and the promotion fit in the rest.
+    assert!(
+        took < Duration::from_secs(4),
+        "group b failed over {took:?} after its primary died"
+    );
 }
