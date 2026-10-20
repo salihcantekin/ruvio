@@ -24,7 +24,10 @@ units, a real two-shard routing smoke, and every client suite (Rust, C# with the
 .NET integrations, Go on its `go.mod` floor, Node, Python 3.9 and 3.13, Java)
 against live servers started by `scripts/run_with_servers.sh`. Live client
 tests skip themselves without `RUVIO_TEST_ADDR`, so a suite run without a
-server proves only the offline tests. The extended workflow at
+server proves only the offline tests. The script also starts three
+`ruvio coordinator` processes over a two-node group, and each client has one
+live test that kills that group's primary and follows the failover; it adds
+about 5-8 s to each client suite (see `docs/CLIENT_BEHAVIOR.md`, *Tests*). The extended workflow at
 `.github/workflows/ci.yml` is **manual-dispatch only**. When dispatched, it
 defines these additional checks:
 

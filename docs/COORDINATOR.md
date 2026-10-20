@@ -365,8 +365,10 @@ support connects to the coordinators with the group name as the service name:
 
 Checked with redis-py's `Sentinel` (5.2): it discovers the primary, writes through it, and writes to
 the new primary about 1.2 seconds after the old one is killed (`scripts/coordinator_faults.py client`).
-Other libraries were not tried. Ruvio's own clients do not speak Sentinel yet; after a failover they reach the new primary through their
-seed addresses (see [CLIENT_BEHAVIOR.md](CLIENT_BEHAVIOR.md)) and `ROLE`.
+Other libraries were not tried. Ruvio's own six clients ask the coordinators through their coordinator
+option (`sentinel_master`, see [CLIENT_BEHAVIOR.md](CLIENT_BEHAVIOR.md#following-a-failover)); their live tests kill a
+primary under three coordinators, and the first write through the coordinators lands on the new primary about
+0.9-1.6 seconds later (Mac, debug server).
 
 ## Security
 
