@@ -635,7 +635,17 @@ impl Api {
             ));
         }
         // Not while a failover of the group is being decided: it might choose this member.
-        let _decided = self.sightings.grants().decision(&configured.name).await;
+        let Ok(_decided) = tokio::time::timeout(
+            MEMBERSHIP_WAIT,
+            self.sightings.grants().decision(&configured.name),
+        )
+        .await
+        else {
+            return Value::Error(format!(
+                "ERR a failover of {} is being decided; try again",
+                configured.name
+            ));
+        };
         let group = self.machine.group(configured);
 
         if self

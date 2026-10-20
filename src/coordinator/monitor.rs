@@ -118,6 +118,12 @@ impl Sightings {
         let key = (group.to_owned(), member.to_owned());
 
         if sighting.complete() {
+            let mut sighting = sighting;
+
+            // One failed `INFO server` does not forget who the member is.
+            if sighting.run_id.is_none() {
+                sighting.run_id = sightings.get(&key).and_then(|known| known.run_id.clone());
+            }
             sightings.insert(key, sighting);
         } else {
             let known = sightings.entry(key).or_default();
@@ -1360,11 +1366,39 @@ impl Leader {
         }
 
         reconcile(config, group, &primary, &seen, &fence).await;
+        self.list_again(configured).await;
         self.start_discovery(configured, group, &seen[at]);
     }
 }
 
 impl Leader {
+    /// Records the group's list again when the file names a member that was forgotten, which
+    /// takes it back (see [`super::raft::apply_members`]). Rare: only after the file changed.
+    async fn list_again(&self, configured: &Group) {
+        let forgotten = self.machine.forgotten(&configured.name);
+
+        if !configured
+            .members
+            .iter()
+            .any(|member| forgotten.contains(&member.address.to_string()))
+        {
+            return;
+        }
+        let (group, previous) = self.machine.group_and_record(configured);
+        let request = Request::SetMembers {
+            group: configured.name.clone(),
+            previous,
+            members: group.members,
+        };
+
+        match tokio::time::timeout(DISCOVERY_WRITE, self.raft.client_write(request)).await {
+            Ok(Ok(reply)) if reply.data => {
+                info!(group = %configured.name, "a forgotten member is listed in the file again; it is a member again")
+            }
+            _ => {}
+        }
+    }
+
     /// Starts [`Leader::discover`] on its own task when the answering primary lists replicas
     /// that `group` does not have, have not been forgotten and did not fail lately; one at a
     /// time per group, so it never delays the group's tending.

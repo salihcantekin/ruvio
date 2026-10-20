@@ -610,22 +610,28 @@ pub fn apply_members(
                     .any(|member| member.address.to_string() == primary)
             });
 
-            let forgets = forgotten.get(group).is_some_and(|forgotten| {
-                listed
-                    .iter()
-                    .any(|member| forgotten.contains(&member.address.to_string()))
-            });
-
-            if members.get(group) != previous.as_ref()
-                || twice
-                || forgets
-                || !holds_primary
-                || members.get(group) == Some(listed)
-            {
+            if members.get(group) != previous.as_ref() || twice || !holds_primary {
                 return false;
             }
-            members.insert(group.clone(), listed.clone());
-            true
+            // Listing a forgotten member takes it back: the leader lists one only when the
+            // file names it again (discovery skips forgotten members).
+            let mut changed = false;
+
+            if let Some(forgotten) = forgotten.get_mut(group) {
+                let before = forgotten.len();
+
+                forgotten.retain(|address| {
+                    !listed
+                        .iter()
+                        .any(|member| member.address.to_string() == *address)
+                });
+                changed = forgotten.len() != before;
+            }
+            if members.get(group) != Some(listed) {
+                members.insert(group.clone(), listed.clone());
+                changed = true;
+            }
+            changed
         }
         Request::Forget { group, member } => {
             if primary(group).as_ref() == Some(member) {
@@ -1273,12 +1279,7 @@ mod tests {
 
         assert!(apply!(&forget));
         assert!(!apply!(&forget));
-        // A forgotten member is neither listed again nor made primary.
-        assert!(!apply!(&Request::SetMembers {
-            group: "main".into(),
-            previous: Some(vec![member(6379), member(6380)]),
-            members: vec![member(6379), member(6380), member(6381)],
-        }));
+        // A forgotten member is not made primary until it is listed again.
         assert!(forgotten_primary(
             &forgotten,
             &Request::SetPrimary {
@@ -1290,10 +1291,13 @@ mod tests {
         ));
         assert_eq!(forgotten["main"], ["127.0.0.1:6381"]);
         assert_eq!(members["main"].len(), 2);
-        members.insert(
-            "main".into(),
-            vec![member(6379), member(6380), member(6381)],
-        );
+        // Listed again (the file names it): no longer forgotten.
+        assert!(apply!(&Request::SetMembers {
+            group: "main".into(),
+            previous: Some(vec![member(6379), member(6380)]),
+            members: vec![member(6379), member(6380), member(6381)],
+        }));
+        assert!(forgotten["main"].is_empty());
         machine.state.write().unwrap().members = members;
         let listed = |group: &Group| -> Vec<u16> {
             group
