@@ -117,6 +117,20 @@ pub struct ClientOptions {
     /// server without replication). Replies are then held until that many replicas have the
     /// writes on disk. Defaults to `None` (nothing is sent).
     pub durability: Option<Durability>,
+    /// When true (the default) a standalone client finds the primary again after a failover:
+    /// on a reconnect with several seeds (or a [`Self::sentinel_master`]) it asks the seeds
+    /// `ROLE` and connects to the one that answers `master`, and on a `READONLY` reply to a
+    /// command it does the same and sends that command once more to the new primary (`READONLY`
+    /// means it was not applied). A replica's reported primary is followed. Nothing is sent
+    /// while the connection is healthy. Ignored in cluster mode. Set it to false to get the
+    /// `READONLY` error and the old reconnect order back.
+    pub follow_primary: bool,
+    /// When set, [`Self::seeds`] (or `host`/`port`) are coordinator or Sentinel addresses, not
+    /// data nodes: the primary of this master name is asked with
+    /// `SENTINEL get-master-addr-by-name <name>`, checked with `ROLE`, and connected to, at
+    /// connect time, on every reconnect and after a `READONLY` reply. The same `AUTH`
+    /// credentials are sent to the coordinators and the data node. Defaults to `None`.
+    pub sentinel_master: Option<String>,
 }
 
 /// The replicas a connection waits for before its replies are released; see
@@ -186,6 +200,157 @@ pub(crate) fn open_first(
     Err(last_error.unwrap_or_else(|| Error::Protocol("no address to connect to".to_owned())))
 }
 
+/// What `ROLE` said: `master`, or `slave` with the address the replica reports for its primary
+/// (for Ruvio that is the replication address, which is not always a client address).
+enum Role {
+    Master,
+    Replica(Option<(String, u16)>),
+}
+
+fn read_role(reply: &RespValue) -> Option<Role> {
+    let items = reply.as_array()?;
+    let kind = items.first()?.as_string().ok()??;
+
+    if kind.eq_ignore_ascii_case("master") {
+        return Some(Role::Master);
+    }
+
+    if !kind.eq_ignore_ascii_case("slave") {
+        return None;
+    }
+
+    let host = items
+        .get(1)
+        .and_then(|item| item.as_string().ok().flatten())
+        .filter(|host| !host.is_empty());
+    let port = items
+        .get(2)
+        .and_then(RespValue::as_integer)
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port != 0);
+
+    Some(Role::Replica(host.zip(port)))
+}
+
+/// The options of a probe socket: no durability, and a reply wait of at most the connect
+/// timeout, so a hung seed costs one bounded wait and never the 30 s command timeout.
+fn probe_options(options: &ClientOptions) -> ClientOptions {
+    let mut probe = options.clone();
+
+    probe.durability = None;
+    probe.command_timeout = Some(
+        options
+            .command_timeout
+            .map_or(options.connect_timeout, |wait| {
+                wait.min(options.connect_timeout)
+            }),
+    );
+
+    probe
+}
+
+/// One bounded question to one address. `None` when it cannot be reached or does not answer;
+/// a refused `AUTH` is an error, as in [`open_first`].
+fn ask(
+    address: &(String, u16),
+    options: &ClientOptions,
+    arguments: &[&str],
+) -> Result<Option<RespValue>, Error> {
+    let mut connection = match Connection::open(&address.0, address.1, options) {
+        Ok(connection) => connection,
+        Err(Error::Io(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+
+    match connection.send(arguments) {
+        Ok(RespValue::Error(_)) | Err(Error::Io(_)) => Ok(None),
+        Ok(reply) => Ok(Some(reply)),
+        Err(error) => Err(error),
+    }
+}
+
+fn ask_role(address: &(String, u16), probe: &ClientOptions) -> Result<Option<Role>, Error> {
+    Ok(ask(address, probe, &["ROLE"])?.and_then(|reply| read_role(&reply)))
+}
+
+/// The address `SENTINEL get-master-addr-by-name` names, when the coordinator answers one.
+fn ask_sentinel(
+    address: &(String, u16),
+    name: &str,
+    probe: &ClientOptions,
+) -> Result<Option<(String, u16)>, Error> {
+    let Some(reply) = ask(
+        address,
+        probe,
+        &["SENTINEL", "get-master-addr-by-name", name],
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some([host, port]) = reply.as_array() else {
+        return Ok(None);
+    };
+    let host = host
+        .as_string()
+        .ok()
+        .flatten()
+        .filter(|host| !host.is_empty());
+    let port = port
+        .as_string()
+        .ok()
+        .flatten()
+        .and_then(|port| port.parse::<u16>().ok());
+
+    Ok(host.zip(port))
+}
+
+/// Finds the address that answers `ROLE` with `master`, asking `seeds` in order from `start`.
+/// A replica's reported primary is asked after the seeds, once per address. With
+/// [`ClientOptions::sentinel_master`] the seeds are coordinators: each names a primary, and the
+/// first that `ROLE` confirms wins. `avoid` is an address that must not be taken (the one that
+/// just answered `READONLY`). One round, every question bounded by [`probe_options`]; `None`
+/// when no address is confirmed.
+pub(crate) fn find_primary(
+    seeds: &[(String, u16)],
+    start: usize,
+    avoid: Option<&(String, u16)>,
+    options: &ClientOptions,
+) -> Result<Option<(String, u16)>, Error> {
+    let probe = probe_options(options);
+    let mut queue: std::collections::VecDeque<(String, u16)> = (0..seeds.len())
+        .map(|step| seeds[(start + step) % seeds.len()].clone())
+        .collect();
+
+    if let Some(name) = &options.sentinel_master {
+        for seed in queue {
+            if let Some(address) = ask_sentinel(&seed, name, &probe)? {
+                if Some(&address) != avoid
+                    && matches!(ask_role(&address, &probe)?, Some(Role::Master))
+                {
+                    return Ok(Some(address));
+                }
+            }
+        }
+
+        return Ok(None);
+    }
+
+    let mut seen: Vec<(String, u16)> = queue.iter().cloned().collect();
+
+    while let Some(address) = queue.pop_front() {
+        match ask_role(&address, &probe)? {
+            Some(Role::Master) if Some(&address) != avoid => return Ok(Some(address)),
+            Some(Role::Replica(Some(reported))) if !seen.contains(&reported) => {
+                seen.push(reported.clone());
+                queue.push_back(reported);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(None)
+}
+
 impl Default for ClientOptions {
     fn default() -> Self {
         Self {
@@ -204,6 +369,8 @@ impl Default for ClientOptions {
             reconnect_max_delay: Duration::from_secs(2),
             read_policy: ReadPolicy::Primary,
             durability: None,
+            follow_primary: true,
+            sentinel_master: None,
         }
     }
 }
@@ -265,6 +432,9 @@ pub struct Client {
     /// The addresses from [`ClientOptions::addresses`] and the one the socket is connected to.
     addresses: Vec<(String, u16)>,
     current: usize,
+    /// True between a successful `MULTI` and `EXEC` / `DISCARD` sent through this client; a
+    /// refused command inside it is never sent again.
+    in_multi: bool,
 }
 
 enum Transport {
@@ -411,10 +581,18 @@ impl Client {
     /// # }
     /// ```
     pub fn connect_with(options: ClientOptions) -> Result<Self, Error> {
-        let addresses = options.addresses();
+        let mut addresses = options.addresses();
 
         if addresses.iter().any(|(host, _)| host.is_empty()) {
             return Err(Error::Protocol("host is required".to_owned()));
+        }
+
+        if let Some(name) = &options.sentinel_master {
+            let primary = find_primary(&addresses, 0, None, &options)?.ok_or_else(|| {
+                Error::Protocol(format!("no coordinator names a primary for '{name}'"))
+            })?;
+
+            addresses = vec![primary];
         }
 
         let (seed, current) = open_first(&addresses, 0, &options)?;
@@ -446,6 +624,7 @@ impl Client {
                     subscriptions: Vec::new(),
                     addresses,
                     current,
+                    in_multi: false,
                 })
             }
 
@@ -1423,9 +1602,32 @@ impl Client {
             Transport::Cluster(router) => router.execute(arguments)?,
         };
 
-        let reply = throw_error(reply)?;
+        let reply = match throw_error(reply) {
+            Err(Error::Server(message)) if is_readonly(&message) && self.follows() => {
+                if !self.follow_after_readonly()? {
+                    return Err(Error::Server(message));
+                }
+
+                return throw_error(self.send_single(arguments)?);
+            }
+            other => other?,
+        };
 
         self.remember_subscription(arguments);
+
+        if self.in_multi {
+            if arguments.first().is_some_and(|name| {
+                name.eq_ignore_ascii_case("EXEC") || name.eq_ignore_ascii_case("DISCARD")
+            }) {
+                self.in_multi = false;
+            }
+        } else if matches!(&reply, RespValue::Simple(ok) if ok == "OK")
+            && arguments
+                .first()
+                .is_some_and(|name| name.len() == 5 && name.eq_ignore_ascii_case("MULTI"))
+        {
+            self.in_multi = true;
+        }
 
         // MONITOR turns this socket into a push stream: drop the command timeout from it,
         // unless the caller set a read timeout to poll with.
@@ -1468,7 +1670,19 @@ impl Client {
             Transport::Cluster(router) => router.execute_binary(arguments)?,
         };
 
-        throw_error(reply)
+        match throw_error(reply) {
+            Err(Error::Server(message)) if is_readonly(&message) && self.follows() => {
+                if !self.follow_after_readonly()? {
+                    return Err(Error::Server(message));
+                }
+
+                match &mut self.transport {
+                    Transport::Single(connection) => throw_error(connection.send_bytes(arguments)?),
+                    Transport::Cluster(_) => Err(Error::Server(message)),
+                }
+            }
+            other => other,
+        }
     }
 
     /// Pipelines commands: writes all of them, then reads one reply each, in one round trip.
@@ -1593,7 +1807,7 @@ impl Client {
             options.host = host;
             options.port = port;
             options.seeds.clear();
-        } else if self.addresses.len() > 1 {
+        } else if self.addresses.len() > 1 && self.options.sentinel_master.is_none() {
             // The subscriber starts at the address the command socket is on.
             options.seeds = self.addresses.clone();
             options.seeds.rotate_left(self.current);
@@ -1645,14 +1859,17 @@ impl Client {
         self.notify_lost(host, port);
 
         // Each attempt tries every address once, starting with the one after the address that
-        // dropped, so a single address behaves as before and a moved primary is found.
+        // dropped, so a single address behaves as before and a moved primary is found. With
+        // several seeds (or a coordinator name) the address that answers `ROLE` with `master`
+        // comes first.
         let start = (self.current + 1) % self.addresses.len();
+        let follow = self.follows();
         let mut attempt = 0_u32;
 
-        let (mut opened, current) = loop {
+        let (opened, current) = loop {
             attempt += 1;
 
-            match open_first(&self.addresses, start, &self.options) {
+            match self.open_next(start, follow) {
                 Ok(found) => break found,
                 Err(error) => match self.next_delay(attempt) {
                     Some(delay) => std::thread::sleep(delay),
@@ -1661,6 +1878,30 @@ impl Client {
             }
         };
 
+        self.settle(opened, current)
+    }
+
+    /// One reconnect attempt: the confirmed primary when `follow` is set and one is found, else
+    /// the first address that answers.
+    fn open_next(&mut self, start: usize, follow: bool) -> Result<(Connection, usize), Error> {
+        if follow {
+            let seeds = self.follow_seeds();
+
+            if let Some(address) = find_primary(&seeds, start % seeds.len(), None, &self.options)? {
+                match Connection::open(&address.0, address.1, &self.options) {
+                    Ok(connection) => return Ok((connection, self.locate(address))),
+                    Err(Error::Io(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+
+        open_first(&self.addresses, start, &self.options)
+    }
+
+    /// Restores `SELECT` and subscriptions on a freshly opened socket and makes it the
+    /// connection.
+    fn settle(&mut self, mut opened: Connection, current: usize) -> Result<(), Error> {
         if self.database != 0 {
             let index = self.database.to_string();
 
@@ -1675,12 +1916,103 @@ impl Client {
 
         self.transport = Transport::Single(opened);
         self.current = current;
+        self.in_multi = false;
 
         let (host, port) = self.addresses[current].clone();
 
         self.notify_restored(host, port);
 
         Ok(())
+    }
+
+    /// True for a standalone client that has something to ask: several seeds or a coordinator
+    /// name. A lone address behaves as it always did.
+    fn follows(&self) -> bool {
+        self.options.follow_primary
+            && matches!(self.transport, Transport::Single(_))
+            && (self.addresses.len() > 1 || self.options.sentinel_master.is_some())
+    }
+
+    /// Where the primary is asked for: the coordinators with a master name, else the seeds
+    /// (plus any address found by an earlier follow).
+    fn follow_seeds(&self) -> Vec<(String, u16)> {
+        if self.options.sentinel_master.is_some() {
+            self.options.addresses()
+        } else {
+            self.addresses.clone()
+        }
+    }
+
+    /// The index of `address` in the connect list, which gains it when it is new (with a
+    /// coordinator name the list is just the primary).
+    fn locate(&mut self, address: (String, u16)) -> usize {
+        if self.options.sentinel_master.is_some() {
+            self.addresses = vec![address];
+
+            return 0;
+        }
+
+        match self.addresses.iter().position(|known| *known == address) {
+            Some(index) => index,
+            None => {
+                self.addresses.push(address);
+
+                self.addresses.len() - 1
+            }
+        }
+    }
+
+    /// Moves the connection to the primary after a `READONLY` reply, asking again with the
+    /// reconnect backoff until [`ClientOptions::max_reconnect_attempts`] rounds have passed.
+    /// Returns true when the command may be sent again on the new socket: the refusal means it
+    /// was not applied, except inside a transaction, whose earlier commands are lost with the
+    /// old socket.
+    #[cold]
+    fn follow_after_readonly(&mut self) -> Result<bool, Error> {
+        let retry = !self.in_multi;
+        let refused = self.addresses[self.current].clone();
+        let mut attempt = 0_u32;
+
+        loop {
+            attempt += 1;
+
+            let seeds = self.follow_seeds();
+            let start = if self.options.sentinel_master.is_some() {
+                0
+            } else {
+                (self.current + 1) % seeds.len()
+            };
+
+            if let Some(address) = find_primary(&seeds, start, Some(&refused), &self.options)? {
+                match Connection::open(&address.0, address.1, &self.options) {
+                    Ok(opened) => {
+                        self.notify_lost(refused.0.clone(), refused.1);
+
+                        let index = self.locate(address);
+
+                        self.settle(opened, index)?;
+
+                        return Ok(retry);
+                    }
+                    Err(Error::Io(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+
+            match self.next_delay(attempt) {
+                Some(delay) => std::thread::sleep(delay),
+                None => return Ok(false),
+            }
+        }
+    }
+
+    fn send_single(&mut self, arguments: &[&str]) -> Result<RespValue, Error> {
+        match &mut self.transport {
+            Transport::Single(connection) => connection.send(arguments),
+            Transport::Cluster(_) => Err(Error::Protocol(
+                "a cluster client does not follow a primary".to_owned(),
+            )),
+        }
     }
 
     // Doubles per attempt and is capped at reconnect_max_delay, so a server that is still
@@ -1892,7 +2224,15 @@ fn finish_standalone(
         subscriptions: Vec::new(),
         addresses,
         current,
+        in_multi: false,
     })
+}
+
+/// A refused write: `READONLY` followed by a space or nothing.
+fn is_readonly(message: &str) -> bool {
+    message
+        .strip_prefix("READONLY")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
 }
 
 fn is_subscription_command(arguments: &[&str]) -> bool {
@@ -2437,6 +2777,8 @@ mod tests {
                     .map(|port| ("127.0.0.1".to_owned(), *port))
                     .collect(),
                 discover_cluster: false,
+                // The scripted seeds only answer PING; the rotation is what is checked.
+                follow_primary: false,
                 reconnect_base_delay: Duration::ZERO,
                 reconnect_max_delay: Duration::ZERO,
                 ..ClientOptions::default()

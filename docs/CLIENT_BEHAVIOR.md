@@ -28,7 +28,7 @@ What the six clients do when a cluster redirects, a command spans slots, or a so
 | Socket dropped before any reply byte | The command fails and is never sent again, reads included. The socket is opened again for the next command |
 | Pipelines in a cluster | Grouped per node, replies returned in the original order |
 | Seed addresses | A list of seed addresses can be given in place of the single host and port; with no list the host and port are used as before. Connecting tries the seeds in order, one connect attempt each, and keeps the first that answers. A seed that cannot be reached (refused, timed out) is skipped; a refused `AUTH` or `SELECT` stops at once. When none answers, the last connect error is returned |
-| Reconnect with seeds (standalone) | Each reconnect attempt tries every seed once, starting with the seed after the address that dropped and ending with that address; the reconnect backoff runs between attempts, as with one address. The command that hit the drop still fails. A subscriber socket opened later starts at the address the command socket is on |
+| Reconnect with seeds (standalone) | Each reconnect attempt tries every seed once, starting with the seed after the address that dropped and ending with that address; the reconnect backoff runs between attempts, as with one address. The command that hit the drop still fails. A subscriber socket opened later starts at the address the command socket is on. With several seeds the address that answers `ROLE` with `master` comes first, see [Following a failover](#following-a-failover) |
 | Slot map reload (cluster) | `CLUSTER SLOTS` comes from the first reachable seed. A reload asks the nodes that have an open socket first; when none answers, it opens every other known node and then every seed, one connect attempt each, until one returns a slot map. A node that cannot be opened again (after its reconnect attempts) triggers that reload, and the command goes to the owner the new map names; a keyless command whose node is gone goes to the first reachable node of the new map. Seeds are never asked while the known nodes answer, so the routing path does not change |
 | Stream entry fields | Returned as `(name, value)` pairs in stored order; a name written twice comes back twice. Rust `Vec<(String, String)>`, C# `IReadOnlyList<KeyValuePair<string, string>>`, Go `XMessage.Values` (flat; `Map()` keeps the last value of a repeated name), Java `List<KeyValue<K, V>>`, Python a list of tuples, Node `[name, value][]`. `HRANDFIELD` with a negative count and `WITHVALUES` likewise returns every pair, repeats included |
 
@@ -59,6 +59,69 @@ A cluster client can send read-only commands to replicas. The server lists each 
 
 The live tests start a 2-shard primary and its 2-shard replica (`RUVIO_REPLICATED_ADDR`, `RUVIO_REPLICA_ADDR` from `scripts/run_with_servers.sh`) and check through the replica's `INFO get_commands` that a read went to the replica.
 
+## Following a failover
+
+After a failover the primary is another node. A standalone client with several seeds, or with a coordinator name, finds it again instead of staying on a node that is now a replica. All six clients do the same; this section is the contract. It applies to standalone connections only: a cluster client (a multi-node slot map) keeps its `MOVED`/`ASK` rules and does not run any of this.
+
+| Client | Follow option (default on) | Coordinator option (default off) |
+| --- | --- | --- |
+| Rust | `ClientOptions::follow_primary` | `ClientOptions::sentinel_master: Option<String>` |
+| C# | `RuvioClientOptions.FollowPrimary` | `RuvioClientOptions.SentinelMaster` |
+| Go | `Options.DisableFollowPrimary` (zero value keeps it on) | `Options.SentinelMaster` |
+| Java | `RuvioOptions.Builder.followPrimary(boolean)` | `RuvioOptions.Builder.sentinelMaster(String)` |
+| Node | `followPrimary: boolean` | `sentinelMaster: string` |
+| Python | `follow_primary=True` | `sentinel_master=None` |
+
+Following is active when the option is on, the connection is standalone, and there are at least two seeds or a coordinator name is set. With one seed and no name nothing changes: reconnect and `READONLY` behave as in the tables above. Off restores exactly the behavior of those tables.
+
+### Terms
+
+A probe is a short-lived socket made only to ask one question. It connects (bounded by the connect timeout), sends `AUTH` as configured (nothing else: no `SELECT`, no durability, no subscriptions), sends one command, reads one reply, and closes. The reply wait of a probe is the smaller of the connect timeout and the command timeout (the connect timeout when the command timeout is off), so a hung seed costs one bounded wait and never the 30 s command timeout. A probe that cannot connect, times out, drops, or gets an error reply counts as "no answer" for that address. A refused `AUTH` is not "no answer": it fails the operation with that error at once, as connecting does.
+
+`ROLE` is read from the reply array: first element `master` means primary; `slave` means replica, with element 2 the host and element 3 the port (an integer; a string is accepted) it reports for its primary. A replica that reports no host or port 0 reports nothing. Any other reply is "no answer". Ruvio's replica reports the primary's replication address, which is not always its client address; Redis-compatible servers report the client address. The reported address is therefore only a hint: it is probed like a seed and ignored when it does not answer `ROLE`.
+
+### Finding the primary (one round)
+
+Input: the seed list, a start index, an optional address to avoid. Output: the address of a node that answered `master`, or none.
+
+1. Build a queue of the seeds in order, starting at the start index and wrapping around. The "seen" set holds the seeds.
+2. Take the next address. Probe it with `ROLE`.
+3. `master` and the address is not the one to avoid: the round ends with this address. (The avoided address is the one that just answered `READONLY`; a primary that was replaced can still say `master`.)
+4. `slave` with a reported address that is not in the seen set: add it to the seen set and to the end of the queue. Everything else (no answer, an avoided master, a reported address already seen) just moves on.
+5. When the queue is empty, the round ends with none.
+
+With a coordinator name the seeds are coordinators instead of data nodes. For each seed in order, probe it with `SENTINEL get-master-addr-by-name <name>`; an array of host and port (a string port) names an address, a nil or error reply is "no answer". Probe the named address with `ROLE` as above: if it answers `master` (and is not the avoided address) the round ends with it, otherwise the next coordinator is asked. Replica hints are not followed in this mode. The same `AUTH` credentials go to coordinators and data nodes.
+
+A round sends at most two probes per distinct address (a seed and, once, a reported address) and is bounded by the probe timeouts. No state of the connection is kept in a probe.
+
+### On reconnect
+
+When a standalone connection is found broken and `reconnect` is on, each reconnect attempt that follows runs one round (start index: the seed after the one that dropped; nothing avoided). If a primary is found, a normal connection (with `AUTH`, durability, `SELECT`, subscriptions restored as before) is opened to it. If that open fails with an I/O error, or the round found none, the attempt falls back to the existing seed order (first seed that answers, as in "Reconnect with seeds"): a client may then sit on a replica during an election and still serve reads, and its next write meets `READONLY` below. The reconnect backoff and attempt limits are unchanged. The command that hit the drop is still not sent again. The connection-lost and connection-restored hooks report the old and the new address. The first connect keeps its order (first seed that answers), except with a coordinator name, where the first connect asks the coordinators (one round, no waiting between rounds) and fails with the client's own protocol error naming the master when none names a primary.
+
+### On `READONLY`
+
+The reply to a command on a standalone connection is an error whose text is `READONLY` alone or `READONLY` followed by a space. Only then:
+
+1. Run rounds to find the primary, avoiding the address that answered. Between rounds wait with the reconnect backoff (Rust and C#: their attempt count, base and maximum delay; Go, Java, Node and Python: up to 8 rounds, waits of 100 ms doubling to a 2 s cap, 7.1 s in all, in a timer or sleep that never blocks other work). With `reconnect` off, one round.
+2. When a primary is found, open a normal connection to it (as on reconnect), replace the old socket, and report lost and restored.
+3. Retry rule: the refused command is sent once more on the new connection, because `READONLY` is sent before the command runs, so it was not applied. The retry's reply, an error included (a second `READONLY` too), goes to the caller; there is never a third send and no new round for the retry.
+4. When no round finds a primary, the original `READONLY` error is returned. The connection stays where it was.
+
+Not retried (the connection still moves to the primary, so the next command works):
+
+- A command sent inside a transaction the client opened (`MULTI` acknowledged, no `EXEC` or `DISCARD` since): its earlier queued commands are gone with the old socket, so sending only this one would break the transaction. The `READONLY` error is returned and the client is no longer in a transaction.
+- Commands of a pipeline: a `READONLY` reply at an index of a pipeline is returned at that index; nothing follows and nothing is resent.
+- Any other error, `LOADING`, `MASTERDOWN` and `NOREPLICAS` included, and any reply that is not `READONLY`.
+- A command that failed with an I/O error (the "Socket dropped" rule stands: never sent again).
+
+### Cost and timeouts
+
+While the connection is healthy nothing is sent and nothing is checked on the success path: the only added work is looking at the text of an error reply that is already being returned. Python and Node check it where they already inspect error replies. A client that tracks the transaction flag does it only where it already looks at command names, and sets it on the `MULTI` reply. Probes are the only extra connections, and only during a reconnect or after a `READONLY` reply. Existing command timeouts are not changed; the added wait is bounded by (rounds x probes x probe timeout) plus the backoff, about 7 s of backoff in the default setup.
+
+### Tests
+
+Every client has a scripted test (nodes that answer `ROLE`, refuse writes with `READONLY`, and name a primary for `SENTINEL`) for: the retry once, the second refusal, the transaction, the reconnect order, the reported primary, the coordinator name, the option off, no extra commands while healthy, and a hung seed bounded. Every client also has a live test on the pair `scripts/run_with_servers.sh` starts (`RUVIO_FAILOVER_ADDRS`, the two client addresses, primary first; `RUVIO_FAILOVER_REPLICATION`, their replication addresses): connect with both as seeds, write, wait until the replica holds the key, `REPLICAOF NO ONE` on the replica, `REPLICAOF host port` (the new primary's replication address) on the old primary, and check that the next write through the client succeeds within 5 s and lands on the new primary; that the same situation with the option off is `READONLY`; and that after `CLIENT KILL ID` on the client's socket the reconnect is on the node whose `ROLE` is `master` before any write. Without the variables the live test returns early. Poll with deadlines, never fixed sleeps. No coordinator process is needed.
+
 ## Differences
 
 | Topic | Rust | C# | Go | Java | Node | Python |
@@ -70,6 +133,7 @@ The live tests start a 2-shard primary and its 2-shard replica (`RUVIO_REPLICATE
 | **differs**: a replica answers `LOADING` or `MASTERDOWN` to a read inside a pipeline (`prefer-replica`) | returned as that command's error | the read is sent again to the primary | returned as that command's error | the read is sent again to the primary | the read is sent again to the primary | returned as that command's error |
 | **differs**: wait between seed rounds | the reconnect backoff | the reconnect backoff | none: the next command makes the next round | none: the next command makes the next round | none: the next command makes the next round | none: the next command makes the next round |
 | **differs**: reconnect option | `ClientOptions::reconnect` (default on), attempts and backoff settings | `RuvioClientOptions.Reconnect` (default on), attempts and backoff settings | always on, no option | always on, no option | `reconnect` (default on) | always on, no option |
+| follow-failover options | `follow_primary`, `sentinel_master` | `FollowPrimary`, `SentinelMaster` | `DisableFollowPrimary`, `SentinelMaster` | `followPrimary`, `sentinelMaster` | `followPrimary`, `sentinelMaster` | `follow_primary`, `sentinel_master` |
 
 ## Where it lives
 
