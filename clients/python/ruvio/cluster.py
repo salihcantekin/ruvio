@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import random
 import socket
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import _cluster as cl
@@ -97,8 +98,10 @@ class ClusterRuvio(Ruvio):
     * A pipeline is grouped per node and the replies come back in your order. A pipeline holding a
       command with keys in several slots is refused before sending. A transaction
       (``pipeline(transaction=True)``) must use one slot; ``watch`` pins the node.
-    * ``MOVED`` replies are followed up to 3 times per command (a Ruvio server forwards instead of
-      sending ``MOVED`` for keys, so this matters for other topologies); ``ASK`` is not followed.
+    * ``MOVED`` and ``ASK`` replies are followed up to 3 times per command in all (a Ruvio server forwards
+      instead of sending ``MOVED`` for keys, so this matters for other topologies); ``ASK`` sends ``ASKING`` first
+      and does not change the slot table. ``TRYAGAIN`` is retried up to 3 times after short sleeps (single commands; a pipeline gets it as that
+      command's error).
     * A node socket that fails is closed and reopened by the next command for that node. A command that
       hit a transport failure is never sent again.
     * With ``read_policy=ReadPolicy.PREFER_REPLICA`` or ``REPLICA`` (default ``PRIMARY``), commands the server
@@ -413,7 +416,10 @@ class ClusterRuvio(Ruvio):
             name, _ = cl.frame_head(data)
             reply = self._special(name.upper(), data, dec)
         if isinstance(reply, ResponseError):
-            raise reply
+            if cl.is_tryagain(reply):  # only an error reply gets here
+                reply = self._redirect(reply, data, dec)
+            if isinstance(reply, ResponseError):
+                raise reply
         return reply if conv is None else conv(reply)
 
     def _open_target(self, ni: int, data: bytes) -> _Conn:
@@ -539,17 +545,83 @@ class ClusterRuvio(Ruvio):
         raise error
 
     def _redirect(self, err: MovedError, data: bytes, dec: bool) -> Any:
-        """``-MOVED``: re-sends the command to the node the reply names, at most
-        ``MAX_REDIRECTS`` times; the last ``MovedError`` is returned when they run out."""
+        """Follows ``-MOVED`` and ``-ASK`` (one budget of ``MAX_REDIRECTS`` per command) and re-sends after
+        ``-TRYAGAIN`` (``TRYAGAIN_DELAYS``, one sleep before each re-send); the last error is returned when
+        a budget runs out. ``ASK`` sends ``ASKING`` and the command to the named node and leaves the table alone."""
         reply: Any = err
-        for hop in range(cl.MAX_REDIRECTS):
-            mv = cl.parse_moved(reply)
-            if mv is None:
+        hops = moved = tries = 0
+        while True:
+            if cl.is_tryagain(reply):
+                if tries == len(cl.TRYAGAIN_DELAYS):
+                    return reply
+                node = self._route_node(data)
+                if node is None:
+                    return reply
+                time.sleep(cl.TRYAGAIN_DELAYS[tries])
+                tries += 1
+                reply = self._rt(node.conn, data, dec)
+            else:
+                if hops == cl.MAX_REDIRECTS:
+                    return reply
+                ask = cl.parse_ask(reply)
+                if ask is not None:
+                    reply = self._rt_asking(self._ask_node(ask).conn, data, dec)
+                else:
+                    mv = cl.parse_moved(reply)
+                    if mv is None:
+                        return reply
+                    reply = self._rt(self._moved_to(mv, moved).conn, data, dec)
+                    moved += 1
+                hops += 1
+            if reply.__class__ is not MovedError and not cl.is_tryagain(reply):
                 return reply
-            reply = self._rt(self._moved_to(mv, hop).conn, data, dec)
-            if reply.__class__ is not MovedError:
-                return reply
-        return reply
+
+    def _route_node(self, data: bytes) -> Optional[_Node]:
+        """The node the current table names for a command's frame (the seed for a keyless one); None for a
+        command that is split over several nodes or sent to all of them."""
+        c = self._cl
+        ni = cl.node_index(data, c.slots)
+        if ni is not None:
+            return c.targets[ni]
+        name, _ = cl.frame_head(data)
+        args = cl.split_frame(data)
+        p = cl.plan(name.upper(), args)
+        if p[0] == cl.PLAN_SLOT:
+            return self._owner(p[1])
+        if p[0] == cl.PLAN_SPLIT and p[1]:
+            return self._owner(cl.key_slot(p[1][0])) if len({cl.key_slot(k) for k in p[1]}) == 1 else None
+        return None
+
+    def _ask_node(self, ask: Tuple[int, str, int]) -> _Node:
+        """The node an ``ASK`` names; one that is not known yet gets a connection, the table is not touched."""
+        _, host, port = ask
+        c = self._cl
+        node = c.by_addr.get((host, port))
+        if node is None:
+            node = self._new_node(host, port)
+            c.by_addr[(host, port)] = node
+        return node
+
+    def _rt_asking(self, conn: _Conn, data: bytes, dec: bool) -> Any:
+        """``ASKING`` and the command in one write; the ``ASKING`` reply is read and dropped unless it is an error."""
+        if conn.sock is None:
+            conn.open()
+        p = conn.parser
+        if p.decode is not dec:
+            p.decode = dec
+        t = conn.opts.socket_timeout
+        wait = frames_wait(data) if t is not None else 0.0
+        try:
+            if wait:
+                conn.sock.settimeout(None if wait == FOREVER else t + wait)  # type: ignore[union-attr]
+            conn.sock.sendall(cl.ASKING + data)  # type: ignore[union-attr]
+            first = conn.read()
+            reply = conn.read()
+            if wait:
+                conn.sock.settimeout(t)  # type: ignore[union-attr]
+        except BaseException as exc:
+            raise _fail(conn, exc) from None
+        return first if isinstance(first, ResponseError) else reply
 
     def _moved_to(self, mv: Tuple[int, str, int], hop: int) -> _Node:
         """The node a ``MOVED`` names. The command's first ``MOVED`` to a node in the table points

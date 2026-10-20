@@ -138,12 +138,15 @@ only for a possible `MOVED` retry.
 
 - **`-MOVED`**: the slot is repointed to the named node and the command is sent there; up to **3** redirects are followed per command, a fourth `MOVED` is returned as the error.
   The whole table is re-read with `CLUSTER SLOTS` only when the named node is unknown or on the second `MOVED` for the same command (one request is shared by all callers).
+- **`-ASK`**: `ASKING` and the command are written together to the named node (opened if unknown) and its reply is returned; the slot table is not changed, so the next command for that slot still goes to the owner.
+  `ASK` and `MOVED` share the limit of **3** redirects per command.
+- **`-TRYAGAIN`**: the command is sent again, routed by the current table, up to **3** times after waits of 5, 10 and 20 ms; the fourth `TRYAGAIN` is returned as the error.
   Transport failures are never replayed: the affected calls reject with `ConnectionError`, only that node reconnects (lazily), other nodes are untouched.
 - **Pipelines** are grouped per node: frames are written to each node's connection in call order (one coalesced write per node), replies come back in call order.
-  A cross-slot `MGET`-style command inside a pipeline is split, an unsplittable cross-slot one leaves a `CROSSSLOT` error in its own slot, and `MOVED` is followed per command.
+  A cross-slot `MGET`-style command inside a pipeline is split, an unsplittable cross-slot one leaves a `CROSSSLOT` error in its own slot, and `MOVED`, `ASK` and `TRYAGAIN` are followed per command.
   A lost connection rejects `exec()`, as for a single connection.
-- **Transactions** (`c.multi()`): all keys must hash to one slot, otherwise `exec()` rejects with `CROSSSLOT` and sends nothing; keyless ones run on the seed. `MOVED` inside a
-  transaction is not retried (it surfaces as the `EXECABORT`/command error; the next call fixes the table). `WATCH` needs the owner's own connection: `c.isolated(key, async iso => {...})`.
+- **Transactions** (`c.multi()`): all keys must hash to one slot, otherwise `exec()` rejects with `CROSSSLOT` and sends nothing; keyless ones run on the seed. `MOVED`, `ASK` and `TRYAGAIN` inside a
+  transaction are not retried (it surfaces as the `EXECABORT`/command error; the next call fixes the table). `WATCH` needs the owner's own connection: `c.isolated(key, async iso => {...})`.
 - **Blocking commands** (`BLPOP`, `BRPOP`, `BZPOP*`, `BLMOVE`, `BLMPOP`, `XREAD`/`XREADGROUP ... BLOCK`, `FILLGET ... WAIT`, `WAIT`) run on a pooled dedicated connection to the
   owning node, so they never park the shared one. (Inside a pipeline they use the shared connection.)
 - **Pub/Sub**: `c.subscriber()` connects to the seed node (`SUBSCRIBE`, `PSUBSCRIBE`); `await c.subscriberFor(channel)` connects to the node owning the channel's slot

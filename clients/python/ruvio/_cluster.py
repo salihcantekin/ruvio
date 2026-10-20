@@ -26,8 +26,14 @@ from .errors import CrossSlotError, ResponseError, RuvioError
 
 SLOT_COUNT = 16384
 
-#: ``-MOVED`` redirects followed per command before the error is returned
+#: ``-MOVED`` / ``-ASK`` redirects followed per command (one budget) before the error is returned
 MAX_REDIRECTS = 3
+
+#: sleeps in seconds before the 1st, 2nd and 3rd re-send of a command answered ``-TRYAGAIN``
+TRYAGAIN_DELAYS = (0.005, 0.010, 0.020)
+
+#: ``ASKING`` as a frame, sent in front of the command an ``-ASK`` redirect names
+ASKING = b"*1\r\n$6\r\nASKING\r\n"
 
 _crc16 = binascii.crc_hqx  # CRC-CCITT with poly 0x1021 and init 0 == CRC16/XMODEM, in C
 
@@ -597,8 +603,25 @@ def parse_slots(reply: Any, seed_host: str) -> Optional[Topology]:
 
 def parse_moved(err: BaseException) -> Optional[Tuple[int, str, int]]:
     """``(slot, host, port)`` of a ``MOVED slot host:port`` error; None for anything else."""
+    return _parse_redirect(err, "MOVED ")
+
+
+def parse_ask(err: BaseException) -> Optional[Tuple[int, str, int]]:
+    """``(slot, host, port)`` of an ``ASK slot host:port`` error; None for anything else."""
+    return _parse_redirect(err, "ASK ")
+
+
+def is_tryagain(err: Any) -> bool:
+    """True for a ``TRYAGAIN`` error reply (a ``ResponseError``; any other value is False)."""
+    if not isinstance(err, BaseException):
+        return False
     msg = err.args[0] if err.args else ""
-    if not isinstance(msg, str) or not msg.startswith("MOVED "):
+    return isinstance(msg, str) and msg.startswith("TRYAGAIN")
+
+
+def _parse_redirect(err: BaseException, prefix: str) -> Optional[Tuple[int, str, int]]:
+    msg = err.args[0] if err.args else ""
+    if not isinstance(msg, str) or not msg.startswith(prefix):
         return None
     parts = msg.split()
     if len(parts) < 3:

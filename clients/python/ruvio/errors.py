@@ -101,8 +101,8 @@ class ExecAbortError(ResponseError):
 
 
 class MovedError(ResponseError):
-    """``MOVED`` / ``ASK`` cluster redirection that was not resolved (the cluster client follows ``MOVED`` up
-    to 3 times; ``ASK`` is never followed).
+    """``MOVED`` / ``ASK`` cluster redirection that was not resolved (the cluster client follows ``MOVED``
+    and ``ASK`` up to 3 times per command in all). ``TRYAGAIN`` is a plain :class:`ResponseError`.
     """
 
 

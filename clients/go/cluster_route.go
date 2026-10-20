@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 func (cl *cluster) exec(ctx context.Context, r *request) (Value, error) {
@@ -147,16 +148,38 @@ func (cl *cluster) run(ctx context.Context, t *topology, slot int, r *request, b
 	return cl.send(ctx, node, r, blocking, 0)
 }
 
-// send sends r on node and follows -MOVED until the command has been redirected
+// send sends r on node and follows -MOVED and -ASK until the command has been redirected
 // maxRedirects times in all; redirects is how many it has already followed. Each
-// redirect patches the slot and goes to the node the MOVED named; from the second
-// on it also reloads the table. It recycles r.
+// -MOVED patches the slot and goes to the node it named; from the second redirect on it
+// also reloads the table. -ASK sends ASKING and the command to the named node and leaves
+// the table alone. -TRYAGAIN sends the command again, routed by the current table, up to
+// maxTryAgain times. It recycles r.
 func (cl *cluster) send(ctx context.Context, node *Client, r *request, blocking bool, redirects int) (Value, error) {
+	return cl.drive(ctx, node, false, r, blocking, redirects, 0)
+}
+
+// drive is the loop behind send; asking says the first send goes out behind ASKING, and
+// retries is how many -TRYAGAIN retries the command has used.
+func (cl *cluster) drive(ctx context.Context, node *Client, asking bool, r *request, blocking bool, redirects, retries int) (Value, error) {
 	reloaded := false
 	for {
-		ok, err := node.rt(ctx, r, blocking, !reloaded)
-		if !ok {
-			return Value{}, err
+		var ok bool
+		var err error
+		if asking {
+			asking = false
+			var v Value
+			if v, ok, err = cl.askRT(ctx, node, r, blocking); !ok {
+				putReq(r)
+				if v.Kind == KindError {
+					return v, &Error{Msg: b2s(v.Bytes)}
+				}
+				return Value{}, err
+			}
+		} else {
+			ok, err = node.rt(ctx, r, blocking, !reloaded)
+			if !ok {
+				return Value{}, err
+			}
 		}
 		if r.err != nil {
 			err := r.err
@@ -176,19 +199,16 @@ func (cl *cluster) send(ctx context.Context, node *Client, r *request, blocking 
 		}
 		v := r.val
 		if v.Kind == KindError {
-			if redirects < maxRedirects {
-				if ms, addr, isMoved := parseMoved(v.Bytes); isMoved {
-					redirects++
-					nn, err := cl.applyMoved(ctx, ms, addr, redirects >= 2)
-					if err != nil {
-						putReq(r)
-						return Value{}, err
-					}
-					node = nn
-					r.val, r.vals, r.err = Value{}, nil, nil // the command was not executed: send it again
-					r.state.Store(stateWaiting)
-					continue
-				}
+			nn, ask, err := cl.follow(ctx, v.Bytes, r, &redirects, &retries)
+			if err != nil {
+				putReq(r)
+				return Value{}, err
+			}
+			if nn != nil {
+				node, asking = nn, ask
+				r.val, r.vals, r.err = Value{}, nil, nil // the command was not executed: send it again
+				r.state.Store(stateWaiting)
+				continue
 			}
 			putReq(r)
 			return v, &Error{Msg: b2s(v.Bytes)}
@@ -196,6 +216,85 @@ func (cl *cluster) send(ctx context.Context, node *Client, r *request, blocking 
 		putReq(r)
 		return v, nil
 	}
+}
+
+// follow decides what to do with the error reply msg to r: it returns the node to send r
+// to again (behind ASKING when ask is set), or a nil node when the reply goes back to the
+// caller (not a redirect, or its budget is spent). -TRYAGAIN waits before it returns.
+func (cl *cluster) follow(ctx context.Context, msg []byte, r *request, redirects, retries *int) (node *Client, ask bool, err error) {
+	if ms, addr, ok := parseMoved(msg); ok {
+		if *redirects >= maxRedirects {
+			return nil, false, nil
+		}
+		*redirects++
+		node, err = cl.applyMoved(ctx, ms, addr, *redirects >= 2)
+		return node, false, err
+	}
+	if _, addr, ok := parseAsk(msg); ok {
+		if *redirects >= maxRedirects {
+			return nil, false, nil
+		}
+		*redirects++
+		cl.mu.Lock()
+		node = cl.node(addr)
+		cl.mu.Unlock()
+		return node, true, nil
+	}
+	if isTryAgain(msg) {
+		if *retries >= maxTryAgain {
+			return nil, false, nil
+		}
+		wait := tryAgainWait << *retries
+		*retries++
+		tm := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			tm.Stop()
+			return nil, false, ctx.Err()
+		case <-tm.C:
+		}
+		node = cl.seed
+		if _, slot, _, rerr := routeFrame(r.buf); rerr == nil && slot >= 0 {
+			if t := cl.t.Load(); t != nil {
+				node = t.nodeAt(slot, cl.seed)
+			}
+		}
+		return node, false, nil
+	}
+	return nil, false, nil
+}
+
+// askFrame is ASKING as a RESP frame.
+const askFrame = "*1\r\n$6\r\nASKING\r\n"
+
+// askRT sends ASKING and the command in r to node in one write and puts the command's
+// reply in r.val. ok=false: the call failed; a failed ASKING comes back as v with
+// KindError, any other failure as err. The caller recycles r either way.
+func (cl *cluster) askRT(ctx context.Context, node *Client, r *request, blocking bool) (v Value, ok bool, err error) {
+	q := getReq()
+	q.buf = append(append(q.buf, askFrame...), r.buf...)
+	q.expect = 2
+	q.vals = make([]Value, 0, 2)
+	rok, err := node.rt(ctx, q, blocking, false)
+	if !rok {
+		return Value{}, false, err
+	}
+	if q.err != nil {
+		err = q.err
+		putReq(q)
+		return Value{}, false, err
+	}
+	if len(q.vals) != 2 {
+		putReq(q)
+		return Value{}, false, ErrProtocol
+	}
+	first, second := q.vals[0], q.vals[1]
+	putReq(q)
+	if first.Kind == KindError {
+		return first, false, nil
+	}
+	r.val = second
+	return Value{}, true, nil
 }
 
 // reloadNode reloads the slot table after a node could not be opened and returns the node
@@ -224,16 +323,20 @@ func (cl *cluster) reloadNode(ctx context.Context, r *request) *Client {
 	return nil
 }
 
-// redirect resends the command in r after its first -MOVED reply mv (from a pipelined
-// write), with the same limit and table updates as send. It recycles r.
-func (cl *cluster) redirect(ctx context.Context, mv []byte, r *request) (Value, error) {
-	ms, addr, _ := parseMoved(mv)
-	nn, err := cl.applyMoved(ctx, ms, addr, false)
+// redirect resends the command in r after its first -MOVED, -ASK or -TRYAGAIN reply msg
+// (from a pipelined write), with the same limits and table updates as send. It recycles r.
+func (cl *cluster) redirect(ctx context.Context, msg []byte, r *request) (Value, error) {
+	redirects, retries := 0, 0
+	nn, ask, err := cl.follow(ctx, msg, r, &redirects, &retries)
 	if err != nil {
 		putReq(r)
 		return Value{}, err
 	}
-	return cl.send(ctx, nn, r, false, 1)
+	if nn == nil {
+		putReq(r)
+		return Value{Kind: KindError, Bytes: msg}, &Error{Msg: b2s(msg)}
+	}
+	return cl.drive(ctx, nn, ask, r, false, redirects, retries)
 }
 
 // routeFrame reads the command at the start of b and reports how to route it. slot is the

@@ -14,6 +14,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
@@ -43,6 +44,11 @@ public final class ClusterRouter implements AutoCloseable {
     public static final int SLOTS = 16384;
     /** MOVED redirects followed per command (each to the node the reply names) before the error is returned. */
     public static final int MAX_REDIRECTS = 3;
+    /** Sends again after {@code TRYAGAIN} per command (waiting 5, 10 and 20 ms) before the error is returned. */
+    public static final int MAX_TRYAGAIN = 3;
+    /** The wait before the first {@code TRYAGAIN} retry; it doubles for each further one. */
+    private static final long TRYAGAIN_WAIT_MS = 5;
+    private static final byte[] ASKING = "*1\r\n$6\r\nASKING\r\n".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
 
     /** Where a routed frame goes: straight onto a connection, or into a pipeline group. */
     public interface Sink {
@@ -839,6 +845,94 @@ public final class ClusterRouter implements AutoCloseable {
         }
     }
 
+    /**
+     * Tells whether an error is an {@code ASK} redirect.
+     *
+     * @param error the failure
+     * @return {@code true} for a server error starting with {@code ASK}
+     */
+    public static boolean isAsk(Throwable error) {
+        if (!(error instanceof RuvioServerException)) {
+            return false;
+        }
+        String m = error.getMessage();
+        return m != null && m.startsWith("ASK ");
+    }
+
+    /**
+     * Tells whether an error is a {@code TRYAGAIN} reply: nothing ran, the slot is being handed over.
+     *
+     * @param error the failure
+     * @return {@code true} for a server error starting with {@code TRYAGAIN}
+     */
+    public static boolean isTryAgain(Throwable error) {
+        if (!(error instanceof RuvioServerException)) {
+            return false;
+        }
+        String m = error.getMessage();
+        return m != null && m.startsWith("TRYAGAIN");
+    }
+
+    /**
+     * Sends a command again after {@code TRYAGAIN}, routed by the current slot table, once the wait for this
+     * retry has passed. The wait is scheduled, never slept, so a reader thread is not held.
+     *
+     * @param r the request to send again ({@code r.retries} already counts this retry)
+     * @param tryAgain the {@code TRYAGAIN} error
+     */
+    public void retryLater(RoutedRequest<?> r, Throwable tryAgain) {
+        try {
+            CompletableFuture.delayedExecutor(TRYAGAIN_WAIT_MS << (r.retries - 1), TimeUnit.MILLISECONDS, BACKGROUND)
+                    .execute(() -> resend(r, tryAgain));
+        } catch (RejectedExecutionException e) {
+            r.failFinal(tryAgain);
+        }
+    }
+
+    private void resend(RoutedRequest<?> r, Throwable tryAgain) {
+        try {
+            r.replica = null;
+            route(DIRECT, slotOf(r.frame, r.frameOff, r.frameLen), r.frame, r.frameOff, r.frameLen, r, false);
+        } catch (RuntimeException e) {
+            r.failFinal(e);
+        }
+    }
+
+    /** The slot of an encoded single-slot command, or -1 when it has no key. */
+    private static int slotOf(byte[] buf, int off, int len) {
+        Frame f = new Frame();
+        f.out.buf = Arrays.copyOfRange(buf, off, off + len);
+        f.out.pos = len;
+        f.parse();
+        byte[] b = f.out.buf;
+        ClusterKeys.Spec spec = ClusterKeys.spec(b, f.off[0], f.len[0]);
+        if (spec.first) {
+            return f.argc >= 2 ? HashSlot.of(b, f.off[1], f.len[1]) : -1;
+        }
+        int n = ClusterKeys.keys(spec, f);
+        return n > 0 ? HashSlot.of(b, f.off[f.keyIdx[0]], f.len[f.keyIdx[0]]) : -1;
+    }
+
+    /** Stands in the reply queue for the {@code +OK} of {@code ASKING}; an error fails the command it precedes. */
+    private static final class AskingRequest extends Request<Void> {
+        private final RoutedRequest<?> command;
+
+        AskingRequest(RoutedRequest<?> command) {
+            super(Reply.OK, null, null);
+            this.command = command;
+        }
+
+        @Override
+        public void deliver(Object value) {
+            // the +OK is discarded
+        }
+
+        @Override
+        public void fail(Throwable error) {
+            command.failFinal(error);
+        }
+    }
+
     private void followMoved(RoutedRequest<?> r, Throwable error) {
         try {
             String[] parts = error.getMessage().split(" ");
@@ -852,6 +946,21 @@ public final class ClusterRouter implements AutoCloseable {
             String host = colon > 0 ? addr.substring(0, colon) : seed.host;
             int port = Integer.parseInt(addr.substring(colon + 1));
             r.replica = null;
+            if (error.getMessage().startsWith("ASK ")) {
+                // One-off: the slot table stays as it is.
+                ClusterNode target = addNode(host, port);
+                Connection c = target.link.get();
+                RespOut o = c.begin();
+                try {
+                    o.raw(ASKING);
+                    o.raw(r.frame, r.frameOff, r.frameLen);
+                } catch (RuntimeException e) {
+                    c.abort();
+                    throw e;
+                }
+                c.endMany(new Request<?>[] {new AskingRequest(r), r}, 2);
+                return;
+            }
             ClusterNode target = onMoved(slot, host, port, r.redirects > 1);
             DIRECT.send(target, r.frame, r.frameOff, r.frameLen, r);
         } catch (RuntimeException e) {

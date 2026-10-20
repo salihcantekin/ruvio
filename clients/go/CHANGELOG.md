@@ -4,12 +4,12 @@ Notable changes to the Go client `github.com/salihcantekin/ruvio/clients/go`. A 
 
 ## Unreleased
 
+- A cluster client now follows `-ASK slot host:port` (sends `ASKING` and the command to the named node, slot map unchanged) and retries `-TRYAGAIN` up to 3 times after 5, 10 and 20 ms. `-ASK` shares the 3-redirect budget with `-MOVED`; pipelines repair both the same way. The plain client is unchanged.
 - **Behavior change:** `Options.CommandTimeout` is now 30 seconds when left 0 (was no limit); a negative value turns it off. A blocking command gets its own wait on top (`BLPOP k 5` may take 5 s plus the timeout; a wait of 0, or one the client cannot parse, has no deadline; a pipeline takes its largest wait), and a Pub/Sub or `MONITOR` connection never times out while it waits for messages (issue #48 follow-up).
 - The command timeout costs no allocation per call: the socket read deadline is set once per connection and the reader fails overdue requests (their late replies are still read and dropped), instead of `context.WithTimeout` per call. Measured: a GET with the default on went from 6 allocations (448 B) to 1 (64 B, the same as off), a SET from 5 (384 B) to 0. A cluster pipeline that spans nodes now gets the timeout too (issue #48 follow-up).
 - `MoveSlots(ctx, first, last, shard)` and `MoveSlotsStatus(ctx)` for `RUVIO MOVESLOTS`, which moves a slot range to another shard of the same server.
 - `HMSet(ctx, key, fieldValues...)` sends `HMSET` (multi-field `HSET` that replies `OK`; Redis marks it deprecated) (issue #26).
 - `Options.CommandTimeout` bounds a call whose context has no deadline (it fails with `context.DeadlineExceeded`, the connection stays usable) (issue #48).
-- Docs: the README states that `-ASK` is not followed, as the Python and Node clients already did (issue #49).
 - `Options.ReadPolicy` (`ReadPrimary` by default, `ReadPreferReplica`, `ReadReplica`): a cluster client sends reads (commands the server flags readonly and not blocking) to one replica per shard, found in `CLUSTER SLOTS` and picked when the slot map loads. Pipelines go to replicas only when every command is a read; a replica that cannot be connected or answers `LOADING` is skipped until the next load. Replication is asynchronous, so reads can miss recent writes. With the default policy nothing changes.
 - `ReplicaOf(ctx, host, port)`, `ReplicaOfNoOne(ctx, force)` and `Role(ctx)` for `REPLICAOF` and `ROLE`.
 - `Options.Seeds`: `host:port` seed addresses tried in order instead of `Addr`. A dropped connection reconnects starting with the next seed; a cluster reloads its slot map from the other known nodes and then the seeds when no open socket answers. A custom `Dial` receives the seed being tried.
