@@ -4,6 +4,7 @@ Notable changes to the C# packages `Ruvio.Client` and `Ruvio.Client.AspNetCore`,
 
 ## Unreleased
 
+- Fixed: stream reads (`XRANGE`, `XREVRANGE`, `XREAD`, `XREADGROUP` and `XCLAIM`) preserve repeated field names and their order instead of keeping only the last value for each name.
 - **Behavior change:** `RuvioClientOptions.CommandTimeout` is now 30 seconds by default (was no limit); `TimeSpan.Zero` turns it off. A blocking command gets its own wait on top (`BLPOP k 5` may take 5 s plus the timeout; a wait of 0, or one the client cannot parse, has no deadline; a pipeline takes its largest wait), and a Pub/Sub or `MONITOR` connection never times out while it waits for messages (issue #48 follow-up).
 - The command timeout costs no allocation and no timer per command: one timer per connection fails the sent requests whose deadline has passed (their late replies are still read and dropped), and a caller with no cancellation of its own reads its own reply again. Measured on one connection, GET/SET with the default on allocated about 650 B more per call than with it off (a linked `CancellationTokenSource`, a timer, an async wrapper and a closure); now the same as off. With it off, calls also lose a closure (about 170 B) that the earlier code allocated on every call. A stream write that takes no data for the whole timeout now closes the connection (issue #48 follow-up).
 - `MoveSlotsAsync(first, last, shard)` and `GetMoveSlotsStatusAsync()` for `RUVIO MOVESLOTS`, which moves a slot range to another shard of the same server.
