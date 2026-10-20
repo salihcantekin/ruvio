@@ -6,7 +6,8 @@
 //!    skips the copies.
 //! 2. `EXPORT id first last host port [AUTH ...]` on the source node: the shard that holds
 //!    the range connects to the target shard's client port and copies the range with
-//!    `COPY id batch` in bounded steps, then the keys written meanwhile until few are left.
+//!    `COPY id batch` in bounded steps, waits until `REPLICAS id` reports that the target's
+//!    replicas hold the copy, then sends the keys written meanwhile until few are left.
 //! 3. The source freezes the range (its commands get `TRYAGAIN`), sends the last changes and
 //!    `PREPARE id`: the target syncs its log, marks the copy prepared and answers the
 //!    sequence it reached. A prepared copy survives a restart until the map decides.
@@ -39,6 +40,10 @@ const REPLY_LIMIT: Duration = Duration::from_secs(10);
 /// The longest the frozen hand-over may take before the source gives up and serves the
 /// range again (the coordinators have not committed anything yet).
 const FREEZE_LIMIT: Duration = Duration::from_secs(1);
+/// The longest the source waits for the target's replicas to take the copy before it
+/// freezes the range, and how often it asks.
+const REPLICA_CATCH_UP: Duration = Duration::from_secs(10);
+const REPLICA_POLL: Duration = Duration::from_millis(10);
 
 /// The moves this node takes part in: at most one import and one export at a time.
 #[derive(Default)]
@@ -174,13 +179,14 @@ pub(super) fn command(state: &Rc<ShardState>, args: &[&[u8]]) -> Response<'stati
         Some(sub) if sub == b"IMPORT" && args.len() == 5 => import(state, args),
         Some(sub) if sub == b"COPY" && args.len() == 3 => copy(state, args[1], args[2]),
         Some(sub) if sub == b"PREPARE" && args.len() == 2 => prepare(state, args[1]),
+        Some(sub) if sub == b"REPLICAS" && args.len() == 2 => replicas(state, args[1]),
         Some(sub) if sub == b"EXPORT" && (args.len() == 6 || args.len() >= 8) => {
             export(state, args)
         }
         Some(sub) if sub == b"CANCEL" && args.len() == 2 => cancel(state, args[1]),
         _ => Err(
             "ERR RUVIO MIGRATE expects IMPORT id first last shard, COPY id batch, PREPARE id, \
-             EXPORT id first last host port [AUTH ...], CANCEL id or STATUS"
+             REPLICAS id, EXPORT id first last host port [AUTH ...], CANCEL id or STATUS"
                 .into(),
         ),
     };
@@ -459,6 +465,20 @@ fn prepare(state: &Rc<ShardState>, id: &[u8]) -> Reply {
         "a slot range from another node is prepared; waiting for the cluster map"
     );
     Ok(Response::Integer(position as i64))
+}
+
+/// `REPLICAS id`, on the target shard: how many of its replicas do not yet hold every
+/// record it has logged.
+fn replicas(state: &Rc<ShardState>, id: &[u8]) -> Reply {
+    let import = current_import(state, id)?;
+    let last = state
+        .persistence
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .last_sequence();
+    let behind = replicas_behind(&forwarding(state)?.fabric, import.shard, last);
+
+    Ok(Response::Integer(behind as i64))
 }
 
 /// `EXPORT id first last host port [AUTH ...]`, on any shard of the source node.
@@ -1023,6 +1043,8 @@ async fn copy_and_prepare(
         }
     }
     link.copy(export, batch).await?;
+    link.drain().await?;
+    wait_for_target_replicas(&mut link, export).await?;
 
     // Keys written since they were copied, until few are left.
     let mut changes = Vec::new();
@@ -1114,6 +1136,26 @@ async fn copy_and_prepare(
         freeze: frozen_at.elapsed(),
     }) {
         return Err("cancelled".into());
+    }
+    Ok(())
+}
+
+/// Waits, up to [`REPLICA_CATCH_UP`], until the target's replicas hold the copy sent so far.
+/// The coordinators commit the move only once they do, and the range stays frozen here until
+/// then: a replica that syncs every record would otherwise catch up on the whole range while
+/// it is frozen. A target that does not know `REPLICAS` is not waited for.
+async fn wait_for_target_replicas(link: &mut Link, export: &Export) -> Result<(), String> {
+    let started = Instant::now();
+
+    while started.elapsed() < REPLICA_CATCH_UP {
+        link.send(&[b"RUVIO", b"MIGRATE", b"REPLICAS", &export.id])
+            .await?;
+        match link.reply().await {
+            Ok(0) => break,
+            Ok(_) => tokio::time::sleep(REPLICA_POLL).await,
+            Err(error) if error.starts_with("the target refused") => break,
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }
