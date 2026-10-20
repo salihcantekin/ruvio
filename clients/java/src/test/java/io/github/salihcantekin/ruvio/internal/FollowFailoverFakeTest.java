@@ -34,7 +34,7 @@ import org.junit.jupiter.api.Test;
 class FollowFailoverFakeTest {
     private static final long PATIENCE_NANOS = TimeUnit.SECONDS.toNanos(10);
 
-    private enum Kind { MASTER, REPLICA, LIAR, NAMES }
+    private enum Kind { MASTER, REPLICA, LIAR, NAMES, PROMOTED }
 
     /** What a scripted node is at the moment; changed while the test runs, as a failover does. */
     private static final class Mode {
@@ -50,6 +50,8 @@ class FollowFailoverFakeTest {
     private static final Mode MASTER = new Mode(Kind.MASTER, 0);
     private static final Mode LIAR = new Mode(Kind.LIAR, 0);
     private static final Mode REPLICA = new Mode(Kind.REPLICA, 0);
+    /** A replica promoted right after it answers its first {@code ROLE}. */
+    private static final Mode PROMOTED = new Mode(Kind.PROMOTED, 0);
 
     private static Mode replicaOf(FakeNode primary) {
         return new Mode(Kind.REPLICA, primary.port);
@@ -109,7 +111,13 @@ class FollowFailoverFakeTest {
 
     private Node node(Mode mode) throws IOException {
         Node[] self = new Node[1];
-        FakeNode fake = new FakeNode(args -> answer(args, self[0].mode));
+        FakeNode fake = new FakeNode(args -> {
+            Mode now = self[0].mode;
+            if (now.kind == Kind.PROMOTED && args.get(0).equalsIgnoreCase("ROLE")) {
+                self[0].mode = MASTER;
+            }
+            return answer(args, now);
+        });
         toClose.add(fake);
         self[0] = new Node(mode, fake);
         return self[0];
@@ -118,10 +126,10 @@ class FollowFailoverFakeTest {
     private static String answer(List<String> args, Mode mode) {
         String name = args.get(0).toUpperCase();
         boolean writes = name.equals("SET") || name.equals("INCR") || name.equals("DEL");
-        boolean replica = mode.kind == Kind.REPLICA || mode.kind == Kind.LIAR;
+        boolean replica = mode.kind == Kind.REPLICA || mode.kind == Kind.LIAR || mode.kind == Kind.PROMOTED;
         switch (name) {
             case "ROLE":
-                if (mode.kind == Kind.REPLICA) {
+                if (mode.kind == Kind.REPLICA || mode.kind == Kind.PROMOTED) {
                     return "*5\r\n$5\r\nslave\r\n$9\r\n127.0.0.1\r\n:" + mode.port + "\r\n$9\r\nconnected\r\n:0\r\n";
                 }
                 return "*3\r\n$6\r\nmaster\r\n:0\r\n*0\r\n";
@@ -340,6 +348,46 @@ class FollowFailoverFakeTest {
             assertReadonly(() -> c.set("k", "v"));
             assertEquals(1, old.seen("SET"));
             assertEquals(1, liar.seen("SET"));
+        }
+    }
+
+    @Test
+    void theRefusingReplicaIsTakenOnceItIsPromoted() throws Exception {
+        Node node = node(MASTER);
+        Node other = node(REPLICA);
+        try (RuvioClient<String, String> c = RuvioClient.connect(seeds(node.address(), other.address()).build())) {
+            node.mode = PROMOTED;
+            // The first round finds it a replica and no other primary; the next round finds it promoted and the
+            // write is sent there again.
+            c.set("k", "v");
+            assertEquals(2, node.seen("SET"));
+            assertEquals(0, other.seen("SET"));
+            assertEquals(2, node.seen("ROLE"));
+        }
+    }
+
+    @Test
+    void aRefusingNodeThatStillSaysMasterIsNeverTaken() throws Exception {
+        Node liar = node(MASTER);
+        Node other = node(REPLICA);
+        try (RuvioClient<String, String> c = RuvioClient.connect(seeds(liar.address(), other.address()).build())) {
+            liar.mode = LIAR;
+            assertReadonly(() -> c.set("k", "v"));
+            assertEquals(1, liar.seen("SET"));
+            assertEquals(8, liar.seen("ROLE")); // every round asked it and passed it over
+        }
+    }
+
+    @Test
+    void aCoordinatorNamingTheRefusingReplicaIsFollowedOnceItIsPromoted() throws Exception {
+        Node coordinator = node(MASTER);
+        Node node = node(MASTER);
+        coordinator.mode = names(node.fake);
+        try (RuvioClient<String, String> c = RuvioClient.connect(seeds(coordinator.address()).sentinelMaster("main").build())) {
+            c.ping();
+            node.mode = PROMOTED;
+            c.set("k", "v");
+            assertEquals(2, node.seen("SET"));
         }
     }
 

@@ -455,7 +455,11 @@ one failover) with `ERR change cursor generation is unknown to this server`: rel
 `FROM NOW`. The older two-part form `<shard>:<seq>` is still accepted and read as the shard's
 current generation, which is how it behaved before; it cannot detect a rewind. Two replicas
 promoted at once from the same primary (split brain without a coordinator) get the same
-generation, and a cursor cannot tell their logs apart.
+generation, and a cursor cannot tell their logs apart. A primary told to follow another one
+(`REPLICAOF host port`, also by a coordinator) ends its streams with `["resync", "the shard
+follows another primary; resume on it"]` before its log takes the new primary's records; here the
+client does not reload: it subscribes on the new primary with its last cursor, where the rewind
+rule above applies.
 
 `COMMITTED` streams only records at or below the shard's committed sequence
 (`replication_committed_sequence`, the highest record a `CLIENT DURABILITY` reply was released
@@ -545,6 +549,14 @@ that installs a full copy acknowledges nothing until it has caught up, so with a
 single replica and `min-replicas-to-write 1` the primary refuses writes while that
 replica resyncs, as in Redis. Both change
 with `CONFIG SET`. Only role `primary` applies them.
+
+For a synchronous write per connection, `CLIENT DURABILITY REPLICAS n [TIMEOUT ms]`
+holds the connection's replies until `n` replicas hold the records written before
+them on disk (default timeout 5000 ms); on timeout the batch's replies become
+`NOREPLICAS` and the writes stay applied. After a timeout, the connection's next
+batch waits only if the shard logged a new record in between, so a read sent right
+after can return a write no replica holds yet. See
+[COORDINATOR.md](COORDINATOR.md#what-can-be-lost-and-split-brain).
 
 `replication.primary_lease` / `primary-lease` (default `false`) makes a primary
 (or a node with no replication role) take writes only while a majority of the
