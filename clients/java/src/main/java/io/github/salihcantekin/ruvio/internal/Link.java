@@ -429,10 +429,12 @@ public final class Link implements AutoCloseable {
     private Connection moveAfterReadonly(Connection refusedOn) {
         synchronized (followLock) {
             Connection now = connection;
-            if (now != null && now.isOpen() && (now.port != refusedOn.port || !now.host.equals(refusedOn.host))) {
-                return now; // an earlier refusal already moved the connection
+            if (now != null && now != refusedOn && now.isOpen()) {
+                return now; // an earlier refusal already moved the connection (possibly to the same, promoted node)
             }
-            Address refused = new Address(refusedOn.host, refusedOn.port);
+            // Kept across rounds: cleared once the refusing node says it is a replica, so its promotion a moment
+            // later is taken instead of waiting out every round.
+            Address[] refused = {new Address(refusedOn.host, refusedOn.port)};
             boolean coordinators = options.sentinelMaster != null;
             long wait = followBaseMillis;
             for (int round = 0; round < FOLLOW_ROUNDS; round++) {
@@ -657,17 +659,27 @@ public final class Link implements AutoCloseable {
      *
      * @param seeds where to ask
      * @param start the first seed to ask
-     * @param avoid an address that must not be taken (the one that just answered {@code READONLY}), or null
+     * @param avoid {@code avoid[0]} is an address that must not be taken (the one that just answered
+     *     {@code READONLY}) while it still says {@code master}: a replaced primary does. It is set to null once it
+     *     answers {@code ROLE} as a replica, so a later round takes it when it is promoted. Null avoids nothing.
      * @return the primary, or null when no address is confirmed
      */
-    private Address findPrimary(Address[] seeds, int start, Address avoid) {
+    private Address findPrimary(Address[] seeds, int start, Address[] avoid) {
+        Address avoided = avoid == null ? null : avoid[0];
         int n = seeds.length;
         if (options.sentinelMaster != null) {
             for (int i = 0; i < n; i++) {
                 Address named = named(ask(seeds[(start + i) % n], "SENTINEL", "get-master-addr-by-name", options.sentinelMaster));
-                if (named != null && !named.equals(avoid)) {
+                if (named != null) {
                     Role role = roleOf(ask(named, "ROLE"));
-                    if (role != null && role.master) {
+                    if (role == null) {
+                        continue;
+                    }
+                    if (!role.master) {
+                        if (named.equals(avoided)) {
+                            avoid[0] = avoided = null;
+                        }
+                    } else if (!named.equals(avoided)) {
                         return named;
                     }
                 }
@@ -688,10 +700,15 @@ public final class Link implements AutoCloseable {
                 continue;
             }
             if (role.master) {
-                if (!a.equals(avoid)) {
+                if (!a.equals(avoided)) {
                     return a;
                 }
-            } else if (role.reported != null && !seen.contains(role.reported)) {
+                continue;
+            }
+            if (a.equals(avoided)) {
+                avoid[0] = avoided = null;
+            }
+            if (role.reported != null && !seen.contains(role.reported)) {
                 seen.add(role.reported);
                 queue.addLast(role.reported);
             }

@@ -22,6 +22,9 @@ internal enum NodeKind
 
     /// <summary>Accepts connections and reads commands, but never answers.</summary>
     Silent,
+
+    /// <summary>A replica (naming no primary) that is promoted to <see cref="Master"/> right after it answers its first <c>ROLE</c>.</summary>
+    Promoted,
 }
 
 internal sealed record NodeMode(NodeKind Kind, int Primary = 0);
@@ -113,7 +116,14 @@ internal sealed class FailoverNode : IDisposable
                     continue;
                 }
 
-                await stream.WriteAsync(Encoding.UTF8.GetBytes(Answer(arguments, _mode)), _stop.Token);
+                NodeMode mode = _mode;
+
+                if (mode.Kind is NodeKind.Promoted && arguments[0].Equals("ROLE", StringComparison.OrdinalIgnoreCase))
+                {
+                    _mode = new NodeMode(NodeKind.Master);
+                }
+
+                await stream.WriteAsync(Encoding.UTF8.GetBytes(Answer(arguments, mode)), _stop.Token);
             }
         }
         catch (Exception error) when (error is IOException or OperationCanceledException or ObjectDisposedException or SocketException)
@@ -148,6 +158,7 @@ internal sealed class FailoverNode : IDisposable
             case "ROLE":
                 return mode.Kind switch
                 {
+                    NodeKind.Promoted => "*3\r\n$5\r\nslave\r\n$0\r\n\r\n:0\r\n",
                     NodeKind.Replica => mode.Primary == 0
                         ? "*3\r\n$5\r\nslave\r\n$0\r\n\r\n:0\r\n"
                         : $"*3\r\n$5\r\nslave\r\n$9\r\n127.0.0.1\r\n:{mode.Primary}\r\n",
@@ -158,7 +169,7 @@ internal sealed class FailoverNode : IDisposable
                     ? $"*2\r\n$9\r\n127.0.0.1\r\n${mode.Primary.ToString().Length}\r\n{mode.Primary}\r\n"
                     : "*-1\r\n";
             case "SET" or "INCR" or "DEL":
-                return mode.Kind is NodeKind.Replica or NodeKind.Liar
+                return mode.Kind is NodeKind.Replica or NodeKind.Liar or NodeKind.Promoted
                     ? "-READONLY You can't write against a read only replica.\r\n"
                     : "+OK\r\n";
             case "NOPE":

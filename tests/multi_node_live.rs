@@ -525,3 +525,98 @@ fn a_prepared_move_survives_restarts_on_both_sides_until_it_is_cancelled() {
     assert_eq!(on_b.call(&["DBSIZE"]), "0");
     assert_eq!(on_b.call(&["RUVIO", "MIGRATE", "STATUS"]), "[state,none]");
 }
+
+/// A replica holding a map that gave a range to another group, promoted before its primary's
+/// record of the move arrived, answers `MOVED` for the range from its first command on: the
+/// map already pointed the range at the other group when it was installed, before the shard
+/// records the loss after the promotion.
+#[test]
+fn a_promoted_replica_redirects_a_range_the_map_gave_away_from_its_first_command() {
+    use std::io::{Read, Write};
+
+    let env = [
+        ("RUVIO_SHARDS", "1"),
+        ("RUVIO_DURABILITY", "always"),
+        ("RUVIO_SNAPSHOT_INTERVAL_MS", "0"),
+    ];
+    let mut primary = Server::start_with(&env);
+    let mut replica = Server::start_with(&env);
+    let dir = tempfile::tempdir().unwrap();
+    let topology = dir.path().join("topology.toml");
+    let a_port = primary.ports().port_at(0);
+    // Group b never runs: only its address is named in `MOVED`.
+    let b_port = primary.ports().port_at(9);
+    let (primary_repl, replica_repl) = (primary.ports().port_at(5), replica.ports().port_at(5));
+    let map = |version: u64, a_slots: &str, b_slots: &str| {
+        format!(
+            "version = {version}\n[[groups]]\nname = \"a\"\naddress = \"127.0.0.1:{a_port}\"\nshards = 1\nslots = [{a_slots}]\n\
+             [[groups]]\nname = \"b\"\naddress = \"127.0.0.1:{b_port}\"\nshards = 1\nslots = [{b_slots}]\n"
+        )
+    };
+
+    std::fs::write(&topology, map(1, "\"0-8191\"", "\"8192-16383\"")).unwrap();
+    primary.set_env("RUVIO_REPLICATION_ROLE", "primary");
+    primary.set_env(
+        "RUVIO_REPLICATION_LISTEN",
+        &format!("127.0.0.1:{primary_repl}"),
+    );
+    replica.set_env("RUVIO_REPLICATION_ROLE", "replica");
+    replica.set_env(
+        "RUVIO_REPLICATION_LISTEN",
+        &format!("127.0.0.1:{replica_repl}"),
+    );
+    replica.set_env(
+        "RUVIO_REPLICATION_PRIMARY",
+        &format!("127.0.0.1:{primary_repl}"),
+    );
+    for server in [&mut primary, &mut replica] {
+        server.set_env("RUVIO_CLUSTER_TOPOLOGY", topology.to_str().unwrap());
+        server.set_env("RUVIO_CLUSTER_GROUP", "a");
+        server.restart();
+    }
+
+    let moving = key_in(100..200, "moving");
+    let mut on_primary = Client::connect(&primary.address);
+    let mut on_replica = Client::connect(&replica.address);
+
+    assert_eq!(on_primary.call(&["SET", &moving, "1"]), "OK");
+    wait_for(&mut on_replica, &["GET", &moving], "1");
+
+    // The map that gives the range to group b reaches the replica, and its primary goes
+    // before it logs giving the range away.
+    let next = map(2, "\"200-8191\"", "\"0-199\", \"8192-16383\"");
+
+    assert_eq!(on_replica.call(&["RUVIO", "TOPOLOGY", "SET", &next]), "OK");
+    primary.stop();
+
+    // One read carries both, so no other task runs on the shard between them.
+    let mut stream = std::net::TcpStream::connect(&replica.address).unwrap();
+    let pipeline = format!(
+        "*3\r\n$9\r\nREPLICAOF\r\n$2\r\nNO\r\n$3\r\nONE\r\n*3\r\n$3\r\nSET\r\n${}\r\n{moving}\r\n$1\r\n2\r\n",
+        moving.len()
+    );
+
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    stream.write_all(pipeline.as_bytes()).unwrap();
+    let mut replies = String::new();
+    let mut buffer = [0u8; 512];
+
+    while replies.matches("\r\n").count() < 2 {
+        let read = stream.read(&mut buffer).unwrap();
+
+        assert!(read > 0, "closed after {replies:?}");
+        replies.push_str(std::str::from_utf8(&buffer[..read]).unwrap());
+    }
+    let (promoted, write) = replies.split_once("\r\n").unwrap();
+
+    assert_eq!(promoted, "+OK");
+    assert!(
+        write.starts_with(&format!(
+            "-MOVED {} 127.0.0.1:{b_port}",
+            hash_slot(moving.as_bytes())
+        )),
+        "{replies:?}"
+    );
+}

@@ -1185,6 +1185,10 @@ public sealed partial class RuvioClient : IRuvioClient
                 return _seed;
             }
 
+            // Kept across rounds: cleared once the refusing node says it is a replica, so its promotion a moment later
+            // is taken instead of waiting out every round.
+            var avoid = new StrongBox<(string Host, int Port)?>((refused.Host, refused.Port));
+
             for (int attempt = 1; ; attempt++)
             {
                 (string Host, int Port)[] seeds = FollowSeeds();
@@ -1193,7 +1197,7 @@ public sealed partial class RuvioClient : IRuvioClient
                     : (Array.FindIndex(seeds, seed => seed.Port == refused.Port
                         && string.Equals(seed.Host, refused.Host, StringComparison.OrdinalIgnoreCase)) + 1) % seeds.Length;
 
-                if (await PrimaryProbe.FindAsync(seeds, start, (refused.Host, refused.Port), _options, cancellationToken)
+                if (await PrimaryProbe.FindAsync(seeds, start, avoid, _options, cancellationToken)
                     .ConfigureAwait(false) is { } primary)
                 {
                     try
