@@ -299,7 +299,7 @@ RuvioOptions options = RuvioOptions.builder()
   when opening it fails with an I/O error, the plain seed order applies. The command that hit the drop still fails.
 * **On `READONLY`** (the error text is `READONLY` alone or followed by a space): the client runs up to 8 rounds
   (waits of 100 ms doubling to 2 s, on a background thread, never on a reader thread), avoiding the address that
-  answered, moves the shared connection to the primary it finds, and sends the refused command once more. The second
+  answered while it still says `master` (once it says it is a replica, a later round takes it when it is promoted), moves the shared connection to the primary it finds, and sends the refused command once more. The second
   reply, a second `READONLY` included, is the result; there is never a third send. With no primary the original
   `READONLY` error is returned and the connection stays. Other errors (`LOADING`, `MASTERDOWN`, `NOREPLICAS`) and I/O
   errors are never retried.

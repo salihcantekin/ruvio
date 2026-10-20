@@ -105,7 +105,8 @@ public class FollowAllocationTests
 
             Console.WriteLine($"follow alloc: retained bytes grew by {grown} over 20000 commands");
             // Noise measured up to about 90 KB (pool trimming); one retained 24-byte object per command is 480 KB.
-            Assert.InRange(grown, -262144, 196608);
+            // Only growth is a leak: a collection that frees more than it held before is not.
+            Assert.InRange(grown, long.MinValue, 196608);
         }
     }
 

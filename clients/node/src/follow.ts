@@ -172,14 +172,15 @@ async function askSentinel(addr: Addr, name: string, o: ConnectionOptions, scope
 /**
  * @internal One round: the address that answers `ROLE` with `master`, asking `seeds` in order from
  * `start` (wrapping), then the primary a replica reports, once per address. With `sentinel` the
- * seeds are coordinators: each names a primary and the first that `ROLE` confirms wins. `avoid` is
- * never taken (the node that just answered `READONLY`). Resolves `null` when no address is
- * confirmed, and rejects only when `AUTH` is refused.
+ * seeds are coordinators: each names a primary and the first that `ROLE` confirms wins. `avoid.addr`
+ * (the node that just answered `READONLY`) is not taken while it still says `master`: a replaced
+ * primary does. Once it answers `ROLE` as a replica it is cleared, so a later round takes it when it
+ * is promoted. Resolves `null` when no address is confirmed, and rejects only when `AUTH` is refused.
  */
 export async function findPrimary(
   seeds: readonly Addr[],
   start: number,
-  avoid: Addr | null,
+  avoid: { addr: Addr | null },
   o: ConnectionOptions,
   sentinel: string | undefined,
   scope: ProbeScope,
@@ -190,9 +191,12 @@ export async function findPrimary(
     for (const coordinator of queue) {
       if (scope.dead) return null;
       const named = await askSentinel(coordinator, sentinel, o, scope);
-      if (named === null || (avoid !== null && same(named, avoid))) continue;
+      if (named === null) continue;
       const role = await askRole(named, o, scope);
-      if (role !== null && role.master) return named;
+      if (role === null) continue;
+      const avoided = avoid.addr !== null && same(named, avoid.addr);
+      if (role.master && !avoided) return named;
+      if (!role.master && avoided) avoid.addr = null;
     }
     return null;
   }
@@ -202,9 +206,13 @@ export async function findPrimary(
     const addr = queue[i]!;
     const role = await askRole(addr, o, scope);
     if (role === null) continue;
+    const avoided = avoid.addr !== null && same(addr, avoid.addr);
     if (role.master) {
-      if (avoid === null || !same(addr, avoid)) return addr;
-    } else if (role.hint !== null && !seen.some((x) => same(x, role.hint!))) {
+      if (!avoided) return addr;
+      continue;
+    }
+    if (avoided) avoid.addr = null;
+    if (role.hint !== null && !seen.some((x) => same(x, role.hint!))) {
       seen.push(role.hint);
       queue.push(role.hint);
     }

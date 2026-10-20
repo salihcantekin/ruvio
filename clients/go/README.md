@@ -190,7 +190,8 @@ With two or more `Seeds` a standalone client finds the primary again after a fai
 the connection drops, the reconnect asks the seeds `ROLE` and connects to the one that answers
 `master` (a replica's reported primary is tried too); if none does, the usual seed order
 applies. When a command is answered `READONLY` (the node was demoted) the client does the same,
-avoiding the node that answered, and sends that command once more on the new connection:
+avoiding the node that answered while it still says `master` (once it says it is a replica, a
+later round takes it when it is promoted), and sends that command once more on the new connection:
 `READONLY` is sent before the command runs, so the retry cannot apply it twice. A second
 `READONLY` is returned, and nothing is sent again after a transaction opened with `Do("MULTI")`
 on the shared connection, or after an I/O error. Up to 8 rounds run with waits of 100 ms
