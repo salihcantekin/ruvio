@@ -192,6 +192,77 @@ fn a_replica_of_the_new_primary_fences_the_old_one() {
     }
 }
 
+/// The first primary, restarted with its primary configuration after it followed the promoted
+/// replica, forks a newer epoch than the promoted one. Pointed back with `REPLICAOF ... YIELD`
+/// (what the coordinators send) it follows the promoted primary instead of fencing it.
+#[test]
+fn a_restarted_primary_yields_to_the_primary_it_is_pointed_at() {
+    use crate::config::ReplicationRole::{Primary, Replica};
+
+    let primary_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let ports = crate::test_ports::reserve();
+    let (old, new) = (ports.address_at(0), ports.address_at(1));
+    let port = new.port().to_string();
+    let as_configured = |config: &mut AppConfig| {
+        config.persistence = persistence(primary_dir.path());
+        config.replication = replication(Primary, Some(old), None);
+    };
+
+    let (primary_address, primary_stop, primary) = serve_with(as_configured);
+    let (replica_address, replica_stop, replica) = serve_with(|config| {
+        config.persistence = persistence(replica_dir.path());
+        config.replication = replication(Replica, Some(new), Some(old));
+    });
+
+    assert_eq!(command(primary_address, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+    wait_for_reply(replica_address, &[b"GET", b"k"], b"$1\r\nv\r\n");
+    primary_stop.request();
+    join_within(primary, PATIENCE).unwrap();
+    assert_eq!(
+        command(replica_address, &[b"REPLICAOF", b"NO", b"ONE"]),
+        b"+OK\r\n"
+    );
+    assert_eq!(info_field(replica_address, "replication_epoch"), Some(1));
+
+    // First restart: the old primary writes its own root history and follows the new one.
+    let (back_address, back_stop, back) = serve_with(as_configured);
+    assert_eq!(
+        command(
+            back_address,
+            &[b"REPLICAOF", b"127.0.0.1", port.as_bytes(), b"YIELD"]
+        ),
+        b"+OK\r\n"
+    );
+    assert_eq!(command(replica_address, &[b"SET", b"a", b"1"]), b"+OK\r\n");
+    wait_for_reply(back_address, &[b"GET", b"a"], b"$1\r\n1\r\n");
+    back_stop.request();
+    join_within(back, PATIENCE).unwrap();
+
+    // Second restart: its last role was replica, so it forks one epoch above the new primary
+    // and takes a write the new primary never sees.
+    let (back_address, back_stop, back) = serve_with(as_configured);
+    assert_eq!(info_field(back_address, "replication_epoch"), Some(2));
+    assert_eq!(command(back_address, &[b"SET", b"late", b"1"]), b"+OK\r\n");
+    assert_eq!(
+        command(
+            back_address,
+            &[b"REPLICAOF", b"127.0.0.1", port.as_bytes(), b"YIELD"]
+        ),
+        b"+OK\r\n"
+    );
+    assert_eq!(command(replica_address, &[b"SET", b"b", b"1"]), b"+OK\r\n");
+    wait_for_reply(back_address, &[b"GET", b"b"], b"$1\r\n1\r\n");
+    assert_eq!(command(back_address, &[b"EXISTS", b"late"]), b":0\r\n");
+    assert_eq!(info_field(replica_address, "replication_fenced"), Some(0));
+    assert_eq!(command(replica_address, &[b"SET", b"c", b"1"]), b"+OK\r\n");
+
+    for (stop, server) in [(back_stop, back), (replica_stop, replica)] {
+        stop.request();
+        join_within(server, PATIENCE).unwrap();
+    }
+}
+
 /// A replica that has not finished copying its primary answers `LOADING` to every command,
 /// `REPLICAOF` included: it is promoted with a restart and `--force-promote-incomplete`.
 /// (`REPLICAOF NO ONE` sent to a complete shard of a process with an incomplete one needs

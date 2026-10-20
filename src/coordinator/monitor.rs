@@ -2090,14 +2090,34 @@ async fn reconcile(
         } else {
             let host = target.replication.host.clone();
             let port = target.replication.port.to_string();
-
-            command(
+            // `YIELD`: the member follows the recorded primary even when it wrote or followed
+            // a newer epoch (a replica restarted with a primary's configuration forks one),
+            // instead of fencing it: the record is trusted, so the fence holds just before. A
+            // member of an older build knows no `YIELD` and gets the plain command.
+            let result = command(
                 member,
                 config.auth.as_deref(),
-                &[b"REPLICAOF", host.as_bytes(), port.as_bytes()],
+                &[b"REPLICAOF", host.as_bytes(), port.as_bytes(), b"YIELD"],
                 timeout,
             )
-            .await
+            .await;
+
+            match result {
+                Err(error) if error.contains("wrong number of arguments") => {
+                    if !fence.holds().await {
+                        warn!(group = %group.name, "no longer confirmed as the leader; leaving the group's members as they are");
+                        return;
+                    }
+                    command(
+                        member,
+                        config.auth.as_deref(),
+                        &[b"REPLICAOF", host.as_bytes(), port.as_bytes()],
+                        timeout,
+                    )
+                    .await
+                }
+                result => result,
+            }
         };
 
         match result {

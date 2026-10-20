@@ -211,7 +211,8 @@ pub(in crate::protocol) fn cmd_config<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
 }
 
 /// `REPLICAOF host port` or `REPLICAOF NO ONE`; `REPLICAOF NO ONE FORCE` promotes a replica
-/// that has not finished copying its primary.
+/// that has not finished copying its primary, and `REPLICAOF host port YIELD` follows the
+/// primary without claiming a newer epoch to it.
 pub(in crate::protocol) fn cmd_replicaof<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
     let no_one = args.len() >= 2
         && args.bytes(0).eq_ignore_ascii_case(b"NO")
@@ -229,6 +230,10 @@ pub(in crate::protocol) fn cmd_replicaof<'a>(args: &Args<'a, '_>) -> Parsed<'a> 
         2 => Ok(Command::ReplicaOf {
             primary: Some((args.arg(0), args.arg(1))),
             force: false,
+        }),
+        3 if !no_one && args.bytes(2).eq_ignore_ascii_case(b"YIELD") => Ok(Command::ReplicaOf {
+            primary: Some((args.arg(0), args.arg(1))),
+            force: true,
         }),
         _ => Err(ProtocolError::Invalid(
             "wrong number of arguments for 'replicaof' command",

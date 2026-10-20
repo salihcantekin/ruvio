@@ -1618,6 +1618,7 @@ fn link_to(
             announce: None,
             peers: Arc::new(DurableAcks::new()),
             tls: None,
+            yields: false,
         },
         outbound,
     )

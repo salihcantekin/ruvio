@@ -1775,6 +1775,9 @@ pub struct ReplicaLink {
     pub peers: Arc<DurableAcks>,
     /// Wraps the dialed connection in TLS; none leaves the link in cleartext.
     pub tls: Option<Arc<crate::tls::ReplicaTlsClient>>,
+    /// `REPLICAOF ... YIELD`: send epoch zero and follow the primary whatever its epoch, so
+    /// an epoch this shard forked or followed does not fence the primary it was pointed at.
+    pub yields: bool,
 }
 
 pub fn spawn_replica_reader(link: ReplicaLink) -> ReplicationThread {
@@ -2592,7 +2595,7 @@ fn read_primary(
         password: link.password.clone(),
         history: followed.history,
         shard_count: link.shard_count,
-        epoch: followed.epoch,
+        epoch: if link.yields { 0 } else { followed.epoch },
         announce: link.announce.clone(),
     };
 
@@ -2643,7 +2646,8 @@ fn read_primary(
     }
 
     // A primary below the epoch this replica already followed is an old, replaced one.
-    if matches!(status, HandshakeStatus::Ok | HandshakeStatus::Snapshot)
+    if !link.yields
+        && matches!(status, HandshakeStatus::Ok | HandshakeStatus::Snapshot)
         && primary_history.epoch < followed.epoch
     {
         warn!(
