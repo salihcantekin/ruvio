@@ -1327,7 +1327,7 @@ export abstract class Commands {
   }
   /**
    * Adds a decimal number to a string value (`INCRBYFLOAT`). The TTL is kept.
-   * Computed in double precision and printed with 15 significant digits; Redis uses long double, so results with more digits can differ in the last places.
+   * Computed in double precision and printed with 16 significant digits; Redis uses long double, so results with more digits can differ in the last places.
    *
    * @param key Key to operate on (string, or Buffer for binary keys).
    * @param delta Number to add (may be negative).
@@ -3253,7 +3253,7 @@ export abstract class Commands {
     return opts?.ttl === undefined ? this._3(null, C.HINCRBY, key, field, delta) : this._v(null, C.HINCRBY, pushTtl([key, field, delta], opts.ttl));
   }
   /**
-   * Adds a decimal number to a field (`HINCRBYFLOAT`). Computed in double precision and printed with 15 significant digits (Redis uses long double). Keeps a field TTL.
+   * Adds a decimal number to a field (`HINCRBYFLOAT`). Computed in double precision and printed with 16 significant digits (Redis uses long double). Keeps a field TTL.
    *
    * @param key Key to operate on (string, or Buffer for binary keys).
    * @param field Hash field name.

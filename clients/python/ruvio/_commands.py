@@ -1140,7 +1140,7 @@ class Commands:
     def incrbyfloat(self, key: KeyT, amount: float, *, ttl: Optional[TtlT] = None) -> Any:
         """``INCRBYFLOAT key amount [EX seconds|PX ms]`` - adds a float. A missing key counts as 0; keeps the TTL.
 
-        The sum is computed in double precision and stored with at most 15 significant digits (Redis
+        The sum is computed in double precision and stored with at most 16 significant digits (Redis
         uses ``long double``, so the last digits can differ).
 
         Args:
@@ -3033,7 +3033,7 @@ Same as ``lmove(src, dst, "RIGHT", "LEFT")``.
         return self._c(_balances, "HTRANSFER", key, from_field, to_field, amount, "MAX", max)
 
     def hincrbyfloat(self, key: KeyT, field: Arg, amount: float) -> Any:
-        """``HINCRBYFLOAT key field amount`` - adds a float to a field (15 significant digits). Keeps a field TTL.
+        """``HINCRBYFLOAT key field amount`` - adds a float to a field (16 significant digits). Keeps a field TTL.
 
         Args:
             key: The hash key.

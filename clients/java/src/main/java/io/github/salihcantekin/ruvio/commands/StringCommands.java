@@ -610,7 +610,7 @@ public abstract class StringCommands<K, V> extends BaseCommands<K, V> {
 
     /**
      * Sends {@code INCRBYFLOAT key delta}: adds a floating-point number to a numeric string. A missing key
-     * counts as 0. Ruvio computes in double precision and stores 15 significant digits (Redis uses long double).
+     * counts as 0. Ruvio computes in double precision and stores 16 significant digits (Redis uses long double).
      *
      * @param key the key to change
      * @param delta the amount to add (may be negative)

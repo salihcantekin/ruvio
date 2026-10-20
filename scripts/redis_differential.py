@@ -744,7 +744,7 @@ COMMANDS = COMMANDS + COLLECTIONS + LISTS
 
 
 def same_float(name, actual, expected) -> bool:
-    """INCRBYFLOAT/HINCRBYFLOAT print 15 digits here and 17 in Redis (documented difference)."""
+    """INCRBYFLOAT/HINCRBYFLOAT print 16 digits here and 17 in Redis (documented difference)."""
     if name not in (b"INCRBYFLOAT", b"HINCRBYFLOAT"):
         return False
     try:

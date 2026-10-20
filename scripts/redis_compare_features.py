@@ -86,7 +86,7 @@ FEATURES = [
     ("PERSIST (key without TTL)", ["PERSIST", "k"], 300_000, ""),
     ("EXPIRE (key with TTL)", ["EXPIRE", "ttlk", "100000"], 300_000, ""),
     ("APPEND (1 byte)", ["APPEND", "ap", "x"], 300_000, "value grows"),
-    ("INCRBYFLOAT", ["INCRBYFLOAT", "fl", "1.5"], 300_000, "Ruvio prints 15 digits"),
+    ("INCRBYFLOAT", ["INCRBYFLOAT", "fl", "1.5"], 300_000, "Ruvio prints 16 digits"),
     ("HSET (existing field)", ["HSET", "h", "f1", "v1"], 300_000, ""),
     ("HGET", ["HGET", "h", "f1"], 300_000, ""),
     ("HMGET (2 fields)", ["HMGET", "h", "f1", "f2"], 300_000, ""),
