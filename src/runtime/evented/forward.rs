@@ -211,6 +211,8 @@ pub(crate) struct Fabric {
     pub(super) config: Mutex<super::live::ConfigAuthority>,
     /// Slot moves between these shards.
     pub(super) mover: super::moveslots::SlotMover,
+    /// Ranges moving to or from another node.
+    pub(super) migrations: super::migrate::Migrations,
     /// The cluster map when this node is one of several; set before any shard serves.
     topology: std::sync::OnceLock<crate::topology::SharedTopology>,
 }
@@ -240,6 +242,7 @@ impl Fabric {
             slots: SlotTable::from_formula(count),
             config: Mutex::new(super::live::ConfigAuthority::default()),
             mover: super::moveslots::SlotMover::default(),
+            migrations: super::migrate::Migrations::default(),
             topology: std::sync::OnceLock::new(),
         })
     }

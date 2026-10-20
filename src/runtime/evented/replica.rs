@@ -914,6 +914,21 @@ fn drain_replicated_budget(state: &ShardState, budget: usize) -> usize {
         };
 
         match applied {
+            Ok((_, mutation, _))
+                if matches!(
+                    mutation,
+                    crate::OwnedMutation::SlotsIncoming { .. }
+                        | crate::OwnedMutation::SlotsGiven { .. }
+                ) =>
+            {
+                let sequence = state
+                    .persistence
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .last_sequence();
+
+                super::migrate::replicated(state, &mutation, sequence);
+            }
             Ok((database, mutation, skip_expired)) => {
                 let track_plan = crate::tracking::TrackPlan::replicated(database, &mutation);
                 let hot = database == 0

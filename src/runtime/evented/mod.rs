@@ -70,6 +70,7 @@ mod info;
 mod input;
 mod live;
 mod maintenance;
+mod migrate;
 mod moveslots;
 mod net;
 mod pubsub;

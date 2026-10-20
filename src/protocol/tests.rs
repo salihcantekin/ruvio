@@ -1671,6 +1671,22 @@ fn slowlog_arguments_never_keep_passwords() {
 
     assert_eq!(shown(&[b"AUTH", b"hunter2"]), ["AUTH", "(redacted)"]);
     assert_eq!(
+        shown(&[
+            b"RUVIO",
+            b"MIGRATE",
+            b"EXPORT",
+            b"m1",
+            b"0",
+            b"99",
+            b"10.0.0.2",
+            b"6379",
+            b"AUTH",
+            b"mover",
+            b"hunter2"
+        ])[8..],
+        ["AUTH", "(redacted)", "(redacted)"]
+    );
+    assert_eq!(
         shown(&[b"AUTH", b"bob", b"hunter2"]),
         ["AUTH", "(redacted)", "(redacted)"]
     );

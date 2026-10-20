@@ -70,6 +70,7 @@ pub(super) fn validate_command_payloads(
         | Command::ReplicaOf { .. }
         | Command::MoveSlots(_)
         | Command::Topology(_)
+        | Command::Migrate(_)
         | Command::Role
         | Command::Bgsave
         | Command::DbSize

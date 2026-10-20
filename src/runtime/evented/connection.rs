@@ -1472,6 +1472,7 @@ fn plain_command(command: &Command<'_>) -> bool {
                 | Command::ReplicaOf { .. }
                 | Command::MoveSlots(_)
                 | Command::Topology(_)
+                | Command::Migrate(_)
                 | Command::Role
                 | Command::Bgsave
                 | Command::ChangesSubscribe(_)
@@ -1824,6 +1825,14 @@ async fn dispatch_inner<'s>(
 
             Command::Topology(map) => {
                 super::topology::command(state, map.as_deref(), output)?;
+
+                return Ok(());
+            }
+
+            Command::Migrate(args) => {
+                let args: Vec<&[u8]> = args.iter().map(AsRef::as_ref).collect();
+
+                write_response(output, super::migrate::command(state, &args))?;
 
                 return Ok(());
             }

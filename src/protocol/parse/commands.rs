@@ -45,6 +45,12 @@ pub(in crate::protocol) fn cmd_ruvio<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
         };
     }
 
+    if args.len() >= 2 && args.bytes(0).eq_ignore_ascii_case(b"MIGRATE") {
+        return Ok(Command::Migrate(
+            (1..args.len()).map(|at| args.arg(at)).collect(),
+        ));
+    }
+
     match args.len() {
         0 => Ok(Command::Ruvio(None)),
         1 => Ok(Command::Ruvio(Some(args.arg(0)))),
