@@ -260,8 +260,11 @@ the default quota).
 8. The coordinator port (`ruvio coordinator`) carries Raft votes and the
    Sentinel API. With `secret` unset anyone who reaches it can read the
    topology and take part in failover decisions; with it set, calls without the
-   secret are refused and clients must `AUTH`. The secret is sent in clear text:
-   keep coordinators on a private network. The coordinators' data-node user
+   secret are refused and clients must `AUTH`. Without `tls_cert` the secret
+   and the Raft traffic are sent in clear text, and without `node_tls` so are
+   the coordinators' commands and `auth` password to the data nodes: set both
+   (with `tls_ca`) or keep coordinators on a private network. The coordinators'
+   data-node user
    (`auth`) needs only `ROLE`, `INFO`, `CONFIG GET` and `REPLICAOF` (and `RUVIO`
    for a multi-node cluster or `primary_lease_ms`).
 9. Anyone allowed `ruvio|lease` (`@admin`) can renew a primary's lease with

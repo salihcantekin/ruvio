@@ -41,6 +41,8 @@ struct Group {
     resp: Vec<SocketAddr>,
     replication: Vec<SocketAddr>,
     coordinators: Vec<SocketAddr>,
+    /// Data nodes serve only TLS on their RESP ports when set.
+    tls: Option<TestTls>,
     _ports: (test_ports::PortBlock, test_ports::PortBlock),
 }
 
@@ -53,7 +55,26 @@ impl Group {
             resp: (0..3).map(|index| data.address_at(index)).collect(),
             replication: (0..3).map(|index| replication.address_at(index)).collect(),
             coordinators: (3..6).map(|index| data.address_at(index)).collect(),
+            tls: None,
             _ports: (data, replication),
+        }
+    }
+
+    /// A group whose data nodes and coordinators all use certificates from one test CA.
+    fn with_tls(dir: &Path) -> Self {
+        Self {
+            tls: Some(TestTls::new(dir)),
+            ..Self::new()
+        }
+    }
+
+    /// One command to data node `index`, over TLS when the group has it.
+    fn call_node(&self, index: usize, args: &[&str]) -> Option<String> {
+        let address = self.resp[index].to_string();
+
+        match &self.tls {
+            Some(tls) => tls.calls(&address, &[args])?.pop(),
+            None => call(&address, args),
         }
     }
 
@@ -99,11 +120,16 @@ impl Group {
             ),
             None => command.env("RUVIO_REPLICATION_ROLE", "primary"),
         };
+        if let Some(tls) = &self.tls {
+            command
+                .env("RUVIO_TLS_CERT", &tls.cert)
+                .env("RUVIO_TLS_KEY", &tls.key);
+        }
         command.envs(env.iter().copied());
         let process = Process(command.spawn().unwrap());
 
         wait_until("a data node to answer", || {
-            ping(&self.resp[index].to_string())
+            self.call_node(index, &["PING"]).as_deref() == Some("PONG")
         });
         process
     }
@@ -182,10 +208,17 @@ impl Group {
 
     /// The primary coordinator `index` names, as an index into the data nodes.
     fn primary_by(&self, index: usize) -> Option<usize> {
-        let reply = call_with_secret(
-            &self.coordinators[index].to_string(),
-            &["SENTINEL", "get-master-addr-by-name", "main"],
-        )?;
+        let address = self.coordinators[index].to_string();
+        let question = ["SENTINEL", "get-master-addr-by-name", "main"];
+        let reply = match &self.tls {
+            Some(tls) => {
+                let replies = tls.calls(&address, &[&["AUTH", SECRET], &question])?;
+
+                (replies[0] == "OK").then_some(())?;
+                replies[1].clone()
+            }
+            None => call_with_secret(&address, &question)?,
+        };
         let port: u16 = reply.split_whitespace().nth(1)?.parse().ok()?;
 
         self.resp.iter().position(|address| address.port() == port)
@@ -1492,4 +1525,146 @@ fn a_stalled_member_does_not_hold_up_the_primary_lease() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(writes > 20, "only {writes} writes in four seconds");
+}
+
+/// A test CA and one certificate it signed for 127.0.0.1, used by every process of a group.
+struct TestTls {
+    ca: std::path::PathBuf,
+    cert: std::path::PathBuf,
+    key: std::path::PathBuf,
+    client: std::sync::Arc<rustls::ClientConfig>,
+}
+
+impl TestTls {
+    fn new(dir: &Path) -> Self {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(vec!["Ruvio test CA".into()]).unwrap();
+
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".into()])
+            .unwrap()
+            .signed_by(&key, &issuer)
+            .unwrap();
+        let tls = |name: &str| dir.join(name);
+
+        std::fs::write(tls("ca.crt"), ca_cert.pem()).unwrap();
+        std::fs::write(tls("node.crt"), cert.pem()).unwrap();
+        std::fs::write(tls("node.key"), key.serialize_pem()).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+
+        roots.add(ca_cert.der().clone()).unwrap();
+        Self {
+            ca: tls("ca.crt"),
+            cert: tls("node.crt"),
+            key: tls("node.key"),
+            client: std::sync::Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            ),
+        }
+    }
+
+    /// The coordinator settings: TLS on its port, to the other coordinators and to the nodes.
+    fn coordinator_settings(&self) -> String {
+        format!(
+            "tls_cert = \"{}\"\ntls_key = \"{}\"\ntls_ca = \"{}\"\nnode_tls = true",
+            self.cert.display(),
+            self.key.display(),
+            self.ca.display()
+        )
+    }
+
+    /// Several commands on one TLS connection, each reply as `call` gives it.
+    fn calls(&self, address: &str, commands: &[&[&str]]) -> Option<Vec<String>> {
+        let stream = std::net::TcpStream::connect_timeout(
+            &address.parse().ok()?,
+            Duration::from_millis(300),
+        )
+        .ok()?;
+
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .ok()?;
+        let name = rustls::pki_types::ServerName::try_from("127.0.0.1").ok()?;
+        let connection =
+            rustls::ClientConnection::new(std::sync::Arc::clone(&self.client), name).ok()?;
+        let mut stream = rustls::StreamOwned::new(connection, stream);
+        let mut frame = String::new();
+
+        for args in commands {
+            frame.push_str(&format!("*{}\r\n", args.len()));
+            for arg in *args {
+                frame.push_str(&format!("${}\r\n{arg}\r\n", arg.len()));
+            }
+        }
+        stream.write_all(frame.as_bytes()).ok()?;
+        stream.flush().ok()?;
+        let mut reader = BufReader::new(stream);
+
+        commands.iter().map(|_| read_reply(&mut reader)).collect()
+    }
+}
+
+/// Coordinators that speak TLS among themselves, to clients and to data nodes that accept
+/// nothing else still agree on the primary and fail it over.
+#[test]
+fn coordinators_fail_over_over_tls() {
+    let dir = tempfile::tempdir().unwrap();
+    let group = Group::with_tls(dir.path());
+    let tls = group.tls.as_ref().unwrap();
+    let mut nodes = [
+        group.node(dir.path(), 0, None),
+        group.node(dir.path(), 1, Some(0)),
+        group.node(dir.path(), 2, Some(0)),
+    ];
+
+    // The nodes take no clear text: a coordinator reaches them only through TLS.
+    assert_eq!(call(&group.resp[0].to_string(), &["PING"]), None);
+    assert_eq!(
+        group.call_node(0, &["SET", "before", "1"]).as_deref(),
+        Some("OK")
+    );
+    let _coordinators: Vec<Process> = (0..3)
+        .map(|index| {
+            group.coordinator_with(
+                dir.path(),
+                index,
+                &tls.coordinator_settings(),
+                &group.resp,
+                None,
+            )
+        })
+        .collect();
+
+    wait_until("the coordinators to agree on the primary over TLS", || {
+        (0..3).all(|index| group.primary_by(index) == Some(0))
+    });
+    // Neither the Sentinel API nor the Raft calls answer in clear text.
+    assert_eq!(call(&group.coordinators[0].to_string(), &["PING"]), None);
+
+    nodes[0].kill();
+    let killed = Instant::now();
+
+    wait_until("a failover over TLS", || {
+        group.primary_by(0).is_some_and(|node| node != 0)
+    });
+    let promoted = group.primary_by(0).unwrap();
+
+    wait_until("the new primary to take writes", || {
+        group.call_node(promoted, &["SET", "after", "1"]).as_deref() == Some("OK")
+    });
+    assert!(
+        killed.elapsed() < Duration::from_secs(15),
+        "failover took {:?}",
+        killed.elapsed()
+    );
+    wait_until("the other replica to follow the new primary", || {
+        group.call_node(3 - promoted, &["GET", "after"]).as_deref() == Some("1")
+    });
 }

@@ -587,7 +587,9 @@ the certificate must cover the name or address replicas dial. A replica verifies
 it against `replication.tls_ca` (PEM issuer, required on a replica) and, when
 the primary asks for one (`tls_client_ca`/`tls_client_auth` apply to replicas
 too), presents `replication.tls_client_cert` and `replication.tls_client_key`
-(both or neither). Both ends of a link must agree: a TLS replica cannot follow a
+(both or neither). `ruvio coordinator` has its own TLS settings (`tls_cert`,
+`tls_key`, `tls_ca`, `node_tls`; see "Security" in [COORDINATOR.md](COORDINATOR.md)).
+Both ends of a link must agree: a TLS replica cannot follow a
 cleartext primary or the reverse. Off, nothing is loaded and the stream is
 exactly as before.
 

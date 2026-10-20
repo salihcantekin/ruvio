@@ -5,9 +5,10 @@ use std::{io, time::Duration};
 
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::TcpStream,
     time::timeout,
 };
+
+use super::tls::Stream;
 
 /// A RESP2 reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -159,9 +160,10 @@ pub async fn read_command<R: AsyncBufRead + Unpin>(
     }
 }
 
-/// A connection to one data node, opened per call and logged in when `auth` is set.
+/// A connection to one data node, opened per call, over TLS with `node_tls`, and logged in
+/// when `auth` is set.
 pub struct NodeClient {
-    reader: BufReader<TcpStream>,
+    reader: BufReader<Stream>,
 }
 
 impl NodeClient {
@@ -170,14 +172,9 @@ impl NodeClient {
         auth: Option<&str>,
         wait: Duration,
     ) -> io::Result<Self> {
-        let stream = timeout(
-            wait,
-            TcpStream::connect((address.host.as_str(), address.port)),
-        )
-        .await
-        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
-
-        stream.set_nodelay(true)?;
+        let stream = timeout(wait, super::tls::get().dial_node(address))
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
         let mut client = Self {
             reader: BufReader::new(stream),
         };

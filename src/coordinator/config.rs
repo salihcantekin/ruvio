@@ -117,6 +117,20 @@ struct FileConfig {
     /// read the topology and take part in the coordinators' votes.
     #[serde(default)]
     secret: Option<String>,
+    /// TLS on the coordinator port (Raft and the Sentinel API), and on the calls to the other
+    /// coordinators, which must all have it. The pair is also the client certificate shown
+    /// to data nodes that ask for one.
+    #[serde(default)]
+    tls_cert: Option<PathBuf>,
+    #[serde(default)]
+    tls_key: Option<PathBuf>,
+    /// The CA that vouches for the other coordinators' certificates and, with `node_tls`, the
+    /// data nodes'.
+    #[serde(default)]
+    tls_ca: Option<PathBuf>,
+    /// Dial data nodes with TLS (their `tls_cert`), checked against `tls_ca`.
+    #[serde(default)]
+    node_tls: bool,
     #[serde(default)]
     groups: Vec<Group>,
 }
@@ -164,7 +178,46 @@ pub struct CoordinatorConfig {
     pub primary_lease: Option<(Duration, Duration)>,
     pub auth: Option<String>,
     pub secret: Option<String>,
+    pub tls: TlsSettings,
     pub groups: Vec<Group>,
+}
+
+/// The coordinator's TLS files; everything off by default.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TlsSettings {
+    /// The certificate and key of the coordinator port; `None` serves and calls the other
+    /// coordinators in clear text.
+    pub pair: Option<(PathBuf, PathBuf)>,
+    pub ca: Option<PathBuf>,
+    pub node_tls: bool,
+}
+
+impl TlsSettings {
+    fn parse(
+        cert: Option<PathBuf>,
+        key: Option<PathBuf>,
+        ca: Option<PathBuf>,
+        node_tls: bool,
+    ) -> Result<Self, String> {
+        let set = |path: Option<PathBuf>| path.filter(|path| !path.as_os_str().is_empty());
+        let pair = match (set(cert), set(key)) {
+            (Some(cert), Some(key)) => Some((cert, key)),
+            (None, None) => None,
+            _ => return Err("tls_cert and tls_key must be set together".into()),
+        };
+        let ca = set(ca);
+
+        if ca.is_none() && (pair.is_some() || node_tls) {
+            return Err(
+                "tls_cert and node_tls need tls_ca, the CA that vouches for the other coordinators and the data nodes".into(),
+            );
+        }
+        if ca.is_some() && pair.is_none() && !node_tls {
+            return Err("tls_ca needs tls_cert and tls_key, or node_tls".into());
+        }
+
+        Ok(Self { pair, ca, node_tls })
+    }
 }
 
 impl CoordinatorConfig {
@@ -298,6 +351,7 @@ impl CoordinatorConfig {
                 .ok()
                 .or(file.secret)
                 .filter(|secret| !secret.is_empty()),
+            tls: TlsSettings::parse(file.tls_cert, file.tls_key, file.tls_ca, file.node_tls)?,
             groups: file.groups,
         })
     }
@@ -478,6 +532,34 @@ members = [
         assert_eq!(config.primary_lease, None);
         assert_eq!(config.group("main").unwrap().members.len(), 2);
         assert!(config.group("other").is_none());
+    }
+
+    #[test]
+    fn tls_settings_come_in_complete_sets() {
+        let with = |extra: &str| {
+            CoordinatorConfig::parse(&SAMPLE.replacen(
+                "down_after_ms = 1000",
+                &format!("down_after_ms = 1000\n{extra}"),
+                1,
+            ))
+        };
+
+        assert_eq!(with("").unwrap().tls, TlsSettings::default());
+        let full =
+            with("tls_cert = \"c.pem\"\ntls_key = \"k.pem\"\ntls_ca = \"ca.pem\"\nnode_tls = true")
+                .unwrap()
+                .tls;
+
+        assert_eq!(full.pair, Some(("c.pem".into(), "k.pem".into())));
+        assert_eq!(full.ca, Some("ca.pem".into()));
+        assert!(full.node_tls);
+        let nodes_only = with("tls_ca = \"ca.pem\"\nnode_tls = true").unwrap().tls;
+
+        assert_eq!(nodes_only.pair, None);
+        assert!(with("tls_cert = \"c.pem\"\ntls_ca = \"ca.pem\"").is_err());
+        assert!(with("tls_cert = \"c.pem\"\ntls_key = \"k.pem\"").is_err());
+        assert!(with("node_tls = true").is_err());
+        assert!(with("tls_ca = \"ca.pem\"").is_err());
     }
 
     #[test]
