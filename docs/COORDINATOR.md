@@ -62,8 +62,12 @@ which, per shard):
 After a failover to a replica that held every committed record, the values still apply, so the next
 failover also waits for a replica that caught up. After an unclean one those records are gone and the
 new primary reuses their sequence numbers: the old values are dropped, and the stale ones replicas keep
-reporting are ignored until the new primary commits past them. The values are held in memory: a
-coordinator that restarts while the primary is down learns only what the remaining members report.
+reporting are ignored until the new primary commits past them. The leader writes the values (and
+the ignored stale ones) through Raft when they rise, at most once per ping and in one entry for all
+groups, and every coordinator starts from that record: a new leader, or coordinators that all
+restarted while the primary and the replica holding the records are down, still wait for a replica
+that has them. A value that rose in the last ping before the leader died may not be recorded yet; the
+other coordinators also learn the values from the members on every ping.
 Coordinators' `INFO` shows them as `committed=` on the group's line. Groups whose clients never use
 `CLIENT DURABILITY` report 0 everywhere and fail over as before.
 
@@ -248,6 +252,13 @@ move the range back with another `COORDINATOR MOVE`. The copy rate of a source i
 `migration_max_bytes_per_sec` in its configuration (0, the default, means no cap); the frozen hand-over
 is never slowed down. Nodes need durability `memory`, `everysec` or `always` (not `snapshot`).
 
+## Upgrading
+
+Upgrade all coordinators together: stop every one, replace the binary, start them again. A release
+that records committed sequences in Raft writes a log entry older coordinators cannot read; an older
+coordinator that receives one cannot follow the log, and one restarted on such a log refuses to start.
+The newer release reads the log, vote and snapshot an older one wrote. Data nodes are not affected.
+
 ## Limits of this version
 
 - Groups are declared in the file; replicas are not discovered from the primary yet.
@@ -255,13 +266,14 @@ is never slowed down. Nodes need durability `memory`, `everysec` or `always` (no
   them with the new `peers`).
 - No primary leases: an isolated primary is stopped by `min-replicas-to-write`, not by the coordinators.
 - Ranges move only when an operator asks (`COORDINATOR MOVE`); nothing rebalances by load yet.
-- The committed sequences a failover must keep live in the coordinators' memory, not in Raft.
 
 ## Tests
 
 - `tests/coordinator_live.rs`: three data nodes and three coordinators as real processes: failover after
   the primary is killed, the old primary returning as a replica, agreement kept across a restart of every
-  coordinator, no failover without a majority, and the secret; and two groups of a multi-node cluster,
+  coordinator, no failover without a majority, and the secret; the committed sequences kept across a
+  restart of every coordinator while the primary and the replica holding them are down (only `FORCE`
+  promotes the other replica); and two groups of a multi-node cluster,
   where a failover in one changes the other's `MOVED` answers, and a range moves from one to the other
   while a client keeps writing a key of it (every acknowledged write is on the new owner).
 - `tests/multi_node_live.rs`: the node side of a move driven by hand, and a prepared move kept across

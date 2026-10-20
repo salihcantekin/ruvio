@@ -13,7 +13,9 @@ use tracing::{info, warn};
 
 use super::{
     config::{CoordinatorConfig, Group, Member},
-    raft::{Primary, Raft, Request, RpcRequest, RpcResponse, StateMachine},
+    raft::{
+        Commit, Primary, Raft, Recorded, Request, RpcRequest, RpcResponse, StateMachine, raise,
+    },
     resp::{NodeClient, Value},
 };
 
@@ -203,32 +205,14 @@ async fn command(member: &Member, auth: Option<&str>, args: &[&[u8]]) -> Result<
 }
 
 /// Every group's committed sequences as this coordinator learned them, per shard: a failover
-/// keeps these records. Held in memory; a restarted coordinator learns them again from the
-/// members.
+/// keeps these records. Learned from the members on every tick and taken in from the Raft
+/// record, where the leader writes them when they rise, so a new or restarted leader starts
+/// from what the previous one knew.
 #[derive(Clone, Default)]
 pub struct Commits(Arc<Mutex<HashMap<String, Commit>>>);
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct Commit {
-    /// The primary's epoch the values belong to.
-    epoch: u64,
-    /// The highest committed sequence seen, per shard.
-    committed: Vec<u64>,
-    /// Per shard, what replicas may still report from a primary whose history an unclean
-    /// failover dropped (a replica keeps the highest value it was ever told); replica reports
-    /// up to it are ignored.
-    stale: Vec<u64>,
-}
-
 fn at(values: &[u64], shard: usize) -> u64 {
     values.get(shard).copied().unwrap_or(0)
-}
-
-fn raise(values: &mut Vec<u64>, shard: usize, value: u64) {
-    if values.len() <= shard {
-        values.resize(shard + 1, 0);
-    }
-    values[shard] = values[shard].max(value);
 }
 
 impl Commit {
@@ -285,19 +269,43 @@ impl Commit {
 }
 
 impl Commits {
-    /// Updates what is known committed in `group` from this tick's sightings and returns it.
+    /// Updates what is known committed in `group` from the Raft record and this tick's
+    /// sightings, and returns it.
     pub fn learn(
         &self,
         group: &Group,
         primary: Primary,
         seen: &[Sighting],
         fresh: Duration,
+        recorded: &Recorded,
     ) -> Vec<u64> {
         let mut commits = self.0.lock().unwrap_or_else(|error| error.into_inner());
         let commit = commits.entry(group.name.clone()).or_default();
 
+        if let Some(record) = recorded.get(&group.name) {
+            commit.merge(record);
+        }
         commit.learn(group, primary, seen, fresh);
         commit.committed.clone()
+    }
+
+    /// The groups whose values would change the Raft record: what the leader records next.
+    pub fn ahead_of(&self, recorded: &Recorded) -> Recorded {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .filter(|(group, commit)| match recorded.get(*group) {
+                Some(record) => record.clone().merge(commit),
+                // Groups that never use `CLIENT DURABILITY` write nothing.
+                None => commit
+                    .committed
+                    .iter()
+                    .chain(&commit.stale)
+                    .any(|&value| value > 0),
+            })
+            .map(|(group, commit)| (group.clone(), commit.clone()))
+            .collect()
     }
 
     /// What is known committed in `group`, per shard; empty when nothing is.
@@ -481,8 +489,10 @@ pub async fn lead(
     loop {
         tick.tick().await;
         if raft.current_leader().await != Some(config.id) {
-            // Every coordinator learns what was committed, so a new leader knows it.
+            // Every coordinator learns what was committed, so a new leader also knows what
+            // rose after the last record.
             let primaries = machine.primaries();
+            let recorded = machine.commits();
 
             for group in &config.groups {
                 if let Some(primary) = primaries.get(&group.name) {
@@ -490,11 +500,13 @@ pub async fn lead(
                         .map(|member| sightings.get(&group.name, member))
                         .collect();
 
-                    commits.learn(group, *primary, &seen, config.down_after);
+                    commits.learn(group, *primary, &seen, config.down_after, &recorded);
                 }
             }
             continue;
         }
+
+        let recorded = machine.commits();
 
         for group in &config.groups {
             let seen: Vec<Sighting> = (0..group.members.len())
@@ -518,7 +530,7 @@ pub async fn lead(
                 }
                 continue;
             };
-            let committed = commits.learn(group, primary, &seen, config.down_after);
+            let committed = commits.learn(group, primary, &seen, config.down_after, &recorded);
             let primary_age = seen[primary.member].last_ok.map(|at| at.elapsed());
 
             if primary_age.is_none_or(|age| age > config.down_after)
@@ -537,6 +549,7 @@ pub async fn lead(
             reconcile(&config, group, primary, &seen).await;
         }
 
+        record_commits(&raft, &commits, &recorded).await;
         push_cluster_map(&config, &machine, &sightings).await;
         // A move the previous leader began continues here.
         super::migrate::resume(&moves);
@@ -623,6 +636,21 @@ async fn push_cluster_map(
                     .retain(|known| *known != key);
             });
         }
+    }
+}
+
+/// Writes the committed sequences that rose since the last record through Raft, all groups in
+/// one entry. A write that fails or takes too long is tried again on the next tick.
+async fn record_commits(raft: &Raft, commits: &Commits, recorded: &Recorded) {
+    let ahead = commits.ahead_of(recorded);
+
+    if ahead.is_empty() {
+        return;
+    }
+    match tokio::time::timeout(CALL_TIMEOUT, raft.client_write(Request::Commit(ahead))).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => warn!(%error, "could not record the committed sequences"),
+        Err(_) => warn!("recording the committed sequences timed out"),
     }
 }
 
@@ -788,9 +816,13 @@ pub async fn force_failover(force: Force<'_>, group: &Group) -> Result<String, S
             group.name
         ));
     }
-    let committed = force
-        .commits
-        .learn(group, primary, &seen, force.config.down_after);
+    let committed = force.commits.learn(
+        group,
+        primary,
+        &seen,
+        force.config.down_after,
+        &force.machine.commits(),
+    );
     let failing = Failing {
         group,
         primary,
@@ -990,15 +1022,24 @@ mod tests {
             member(following(&group, 2), &[0, 0], &[99, 99]),
         ];
 
-        assert_eq!(commits.learn(&group, primary, &seen, fresh), vec![20, 30]);
+        assert_eq!(
+            commits.learn(&group, primary, &seen, fresh, &Recorded::new()),
+            vec![20, 30]
+        );
         // A replica's value above what the answering primary holds is left from an earlier
         // primary: it counts only up to the primary's sequence.
         seen[1].shard_committed = vec![70, 30];
-        assert_eq!(commits.learn(&group, primary, &seen, fresh), vec![50, 30]);
+        assert_eq!(
+            commits.learn(&group, primary, &seen, fresh, &Recorded::new()),
+            vec![50, 30]
+        );
         // The primary is down: replicas' values count as told, and the highest one stays.
         seen[0].last_ok = None;
         seen[1].shard_committed = vec![55, 10];
-        assert_eq!(commits.learn(&group, primary, &seen, fresh), vec![55, 30]);
+        assert_eq!(
+            commits.learn(&group, primary, &seen, fresh, &Recorded::new()),
+            vec![55, 30]
+        );
         assert_eq!(
             choose(&group, 0, &seen, fresh, &[55, 30], false),
             Choice::Wait
@@ -1014,7 +1055,11 @@ mod tests {
             name: "quiet".into(),
             ..group.clone()
         };
-        assert!(commits.learn(&other, primary, &quiet, fresh).is_empty());
+        assert!(
+            commits
+                .learn(&other, primary, &quiet, fresh, &Recorded::new())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1032,7 +1077,10 @@ mod tests {
             member(following(&group, 0), &[30], &[40]),
         ];
 
-        assert_eq!(commits.learn(&group, first, &seen, fresh), vec![40]);
+        assert_eq!(
+            commits.learn(&group, first, &seen, fresh, &Recorded::new()),
+            vec![40]
+        );
 
         // Member 1 held every committed record and was promoted: they stay committed, so
         // member 2 must catch up before it can take over.
@@ -1043,7 +1091,10 @@ mod tests {
         seen[0] = Sighting::default();
         seen[1] = member(Role::Master, &[45], &[0]);
         seen[2] = member(following(&group, 1), &[30], &[40]);
-        assert_eq!(commits.learn(&group, second, &seen, fresh), vec![40]);
+        assert_eq!(
+            commits.learn(&group, second, &seen, fresh, &Recorded::new()),
+            vec![40]
+        );
         assert_eq!(choose(&group, 1, &seen, fresh, &[40], false), Choice::Wait);
 
         // Forced onto member 2, which lacked them: those records are lost and its own
@@ -1055,11 +1106,134 @@ mod tests {
         };
         seen[1] = member(following(&group, 2), &[30], &[40]);
         seen[2] = member(Role::Master, &[32], &[0]);
-        assert_eq!(commits.learn(&group, third, &seen, fresh), vec![0]);
+        assert_eq!(
+            commits.learn(&group, third, &seen, fresh, &Recorded::new()),
+            vec![0]
+        );
         seen[2].last_ok = None;
-        assert_eq!(commits.learn(&group, third, &seen, fresh), vec![0]);
+        assert_eq!(
+            commits.learn(&group, third, &seen, fresh, &Recorded::new()),
+            vec![0]
+        );
         // A durable write of the new primary above the old value counts again.
         seen[1].shard_committed = vec![41];
-        assert_eq!(commits.learn(&group, third, &seen, fresh), vec![41]);
+        assert_eq!(
+            commits.learn(&group, third, &seen, fresh, &Recorded::new()),
+            vec![41]
+        );
+    }
+
+    #[test]
+    fn a_new_leader_starts_from_the_recorded_commits_and_records_only_what_rose() {
+        let group = group(3);
+        let fresh = Duration::from_secs(5);
+        let primary = Primary {
+            member: 0,
+            epoch: 1,
+        };
+        let old_leader = Commits::default();
+        let mut seen = vec![
+            member(Role::Master, &[50], &[40]),
+            member(following(&group, 0), &[45], &[40]),
+            member(following(&group, 0), &[30], &[0]),
+        ];
+        let mut recorded = Recorded::new();
+
+        assert_eq!(
+            old_leader.learn(&group, primary, &seen, fresh, &recorded),
+            vec![40]
+        );
+        let ahead = old_leader.ahead_of(&recorded);
+
+        assert_eq!(ahead.keys().collect::<Vec<_>>(), ["main"]);
+        assert!(super::super::raft::apply_commit(
+            &mut recorded,
+            &Request::Commit(ahead)
+        ));
+        // Recorded: nothing more to write until a value rises.
+        assert!(old_leader.ahead_of(&recorded).is_empty());
+        old_leader.learn(&group, primary, &seen, fresh, &recorded);
+        assert!(old_leader.ahead_of(&recorded).is_empty());
+
+        // The old leader and the primary are gone, and so is member 1; member 2 never held
+        // record 40 and reports nothing committed. A coordinator that knows only what members
+        // report would promote it; one that starts from the record waits.
+        seen[0] = Sighting::default();
+        seen[1] = Sighting::default();
+        let new_leader = Commits::default();
+
+        assert!(
+            new_leader
+                .learn(&group, primary, &seen, fresh, &Recorded::new())
+                .is_empty()
+        );
+        assert_eq!(
+            new_leader.learn(&group, primary, &seen, fresh, &recorded),
+            vec![40]
+        );
+        assert_eq!(choose(&group, 0, &seen, fresh, &[40], false), Choice::Wait);
+        assert!(new_leader.ahead_of(&recorded).is_empty());
+
+        // Groups that never use durability write nothing.
+        let quiet = Commits::default();
+        let idle = vec![
+            member(Role::Master, &[50], &[0]),
+            member(following(&group, 0), &[45], &[0]),
+            Sighting::default(),
+        ];
+        quiet.learn(&group, primary, &idle, fresh, &Recorded::new());
+        assert!(quiet.ahead_of(&Recorded::new()).is_empty());
+    }
+
+    #[test]
+    fn the_stale_floor_of_an_unclean_failover_is_recorded_too() {
+        let group = group(3);
+        let fresh = Duration::from_secs(5);
+        let leader = Commits::default();
+        let mut recorded = Recorded::new();
+        let mut seen = vec![
+            member(Role::Master, &[50], &[40]),
+            member(following(&group, 0), &[45], &[40]),
+            member(following(&group, 0), &[30], &[0]),
+        ];
+        let first = Primary {
+            member: 0,
+            epoch: 1,
+        };
+
+        leader.learn(&group, first, &seen, fresh, &recorded);
+        let ahead = leader.ahead_of(&recorded);
+        apply_commit_request(&mut recorded, ahead);
+
+        // Forced onto member 2, which lacked record 40; member 1 keeps reporting 40.
+        let second = Primary {
+            member: 2,
+            epoch: 2,
+        };
+        seen[0] = Sighting::default();
+        seen[1] = member(following(&group, 2), &[45], &[40]);
+        seen[2] = member(Role::Master, &[32], &[0]);
+        assert_eq!(
+            leader.learn(&group, second, &seen, fresh, &recorded),
+            vec![0]
+        );
+        let ahead = leader.ahead_of(&recorded);
+        apply_commit_request(&mut recorded, ahead);
+        assert_eq!(recorded["main"].epoch, 2);
+        assert_eq!(recorded["main"].stale, [40]);
+
+        // A restarted coordinator ignores member 1's old value: the next failover is not held
+        // up by records that are gone.
+        seen[2].last_ok = None;
+        let restarted = Commits::default();
+
+        assert_eq!(
+            restarted.learn(&group, second, &seen, fresh, &recorded),
+            vec![0]
+        );
+    }
+
+    fn apply_commit_request(recorded: &mut Recorded, ahead: Recorded) {
+        super::super::raft::apply_commit(recorded, &Request::Commit(ahead));
     }
 }

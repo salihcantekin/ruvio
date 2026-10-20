@@ -45,6 +45,10 @@ async fn serve(
             heartbeat_interval: 250,
             election_timeout_min: 1000,
             election_timeout_max: 2000,
+            // The log is rewritten whole on every append and grows by up to one committed
+            // sequence record per tick: snapshot and purge it well before the defaults would.
+            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(1000),
+            max_in_snapshot_log_to_keep: 100,
             ..openraft::Config::default()
         }
         .validate()

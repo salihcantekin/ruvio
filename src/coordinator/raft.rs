@@ -1,5 +1,6 @@
 //! The coordinators' replicated state on openraft: which member of each replication group is
-//! primary, at which epoch. Log, vote and snapshot are small JSON files written with temp file,
+//! primary, at which epoch, the slot ranges moved between groups, and the highest sequence
+//! committed per group and shard (what a failover must keep). Log, vote and snapshot are small JSON files written with temp file,
 //! fsync and rename, like Ruvio's other durable files; RPCs are length-prefixed JSON frames on
 //! the coordinator's own port.
 
@@ -46,7 +47,65 @@ pub enum Request {
     CommitMove { id: String },
     /// The move ended before its commit (cancelled, failed, or a failover interrupted it).
     EndMove { id: String },
+    /// What the leader learned committed in these groups since the last record, sent at most
+    /// once per tick and only when a value rose. Coordinators older than this request cannot
+    /// read a log that holds it: all coordinators are upgraded together.
+    Commit(Recorded),
 }
+
+/// A group's committed sequences under one primary epoch, per shard: a failover keeps them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Commit {
+    /// The primary's epoch the values belong to.
+    pub epoch: u64,
+    /// The highest committed sequence seen, per shard.
+    pub committed: Vec<u64>,
+    /// Per shard, what replicas may still report from a primary whose history an unclean
+    /// failover dropped (a replica keeps the highest value it was ever told); replica reports
+    /// up to it are ignored.
+    pub stale: Vec<u64>,
+}
+
+/// Raises `values[shard]` to at least `value`, growing `values` as needed.
+pub fn raise(values: &mut Vec<u64>, shard: usize, value: u64) {
+    if values.len() <= shard {
+        values.resize(shard + 1, 0);
+    }
+    values[shard] = values[shard].max(value);
+}
+
+impl Commit {
+    /// Takes in `other`: a newer epoch replaces these values (an unclean failover may have
+    /// dropped some), the same epoch raises them shard by shard, an older one changes nothing.
+    /// Returns whether anything changed.
+    pub fn merge(&mut self, other: &Commit) -> bool {
+        if other.epoch < self.epoch {
+            return false;
+        }
+        if other.epoch > self.epoch {
+            let changed = self != other;
+
+            *self = other.clone();
+            return changed;
+        }
+        let before = (self.committed.clone(), self.stale.clone());
+
+        for (values, theirs) in [
+            (&mut self.committed, &other.committed),
+            (&mut self.stale, &other.stale),
+        ] {
+            for (shard, &value) in theirs.iter().enumerate() {
+                if value > 0 {
+                    raise(values, shard, value);
+                }
+            }
+        }
+        before != (self.committed.clone(), self.stale.clone())
+    }
+}
+
+/// Every group's recorded committed sequences.
+pub type Recorded = BTreeMap<String, Commit>;
 
 /// A move between groups the coordinators agreed to start.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,6 +350,9 @@ struct MachineState {
     /// Absent in snapshots written before moves between groups existed.
     #[serde(default)]
     moves: Moves,
+    /// Absent in snapshots written before committed sequences were recorded.
+    #[serde(default)]
+    commits: Recorded,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -345,6 +407,14 @@ impl StateMachine {
             .clone()
     }
 
+    pub fn commits(&self) -> Recorded {
+        self.state
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .commits
+            .clone()
+    }
+
     fn snapshot_path(&self) -> PathBuf {
         self.dir.join("raft-snapshot.json")
     }
@@ -384,14 +454,30 @@ pub fn apply_move(moves: &mut Moves, primaries: &Primaries, request: &Request) -
             true
         }
         Request::EndMove { id } => moves.current.take_if(|current| current.id == *id).is_some(),
-        Request::SetPrimary { .. } => false,
+        Request::SetPrimary { .. } | Request::Commit(_) => false,
     }
+}
+
+/// Applies a commit record; returns whether it changed anything.
+pub fn apply_commit(commits: &mut Recorded, request: &Request) -> bool {
+    let Request::Commit(groups) = request else {
+        return false;
+    };
+    let mut changed = false;
+
+    for (group, commit) in groups {
+        changed |= commits.entry(group.clone()).or_default().merge(commit);
+    }
+    changed
 }
 
 /// Applies one request; returns whether it changed anything.
 pub fn apply_request(primaries: &mut Primaries, request: &Request) -> bool {
     match request {
-        Request::BeginMove(_) | Request::CommitMove { .. } | Request::EndMove { .. } => false,
+        Request::BeginMove(_)
+        | Request::CommitMove { .. }
+        | Request::EndMove { .. }
+        | Request::Commit(_) => false,
         Request::SetPrimary {
             group,
             member,
@@ -492,6 +578,7 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
 
                     apply_request(&mut state.primaries, &request)
                         || apply_move(&mut state.moves, &state.primaries, &request)
+                        || apply_commit(&mut state.commits, &request)
                 }
                 EntryPayload::Membership(membership) => {
                     state.membership = StoredMembership::new(Some(entry.log_id), membership);
@@ -828,6 +915,51 @@ mod tests {
             &Request::CommitMove { id: "m3".into() }
         ));
         assert_eq!(moves.moved.len(), 1);
+    }
+
+    #[test]
+    fn a_commit_record_rises_within_an_epoch_and_a_newer_epoch_replaces_it() {
+        let mut recorded = Recorded::new();
+        let record = |epoch, committed: &[u64], stale: &[u64]| {
+            Request::Commit(Recorded::from([(
+                "main".to_owned(),
+                Commit {
+                    epoch,
+                    committed: committed.to_vec(),
+                    stale: stale.to_vec(),
+                },
+            )]))
+        };
+
+        assert!(apply_commit(&mut recorded, &record(1, &[20, 30], &[])));
+        // Retried or late: nothing changes.
+        assert!(!apply_commit(&mut recorded, &record(1, &[20, 30], &[])));
+        assert!(!apply_commit(&mut recorded, &record(1, &[10, 0], &[])));
+        assert!(apply_commit(&mut recorded, &record(1, &[25, 0], &[])));
+        assert_eq!(recorded["main"].committed, [25, 30]);
+        // An unclean failover's record drops the old values for the new epoch.
+        assert!(apply_commit(&mut recorded, &record(2, &[0, 0], &[25, 30])));
+        assert_eq!(recorded["main"].committed, [0, 0]);
+        assert_eq!(recorded["main"].stale, [25, 30]);
+        // A record of an older epoch arriving late changes nothing.
+        assert!(!apply_commit(&mut recorded, &record(1, &[90, 90], &[])));
+        assert_eq!(recorded["main"].epoch, 2);
+        // Other requests leave it alone, and the commit request moves nothing else.
+        assert!(!apply_commit(
+            &mut recorded,
+            &Request::EndMove { id: "m".into() }
+        ));
+        assert!(!apply_request(&mut Primaries::new(), &record(3, &[1], &[])));
+    }
+
+    #[test]
+    fn a_snapshot_without_commit_records_still_loads() {
+        let state: MachineState = serde_json::from_str(
+            r#"{"last_applied":null,"membership":{"log_id":null,"membership":{"configs":[],"nodes":{}}},"primaries":{}}"#,
+        )
+        .unwrap();
+
+        assert!(state.commits.is_empty());
     }
 
     #[test]
