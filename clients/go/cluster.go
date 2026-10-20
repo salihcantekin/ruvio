@@ -99,6 +99,8 @@ func (cl *cluster) node(addr string) *Client {
 	o.Addr = addr
 	o.Seeds = nil
 	o.Cluster = false
+	o.SentinelMaster = ""
+	o.DisableFollowPrimary = true
 	n := NewClient(o)
 	cl.nodes[addr] = n
 	return n

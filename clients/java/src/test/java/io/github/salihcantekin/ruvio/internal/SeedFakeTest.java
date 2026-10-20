@@ -55,7 +55,8 @@ class SeedFakeTest {
     }
 
     private static RuvioOptions.Builder seeds(String... addresses) {
-        return RuvioOptions.builder().seeds(addresses).connectTimeoutMillis(500).commandTimeoutMillis(5_000);
+        // The scripted seeds do not answer ROLE; the rotation is what is checked (FollowFailoverFakeTest has the rest).
+        return RuvioOptions.builder().seeds(addresses).followPrimary(false).connectTimeoutMillis(500).commandTimeoutMillis(5_000);
     }
 
     @Test

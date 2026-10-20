@@ -514,6 +514,20 @@ Connect tries the seeds in order, one attempt each, and keeps the first that ans
 
 On a cluster, `CLUSTER SLOTS` comes from the first reachable seed. A slot map reload (after a `MOVED` to an unknown node, or when a node cannot be opened again) asks the nodes with an open socket first; when none answers, it opens every other known node and then every seed, one attempt each, until one returns a slot map. The command goes to the owner the new map names, and a command without a key goes to the first reachable node of the new map. Seeds are never asked while the known nodes answer. A pipeline that hits a node that cannot be opened fails; the next command reloads the map.
 
+### Following a failover
+
+With two or more seeds a standalone client finds the primary again after a failover. On a reconnect it asks the seeds `ROLE` and connects to the one that answers `master` (a replica's reported primary is tried too); if none does it falls back to the first seed that answers. When a command is answered `READONLY` (the node was demoted) it does the same and sends that command once more to the new primary: `READONLY` is sent before the command runs, so the retry cannot apply it twice. It is not sent again inside a transaction the client opened, or in a pipeline, and a second `READONLY` is returned as the `RuvioException`. The rounds wait with the reconnect backoff (`MaxReconnectAttempts`, `ReconnectBaseDelay`, `ReconnectMaxDelay`); with `Reconnect = false` there is one round. Nothing is sent while the connection is healthy, and a single address behaves as before. A cluster client keeps its `MOVED`/`ASK` rules. `FollowPrimary = false` turns it off.
+
+With `SentinelMaster` set the seeds are coordinator (or Sentinel) addresses: the client asks `SENTINEL get-master-addr-by-name <name>`, checks the answer with `ROLE`, and connects there, at connect time, on reconnect and after `READONLY`. Connect throws a `RuvioException` naming the master when no coordinator names a primary. The same `AUTH` credentials go to the coordinators and the data node. The rules are the same in every client ([docs/CLIENT_BEHAVIOR.md](../../../docs/CLIENT_BEHAVIOR.md#following-a-failover)).
+
+```csharp
+var options = new RuvioClientOptions { Seeds = ["10.0.0.5:6379", "10.0.0.6:6379"] };
+// Or with coordinators: the seeds are their addresses.
+var viaSentinel = new RuvioClientOptions { Seeds = ["10.0.0.9:26379"], SentinelMaster = "main" };
+```
+
+`FailoverLiveTests` needs the pair `scripts/run_with_servers.sh` starts (`RUVIO_FAILOVER_ADDRS`, `RUVIO_FAILOVER_REPLICATION`) and returns early without it; `FollowFailoverTests` uses scripted nodes and needs nothing.
+
 ### Reads from replicas
 
 `RuvioClientOptions.DurabilityReplicas` (with an optional `DurabilityTimeout`) makes every connection the client opens send `CLIENT DURABILITY REPLICAS n [TIMEOUT ms]` right after `AUTH`, so the server holds that connection's replies until `n` replicas have the writes on disk; a write the replicas do not confirm in time fails with `NOREPLICAS` and stays applied. A server without replication refuses it and the connect fails. The default sends nothing. `SetDurabilityAsync(replicas, timeout)` sets or clears it on one connection.

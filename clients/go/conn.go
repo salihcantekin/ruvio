@@ -600,6 +600,31 @@ func (c *conn) exec(ctx context.Context, r *request) (Value, error) {
 	return v, err
 }
 
+// execKeep is exec for a caller that may send r again: it does not recycle r, which the
+// caller must putReq when kept is true. kept is false when the call was abandoned and the
+// reader owns r.
+func (c *conn) execKeep(ctx context.Context, r *request) (v Value, kept bool, err error) {
+	ok, err := c.roundTrip(ctx, r)
+	if !ok {
+		return Value{}, false, err
+	}
+	v, err = r.val, r.err
+	if err == nil && v.Kind == KindError {
+		err = &Error{Msg: b2s(v.Bytes)}
+	}
+	return v, true, err
+}
+
+// rearm readies a completed request to be sent again.
+func (r *request) rearm() {
+	r.val = Value{}
+	r.vals = nil
+	r.err = nil
+	r.skip = 0
+	r.expect = 1
+	r.state.Store(stateWaiting)
+}
+
 // execMany sends one frame holding n commands and returns n replies (errors in place).
 func (c *conn) execMany(ctx context.Context, r *request, n int) ([]Value, error) {
 	r.expect = n

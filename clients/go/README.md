@@ -184,6 +184,36 @@ reachable seed; when a node cannot be opened again, the slot map is reloaded fro
 that still have a connection and then from the other known nodes and the seeds, and the
 command goes to the owner the new map names. No cost is added to the per-command path.
 
+### Following a failover
+
+With two or more `Seeds` a standalone client finds the primary again after a failover. After
+the connection drops, the reconnect asks the seeds `ROLE` and connects to the one that answers
+`master` (a replica's reported primary is tried too); if none does, the usual seed order
+applies. When a command is answered `READONLY` (the node was demoted) the client does the same,
+avoiding the node that answered, and sends that command once more on the new connection:
+`READONLY` is sent before the command runs, so the retry cannot apply it twice. A second
+`READONLY` is returned, and nothing is sent again after a transaction opened with `Do("MULTI")`
+on the shared connection, or after an I/O error. Up to 8 rounds run with waits of 100 ms
+doubling to 2 s (7.1 s at most, bounded by the call's context); when none finds a primary the
+`READONLY` error is returned and the connection stays. Pipelines, `Conn`, `Tx` and blocking
+commands run on their own connection and return `READONLY` as is. Nothing is sent while the
+connection is healthy, a single address behaves as before, and a cluster client never does
+this. `Options.DisableFollowPrimary` turns it off.
+
+With `Options.SentinelMaster` set, `Seeds` (or `Addr`) are coordinator addresses: the client
+asks `SENTINEL get-master-addr-by-name <name>`, checks the answer with `ROLE`, and connects
+there, on the first connect (which fails with an error wrapping `ErrProtocol` when no
+coordinator names a primary), on reconnect and after `READONLY`. The same `AUTH` credentials
+go to coordinators and data nodes. The rules are the same in every client
+([docs/CLIENT_BEHAVIOR.md](../../docs/CLIENT_BEHAVIOR.md#following-a-failover)).
+
+```go
+c, err := ruvio.Connect(ctx, ruvio.Options{
+    Seeds:          []string{"10.0.0.9:26379"},
+    SentinelMaster: "main",
+})
+```
+
 ## Cluster
 
 ```go
@@ -379,6 +409,10 @@ position kind, `MOVED`, scripted fake nodes; `cluster_live_test.go`: keys spread
 shards, cross-slot `MGET/MSET/DEL` order (plain and in pipelines), pipeline order, forced stale-table recovery,
 transactions, helpers, blocking, `SCAN`, Pub/Sub, scripts, concurrency, standalone fallback
 with `Cluster: true`) skip without their server variables.
+
+`follow_test.go` (scripted nodes) and `follow_live_test.go` (the failover pair
+`scripts/run_with_servers.sh` starts: `RUVIO_FAILOVER_ADDRS`, `RUVIO_FAILOVER_REPLICATION`)
+cover following a failover; the live test skips without the variables.
 
 The live suite exercises every command family against a real server (strings, keys,
 bitmaps/HLL, Ruvio extensions, lists, sets, hashes incl. field TTLs, sorted sets, geo,

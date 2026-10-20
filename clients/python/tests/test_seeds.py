@@ -94,7 +94,7 @@ async def test_a_refused_auth_stops_at_once(build):
 async def test_a_dropped_connection_moves_on_to_the_next_seed(build):
     first, last = value_node("first"), value_node("last")
     try:
-        c = build([f"127.0.0.1:{first.port}", ("127.0.0.1", closed_port()), ("127.0.0.1", last.port)])
+        c = build([f"127.0.0.1:{first.port}", ("127.0.0.1", closed_port()), ("127.0.0.1", last.port)], follow_primary=False)  # probes would add connections
         assert await c.get("k") == "first"
         first.store["drop"] = "1"
         with pytest.raises(ruvio.ConnectionError):

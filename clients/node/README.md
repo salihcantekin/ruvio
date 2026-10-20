@@ -189,6 +189,23 @@ const cluster = createClusterClient({ seeds: ['10.0.0.1:7000', '10.0.0.2:7000', 
 - `ClusterClient` reads the slot table from the first reachable seed. A reload asks the open node connections first; when none answers it opens the other known nodes and then the seeds, and a command whose node cannot be opened goes to the owner the new table names. Seeds that cannot be opened do not stay in `c.nodes`.
 - `seeds` cannot be combined with `path`; an empty host or an invalid port throws a `TypeError` when the client is created.
 
+## Following a failover
+
+A standalone client with two or more `seeds`, or with `sentinelMaster`, finds the primary again after a failover instead of staying on a node that is now a replica. `followPrimary` (default `true`) turns it off; with one address and no coordinator name nothing changes. A `ClusterClient` does not follow.
+
+```ts
+const client = createClient({ seeds: ['10.0.0.1:6379', '10.0.0.2:6379'] });
+const viaCoordinator = createClient({ seeds: ['10.0.0.9:26379'], sentinelMaster: 'main' });
+```
+
+- A probe is a short-lived socket that sends `AUTH` as configured and one command (`ROLE`, or `SENTINEL get-master-addr-by-name <name>`), waits at most the smaller of `connectTimeoutMs` and `commandTimeoutMs`, and closes. A node that does not answer is skipped; a refused `AUTH` fails the operation. A replica's reported primary is probed too, once, when it is no seed.
+- After a dropped connection each reconnect runs one round first (starting at the seed after the one that dropped) and connects to the node that answered `master`; without one it falls back to the seed order. The command that hit the drop still rejects.
+- A reply `READONLY` (that word alone, or followed by a space) makes the client search for the primary, avoiding the node that answered, in up to 8 rounds with waits of 100 ms doubling to 2 s (one round with `reconnect: false`). The waits are timers, so other work goes on. When a primary is found the socket is replaced and the refused command is sent once more; its reply, an error included, is the caller's. When none is found the `READONLY` error is returned and the connection stays. Commands still waiting for a reply on the old socket get a second to be answered, then reject with a `ConnectionError`.
+- Not sent again, though the connection still moves: a command after a `MULTI` you sent with `call` (until `EXEC` or `DISCARD`), a command of a `pipeline()` or `multi()` batch (its `READONLY` error is in its slot), any other error (`LOADING`, `MASTERDOWN`, `NOREPLICAS`), and a command that failed with a dropped socket.
+- With `sentinelMaster` the seeds are coordinators. The first connect asks them (one round) and fails with a `ConnectionError` naming the master when none names a primary. The same `username` and `password` go to coordinators and data nodes.
+- The `connect` event carries the address of the new socket, and `disconnect` the address that was lost as its second argument.
+- While the connection is healthy nothing is sent: the added work is looking at the text of an error reply, and a following client keeps the position of each pending command's frame so a refused one can be sent again.
+
 ## Tests and benchmark
 
 ```sh

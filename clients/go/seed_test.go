@@ -86,7 +86,7 @@ func TestADroppedConnectionMovesOnToTheNextSeed(t *testing.T) {
 		return defaultFake(f, args)
 	})
 	second := okFake(t)
-	c, err := Connect(context.Background(), Options{Seeds: []string{first.addr, second.addr}})
+	c, err := Connect(context.Background(), Options{Seeds: []string{first.addr, second.addr}, DisableFollowPrimary: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestADedicatedConnectionStartsAtTheAddressTheCommandConnectionIsOn(t *testi
 		return defaultFake(f, args)
 	})
 	second := okFake(t)
-	c, err := Connect(context.Background(), Options{Seeds: []string{first.addr, second.addr}})
+	c, err := Connect(context.Background(), Options{Seeds: []string{first.addr, second.addr}, DisableFollowPrimary: true})
 	if err != nil {
 		t.Fatal(err)
 	}

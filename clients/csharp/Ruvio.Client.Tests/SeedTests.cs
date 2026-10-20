@@ -194,6 +194,9 @@ public class SeedTests
     {
         Seeds = seeds,
         DiscoverCluster = false,
+
+        // The scripted seeds only answer PING; the rotation is what is checked.
+        FollowPrimary = false,
         ReconnectBaseDelay = TimeSpan.Zero,
         ReconnectMaxDelay = TimeSpan.Zero,
         ConnectTimeout = TimeSpan.FromMilliseconds(500),

@@ -205,6 +205,7 @@ class ClusterRuvio(Ruvio):
         o.host = host
         o.port = port
         o.seeds = None
+        o.stop_following()
         return _Node(host, port, o)
 
     async def _discover(self) -> None:
@@ -227,6 +228,8 @@ class ClusterRuvio(Ruvio):
                 c.mode = 2
                 return
             self._detach_seed_list()
+            self._st.follow = False
+            self._st.opts.stop_following()
             proto = self._st.proto
             if proto is not None:
                 self._adopt_seed(proto)
@@ -254,6 +257,7 @@ class ClusterRuvio(Ruvio):
         if seed.opts.seeds:
             o = _Options(**seed.opts.as_dict())
             o.host, o.port, o.seeds = seed.host, seed.port, None
+            o.stop_following()
             seed.opts = o
 
     def _adopt_seed(self, proto: Any) -> None:

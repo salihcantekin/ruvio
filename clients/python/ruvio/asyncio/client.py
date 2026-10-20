@@ -45,8 +45,9 @@ from .._models import Message
 from .._pipeline import PipelineBase
 from .._resp import NEED, Push, encode, make_parser
 from .._cluster import ReadPolicy, policy_code
+from .._follow import MASTER, ROUNDS, WAITS, Address, parse_master_addr, parse_role, probe_wait
 from ..client import _SUB_KINDS, _message, _Options, _parse_seeds, parse_url
-from ..errors import ConnectionError, LockError, ResponseError, RuvioError, TimeoutError, WatchError
+from ..errors import ConnectionError, LockError, ProtocolError, ResponseError, RuvioError, TimeoutError, WatchError
 
 __all__ = ["Ruvio", "Pipeline", "PubSub", "Lock"]
 
@@ -177,11 +178,40 @@ class _Cursor:
     (so a reconnect ends with the address that dropped), ``at`` the seed connected to (-1 before the
     first connect). A failed open leaves both alone."""
 
-    __slots__ = ("pos", "at")
+    __slots__ = ("pos", "at", "addrs", "coord", "multi", "once")
 
-    def __init__(self) -> None:
+    def __init__(self, opts: Optional[_Options] = None) -> None:
         self.pos = 0
         self.at = -1
+        #: The addresses a connect tries in order: the seeds, plus any primary a replica reported; with
+        #: ``sentinel_master`` just the primary last found (empty before the first connect).
+        self.addrs: Optional[List[Address]] = None
+        #: With ``sentinel_master``, the coordinators to ask.
+        self.coord: Optional[List[Address]] = None
+        #: True between an acknowledged ``MULTI`` and ``EXEC``/``DISCARD`` sent through the client.
+        self.multi = False
+        #: True while the command a ``READONLY`` reply refused is sent its second time.
+        self.once = False
+        if opts is not None:
+            if opts.sentinel_master is not None:
+                self.addrs = []
+                self.coord = list(opts.seeds) if opts.seeds else [(opts.host, opts.port)]
+            elif opts.seeds:
+                self.addrs = list(opts.seeds)
+
+    def following(self, opts: _Options) -> bool:
+        """Following is active: the option is on and there are at least two seeds or a coordinator name."""
+        if not opts.follow_primary:
+            return False
+        if opts.sentinel_master is not None:
+            return True
+        return bool(opts.seeds) and len(self.addrs or ()) > 1
+
+    def address(self) -> Optional[Address]:
+        """The address the connection is on, or ``None`` before the first connect."""
+        if self.addrs is not None and self.at >= 0:
+            return self.addrs[self.at]
+        return None
 
     def resume(self) -> int:
         """The seed index a new connection that should join this one starts at."""
@@ -191,11 +221,15 @@ class _Cursor:
 class _State:
     """Connection state shared by a client and its ``raw`` view."""
 
-    __slots__ = ("opts", "proto", "lock", "loop", "cur")
+    __slots__ = ("opts", "proto", "lock", "loop", "cur", "follow", "mover")
 
     def __init__(self, opts: _Options) -> None:
-        self.cur = _Cursor()
+        self.cur = _Cursor(opts)
         self.opts = opts
+        #: Following a failover is active (a cluster client turns it off once it routes by slot).
+        self.follow = self.cur.following(opts)
+        #: Serializes the moves to a primary, so many refused commands run one search.
+        self.mover: Optional[asyncio.Lock] = None
         self.proto: Optional[_Proto] = None
         self.lock: Optional[asyncio.Lock] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -203,7 +237,7 @@ class _State:
 
 async def _dial(
     opts: _Options, host: str, port: int, on_push: Optional[Callable[[Any], None]]
-) -> _Proto:
+) -> _Proto:  # noqa: E501
     loop = asyncio.get_running_loop()
     parser = make_parser(opts.parser or "auto")
     try:
@@ -219,32 +253,146 @@ async def _dial(
     return proto
 
 
-async def _open(
-    opts: _Options, on_push: Optional[Callable[[Any], None]] = None, cur: Optional[_Cursor] = None
+async def _take(
+    opts: _Options, cur: _Cursor, address: Address, on_push: Optional[Callable[[Any], None]]
 ) -> _Proto:
-    """Opens a connection and runs the handshake. With seeds, one connect attempt per seed from
-    ``cur.pos`` round to the seed before it; a seed that cannot be reached is skipped, the last connect
-    error is raised when none answers, and a refused handshake raises at once."""
+    """Connects to ``address`` (a node that answered ``master``) and makes it the seed the connection is on."""
+    proto = await _dial(opts, address[0], address[1], on_push)
+    if opts.sentinel_master is not None:
+        cur.addrs = [address]
+        cur.at = 0
+        cur.pos = 0
+        return proto
+    addrs = cur.addrs
+    if address not in addrs:  # type: ignore[operator]
+        addrs.append(address)  # type: ignore[union-attr]
+    i = addrs.index(address)  # type: ignore[union-attr]
+    opts.host, opts.port = address
+    cur.at = i
+    cur.pos = (i + 1) % len(addrs)  # type: ignore[arg-type]
+    return proto
+
+
+async def _probe(address: Address, opts: _Options, command: str, args: Tuple[Any, ...]) -> Any:
+    """One short-lived connection for one question. The reply, or ``None`` when the address cannot be
+    reached, times out, drops or answers an error. A refused ``AUTH`` raises, as connecting does."""
+    po = _Options(**opts.as_dict())
+    po.host, po.port = address
+    po.seeds = None
+    po.db = 0
+    po.client_name = None
+    po.durability_replicas = None
+    po.durability_timeout_ms = None
+    po.on_push = None
+    po.stop_following()
+    wait = probe_wait(opts.connect_timeout, None)
+    total = None if wait is None or opts.connect_timeout is None else opts.connect_timeout + wait
+    try:
+        proto = await asyncio.wait_for(_open(po), total)
+    except ResponseError:
+        raise
+    except (RuvioError, OSError, ValueError, asyncio.TimeoutError):
+        return None
+    try:
+        fut = proto.loop.create_future()
+        proto.pending.append((fut, None, True))
+        proto.send(encode(command, args))
+        return await asyncio.wait_for(fut, wait)
+    except (RuvioError, OSError, ValueError, asyncio.TimeoutError):
+        return None
+    finally:
+        proto.transport.close()  # type: ignore[union-attr]
+
+
+async def _find_primary(nodes: List[Address], start: int, avoid: Optional[Address], opts: _Options) -> Optional[Address]:
+    """One round: the address of a node that answered ``master``, asking ``nodes`` in order from ``start``
+    (a replica's reported primary is asked once, after them), or ``None``. With ``sentinel_master`` the nodes
+    are coordinators, each asked for the master's address, which ``ROLE`` must confirm. ``avoid`` is the
+    address that just answered ``READONLY``. Raises only when ``AUTH`` is refused."""
+    n = len(nodes)
+    queue = [nodes[(start + k) % n] for k in range(n)]
+    name = opts.sentinel_master
+    if name is not None:
+        for coordinator in queue:
+            named = parse_master_addr(await _probe(coordinator, opts, "SENTINEL", ("get-master-addr-by-name", name)))
+            if named is not None and named != avoid:
+                role = parse_role(await _probe(named, opts, "ROLE", ()))
+                if role is not None and role[0] == MASTER:
+                    return named
+        return None
+    seen = set(queue)
+    i = 0
+    while i < len(queue):
+        address = queue[i]
+        i += 1
+        role = parse_role(await _probe(address, opts, "ROLE", ()))
+        if role is None:
+            continue
+        if role[0] == MASTER:
+            if address != avoid:
+                return address
+        elif role[1] is not None and role[1] not in seen:
+            seen.add(role[1])
+            queue.append(role[1])
+    return None
+
+
+async def _connect(opts: _Options, on_push: Optional[Callable[[Any], None]], cur: Optional[_Cursor]) -> _Proto:
+    """A connection (no handshake yet). The first connect keeps the seed order (a coordinator name asks the
+    coordinators instead); a reconnect first asks which node is the primary and falls back to the seed order."""
     seeds = opts.seeds
+    sentinel = opts.sentinel_master is not None and cur is not None
+    if cur is not None and cur.following(opts):
+        if sentinel or cur.at >= 0:
+            found = await _find_primary(cur.coord if sentinel else cur.addrs, cur.pos, None, opts)  # type: ignore[arg-type]
+            if found is not None:
+                try:
+                    return await _take(opts, cur, found, on_push)
+                except ConnectionError:
+                    if sentinel and cur.at < 0:
+                        raise
+            elif sentinel and cur.at < 0:
+                raise ProtocolError(f"no coordinator names a primary for {opts.sentinel_master!r}")
+    if sentinel:
+        if not cur.addrs:  # type: ignore[union-attr]
+            raise ConnectionError("no primary to connect to")
+        proto = await _dial(opts, cur.addrs[0][0], cur.addrs[0][1], on_push)  # type: ignore[union-attr]
+        cur.at = 0  # type: ignore[union-attr]
+        return proto
     if seeds:
         if cur is None:
-            cur = _Cursor()
-        n = len(seeds)
+            cur = _Cursor(opts)
+        addrs = cur.addrs if cur.addrs is not None else list(seeds)
+        n = len(addrs)
         error: Optional[ConnectionError] = None
         for k in range(n):
             i = (cur.pos + k) % n
             try:
-                proto = await _dial(opts, seeds[i][0], seeds[i][1], on_push)
+                proto = await _dial(opts, addrs[i][0], addrs[i][1], on_push)
             except ConnectionError as exc:
                 error = exc
                 continue
             cur.at = i
             cur.pos = (i + 1) % n
-            break
-        else:
-            raise error  # type: ignore[misc]
-    else:
-        proto = await _dial(opts, opts.host, opts.port, on_push)
+            return proto
+        raise error  # type: ignore[misc]
+    return await _dial(opts, opts.host, opts.port, on_push)
+
+
+async def _open(
+    opts: _Options, on_push: Optional[Callable[[Any], None]] = None, cur: Optional[_Cursor] = None
+) -> _Proto:
+    """Opens a connection and runs the handshake. With seeds, one connect attempt per seed from
+    ``cur.pos`` round to the seed before it; a seed that cannot be reached is skipped, the last connect
+    error is raised when none answers, and a refused handshake raises at once. With following active
+    a reconnect (and, with a coordinator name, the first connect) looks for the primary first."""
+    if cur is not None:
+        cur.multi = False
+    return await _handshake(await _connect(opts, on_push, cur), opts)
+
+
+async def _handshake(proto: _Proto, opts: _Options) -> _Proto:
+    """Runs ``AUTH``/``SELECT``/``CLIENT SETNAME``/``CLIENT DURABILITY`` on a new connection; closes it on failure."""
     loop = proto.loop
     hs = opts.handshake()
     if hs:
@@ -299,6 +447,18 @@ class Ruvio(Commands):
         read_policy: Cluster clients only: where reads go. A :class:`ruvio.ReadPolicy` or its string value:
             ``"primary"`` (default), ``"prefer-replica"`` or ``"replica"``. See
             :class:`ruvio.asyncio.ClusterRuvio`. Ignored by a standalone server and without ``cluster=True``.
+        follow_primary: ``True`` (default): a standalone client with at least two ``seeds`` (or a
+            ``sentinel_master``) finds the primary again after a failover. A reconnect connects to the node whose
+            ``ROLE`` is ``master`` (falling back to the seed order), and a ``READONLY`` reply makes the client look for
+            the primary, move to it and send the refused command once more (not inside a transaction opened with
+            ``multi()``, and never again after a second refusal). Pipelines are not resent. ``False`` keeps the plain
+            seed order and returns ``READONLY`` as an error. With one seed and no ``sentinel_master`` nothing changes.
+            A cluster client does not use it. While following is active a command method returns a coroutine
+            instead of a future; await it as usual.
+        sentinel_master: Name of the master to ask coordinators for. The ``seeds`` (or ``host``/``port``) are then
+            coordinators: the client asks each with ``SENTINEL get-master-addr-by-name`` and confirms the answer with
+            ``ROLE``; the first connect fails with :class:`ruvio.ProtocolError` when none names a primary.
+            Needs ``follow_primary``.
 
     The connection opens on the first command, or on ``await client.connect()`` / ``async with``.
 
@@ -338,6 +498,8 @@ class Ruvio(Commands):
         cluster: bool = False,
         seeds: Optional[Sequence[Union[str, Tuple[str, int]]]] = None,
         read_policy: Union[None, str, ReadPolicy] = None,
+        follow_primary: bool = True,
+        sentinel_master: Optional[str] = None,
     ) -> None:
         """Creates the client (nothing is connected yet). See the class docstring for every argument.
 
@@ -359,9 +521,12 @@ class Ruvio(Commands):
             seeds: ``"host:port"`` strings or ``(host, port)`` tuples tried in order in place of
                 ``host``/``port``.
             read_policy: ``"primary"`` (default), ``"prefer-replica"`` or ``"replica"``; cluster clients only.
+            follow_primary: Find the primary again after a failover (default ``True``).
+            sentinel_master: Master name to ask coordinators for; see the class docstring.
 
         Raises:
-            ValueError: A seed has an empty host or a port outside 1-65535, or ``read_policy`` is unknown.
+            ValueError: A seed has an empty host or a port outside 1-65535, ``read_policy`` is unknown, or
+                ``sentinel_master`` is empty or combined with ``unix_socket_path``.
         """
         seed_list = _parse_seeds(seeds)
         if seed_list:
@@ -369,6 +534,13 @@ class Ruvio(Commands):
                 raise ValueError("seeds cannot be combined with unix_socket_path")
             host, port = seed_list[0]
         policy_code(read_policy)  # rejects an unknown value now rather than at the first command
+        if sentinel_master is not None:
+            if not isinstance(sentinel_master, str) or not sentinel_master:
+                raise ValueError("sentinel_master must be a non-empty string")
+            if unix_socket_path:
+                raise ValueError("sentinel_master cannot be combined with unix_socket_path")
+            if not follow_primary:
+                sentinel_master = None  # off restores the plain connect
         self._st = _State(
             _Options(
                 host=host,
@@ -385,6 +557,8 @@ class Ruvio(Commands):
                 parser=parser,
                 on_push=on_push,
                 read_policy=read_policy,
+                follow_primary=bool(follow_primary),
+                sentinel_master=sentinel_master,
             )
         )
         self._decode = decode_responses
@@ -415,7 +589,80 @@ class Ruvio(Commands):
         fut = proto.loop.create_future()
         proto.pending.append((fut, conv, self._decode if decode is None else decode))
         proto.send(data)
+        if self._st.follow:
+            return self._guarded(fut, conv, data, decode, proto)
         return fut
+
+    async def _guarded(self, fut: "asyncio.Future[Any]", conv: Conv, data: bytes, decode: Optional[bool], proto: _Proto) -> Any:
+        """Awaits the reply; a ``READONLY`` error moves the connection to the primary and sends the command once more."""
+        try:
+            return await fut
+        except ResponseError as exc:
+            if exc.code != "READONLY":
+                raise
+            refused = exc
+        st = self._st
+        retry = not st.cur.multi
+        if st.proto is proto:
+            if not await self._move(proto):
+                raise refused
+        elif st.proto is None:
+            try:
+                await self.connect()
+            except RuvioError:
+                raise refused from None
+        if not retry:
+            raise refused
+        now = st.proto
+        if now is None:
+            raise refused
+        again = now.loop.create_future()
+        now.pending.append((again, conv, self._decode if decode is None else decode))
+        now.send(data)
+        return await again
+
+    async def _move(self, proto: _Proto) -> bool:
+        """After a ``READONLY`` reply: rounds that avoid the address that answered, with the backoff between
+        them, until a primary is found and the connection is moved to it. ``False`` when none is."""
+        st = self._st
+        if st.mover is None:
+            st.mover = asyncio.Lock()
+        async with st.mover:
+            if st.proto is not proto:  # another command already moved it
+                return True
+            opts, cur = st.opts, st.cur
+            refused = cur.address()
+            sentinel = opts.sentinel_master is not None
+            nodes = cur.coord if sentinel else cur.addrs
+            for attempt in range(ROUNDS):
+                if attempt:
+                    await asyncio.sleep(WAITS[attempt - 1])
+                found = await _find_primary(nodes, 0 if sentinel else cur.pos, refused, opts)  # type: ignore[arg-type]
+                if found is None:
+                    continue
+                try:
+                    new = await _handshake(await _take(opts, cur, found, opts.on_push), opts)
+                except ConnectionError:
+                    continue
+                if st.proto is not proto:
+                    new.transport.close()  # type: ignore[union-attr]
+                    return True
+                self._install(new)
+                cur.multi = False
+                if proto.transport is not None:
+                    proto.transport.close()
+                return True
+            return False
+
+    def _install(self, proto: _Proto) -> None:
+        st = self._st
+
+        def lost(p: _Proto, st: _State = st) -> None:
+            if st.proto is p:
+                st.proto = None
+
+        proto.on_lost = lost
+        st.proto = proto
 
     async def _connect_then(self, conv: Conv, data: bytes, decode: Optional[bool]) -> Any:
         await self.connect()
@@ -440,14 +687,7 @@ class Ruvio(Commands):
             st.lock = asyncio.Lock()
         async with st.lock:
             if st.proto is None:
-                proto = await _open(st.opts, st.opts.on_push, st.cur)
-
-                def lost(p: _Proto, st: _State = st) -> None:
-                    if st.proto is p:
-                        st.proto = None
-
-                proto.on_lost = lost
-                st.proto = proto
+                self._install(await _open(st.opts, st.opts.on_push, st.cur))
         return self
 
     def _batch(self, payload: List[bytes]) -> "Awaitable[List[Any]]":
@@ -518,6 +758,65 @@ class Ruvio(Commands):
         self._st.opts.password = password
         self._st.opts.username = username
         return ok
+
+    async def multi(self) -> Any:  # type: ignore[override]
+        """``MULTI`` - raw transaction start; remembered so a ``READONLY`` reply inside it is not resent.
+
+        Returns:
+            ``True`` (awaitable).
+        """
+        ok = await super().multi()
+        self._st.cur.multi = True
+        return ok
+
+    async def exec(self) -> Any:  # type: ignore[override]
+        """``EXEC`` - runs the queued commands of a raw ``MULTI`` and ends the transaction.
+
+        Returns:
+            A list with one reply per queued command, or ``None`` when a watched key changed (awaitable).
+        """
+        try:
+            return await super().exec()
+        finally:
+            self._st.cur.multi = False
+
+    async def discard(self) -> Any:  # type: ignore[override]
+        """``DISCARD`` - drops the queued commands of a raw ``MULTI`` and ends the transaction.
+
+        Returns:
+            ``True`` (awaitable).
+        """
+        try:
+            return await super().discard()
+        finally:
+            self._st.cur.multi = False
+
+    def execute_command(self, *args: Any) -> Any:
+        """Sends any command and returns the raw reply (awaitable); see :meth:`Commands.execute_command`.
+
+        Args:
+            *args: Command name followed by its arguments.
+
+        Returns:
+            The server reply as parsed.
+        """
+        if args and self._st.follow:
+            name = args[0]
+            name = (name.decode("ascii", "replace") if isinstance(name, bytes) else str(name)).upper()
+            if name == "MULTI" or name == "EXEC" or name == "DISCARD":
+                return self._execute_tracked(name, args)
+        return super().execute_command(*args)
+
+    async def _execute_tracked(self, name: str, args: Tuple[Any, ...]) -> Any:
+        cur = self._st.cur
+        try:
+            reply = await super().execute_command(*args)
+        except BaseException:
+            if name != "MULTI":
+                cur.multi = False
+            raise
+        cur.multi = name == "MULTI"
+        return reply
 
     @property
     def raw(self) -> "Ruvio":
@@ -603,6 +902,8 @@ This is a coroutine: ``ps = await client.pubsub()``.
         """
         ps = PubSub(self._st.opts, self._decode, ignore_subscribe_messages)
         ps._cur.pos = self._st.cur.resume()
+        if self._st.opts.sentinel_master is None and self._st.cur.addrs is not None:
+            ps._cur.addrs = list(self._st.cur.addrs)  # includes a primary a replica reported
         await ps.connect()
         return ps
 
@@ -1078,7 +1379,7 @@ class PubSub:
             ignore_subscribe_messages: Skip subscribe/unsubscribe confirmations.
         """
         self._opts = opts
-        self._cur = _Cursor()
+        self._cur = _Cursor(opts)
         self._decode = decode
         self.ignore_subscribe_messages = ignore_subscribe_messages
         self._queue: "asyncio.Queue[Any]" = asyncio.Queue()
