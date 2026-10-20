@@ -303,7 +303,8 @@ slows a command or raises RSS for the same data does not land.
   cluster bus endpoint.**
 - [ ] **P2 — Add online slot migration with importing/migrating states and
   bounded transfer queues.** Between the shards of one process this is done:
-  `RUVIO MOVESLOTS` (#50). Between machines: `COORDINATOR MOVE` (#23).
+  `RUVIO MOVESLOTS` (#50). Between machines: `COORDINATOR MOVE` (#23), and
+  `COORDINATOR REBALANCE` to even out slot counts across groups.
 - [ ] **P2 — Add hot-key and skew observability before automated rebalancing.**
 - [ ] **P2 — Define cross-slot command behavior; do not hide distributed
   coordination behind local-looking semantics.**

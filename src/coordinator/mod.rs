@@ -8,6 +8,7 @@ pub mod config;
 mod migrate;
 mod monitor;
 mod raft;
+mod rebalance;
 mod resp;
 mod tls;
 
@@ -384,13 +385,24 @@ impl Api {
                 };
                 self.remove_coordinator(id).await
             }
+            (Some("rebalance"), 2 | 3) => {
+                let dry = match word(2) {
+                    None => false,
+                    Some("dryrun") => true,
+                    Some(_) => return Value::Error("ERR COORDINATOR REBALANCE takes only DRYRUN".into()),
+                };
+
+                rebalance::start(&self.moves, dry)
+                    .await
+                    .unwrap_or_else(Value::Error)
+            }
             (Some("status"), 2) => migrate::status(&self.moves),
             (Some("cancel"), 2) => match migrate::cancel(&self.moves).await {
                 Ok(()) => Value::Simple("OK".into()),
                 Err(error) => Value::Error(error),
             },
             _ => Value::Error(
-                "ERR COORDINATOR expects MOVE first last group shard, STATUS, CANCEL or FAILOVER group FORCE".into(),
+                "ERR COORDINATOR expects MOVE first last group shard, REBALANCE [DRYRUN], STATUS, CANCEL or FAILOVER group FORCE".into(),
             ),
         }
     }

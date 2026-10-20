@@ -29,6 +29,9 @@ const POLL: Duration = Duration::from_millis(10);
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Starts of one move (the first and the ones a failover forces).
 const ATTEMPTS: usize = 3;
+/// The longest a replica may take to take the map before a move: one that is down does not
+/// hold the move up for long.
+const REPLICA_MAP_TIMEOUT: Duration = Duration::from_secs(1);
 /// Polls the leader waits for the target's replicas to hold a prepared copy, and for a node
 /// to drop a cancelled move before it takes the next (10 s each).
 const WAIT_POLLS: usize = (10_000 / POLL.as_millis()) as usize;
@@ -41,14 +44,16 @@ pub struct Mover {
 }
 
 #[derive(Default)]
-struct MoverState {
-    driving: Option<String>,
+pub(super) struct MoverState {
+    pub(super) driving: Option<String>,
     cancel: Option<String>,
-    last: Vec<(String, String)>,
+    pub(super) last: Vec<(String, String)>,
+    /// The rebalance this leader runs, or ran last.
+    pub(super) rebalance: Option<super::rebalance::Progress>,
 }
 
 impl Mover {
-    fn lock(&self) -> std::sync::MutexGuard<'_, MoverState> {
+    pub(super) fn lock(&self) -> std::sync::MutexGuard<'_, MoverState> {
         self.inner.lock().unwrap_or_else(|error| error.into_inner())
     }
 }
@@ -154,16 +159,26 @@ pub async fn start(
     Ok(migration.id)
 }
 
-/// `COORDINATOR CANCEL`: ends the running move unless it is committed already.
+/// `COORDINATOR CANCEL`: ends the running move unless it is committed already, and the
+/// rebalance that started it.
 pub async fn cancel(context: &Context) -> Result<(), String> {
     if !context.leading().await {
         return Err(context.not_leader().await);
     }
-    let Some(current) = context.machine.moves().current else {
-        return Err("ERR no move in progress".into());
-    };
+    let current = context.machine.moves().current;
+    let mut mover = context.mover.lock();
+    let rebalance = mover
+        .rebalance
+        .as_mut()
+        .filter(|progress| progress.running())
+        .map(|progress| progress.stop = true)
+        .is_some();
 
-    context.mover.lock().cancel = Some(current.id);
+    match current {
+        Some(current) => mover.cancel = Some(current.id),
+        None if rebalance => {}
+        None => return Err("ERR no move in progress".into()),
+    }
     Ok(())
 }
 
@@ -193,6 +208,9 @@ pub fn status(context: &Context) -> Value {
     };
 
     pairs.push(("moved_ranges".into(), moves.moved.len().to_string()));
+    if let Some(progress) = &context.mover.lock().rebalance {
+        pairs.extend(progress.pairs());
+    }
     Value::array(
         pairs
             .into_iter()
@@ -315,6 +333,9 @@ async fn attempt_move(context: &Context, migration: &Migration) -> Ended {
     // The current map first: a range a node still holds frozen from a committed move is
     // given away before anything else happens there.
     send_map(context, &[&migration.to, &migration.from]).await;
+    // The target's replicas too: one that still waits for the map of the move before cannot
+    // record this range when its copy arrives, nor take any later map.
+    send_map_to_replicas(context, &migration.to).await;
     let import: [&[u8]; 7] = [
         b"RUVIO",
         b"MIGRATE",
@@ -580,6 +601,40 @@ async fn send_map(context: &Context, groups: &[&String]) {
     }
 }
 
+/// Sends the current map to every member of `group` but its primary. A member that does not
+/// answer gets it from the leader's loop once it does.
+async fn send_map_to_replicas(context: &Context, group: &str) {
+    let (Some(config_group), Some(primary)) = (
+        context.config.group(group),
+        primary_address(context, group, 0),
+    ) else {
+        return;
+    };
+    let Some((_, map)) = context
+        .config
+        .cluster_map(&context.machine.primaries(), &context.machine.moves().moved)
+    else {
+        return;
+    };
+
+    for member in context.machine.group(config_group).members {
+        if member.address == primary || !context.leading().await {
+            continue;
+        }
+        if let Err(error) = expect_ok(
+            call_within(
+                &context.config,
+                &member.address,
+                &[b"RUVIO", b"TOPOLOGY", b"SET", map.as_bytes()],
+                REPLICA_MAP_TIMEOUT,
+            )
+            .await,
+        ) {
+            warn!(%group, member = %member.address, %error, "could not send the cluster map to a replica before a move");
+        }
+    }
+}
+
 fn report(context: &Context, migration: &Migration, state: &str, error: Option<String>) {
     let mut pairs = vec![
         ("state".to_string(), state.to_string()),
@@ -614,12 +669,21 @@ async fn call(
     address: &Endpoint,
     args: &[&[u8]],
 ) -> Result<Value, String> {
-    let mut client = NodeClient::connect(address, config.auth.as_deref(), CALL_TIMEOUT)
+    call_within(config, address, args, CALL_TIMEOUT).await
+}
+
+async fn call_within(
+    config: &CoordinatorConfig,
+    address: &Endpoint,
+    args: &[&[u8]],
+    timeout: Duration,
+) -> Result<Value, String> {
+    let mut client = NodeClient::connect(address, config.auth.as_deref(), timeout)
         .await
         .map_err(|error| format!("{address}: {error}"))?;
 
     client
-        .call(args, CALL_TIMEOUT)
+        .call(args, timeout)
         .await
         .map_err(|error| format!("{address}: {error}"))
 }

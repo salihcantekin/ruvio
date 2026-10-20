@@ -128,7 +128,8 @@ directory.
 
 Between machines, with a multi-node cluster run by `ruvio coordinator`:
 `COORDINATOR MOVE 0 1000 b 0` moves slots 0 to 1000 to shard 0 of group `b`, and
-`COORDINATOR STATUS` follows it. Clients keep working there too: during the short hand-over
+`COORDINATOR STATUS` follows it; `COORDINATOR REBALANCE` evens out the slots across the groups
+with such moves (`DRYRUN` shows the plan first). Clients keep working there too: during the short hand-over
 the old owner answers `TRYAGAIN`, which the Ruvio clients retry, and afterwards `MOVED`. See
 `docs/COORDINATOR.md`.
 

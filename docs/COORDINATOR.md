@@ -478,6 +478,40 @@ move the range back with another `COORDINATOR MOVE`. The copy rate of a source i
 `migration_max_bytes_per_sec` in its configuration (0, the default, means no cap); the frozen hand-over
 is never slowed down. Nodes need durability `memory`, `everysec` or `always` (not `snapshot`).
 
+### Rebalancing
+
+`COORDINATOR REBALANCE` (on the leader, after `AUTH secret`) evens out the slots across the groups, in
+proportion to their shard counts, and answers how many moves it plans; `0` means the slots are even
+already. `COORDINATOR REBALANCE DRYRUN` answers the plan without moving anything, one line per move:
+
+```text
+> COORDINATOR REBALANCE DRYRUN
+1) "8448-8703 a/0 -> b/0"
+2) "8192-8447 a/0 -> b/0"
+```
+
+Each group's share is 16384 times its shards over all shards; the slots left over go to the groups
+that already hold the most, so the fewest slots move. Each move takes at most 256 slots from the group
+with the most to spare to the one that lacks the most, from its fullest shard to the other's emptiest,
+and takes them next to a range the receiver already holds when it can, so the map stays short. The
+leader runs the moves one after another as `COORDINATOR MOVE` would (copy, freeze, commit, new map,
+restart after a failover), and works the plan out again from the committed moves after each one.
+Balance is by slot count, not by keys or memory: a slot holding a very large hash tag counts as one
+slot.
+
+`COORDINATOR STATUS` adds `rebalance` (`running`, `done`, `cancelled`, `failed` or `stopped`),
+`rebalance_moves` (moves done) and `rebalance_left` (moves the plan still holds), and
+`rebalance_error` when one failed. `COORDINATOR CANCEL` cancels the running move and ends the
+rebalance. A second `REBALANCE` or a `MOVE` is refused while one runs. The plan is not in the Raft
+state: if the leader changes, the new leader finishes the move in flight and the rebalance stops
+there (`stopped` on the old leader); run `COORDINATOR REBALANCE` on the new leader to go on. Running
+it again is always safe, since it starts from where the slots are. A group listed with `slots = []`
+gets its share this way.
+
+Before each move the leader also sends the current map to the target group's replicas (waiting at
+most 1 s for each): a replica still waiting for the map of the move before cannot record the new range
+when its copy arrives, and would then refuse every newer map. So moves can run back to back.
+
 The range is frozen from step 3 until the source gets the new map. Measured locally (debug build, one
 Mac running other builds, two groups of a primary and a replica with durability `always`, 303 keys,
 one client writing the range throughout, 5 runs): the writer saw `TRYAGAIN` for 168-237 ms (median
@@ -611,7 +645,12 @@ releases side by side, so the refused handshake itself was not part of the run. 
 
 ## Limits of this version
 
-- Ranges move only when an operator asks (`COORDINATOR MOVE`); nothing rebalances by load yet.
+- Ranges move only when an operator asks (`COORDINATOR MOVE`, `COORDINATOR REBALANCE`), one at a time;
+  nothing rebalances by keys, memory or load, and nothing starts a rebalance on its own.
+- A replica of a target group that is down, or does not answer within 1 s, while two moves into its group
+  run can be left on an old map once it is back: it refuses the second range and every newer map
+  (`gives this node slot ..., whose data is not here` in its log). Give it a full copy again
+  (restart it with an empty data directory).
 
 ## Tests
 
@@ -622,7 +661,9 @@ releases side by side, so the refused handshake itself was not part of the run. 
   committed sequences kept across a restart of every coordinator while the primary and the replica
   holding them are down (only `FORCE` promotes the other replica); and two groups of a multi-node cluster,
   where a failover in one changes the other's `MOVED` answers, and a range moves from one to the other
-  while a client keeps writing a key of it (every acknowledged write is on the new owner). A primary
+  while a client keeps writing a key of it (every acknowledged write is on the new owner); a rebalance of
+  two uneven groups (its dry run, two moves back to back while a client writes, the target's replica
+  holding both ranges) and a cancelled rebalance (nothing moved). A primary
   cut off from the coordinators by a proxy while a client keeps writing to it: with the lease it
   takes no write once a replica is promoted, without it it keeps taking them; and a member that
   accepts connections but never answers does not hold up the primary's lease. With TLS on the coordinator
