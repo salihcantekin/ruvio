@@ -142,7 +142,7 @@ fn a_damaged_table_refuses_to_start() {
 
 /// A reply, as a small client sees it.
 #[derive(Debug, Clone, PartialEq)]
-enum Value {
+pub(super) enum Value {
     Simple(String),
     Error(String),
     Integer(i64),
@@ -150,22 +150,22 @@ enum Value {
     Array(Vec<Value>),
 }
 
-struct Client(std::io::BufReader<StdTcpStream>);
+pub(super) struct Client(pub(super) std::io::BufReader<StdTcpStream>);
 
 impl Client {
-    fn connect(address: SocketAddr) -> Self {
+    pub(super) fn connect(address: SocketAddr) -> Self {
         let stream = StdTcpStream::connect(address).unwrap();
 
         stream.set_read_timeout(Some(PATIENCE)).unwrap();
         Self(std::io::BufReader::new(stream))
     }
 
-    fn call(&mut self, parts: &[&[u8]]) -> Value {
+    pub(super) fn call(&mut self, parts: &[&[u8]]) -> Value {
         self.0.get_mut().write_all(&resp(&[parts])).unwrap();
         self.read()
     }
 
-    fn read(&mut self) -> Value {
+    pub(super) fn read(&mut self) -> Value {
         use std::io::BufRead;
 
         let mut line = String::new();
@@ -201,7 +201,7 @@ impl Client {
     }
 }
 
-fn text(value: &Value) -> String {
+pub(super) fn text(value: &Value) -> String {
     match value {
         Value::Simple(text) | Value::Error(text) => text.clone(),
         Value::Bulk(Some(bytes)) => String::from_utf8_lossy(bytes).into(),
@@ -793,7 +793,7 @@ fn the_old_owner_change_stream_reports_where_a_moved_range_continues() {
             b"CHANGES",
             b"SUBSCRIBE",
             b"FROM",
-            b"0:0",
+            b"0:0:0",
             b"MATCH",
             b"nothing:*",
         ]]))
@@ -808,7 +808,8 @@ fn the_old_owner_change_stream_reports_where_a_moved_range_continues() {
 
     assert_eq!(text(&event[3]), "moved");
     assert_eq!(text(&event[4]), "0-99");
-    assert!(text(&event[5]).starts_with("1:"), "{event:?}");
+    // `generation:shard:sequence`; a server that never replicated is generation 0.
+    assert!(text(&event[5]).starts_with("0:1:"), "{event:?}");
 
     stop_pair(shutdown, server);
 }

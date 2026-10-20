@@ -474,6 +474,8 @@ pub(super) fn demote(
 
     state.role.set(crate::config::ReplicationRole::Replica);
     state.epoch.set(0);
+    // Promoted again later, it commits in the new primary's log, not in the one it wrote.
+    state.durable_replies.reset();
     *state.replication.borrow_mut() = Some(spawn_reader(state, shard_id, primary, primary_name)?);
     warn!(shard_id, %primary, "following a new primary");
     Ok(())

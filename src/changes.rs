@@ -1,8 +1,11 @@
 //! Durable change stream: turns WAL records into client events.
 //!
-//! A subscriber names a cursor `<shard>:<sequence>` and receives every record after it, so a
-//! client that stores the last cursor it processed resumes after a disconnect or restart without
-//! loss or repeats. Records are atomic: all events of one record share a cursor and a write.
+//! A subscriber names a cursor `<generation>:<shard>:<sequence>` and receives every record after
+//! it, so a client that stores the last cursor it processed resumes after a disconnect or restart
+//! without loss or repeats. Records are atomic: all events of one record share a cursor and a
+//! write. The generation is the replication epoch the shard's log was written under: a promoted
+//! replica continues its old primary's sequence numbers only up to the fork, so a cursor past it
+//! names records that no longer exist (see [`ChangeLineage::resume`]).
 
 use crate::{
     mutation::OwnedMutation,
@@ -70,6 +73,8 @@ pub struct ChangeSubscription {
     /// Bit set of [`ChangeKind`]; `0` accepts every kind.
     pub kinds: u16,
     pub values: bool,
+    /// `COMMITTED`: only records at or below the shard's committed sequence.
+    pub committed: bool,
 }
 
 impl ChangeSubscription {
@@ -133,6 +138,9 @@ impl ChangeSubscription {
             } else if word.eq_ignore_ascii_case(b"VALUES") {
                 subscription.values = true;
                 index += 1;
+            } else if word.eq_ignore_ascii_case(b"COMMITTED") {
+                subscription.committed = true;
+                index += 1;
             } else {
                 return Err(ProtocolError::Invalid("unknown CHANGES SUBSCRIBE option"));
             }
@@ -142,28 +150,108 @@ impl ChangeSubscription {
     }
 }
 
-/// Position in one shard's WAL: the last sequence the client has processed.
+/// Position in one shard's WAL: the last sequence the client has processed, in the log
+/// written under `generation`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChangeCursor {
+    /// `None` for the older `<shard>:<sequence>` form, read as the shard's current generation.
+    pub generation: Option<u64>,
     pub shard: u32,
     pub sequence: u64,
 }
 
 impl ChangeCursor {
     pub fn parse(text: &[u8]) -> Result<Self, ProtocolError> {
-        const INVALID: ProtocolError =
-            ProtocolError::Invalid("invalid change cursor, expected <shard>:<sequence>");
+        const INVALID: ProtocolError = ProtocolError::Invalid(
+            "invalid change cursor, expected <generation>:<shard>:<sequence>",
+        );
         let text = std::str::from_utf8(text).map_err(|_| INVALID)?;
-        let (shard, sequence) = text.split_once(':').ok_or(INVALID)?;
+        let (head, sequence) = text.rsplit_once(':').ok_or(INVALID)?;
+        let (generation, shard) = match head.split_once(':') {
+            Some((generation, shard)) => (Some(generation.parse().map_err(|_| INVALID)?), shard),
+            None => (None, head),
+        };
 
         Ok(Self {
+            generation,
             shard: shard.parse().map_err(|_| INVALID)?,
             sequence: sequence.parse().map_err(|_| INVALID)?,
         })
     }
 
     pub fn text(self) -> String {
-        format!("{}:{}", self.shard, self.sequence)
+        match self.generation {
+            Some(generation) => format!("{generation}:{}:{}", self.shard, self.sequence),
+            None => format!("{}:{}", self.shard, self.sequence),
+        }
+    }
+}
+
+/// The history a shard's log continues: its generation and, for a promoted replica, the
+/// generation it forked from and the last sequence the two logs share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChangeLineage {
+    pub generation: u64,
+    pub fork: Option<ChangeFork>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChangeFork {
+    pub generation: u64,
+    pub sequence: u64,
+}
+
+/// Where a stream starts, in this shard's generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeStart {
+    /// The records after the cursor are this log's: stream them.
+    Resume(ChangeCursor),
+    /// The client saw records past the fork that this log never had: tell it once, then
+    /// stream from the fork.
+    Rewound(ChangeCursor),
+}
+
+impl ChangeLineage {
+    /// Where a client holding `cursor` continues on this shard, whose log is durable through
+    /// `durable`. Only the generation this one forked from is known: a cursor from an older
+    /// one, or from a newer primary, is refused.
+    pub fn resume(
+        &self,
+        cursor: ChangeCursor,
+        shard: u32,
+        durable: u64,
+    ) -> Result<ChangeStart, &'static [u8]> {
+        if cursor.shard != shard {
+            return Err(b"ERR change cursor belongs to a different shard");
+        }
+
+        let here = |sequence| ChangeCursor {
+            generation: Some(self.generation),
+            shard,
+            sequence,
+        };
+        let generation = cursor.generation.unwrap_or(self.generation);
+
+        if generation == self.generation {
+            if cursor.sequence > durable {
+                return Err(b"ERR change cursor is ahead of this server");
+            }
+
+            return Ok(ChangeStart::Resume(here(cursor.sequence)));
+        }
+        if generation > self.generation {
+            return Err(b"ERR change cursor generation is newer than this server");
+        }
+
+        match self.fork {
+            Some(fork) if fork.generation == generation && cursor.sequence <= fork.sequence => {
+                Ok(ChangeStart::Resume(here(cursor.sequence)))
+            }
+            Some(fork) if fork.generation == generation => {
+                Ok(ChangeStart::Rewound(here(fork.sequence)))
+            }
+            _ => Err(b"ERR change cursor generation is unknown to this server"),
+        }
     }
 }
 
@@ -175,7 +263,12 @@ pub struct ChangeEvent<'a> {
 }
 
 /// Calls `emit` once per key a record touched, in record order. Transactions expand in place.
-pub fn describe(mutation: &OwnedMutation, emit: &mut dyn FnMut(ChangeEvent<'_>)) {
+/// `generation_of` names the generation of a shard of this server a range moved to.
+pub fn describe(
+    mutation: &OwnedMutation,
+    generation_of: &dyn Fn(u32) -> u64,
+    emit: &mut dyn FnMut(ChangeEvent<'_>),
+) {
     use OwnedMutation as M;
 
     let mut one = |kind: ChangeKind, key: &[u8], value: Option<Vec<u8>>| {
@@ -267,7 +360,7 @@ pub fn describe(mutation: &OwnedMutation, emit: &mut dyn FnMut(ChangeEvent<'_>))
         }),
         M::Transaction { mutations } => {
             for inner in mutations {
-                describe(inner, emit);
+                describe(inner, generation_of, emit);
             }
         }
         // The copy a slot move wrote here is not a client's write.
@@ -279,7 +372,13 @@ pub fn describe(mutation: &OwnedMutation, emit: &mut dyn FnMut(ChangeEvent<'_>))
             position,
         } => {
             let range = format!("{first}-{last}");
-            let cursor = format!("{to}:{position}");
+            let to = u32::from(*to);
+            let cursor = ChangeCursor {
+                generation: Some(generation_of(to)),
+                shard: to,
+                sequence: *position,
+            }
+            .text();
 
             emit(ChangeEvent {
                 kind: ChangeKind::Moved,
@@ -296,6 +395,8 @@ pub fn describe(mutation: &OwnedMutation, emit: &mut dyn FnMut(ChangeEvent<'_>))
             position,
         } => {
             let range = format!("{first}-{last}");
+            // `host:port:sequence`: the other node's generation is not known here, so the
+            // client resumes there with the `<shard>:<sequence>` form, its current generation.
             let mut cursor = address.to_vec();
 
             cursor.extend_from_slice(format!(":{position}").as_bytes());
@@ -348,6 +449,14 @@ pub fn encode_cursor(out: &mut Vec<u8>, resp3: bool, cursor: ChangeCursor) {
     bulk(out, cursor.text().as_bytes());
 }
 
+/// Tells the client that the records after its cursor were taken back by a failover: undo or
+/// reload what it applied past `cursor`, the fork, where the stream continues.
+pub fn encode_rewound(out: &mut Vec<u8>, resp3: bool, cursor: ChangeCursor) {
+    out.extend_from_slice(if resp3 { b">2\r\n" } else { b"*2\r\n" });
+    bulk(out, b"rewound");
+    bulk(out, cursor.text().as_bytes());
+}
+
 /// Tells the client its cursor is no longer retained: reload fully, then `FROM NOW`.
 pub fn encode_resync(out: &mut Vec<u8>, resp3: bool, reason: &str) {
     out.extend_from_slice(if resp3 { b">2\r\n" } else { b"*2\r\n" });
@@ -377,26 +486,115 @@ mod tests {
     fn collect(mutation: &OwnedMutation) -> Vec<Seen> {
         let mut events = Vec::new();
 
-        describe(mutation, &mut |event| {
+        describe(mutation, &|shard| u64::from(shard) + 10, &mut |event| {
             events.push((event.kind, event.key.map(<[u8]>::to_vec), event.value));
         });
         events
     }
 
+    fn at(generation: Option<u64>, shard: u32, sequence: u64) -> ChangeCursor {
+        ChangeCursor {
+            generation,
+            shard,
+            sequence,
+        }
+    }
+
     #[test]
     fn cursors_round_trip_and_reject_garbage() {
-        let cursor = ChangeCursor::parse(b"3:41").unwrap();
+        let cursor = ChangeCursor::parse(b"2:3:41").unwrap();
+
+        assert_eq!(cursor, at(Some(2), 3, 41));
+        assert_eq!(cursor.text(), "2:3:41");
+        // The older form names no generation, and is written back as it came.
+        let old = ChangeCursor::parse(b"3:41").unwrap();
+
+        assert_eq!(old, at(None, 3, 41));
+        assert_eq!(old.text(), "3:41");
+        for garbage in [
+            &b"41"[..],
+            b"a:1",
+            b"1:a:1",
+            b"x:1:1",
+            b"1:2:3:4",
+            b"-1:0:1",
+            b":0:1",
+            b"0:1:",
+        ] {
+            assert!(ChangeCursor::parse(garbage).is_err(), "{garbage:?}");
+        }
+    }
+
+    #[test]
+    fn a_cursor_resumes_rewinds_past_the_fork_or_is_refused() {
+        let promoted = ChangeLineage {
+            generation: 3,
+            fork: Some(ChangeFork {
+                generation: 2,
+                sequence: 100,
+            }),
+        };
+        let resume = |cursor| promoted.resume(cursor, 0, 150);
+
+        // This log's own cursors, in either form.
+        assert_eq!(
+            resume(at(Some(3), 0, 120)),
+            Ok(ChangeStart::Resume(at(Some(3), 0, 120)))
+        );
+        assert_eq!(
+            resume(at(None, 0, 120)),
+            Ok(ChangeStart::Resume(at(Some(3), 0, 120)))
+        );
+        // The old primary's, up to the fork, are this log's too.
+        assert_eq!(
+            resume(at(Some(2), 0, 100)),
+            Ok(ChangeStart::Resume(at(Some(3), 0, 100)))
+        );
+        assert_eq!(
+            resume(at(Some(2), 0, 0)),
+            Ok(ChangeStart::Resume(at(Some(3), 0, 0)))
+        );
+        // Past the fork: the client saw records this log never had, even where this log
+        // has reached the same sequence since.
+        assert_eq!(
+            resume(at(Some(2), 0, 101)),
+            Ok(ChangeStart::Rewound(at(Some(3), 0, 100)))
+        );
+        assert_eq!(
+            resume(at(Some(2), 0, 500)),
+            Ok(ChangeStart::Rewound(at(Some(3), 0, 100)))
+        );
+        assert_eq!(
+            resume(at(Some(4), 0, 1)),
+            Err(&b"ERR change cursor generation is newer than this server"[..])
+        );
+        assert_eq!(
+            resume(at(Some(1), 0, 1)),
+            Err(&b"ERR change cursor generation is unknown to this server"[..])
+        );
+        assert_eq!(
+            resume(at(Some(3), 0, 151)),
+            Err(&b"ERR change cursor is ahead of this server"[..])
+        );
+        assert_eq!(
+            resume(at(Some(3), 1, 1)),
+            Err(&b"ERR change cursor belongs to a different shard"[..])
+        );
+
+        // A log that never forked knows only its own generation.
+        let root = ChangeLineage {
+            generation: 0,
+            fork: None,
+        };
 
         assert_eq!(
-            cursor,
-            ChangeCursor {
-                shard: 3,
-                sequence: 41
-            }
+            root.resume(at(None, 0, 7), 0, 7),
+            Ok(ChangeStart::Resume(at(Some(0), 0, 7)))
         );
-        assert_eq!(cursor.text(), "3:41");
-        assert!(ChangeCursor::parse(b"41").is_err());
-        assert!(ChangeCursor::parse(b"a:1").is_err());
+        assert_eq!(
+            root.resume(at(Some(1), 0, 7), 0, 7),
+            Err(&b"ERR change cursor generation is newer than this server"[..])
+        );
     }
 
     #[test]
@@ -406,14 +604,9 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(
-            parsed.from,
-            Some(ChangeCursor {
-                shard: 0,
-                sequence: 7
-            })
-        );
+        assert_eq!(parsed.from, Some(at(None, 0, 7)));
         assert!(parsed.values);
+        assert!(!parsed.committed);
         assert!(parsed.accepts(ChangeKind::Put, Some(b"user:1")));
         assert!(!parsed.accepts(ChangeKind::Put, Some(b"order:1")));
         assert!(!parsed.accepts(ChangeKind::List, Some(b"user:1")));
@@ -422,6 +615,31 @@ mod tests {
         assert_eq!(
             ChangeSubscription::parse(&[b"FROM", b"NOW"]).unwrap().from,
             None
+        );
+
+        let committed = ChangeSubscription::parse(&[b"from", b"1:0:7", b"committed"]).unwrap();
+
+        assert_eq!(committed.from, Some(at(Some(1), 0, 7)));
+        assert!(committed.committed);
+        assert!(ChangeSubscription::parse(&[b"FROM", b"1:x:7"]).is_err());
+    }
+
+    #[test]
+    fn a_move_inside_the_server_names_the_new_owner_generation() {
+        let events = collect(&OwnedMutation::SlotsMoved {
+            first: 0,
+            last: 99,
+            to: 1,
+            position: 42,
+        });
+
+        assert_eq!(
+            events,
+            vec![(
+                ChangeKind::Moved,
+                Some(b"0-99".to_vec()),
+                Some(b"11:1:42".to_vec())
+            )]
         );
     }
 
@@ -451,10 +669,7 @@ mod tests {
 
     #[test]
     fn events_encode_as_push_or_array() {
-        let cursor = ChangeCursor {
-            shard: 0,
-            sequence: 9,
-        };
+        let cursor = at(Some(1), 0, 9);
         let mut resp3 = Vec::new();
         let mut resp2 = Vec::new();
 
@@ -479,11 +694,18 @@ mod tests {
 
         assert_eq!(
             resp3,
-            b">6\r\n$6\r\nchange\r\n$3\r\n0:9\r\n:0\r\n$3\r\ndel\r\n$1\r\nk\r\n_\r\n"
+            b">6\r\n$6\r\nchange\r\n$5\r\n1:0:9\r\n:0\r\n$3\r\ndel\r\n$1\r\nk\r\n_\r\n"
         );
         assert_eq!(
             resp2,
-            b"*6\r\n$6\r\nchange\r\n$3\r\n0:9\r\n:0\r\n$3\r\ndel\r\n$1\r\nk\r\n$-1\r\n"
+            b"*6\r\n$6\r\nchange\r\n$5\r\n1:0:9\r\n:0\r\n$3\r\ndel\r\n$1\r\nk\r\n$-1\r\n"
         );
+
+        let (mut resp3, mut resp2) = (Vec::new(), Vec::new());
+
+        encode_rewound(&mut resp3, true, at(Some(2), 0, 100));
+        encode_rewound(&mut resp2, false, at(Some(2), 0, 100));
+        assert_eq!(resp3, b">2\r\n$7\r\nrewound\r\n$7\r\n2:0:100\r\n");
+        assert_eq!(resp2, b"*2\r\n$7\r\nrewound\r\n$7\r\n2:0:100\r\n");
     }
 }
