@@ -70,6 +70,7 @@ mod info;
 mod input;
 mod live;
 mod maintenance;
+mod migrate;
 mod moveslots;
 mod net;
 mod pubsub;
@@ -583,8 +584,10 @@ fn run_cluster(config: &AppConfig, shutdown: ShutdownToken, force: bool) -> io::
     if let Some(fabric) = &fabric {
         // The cluster map places this group's slots on its shards first; moves between
         // the shards apply on top of it.
+        let mut pushed = false;
+
         if let Some(path) = &config.cluster_topology {
-            let topology = crate::topology::Topology::load_newest(
+            let (topology, saved) = crate::topology::Topology::load_newest(
                 path,
                 &config.persistence.data_dir,
                 &config.cluster_group,
@@ -592,27 +595,50 @@ fn run_cluster(config: &AppConfig, shutdown: ShutdownToken, force: bool) -> io::
             )
             .map_err(io::Error::other)?;
 
+            pushed = saved;
             fabric.set_topology(topology);
         }
-        let base = fabric
+        let placement: Option<std::sync::Arc<[u16]>> = fabric
             .topology()
             .map(|shared| shared.get().placement(config.shards).into());
-        let moves = load_slot_moves(config, config.shards, base.clone())?;
+        let moves = load_slot_moves(config, config.shards, placement.clone(), Some(pushed))?;
+        let mapped = placement.is_some();
 
         if let Some(moves) = &moves {
-            moves.apply(&fabric.slot_table());
+            moves.apply(&fabric.slot_table(), |slot| {
+                placement
+                    .as_ref()
+                    .map_or(0, |placement| usize::from(placement[usize::from(slot)]))
+            });
         }
-        if config.persistence.profile.uses_wal() {
+        // A node of a multi-node cluster keeps its history even without a log: a range
+        // arriving from another node is tracked here until the map gives it the range.
+        if config.persistence.profile.uses_wal() || placement.is_some() {
             fabric.mover.set_durable(
                 moves.unwrap_or_else(|| {
                     let moves = crate::slot_moves::SlotMoves::new(config.shards);
 
-                    match base {
+                    match placement {
                         Some(base) => moves.with_base(base),
                         None => moves,
                     }
                 }),
-                config.persistence.data_dir.clone(),
+                config
+                    .persistence
+                    .profile
+                    .uses_wal()
+                    .then(|| config.persistence.data_dir.clone()),
+            );
+        }
+        if mapped {
+            migrate::restore(
+                fabric,
+                config
+                    .persistence
+                    .profile
+                    .uses_wal()
+                    .then(|| config.persistence.data_dir.clone()),
+                config.replication.role != crate::config::ReplicationRole::Replica,
             );
         }
     }
@@ -790,40 +816,59 @@ pub fn serve(
     )
 }
 
-/// The slot moves saved in the data directory. Replicas follow each shard's log and the
-/// formula's ownership, so a moved table is refused while replication is on.
+/// The slot moves saved in the data directory, checked against the cluster map
+/// (`placement`, this node's table by the map). Replicas follow ranges that move between
+/// nodes through the log and the map, but not moves between a node's own shards, so those
+/// are refused while replication is on. `pushed`: whether the map came from the
+/// coordinators, when the check's decision is to be saved; `None` reads what an earlier
+/// check saved.
 fn load_slot_moves(
     config: &AppConfig,
     shard_count: usize,
-    base: Option<std::sync::Arc<[u16]>>,
+    placement: Option<std::sync::Arc<[u16]>>,
+    pushed: Option<bool>,
 ) -> io::Result<Option<crate::slot_moves::SlotMoves>> {
     if config.persistence.profile == crate::DurabilityProfile::Memory {
         return Ok(None);
     }
 
-    let moves = crate::slot_moves::SlotMoves::load(&config.persistence.data_dir, shard_count)?;
+    let data_dir = &config.persistence.data_dir;
+    let Some(moves) = crate::slot_moves::SlotMoves::load(data_dir, shard_count)? else {
+        return Ok(None);
+    };
+    let local_moves = moves.has_local_moves();
 
-    if moves.is_some() {
-        crate::slot_moves::SlotMoves::check_base(
-            &config.persistence.data_dir,
-            shard_count,
-            base.as_deref(),
-        )?;
-    }
-
-    if moves.is_some() && config.replication.role != crate::config::ReplicationRole::Off {
+    if local_moves && config.replication.role != crate::config::ReplicationRole::Off {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "slot ranges were moved between shards (SLOTS file); replication is not supported \
              with moved slots",
         ));
     }
+    let Some(placement) = placement else {
+        crate::slot_moves::SlotMoves::check_base(data_dir, shard_count, None)?;
+        return Ok(Some(moves));
+    };
+    // Moves are recorded against the table the node had at its first move: the saved one,
+    // or the formula for moves made before the node had a map.
+    let moves = match crate::slot_moves::SlotMoves::load_base(data_dir, shard_count)? {
+        Some(base) => moves.with_base(base),
+        None => {
+            crate::slot_moves::SlotMoves::check_base(data_dir, shard_count, Some(&placement))?;
+            moves.with_base(placement.clone())
+        }
+    };
+    let Some(pushed) = pushed else {
+        return Ok(Some(moves));
+    };
+    let (moves, changed) = moves
+        .reconcile(&placement, pushed)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
 
-    // With a cluster map, moves were recorded against the map's placement.
-    Ok(match base {
-        Some(base) => moves.map(|moves| moves.with_base(base)),
-        None => moves,
-    })
+    if changed {
+        moves.save(data_dir)?;
+    }
+    Ok(Some(moves))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -948,12 +993,20 @@ async fn serve_async(
                 .topology
                 .as_ref()
                 .map(|shared| shared.get().placement(route.shard_count).into()),
+            // Checked and saved before the shards started.
+            None,
         )?,
         None => None,
     };
     let mut slot_filter = slot_moves
         .as_ref()
         .and_then(|moves| moves.replay_filter(shard_id as usize, snapshot_sequence));
+    // A prepared range from another node is kept on its shard until the map decides.
+    let arriving = slot_moves
+        .as_ref()
+        .and_then(crate::slot_moves::SlotMoves::pending_gain)
+        .filter(|gain| usize::from(gain.to) == shard_id as usize)
+        .map(|gain| gain.first..=gain.last);
 
     let (mut sink, mutations, report) = WalSink::open_after(
         config.persistence.clone(),
@@ -991,7 +1044,11 @@ async fn serve_async(
     let mut note_foreign = |key: &[u8]| {
         let slot = crate::routing::hash_slot(key);
 
-        if other_group(slot) {
+        if other_group(slot)
+            && !slot_moves
+                .as_ref()
+                .is_some_and(|moves| moves.crossed_nodes(slot))
+        {
             skipped_foreign = Some(skipped_foreign.map_or(slot, |known| known.min(slot)));
         }
     };
@@ -1101,7 +1158,14 @@ async fn serve_async(
     }
     if let Some(route) = route.as_ref().filter(|route| route.topology.is_some()) {
         let foreign: Vec<bool> = (0..crate::routing::HASH_SLOT_COUNT as u16)
-            .map(|slot| route.slots.owner(slot) != shard_id as usize)
+            .map(|slot| {
+                let owner = route.slots.owner(slot);
+
+                // A frozen range (a prepared move to another node) is still held here.
+                owner != shard_id as usize
+                    && owner != crate::routing::FROZEN_BASE + shard_id as usize
+                    && !arriving.as_ref().is_some_and(|range| range.contains(&slot))
+            })
             .collect();
 
         if let (count @ 1.., Some(slot)) = store.count_in_slots(&foreign) {
@@ -1267,6 +1331,15 @@ async fn serve_async(
     let shutdown_grace = config.shutdown_grace;
 
     *state.replication.borrow_mut() = attach_replication(&state, shard_id)?;
+    // A map installed just before a stop may have given ranges away before the loss was
+    // recorded: record it now, before this shard serves.
+    if state
+        .route
+        .as_ref()
+        .is_some_and(|route| route.topology.is_some())
+    {
+        migrate::settle(&state);
+    }
     let mut maintenance = tokio::time::interval(Duration::from_millis(100));
     maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     maintenance.tick().await;

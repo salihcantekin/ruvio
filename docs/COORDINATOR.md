@@ -160,14 +160,48 @@ have no slots yet (`slots = []`). Start every data node
 with a `cluster_topology` file holding the same groups and slots (version 1, each group named by its
 first member) and its own `cluster_group`. Once every group has an agreed primary the coordinators send
 each member the map with `RUVIO TOPOLOGY SET`, each group named by its agreed primary; its version is 1
-plus the sum of the groups' epochs, so every failover raises it. A node keeps the newest map it received
+plus the sum of the groups' epochs plus the ranges moved between groups, so every failover and every move
+raises it. A node keeps the newest map it received
 in its data directory (`TOPOLOGY`) and starts from the newer of that file and `cluster_topology`. After
 a failover in one group, the other groups' nodes answer that group's keys with `MOVED` naming the new
-primary within a ping or two. A map that would change a node's own slots is refused: slots do not move
-between groups yet. The data-node user in `auth` also needs `RUVIO` for this; a member that refuses
-the map is logged at most once a minute. The version only counts failovers, so an edit of the groups in
+primary within a ping or two. A node refuses a map that gives its group a slot whose data is not there
+(see *Moving slots between groups*). The data-node user in `auth` also needs `RUVIO` for this; a member that refuses
+the map is logged at most once a minute. The version only counts failovers and moves, so an edit of the groups in
 `coordinator.toml` (an address, the order) does not reach nodes that already serve that version; this
 version of the coordinator does not handle such edits.
+
+## Moving slots between groups
+
+`COORDINATOR MOVE first last group shard` (on the leader, after `AUTH secret`) moves the slots
+`first..=last` to shard `shard` of `group` while both groups keep serving them, and answers the move's
+id. Every slot of the range must be on one shard of one group; a group may start with `slots = []` and
+receive ranges this way. One move runs at a time.
+
+1. The leader records the move (Raft), then tells the target group's primary to expect the range on that
+   shard (`RUVIO MIGRATE IMPORT`) and the source group's primary to send it (`RUVIO MIGRATE EXPORT`).
+2. The source copies the range to the target shard over its client port, in batches, then the keys
+   written meanwhile, until few are left. Clients keep using the source.
+3. The source freezes the range: its commands get `TRYAGAIN`, which every Ruvio client retries after 5,
+   10 and 20 ms. It sends the last changes and the target syncs them to its log. The source then keeps
+   the frozen range on disk (`MIGRATE_OUT`), so a restart cannot serve it again on its own.
+4. The leader waits until the target's connected replicas hold the prepared copy (at most 10 s, or the
+   move is cancelled and started again), commits the move only if neither group failed over since it
+   began, and sends the new map to the target's primary, then the source's, then
+   every other member. The target serves the range; the source answers `MOVED` naming the target and
+   drops its copy in bounded steps. Each range of the new map names its shard (`"100-199@0"`), so the
+   other ranges stay on the shards that hold their data.
+
+Replicas of both groups follow the move from their primary's log. `COORDINATOR STATUS` reports the
+running move, or the last one this leader drove, with the number of moved ranges; `COORDINATOR CANCEL`
+ends the running move before its commit, and the source serves the range again (the end is recorded
+in Raft before the nodes are told, so a late cancel never undoes a committed move). Send cancels to the
+coordinators, not with `RUVIO MIGRATE CANCEL` to the nodes. Before a failover the leader sends the
+newest map to the replica it promotes. A failover of either
+group before the commit cancels the move and starts it again with the new primaries (up to three
+times); a new leader takes over a move its predecessor began. After the commit nothing undoes the move:
+move the range back with another `COORDINATOR MOVE`. The copy rate of a source is capped by
+`migration_max_bytes_per_sec` in its configuration (0, the default, means no cap); the frozen hand-over
+is never slowed down. Nodes need durability `memory`, `everysec` or `always` (not `snapshot`).
 
 ## Limits of this version
 
@@ -175,14 +209,17 @@ version of the coordinator does not handle such edits.
 - The coordinators do not change membership at run time (adding a coordinator means restarting all of
   them with the new `peers`).
 - No primary leases: an isolated primary is stopped by `min-replicas-to-write`, not by the coordinators.
-- Coordinators keep a multi-node cluster's map current but do not move slots between groups.
+- Ranges move only when an operator asks (`COORDINATOR MOVE`); nothing rebalances by load yet.
 
 ## Tests
 
 - `tests/coordinator_live.rs`: three data nodes and three coordinators as real processes: failover after
   the primary is killed, the old primary returning as a replica, agreement kept across a restart of every
   coordinator, no failover without a majority, and the secret; and two groups of a multi-node cluster,
-  where a failover in one changes the other's `MOVED` answers.
+  where a failover in one changes the other's `MOVED` answers, and a range moves from one to the other
+  while a client keeps writing a key of it (every acknowledged write is on the new owner).
+- `tests/multi_node_live.rs`: the node side of a move driven by hand, and a prepared move kept across
+  restarts of both nodes until it is cancelled.
 - `scripts/coordinator_faults.py target/debug/ruvio [scenario ...]`: a TCP proxy between the coordinators
   and each data node; `partition` (primary cut from the coordinators only), `leader` (the coordinator
   leader killed, then the primary), `minority`, `restart`, `loss` (acknowledged writes lost under load),

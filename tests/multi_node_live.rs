@@ -116,26 +116,41 @@ fn each_node_serves_its_slots_and_redirects_the_rest() {
         "[cluster-group,a]"
     );
 
-    // A newer map may move another group's primary, not this group's slots.
-    let map = |version: u64, a_slots: &str, b_port: u16| {
+    // A newer map may move another group's primary; it may not give this group a slot
+    // whose data is not here.
+    let map = |version: u64, a_slots: &str, b_slots: &str, b_port: u16| {
         format!(
             "version = {version}\n[[groups]]\nname = \"a\"\naddress = \"127.0.0.1:{a_port}\"\nshards = 2\nslots = [\"{a_slots}\"]\n\
-             [[groups]]\nname = \"b\"\naddress = \"127.0.0.1:{b_port}\"\nshards = 2\nslots = [\"8192-16383\"]\n"
+             [[groups]]\nname = \"b\"\naddress = \"127.0.0.1:{b_port}\"\nshards = 2\nslots = [\"{b_slots}\"]\n"
         )
-        .replace("\"8192-16383\"", if a_slots == "0-8191" { "\"8192-16383\"" } else { "\"8191-16383\"" })
     };
 
     assert_eq!(on_a.call(&["RUVIO", "TOPOLOGY", "VERSION"]), "7");
     assert!(
-        on_a.call(&["RUVIO", "TOPOLOGY", "SET", &map(6, "0-8191", 9000)])
-            .contains("older")
+        on_a.call(&[
+            "RUVIO",
+            "TOPOLOGY",
+            "SET",
+            &map(6, "0-8191", "8192-16383", 9000)
+        ])
+        .contains("older")
     );
     assert!(
-        on_a.call(&["RUVIO", "TOPOLOGY", "SET", &map(8, "0-8190", 9000)])
-            .contains("this group's slots")
+        on_a.call(&[
+            "RUVIO",
+            "TOPOLOGY",
+            "SET",
+            &map(8, "0-8192", "8193-16383", 9000)
+        ])
+        .contains("whose data is not here")
     );
     assert_eq!(
-        on_a.call(&["RUVIO", "TOPOLOGY", "SET", &map(8, "0-8191", 9000)]),
+        on_a.call(&[
+            "RUVIO",
+            "TOPOLOGY",
+            "SET",
+            &map(8, "0-8191", "8192-16383", 9000)
+        ]),
         "OK"
     );
     assert_eq!(
@@ -276,4 +291,231 @@ fn moves_made_without_a_map_refuse_a_start_with_one() {
     let log = a.restart_refused();
 
     assert!(log.contains("with another slot layout"), "{log}");
+}
+
+fn wait_for(client: &mut Client, args: &[&str], expected: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+
+    loop {
+        let reply = client.call(args);
+
+        if reply.contains(expected) {
+            return reply;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{args:?} never answered {expected}: {reply}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_slot_range_moves_to_another_node_and_stays_there_after_restarts() {
+    let env = [
+        ("RUVIO_SHARDS", "2"),
+        ("RUVIO_DURABILITY", "always"),
+        ("RUVIO_SNAPSHOT_INTERVAL_MS", "0"),
+    ];
+    let mut a = Server::start_with(&env);
+    let mut b = Server::start_with(&env);
+    let dir = tempfile::tempdir().unwrap();
+    let topology = dir.path().join("topology.toml");
+    let (a_port, b_port) = (a.ports().port_at(0), b.ports().port_at(0));
+    let map = |version: u64, a_slots: &str, b_slots: &str| {
+        format!(
+            "version = {version}\n[[groups]]\nname = \"a\"\naddress = \"127.0.0.1:{a_port}\"\nshards = 2\nslots = [{a_slots}]\n\
+             [[groups]]\nname = \"b\"\naddress = \"127.0.0.1:{b_port}\"\nshards = 2\nslots = [{b_slots}]\n"
+        )
+    };
+
+    std::fs::write(
+        &topology,
+        map(
+            1,
+            "\"0-4095@0\", \"4096-8191@1\"",
+            "\"8192-12287@0\", \"12288-16383@1\"",
+        ),
+    )
+    .unwrap();
+    for (server, group) in [(&mut a, "a"), (&mut b, "b")] {
+        server.set_env("RUVIO_CLUSTER_TOPOLOGY", topology.to_str().unwrap());
+        server.set_env("RUVIO_CLUSTER_GROUP", group);
+        server.restart();
+    }
+
+    let moving: Vec<String> = (0..)
+        .map(|n| format!("moving:{n}"))
+        .filter(|key| (100..200).contains(&hash_slot(key.as_bytes())))
+        .take(200)
+        .collect();
+    let staying = key_in(300..400, "staying");
+    let mut on_a = Client::connect(&a.address);
+    let mut on_b = Client::connect(&b.address);
+
+    for key in &moving {
+        assert_eq!(on_a.call(&["SET", key, key]), "OK");
+    }
+    assert_eq!(on_a.call(&["SET", &staying, "1"]), "OK");
+
+    // The target expects the range on its shard 0, then the source copies it there.
+    let port = b_port.to_string();
+
+    assert_eq!(
+        on_b.call(&["RUVIO", "MIGRATE", "IMPORT", "m1", "100", "199", "0"]),
+        "OK"
+    );
+    assert_eq!(
+        on_a.call(&[
+            "RUVIO",
+            "MIGRATE",
+            "EXPORT",
+            "m1",
+            "100",
+            "199",
+            "127.0.0.1",
+            &port
+        ]),
+        "OK"
+    );
+    wait_for(&mut on_a, &["RUVIO", "MIGRATE", "STATUS"], "state,prepared");
+    wait_for(&mut on_b, &["RUVIO", "MIGRATE", "STATUS"], "state,prepared");
+
+    // Frozen until the map decides: the source asks clients to retry, the target does
+    // not serve the range yet.
+    assert!(
+        on_a.call(&["SET", &moving[0], "late"])
+            .starts_with("ERR:TRYAGAIN")
+    );
+    assert!(on_b.call(&["GET", &moving[0]]).starts_with("ERR:MOVED"));
+    assert_eq!(on_a.call(&["GET", &staying]), "1");
+
+    let next = map(
+        2,
+        "\"0-99@0\", \"200-4095@0\", \"4096-8191@1\"",
+        "\"100-199@0\", \"8192-12287@0\", \"12288-16383@1\"",
+    );
+
+    assert_eq!(on_b.call(&["RUVIO", "TOPOLOGY", "SET", &next]), "OK");
+    assert_eq!(on_a.call(&["RUVIO", "TOPOLOGY", "SET", &next]), "OK");
+    wait_for(&mut on_a, &["RUVIO", "MIGRATE", "STATUS"], "state,done");
+    wait_for(&mut on_b, &["RUVIO", "MIGRATE", "STATUS"], "state,done");
+
+    let check = |a: &Server, b: &Server| {
+        let mut on_a = Client::connect(&a.address);
+        let mut on_b = Client::connect(&b.address);
+
+        for key in &moving {
+            assert_eq!(on_b.call(&["GET", key]), *key);
+            assert_eq!(
+                on_a.call(&["GET", key]),
+                format!("ERR:MOVED {} 127.0.0.1:{b_port}", hash_slot(key.as_bytes()))
+            );
+        }
+        assert_eq!(on_a.call(&["GET", &staying]), "1");
+        assert_eq!(on_a.call(&["DBSIZE"]), "1");
+        let slots = on_a.call(&["CLUSTER", "SLOTS"]);
+
+        assert!(
+            slots.contains(&format!("[100,199,[127.0.0.1,{b_port},")),
+            "{slots}"
+        );
+    };
+
+    check(&a, &b);
+    a.restart();
+    b.restart();
+    check(&a, &b);
+}
+
+#[test]
+fn a_prepared_move_survives_restarts_on_both_sides_until_it_is_cancelled() {
+    let env = [
+        ("RUVIO_SHARDS", "2"),
+        ("RUVIO_DURABILITY", "always"),
+        ("RUVIO_SNAPSHOT_INTERVAL_MS", "0"),
+    ];
+    let mut a = Server::start_with(&env);
+    let mut b = Server::start_with(&env);
+    let dir = tempfile::tempdir().unwrap();
+    let topology = dir.path().join("topology.toml");
+    let (a_port, b_port) = (a.ports().port_at(0), b.ports().port_at(0));
+
+    std::fs::write(
+        &topology,
+        format!(
+            "version = 1\n[[groups]]\nname = \"a\"\naddress = \"127.0.0.1:{a_port}\"\nshards = 2\nslots = [\"0-4095@0\", \"4096-8191@1\"]\n\
+             [[groups]]\nname = \"b\"\naddress = \"127.0.0.1:{b_port}\"\nshards = 2\nslots = [\"8192-12287@0\", \"12288-16383@1\"]\n"
+        ),
+    )
+    .unwrap();
+    for (server, group) in [(&mut a, "a"), (&mut b, "b")] {
+        server.set_env("RUVIO_CLUSTER_TOPOLOGY", topology.to_str().unwrap());
+        server.set_env("RUVIO_CLUSTER_GROUP", group);
+        server.restart();
+    }
+
+    let key = key_in(100..200, "kept");
+    let mut on_a = Client::connect(&a.address);
+    let mut on_b = Client::connect(&b.address);
+    let port = b_port.to_string();
+
+    assert_eq!(on_a.call(&["SET", &key, "1"]), "OK");
+    assert_eq!(
+        on_b.call(&["RUVIO", "MIGRATE", "IMPORT", "m1", "100", "199", "0"]),
+        "OK"
+    );
+    assert_eq!(
+        on_a.call(&[
+            "RUVIO",
+            "MIGRATE",
+            "EXPORT",
+            "m1",
+            "100",
+            "199",
+            "127.0.0.1",
+            &port
+        ]),
+        "OK"
+    );
+    wait_for(&mut on_a, &["RUVIO", "MIGRATE", "STATUS"], "state,prepared");
+
+    // The source comes back frozen: the target may own the range by now.
+    a.restart();
+    b.restart();
+    let mut on_a = Client::connect(&a.address);
+    let mut on_b = Client::connect(&b.address);
+
+    assert!(on_a.call(&["SET", &key, "2"]).starts_with("ERR:TRYAGAIN"));
+    assert!(
+        on_a.call(&["RUVIO", "MIGRATE", "STATUS"])
+            .contains("state,prepared")
+    );
+    assert!(
+        on_b.call(&["RUVIO", "MIGRATE", "STATUS"])
+            .contains("state,prepared")
+    );
+
+    // Cancelled on both sides: the source serves the range again, the target drops it.
+    assert_eq!(on_a.call(&["RUVIO", "MIGRATE", "CANCEL", "m1"]), "OK");
+    assert_eq!(on_b.call(&["RUVIO", "MIGRATE", "CANCEL", "m1"]), "OK");
+    wait_for(
+        &mut on_b,
+        &["RUVIO", "MIGRATE", "STATUS"],
+        "state,cancelled",
+    );
+    assert_eq!(on_a.call(&["GET", &key]), "1");
+    assert_eq!(on_a.call(&["SET", &key, "2"]), "OK");
+    assert!(on_b.call(&["GET", &key]).starts_with("ERR:MOVED"));
+    assert_eq!(on_b.call(&["DBSIZE"]), "0");
+
+    // Nothing comes back after another restart.
+    a.restart();
+    b.restart();
+    let mut on_a = Client::connect(&a.address);
+    let mut on_b = Client::connect(&b.address);
+
+    assert_eq!(on_a.call(&["GET", &key]), "2");
+    assert_eq!(on_b.call(&["DBSIZE"]), "0");
+    assert_eq!(on_b.call(&["RUVIO", "MIGRATE", "STATUS"]), "[state,none]");
 }

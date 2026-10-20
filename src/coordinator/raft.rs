@@ -40,6 +40,43 @@ pub enum Request {
         member: usize,
         epoch: u64,
     },
+    /// A slot range begins to move between two groups; refused while another move runs.
+    BeginMove(Migration),
+    /// The target holds the whole range: from now on the map gives it the range.
+    CommitMove { id: String },
+    /// The move ended before its commit (cancelled, failed, or a failover interrupted it).
+    EndMove { id: String },
+}
+
+/// A move between groups the coordinators agreed to start.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Migration {
+    pub id: String,
+    pub first: u16,
+    pub last: u16,
+    pub from: String,
+    pub to: String,
+    /// The target group's shard that receives the range.
+    pub shard: usize,
+    /// Both groups' primary epochs when it began: a failover of either ends it.
+    pub from_epoch: u64,
+    pub to_epoch: u64,
+}
+
+/// A range that moved to `group`'s shard `shard`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MovedRange {
+    pub first: u16,
+    pub last: u16,
+    pub group: String,
+    pub shard: usize,
+}
+
+/// Every committed move, oldest first, and the one in progress.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Moves {
+    pub moved: Vec<MovedRange>,
+    pub current: Option<Migration>,
 }
 
 openraft::declare_raft_types!(
@@ -251,6 +288,9 @@ struct MachineState {
     last_applied: Option<LogId<NodeId>>,
     membership: StoredMembership<NodeId, BasicNode>,
     primaries: Primaries,
+    /// Absent in snapshots written before moves between groups existed.
+    #[serde(default)]
+    moves: Moves,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -297,14 +337,61 @@ impl StateMachine {
             .clone()
     }
 
+    pub fn moves(&self) -> Moves {
+        self.state
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .moves
+            .clone()
+    }
+
     fn snapshot_path(&self) -> PathBuf {
         self.dir.join("raft-snapshot.json")
+    }
+}
+
+/// Applies a move request; returns whether it changed anything. A commit applies only
+/// while both groups still have the primaries the move began with.
+pub fn apply_move(moves: &mut Moves, primaries: &Primaries, request: &Request) -> bool {
+    match request {
+        Request::BeginMove(migration) => {
+            if moves.current.is_some() {
+                return false;
+            }
+            moves.current = Some(migration.clone());
+            true
+        }
+        Request::CommitMove { id } => {
+            let unchanged = |group: &String, epoch: u64| {
+                primaries
+                    .get(group)
+                    .is_some_and(|primary| primary.epoch == epoch)
+            };
+            let Some(migration) = moves.current.take_if(|current| {
+                current.id == *id
+                    && unchanged(&current.from, current.from_epoch)
+                    && unchanged(&current.to, current.to_epoch)
+            }) else {
+                return false;
+            };
+
+            moves.moved.push(MovedRange {
+                first: migration.first,
+                last: migration.last,
+                group: migration.to,
+                shard: migration.shard,
+            });
+            true
+        }
+        Request::EndMove { id } => moves.current.take_if(|current| current.id == *id).is_some(),
+        Request::SetPrimary { .. } => false,
     }
 }
 
 /// Applies one request; returns whether it changed anything.
 pub fn apply_request(primaries: &mut Primaries, request: &Request) -> bool {
     match request {
+        Request::BeginMove(_) | Request::CommitMove { .. } | Request::EndMove { .. } => false,
         Request::SetPrimary {
             group,
             member,
@@ -400,7 +487,12 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
             state.last_applied = Some(entry.log_id);
             replies.push(match entry.payload {
                 EntryPayload::Blank => false,
-                EntryPayload::Normal(request) => apply_request(&mut state.primaries, &request),
+                EntryPayload::Normal(request) => {
+                    let state = &mut *state;
+
+                    apply_request(&mut state.primaries, &request)
+                        || apply_move(&mut state.moves, &state.primaries, &request)
+                }
                 EntryPayload::Membership(membership) => {
                     state.membership = StoredMembership::new(Some(entry.log_id), membership);
                     false
@@ -657,6 +749,85 @@ mod tests {
                 epoch: 2
             }
         );
+    }
+
+    #[test]
+    fn one_move_runs_at_a_time_and_only_its_own_id_ends_it() {
+        let mut moves = Moves::default();
+        let mut primaries = Primaries::new();
+
+        for group in ["a", "b"] {
+            primaries.insert(
+                group.into(),
+                Primary {
+                    member: 0,
+                    epoch: 1,
+                },
+            );
+        }
+        let begin = |id: &str| {
+            Request::BeginMove(Migration {
+                id: id.into(),
+                first: 100,
+                last: 199,
+                from: "a".into(),
+                to: "b".into(),
+                shard: 0,
+                from_epoch: 1,
+                to_epoch: 1,
+            })
+        };
+
+        assert!(apply_move(&mut moves, &primaries, &begin("m1")));
+        assert!(!apply_move(&mut moves, &primaries, &begin("m2")));
+        assert!(!apply_move(
+            &mut moves,
+            &primaries,
+            &Request::CommitMove { id: "m2".into() }
+        ));
+        assert!(apply_move(
+            &mut moves,
+            &primaries,
+            &Request::CommitMove { id: "m1".into() }
+        ));
+        // A retried commit or a late end changes nothing.
+        assert!(!apply_move(
+            &mut moves,
+            &primaries,
+            &Request::CommitMove { id: "m1".into() }
+        ));
+        assert!(!apply_move(
+            &mut moves,
+            &primaries,
+            &Request::EndMove { id: "m1".into() }
+        ));
+        assert_eq!(
+            moves.moved,
+            [MovedRange {
+                first: 100,
+                last: 199,
+                group: "b".into(),
+                shard: 0
+            }]
+        );
+        assert!(apply_move(&mut moves, &primaries, &begin("m2")));
+        assert!(apply_move(
+            &mut moves,
+            &primaries,
+            &Request::EndMove { id: "m2".into() }
+        ));
+        assert_eq!(moves.current, None);
+        assert_eq!(moves.moved.len(), 1);
+
+        // A failover of either group after the move began keeps it from committing.
+        assert!(apply_move(&mut moves, &primaries, &begin("m3")));
+        primaries.get_mut("b").unwrap().epoch = 2;
+        assert!(!apply_move(
+            &mut moves,
+            &primaries,
+            &Request::CommitMove { id: "m3".into() }
+        ));
+        assert_eq!(moves.moved.len(), 1);
     }
 
     #[test]

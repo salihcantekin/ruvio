@@ -8,6 +8,13 @@
 //! after the hand-over (`until`). An entry whose `until` is 0 was never completed: a move
 //! in progress, or one a crash or a cancel ended.
 //!
+//! A range can also come from another node of a multi-node cluster or leave for one (an
+//! online migration): such an entry names [`REMOTE`] as its source or its target. A gain
+//! is begun before the copy arrives, marked prepared once the copy is durable here
+//! (`prepared`, this shard's last sequence then), and completed when the cluster map
+//! gives the range to this node. A loss is recorded completed, at the source shard's first
+//! sequence after the hand-over.
+//!
 //! Recovery replays each shard's checkpoint and log as they were written and keeps, for
 //! every slot, only what the shard held while it owned the slot ([`ReplayFilter`]): records
 //! from a move that never completed are skipped, and keys of a range that left the shard
@@ -27,11 +34,41 @@ pub(crate) const FILE_NAME: &str = "SLOTS";
 /// [`NOT_LOCAL`]. Absent means the formula.
 pub(crate) const BASE_FILE_NAME: &str = "SLOTS_BASE";
 const NOT_LOCAL: u16 = u16::MAX;
+/// The source of a range gained from another node, or the target of one given to another
+/// node.
+pub(crate) const REMOTE: u16 = u16::MAX;
 
-const MAGIC: &[u8; 8] = b"RVSLOTS1";
+/// Version 1 entries have no `prepared` field; version 2 adds it (and remote entries).
+const MAGIC_V1: &[u8; 8] = b"RVSLOTS1";
+const MAGIC: &[u8; 8] = b"RVSLOTS2";
 const HEADER_LEN: usize = MAGIC.len() + 4 + 4;
-const MOVE_LEN: usize = 2 * 4 + 8 * 2;
+const MOVE_LEN_V1: usize = 2 * 4 + 8 * 2;
+const MOVE_LEN: usize = MOVE_LEN_V1 + 8;
 const CHECKSUM_LEN: usize = 4;
+
+/// A step of a range arriving from another node, as a `SlotsIncoming` record carries it,
+/// so a replica of the target records the same steps at the same sequences.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum IncomingStep {
+    /// The copy begins at this record's sequence.
+    Begin = 0,
+    /// Every copy up to this record's sequence is durable.
+    Prepared = 1,
+    /// The move was cancelled: the copies are dropped.
+    Cancelled = 2,
+}
+
+impl IncomingStep {
+    pub(crate) fn from_u8(step: u8) -> Option<Self> {
+        match step {
+            0 => Some(Self::Begin),
+            1 => Some(Self::Prepared),
+            2 => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+}
 
 /// One move of the slots `first..=last` from shard `from` to shard `to`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,13 +79,28 @@ pub(crate) struct SlotMove {
     pub to: u16,
     /// The target's first log sequence of the copy.
     pub since: u64,
-    /// The source's first log sequence after the hand-over; 0 while not completed.
+    /// The source's first log sequence after the hand-over; 0 while not completed. For a
+    /// range gained from another node, the target's sequence when the map gave it the range.
     pub until: u64,
+    /// For a range gained from another node: the target's last sequence once the whole copy
+    /// was durable, 0 before that or after a cancel. A prepared gain keeps its copies through
+    /// a restart until the cluster map decides the move.
+    pub prepared: u64,
 }
 
 impl SlotMove {
     pub(crate) fn completed(&self) -> bool {
         self.until != 0
+    }
+
+    /// Prepared and not yet completed: the copy is kept, the range is not served.
+    pub(crate) fn pending(&self) -> bool {
+        self.prepared != 0 && self.until == 0
+    }
+
+    /// A range gained from another node.
+    pub(crate) fn gained(&self) -> bool {
+        self.from == REMOTE
     }
 
     fn slots(&self) -> std::ops::RangeInclusive<u16> {
@@ -136,6 +188,98 @@ impl SlotMoves {
         crate::replication::write_durably(&data_dir.join(FILE_NAME), &self.encode())
     }
 
+    /// The starting table saved next to the moves ([`BASE_FILE_NAME`]), other nodes' slots
+    /// as a value at or above the shard count; `None` when the moves were recorded against
+    /// the formula.
+    pub(crate) fn load_base(
+        data_dir: &Path,
+        shard_count: usize,
+    ) -> io::Result<Option<std::sync::Arc<[u16]>>> {
+        let bytes = match std::fs::read(data_dir.join(BASE_FILE_NAME)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+
+        if bytes.len() != HASH_SLOT_COUNT * 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{BASE_FILE_NAME} file is damaged"),
+            ));
+        }
+        let base: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+
+        if base
+            .iter()
+            .any(|&owner| owner != NOT_LOCAL && usize::from(owner) >= shard_count)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{BASE_FILE_NAME} file was written for more shards than are configured"),
+            ));
+        }
+        Ok(Some(base.into()))
+    }
+
+    /// Whether any move went between two shards of this node (not to or from another node).
+    pub(crate) fn has_local_moves(&self) -> bool {
+        self.moves
+            .iter()
+            .any(|entry| entry.from != REMOTE && entry.to != REMOTE)
+    }
+
+    /// Checks the moves against the cluster map's table for this node (`placement`: a local
+    /// shard, or at or above the shard count for another group) and returns them with the
+    /// map's decision applied, and whether that changed them:
+    ///
+    /// - a slot the map gives this node must be held here, or be part of a prepared gain,
+    ///   which the map then completes;
+    /// - a slot held here that the map gives another group is accepted only from a map the
+    ///   coordinators sent (`pushed`): the node gave the range away and stopped before it
+    ///   recorded that; its shard records the loss once it has replayed its log.
+    pub(crate) fn reconcile(
+        mut self,
+        placement: &[u16],
+        pushed: bool,
+    ) -> Result<(Self, bool), String> {
+        let mut changed = false;
+
+        if let Some(gain) = self.pending_gain() {
+            let given =
+                (gain.first..=gain.last).all(|slot| placement[usize::from(slot)] == gain.to);
+
+            if given {
+                self.complete(gain.prepared)
+                    .map_err(|error| format!("{FILE_NAME}: {error}"))?;
+                changed = true;
+            }
+        }
+
+        for slot in 0..HASH_SLOT_COUNT as u16 {
+            let held = self.owner(slot) < self.shard_count;
+            let mapped = placement[usize::from(slot)] < self.shard_count;
+
+            if mapped && !held {
+                return Err(format!(
+                    "the cluster map gives this node slot {slot}, but its data is not here \
+                     ({FILE_NAME} file); start with the cluster_topology this node had"
+                ));
+            }
+            if held && !mapped && !pushed {
+                return Err(format!(
+                    "cluster_topology gives slot {slot} to another group, but this node holds \
+                     its data ({FILE_NAME} file); move ranges between groups with the \
+                     coordinators"
+                ));
+            }
+        }
+
+        Ok((self, changed))
+    }
+
     /// Refuses moves saved against another starting table than `base` (`None`: the
     /// formula): their replay would keep the wrong slots on each shard.
     pub(crate) fn check_base(
@@ -218,6 +362,143 @@ impl SlotMoves {
             return Err("log sequences start at 1");
         }
 
+        let from = self.single_owner(first, last)?;
+
+        if from >= self.shard_count {
+            return Err("slot range belongs to another node");
+        }
+        if from == to {
+            return Err("slot range is already on that shard");
+        }
+        self.no_pending_gain()?;
+
+        self.moves.push(SlotMove {
+            first,
+            last,
+            from,
+            to,
+            since,
+            until: 0,
+            prepared: 0,
+        });
+        Ok(())
+    }
+
+    /// Records that a range owned by another node begins to arrive on shard `to`, whose
+    /// copy starts at its sequence `since`.
+    pub(crate) fn begin_gain(
+        &mut self,
+        first: u16,
+        last: u16,
+        to: u16,
+        since: u64,
+    ) -> Result<(), &'static str> {
+        if first > last || usize::from(last) >= HASH_SLOT_COUNT {
+            return Err("invalid slot range");
+        }
+        if to >= self.shard_count {
+            return Err("no such shard");
+        }
+        if since == 0 {
+            return Err("log sequences start at 1");
+        }
+        if (first..=last).any(|slot| self.owner(slot) < self.shard_count) {
+            return Err("slot range is already on this node");
+        }
+        self.no_pending_gain()?;
+
+        self.moves.push(SlotMove {
+            first,
+            last,
+            from: REMOTE,
+            to,
+            since,
+            until: 0,
+            prepared: 0,
+        });
+        Ok(())
+    }
+
+    /// Marks the newest gain prepared: every copy up to this shard's sequence `prepared` is
+    /// durable here.
+    pub(crate) fn prepare(&mut self, prepared: u64) -> Result<(), &'static str> {
+        let Some(entry) = self
+            .moves
+            .last_mut()
+            .filter(|entry| entry.gained() && !entry.completed())
+        else {
+            return Err("no gain in progress");
+        };
+
+        if prepared == 0 {
+            return Err("log sequences start at 1");
+        }
+
+        entry.prepared = prepared;
+        Ok(())
+    }
+
+    /// Ends the newest move unfinished: its copies are skipped on every later restart.
+    pub(crate) fn cancel(&mut self) {
+        if let Some(entry) = self.moves.last_mut().filter(|entry| !entry.completed()) {
+            entry.prepared = 0;
+        }
+    }
+
+    /// Records that shard `from` gave `first..=last` to another node at its sequence `until`
+    /// (its first after the hand-over).
+    pub(crate) fn lose(
+        &mut self,
+        first: u16,
+        last: u16,
+        from: u16,
+        until: u64,
+    ) -> Result<(), &'static str> {
+        if first > last || usize::from(last) >= HASH_SLOT_COUNT {
+            return Err("invalid slot range");
+        }
+        if until == 0 {
+            return Err("log sequences start at 1");
+        }
+        if self.single_owner(first, last)? != from {
+            return Err("slot range is not on that shard");
+        }
+
+        self.moves.push(SlotMove {
+            first,
+            last,
+            from,
+            to: REMOTE,
+            since: 0,
+            until,
+            prepared: 0,
+        });
+        Ok(())
+    }
+
+    /// Whether `slot` ever moved between this node and another one: a log may then hold
+    /// its keys although another group serves it now.
+    pub(crate) fn crossed_nodes(&self, slot: u16) -> bool {
+        self.moves.iter().any(|entry| {
+            (entry.from == REMOTE || entry.to == REMOTE) && entry.slots().contains(&slot)
+        })
+    }
+
+    /// The newest gain when the map has not completed it: arriving, prepared or cancelled.
+    pub(crate) fn unfinished_gain(&self) -> Option<SlotMove> {
+        self.moves
+            .last()
+            .copied()
+            .filter(|entry| entry.gained() && !entry.completed())
+    }
+
+    /// The prepared gain the cluster map has not decided yet.
+    pub(crate) fn pending_gain(&self) -> Option<SlotMove> {
+        self.moves.last().copied().filter(SlotMove::pending)
+    }
+
+    /// The owner every slot of `first..=last` has, or an error when they differ.
+    fn single_owner(&self, first: u16, last: u16) -> Result<u16, &'static str> {
         let owners = self.owners();
         let from = owners[usize::from(first)];
 
@@ -227,23 +508,29 @@ impl SlotMoves {
         {
             return Err("slot range has more than one owner");
         }
-        if from == to {
-            return Err("slot range is already on that shard");
-        }
-
-        self.moves.push(SlotMove {
-            first,
-            last,
-            from,
-            to,
-            since,
-            until: 0,
-        });
-        Ok(())
+        Ok(from)
     }
 
-    /// Completes the newest move at the source's sequence `until`. Until this is saved,
-    /// the move did not happen.
+    /// The owner of `slot` after the completed moves; at or above the shard count when
+    /// another node owns it.
+    pub(crate) fn owner(&self, slot: u16) -> u16 {
+        self.moves
+            .iter()
+            .rev()
+            .find(|entry| entry.completed() && (entry.first..=entry.last).contains(&slot))
+            .map_or_else(|| self.base_owner(slot), |entry| entry.to)
+    }
+
+    /// A prepared gain keeps its copies until the map decides; no other move starts first.
+    fn no_pending_gain(&self) -> Result<(), &'static str> {
+        match self.pending_gain() {
+            Some(_) => Err("a range from another node waits for the cluster map"),
+            None => Ok(()),
+        }
+    }
+
+    /// Completes the newest move at the source's sequence `until` (for a gain, this shard's
+    /// sequence when the map gave it the range). Until this is saved, the move did not happen.
     pub(crate) fn complete(&mut self, until: u64) -> Result<(), &'static str> {
         let Some(entry) = self.moves.last_mut().filter(|entry| !entry.completed()) else {
             return Err("no move in progress");
@@ -252,15 +539,28 @@ impl SlotMoves {
         if until == 0 {
             return Err("log sequences start at 1");
         }
+        if entry.gained() && entry.prepared == 0 {
+            return Err("the range from another node is not prepared");
+        }
 
         entry.until = until;
         Ok(())
     }
 
-    /// Gives every slot of `table` its owner after the completed moves.
-    pub(crate) fn apply(&self, table: &SlotTable) {
+    /// Gives every slot of `table` its owner after the completed moves. A slot of another
+    /// node gets `remote(slot)`, its entry for that node (the cluster map's).
+    pub(crate) fn apply(&self, table: &SlotTable, remote: impl Fn(u16) -> usize) {
         for (slot, owner) in self.owners().into_iter().enumerate() {
-            table.assign(slot as u16, usize::from(owner));
+            let slot = slot as u16;
+
+            table.assign(
+                slot,
+                if owner < self.shard_count {
+                    usize::from(owner)
+                } else {
+                    remote(slot)
+                },
+            );
         }
     }
 
@@ -288,7 +588,12 @@ impl SlotMoves {
         // order; the sort only makes that explicit.
         let mut events: Vec<Event> = Vec::new();
 
-        for entry in self.moves.iter().filter(|entry| entry.completed()) {
+        // A prepared gain keeps its copies until the cluster map decides the move.
+        for entry in self
+            .moves
+            .iter()
+            .filter(|entry| entry.completed() || entry.pending())
+        {
             if entry.to == shard {
                 events.push(Event {
                     sequence: entry.since,
@@ -337,6 +642,7 @@ impl SlotMoves {
             }
             bytes.extend_from_slice(&entry.since.to_le_bytes());
             bytes.extend_from_slice(&entry.until.to_le_bytes());
+            bytes.extend_from_slice(&entry.prepared.to_le_bytes());
         }
         bytes.extend_from_slice(&crc32c::crc32c(&bytes).to_le_bytes());
         bytes
@@ -346,12 +652,14 @@ impl SlotMoves {
         let body_len = bytes.len().checked_sub(CHECKSUM_LEN)?;
         let (body, checksum) = bytes.split_at(body_len);
 
-        if body.len() < HEADER_LEN
-            || &body[..MAGIC.len()] != MAGIC
-            || crc32c::crc32c(body).to_le_bytes() != checksum
-        {
+        if body.len() < HEADER_LEN || crc32c::crc32c(body).to_le_bytes() != checksum {
             return None;
         }
+        let move_len = match &body[..MAGIC.len()] {
+            magic if magic == MAGIC => MOVE_LEN,
+            magic if magic == MAGIC_V1 => MOVE_LEN_V1,
+            _ => return None,
+        };
 
         let u16_at = |at: usize| u16::from_le_bytes([body[at], body[at + 1]]);
         let u32_at = |at: usize| u32::from_le_bytes(body[at..at + 4].try_into().unwrap());
@@ -361,14 +669,14 @@ impl SlotMoves {
 
         if shard_count == 0
             || shard_count > u32::from(u16::MAX)
-            || body.len() != HEADER_LEN + count.checked_mul(MOVE_LEN)?
+            || body.len() != HEADER_LEN + count.checked_mul(move_len)?
         {
             return None;
         }
 
         let moves = (0..count)
             .map(|index| {
-                let at = HEADER_LEN + index * MOVE_LEN;
+                let at = HEADER_LEN + index * move_len;
 
                 SlotMove {
                     first: u16_at(at),
@@ -377,15 +685,23 @@ impl SlotMoves {
                     to: u16_at(at + 6),
                     since: u64_at(at + 8),
                     until: u64_at(at + 16),
+                    prepared: if move_len == MOVE_LEN {
+                        u64_at(at + 24)
+                    } else {
+                        0
+                    },
                 }
             })
             .collect::<Vec<_>>();
+        let shard_or_remote = |shard: u16| shard == REMOTE || u32::from(shard) < shard_count;
         let valid = moves.iter().all(|entry| {
             entry.first <= entry.last
                 && usize::from(entry.last) < HASH_SLOT_COUNT
-                && u32::from(entry.from) < shard_count
-                && u32::from(entry.to) < shard_count
+                && shard_or_remote(entry.from)
+                && shard_or_remote(entry.to)
                 && entry.from != entry.to
+                // A loss is recorded completed.
+                && (entry.to != REMOTE || entry.completed())
         });
 
         valid.then_some(Self {

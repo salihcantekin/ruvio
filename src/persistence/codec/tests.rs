@@ -111,6 +111,17 @@ fn round_trips_every_wal_mutation_type() {
             to: 3,
             position: u64::MAX,
         },
+        OwnedMutation::SlotsIncoming {
+            first: 7,
+            last: 9,
+            step: 2,
+        },
+        OwnedMutation::SlotsGiven {
+            first: 0,
+            last: 16_383,
+            address: b"10.0.0.2:7001".to_vec(),
+            position: 42,
+        },
         OwnedMutation::SetInteger {
             key: b"i".to_vec(),
             value: -42,
@@ -1106,6 +1117,8 @@ fn cover_owned_mutation(mutation: &OwnedMutation) {
         | OwnedMutation::MoveKey { .. }
         | OwnedMutation::SlotCopy { .. }
         | OwnedMutation::SlotsMoved { .. }
+        | OwnedMutation::SlotsIncoming { .. }
+        | OwnedMutation::SlotsGiven { .. }
         | OwnedMutation::SetRange { .. }
         | OwnedMutation::ListSet { .. }
         | OwnedMutation::ListInsert { .. }

@@ -116,7 +116,9 @@ fn holder_ranges(route: &ClusterRoute) -> (Vec<(u16, u16, usize)>, Vec<Holder>) 
 
     for slot in 0..crate::routing::HASH_SLOT_COUNT as u16 {
         let owner = route.slots.owner(slot);
-        let holder = if owner < route.shard_count {
+        let holder = if owner >= crate::routing::FROZEN_BASE {
+            Holder::Local(owner - crate::routing::FROZEN_BASE)
+        } else if owner < route.shard_count {
             Holder::Local(owner)
         } else {
             let group = owner - route.shard_count;
@@ -455,6 +457,11 @@ pub(crate) fn write_moved(
     owner: usize,
     local_shards: usize,
 ) -> io::Result<()> {
+    if owner >= crate::routing::FROZEN_BASE {
+        return output.write_all(
+            b"-TRYAGAIN the slot is moving to another node; send the command again\r\n",
+        );
+    }
     match topology.remote(slot, owner, local_shards) {
         Some((host, port)) => write!(output, "-MOVED {slot} {host}:{port}\r\n"),
         None => output.write_all(b"-CLUSTERDOWN Hash slot not served\r\n"),

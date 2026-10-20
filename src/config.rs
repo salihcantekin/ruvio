@@ -168,6 +168,8 @@ pub struct AppConfig {
     pub cluster_topology: Option<PathBuf>,
     /// This node's group in `cluster_topology`.
     pub cluster_group: String,
+    /// The most bytes per second a range moving to another node copies; 0 = no limit.
+    pub migration_max_bytes_per_sec: u64,
     /// The file this configuration was read from, where `CONFIG REWRITE` writes. Not a
     /// setting: `None` (tests, embedded servers) refuses `CONFIG REWRITE`.
     pub config_file: Option<PathBuf>,
@@ -498,6 +500,11 @@ impl AppConfig {
             self.cluster_topology = (!value.is_empty()).then(|| PathBuf::from(value));
         }
         apply_string(&get, "RUVIO_CLUSTER_GROUP", &mut self.cluster_group);
+        apply_u64(
+            &get,
+            "RUVIO_MIGRATION_MAX_BYTES_PER_SEC",
+            &mut self.migration_max_bytes_per_sec,
+        )?;
 
         if let Some(value) = get("RUVIO_METRICS_ADDR") {
             self.metrics_address = if value.is_empty() { None } else { Some(value) };
@@ -932,6 +939,10 @@ impl AppConfig {
             ),
             ("cluster-group".into(), self.cluster_group.clone()),
             (
+                "migration-max-bytes-per-sec".into(),
+                self.migration_max_bytes_per_sec.to_string(),
+            ),
+            (
                 "hash-max-compact-entries".into(),
                 self.memory.hash_max_compact_entries.to_string(),
             ),
@@ -1193,6 +1204,7 @@ impl Default for AppConfig {
             replication: ReplicationConfig::default(),
             cluster_topology: None,
             cluster_group: String::new(),
+            migration_max_bytes_per_sec: 0,
             config_file: None,
         }
     }
@@ -1236,6 +1248,7 @@ struct FileConfig {
     replication: ReplicationFileConfig,
     cluster_topology: Option<PathBuf>,
     cluster_group: Option<String>,
+    migration_max_bytes_per_sec: Option<u64>,
 }
 
 impl FileConfig {
@@ -1299,6 +1312,10 @@ impl FileConfig {
 
         if let Some(value) = self.cluster_group {
             config.cluster_group = value;
+        }
+
+        if let Some(value) = self.migration_max_bytes_per_sec {
+            config.migration_max_bytes_per_sec = value;
         }
 
         self.replication.apply(&mut config.replication)?;
@@ -2710,6 +2727,13 @@ fn overlay_config(table: &mut toml::Table, loaded: &AppConfig, effective: &AppCo
     if loaded.cluster_group != effective.cluster_group {
         set_toml(table, &["cluster_group"], text(&effective.cluster_group));
     }
+
+    sync_u64(
+        table,
+        &["migration_max_bytes_per_sec"],
+        loaded.migration_max_bytes_per_sec,
+        effective.migration_max_bytes_per_sec,
+    );
 }
 
 fn replication_primary_text(replication: &ReplicationConfig) -> Option<String> {

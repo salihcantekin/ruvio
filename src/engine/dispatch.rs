@@ -107,6 +107,9 @@ pub fn execute_in_database<'a, C: Clock, I: StorageIndex, S: MutationSink, W: Li
         Command::Topology(_) => Ok(Response::Error(
             b"ERR RUVIO TOPOLOGY is handled by the server",
         )),
+        Command::Migrate(_) => Ok(Response::Error(
+            b"ERR RUVIO MIGRATE is handled by the server",
+        )),
 
         Command::Multi
         | Command::Exec

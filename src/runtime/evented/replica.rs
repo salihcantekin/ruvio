@@ -415,6 +415,17 @@ pub(super) fn promote(state: &ShardState, shard_id: u32, force: bool) -> io::Res
         fork = lineage.fork_sequence,
         "promoted to primary"
     );
+    // A range the map gave to another group while this shard followed is recorded (and
+    // logged for this shard's own replicas) now that it writes.
+    if let Some(forwarding) = state.forwarding.as_ref()
+        && forwarding.fabric.topology().is_some()
+    {
+        forwarding.fabric.send(
+            forwarding.me,
+            forwarding.me,
+            Message::Move(super::moveslots::MoveMessage::Settle),
+        );
+    }
     Ok(())
 }
 
@@ -914,6 +925,21 @@ fn drain_replicated_budget(state: &ShardState, budget: usize) -> usize {
         };
 
         match applied {
+            Ok((_, mutation, _))
+                if matches!(
+                    mutation,
+                    crate::OwnedMutation::SlotsIncoming { .. }
+                        | crate::OwnedMutation::SlotsGiven { .. }
+                ) =>
+            {
+                let sequence = state
+                    .persistence
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .last_sequence();
+
+                super::migrate::replicated(state, &mutation, sequence);
+            }
             Ok((database, mutation, skip_expired)) => {
                 let track_plan = crate::tracking::TrackPlan::replicated(database, &mutation);
                 let hot = database == 0

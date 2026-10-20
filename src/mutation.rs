@@ -297,6 +297,21 @@ pub enum Mutation<'a> {
         to: u16,
         position: u64,
     },
+    /// Slots `first..=last` are arriving from another node: a step of that move
+    /// ([`crate::slot_moves::IncomingStep`]). Changes nothing here; a replica records it.
+    SlotsIncoming {
+        first: u16,
+        last: u16,
+        step: u8,
+    },
+    /// Slots `first..=last` moved from this shard to another node, reached at `address`,
+    /// whose log continues them from `position`. A change stream reports it.
+    SlotsGiven {
+        first: u16,
+        last: u16,
+        address: &'a [u8],
+        position: u64,
+    },
     LeasePut {
         key: &'a [u8],
         token: u64,
@@ -593,6 +608,17 @@ pub enum OwnedMutation {
         to: u16,
         position: u64,
     },
+    SlotsIncoming {
+        first: u16,
+        last: u16,
+        step: u8,
+    },
+    SlotsGiven {
+        first: u16,
+        last: u16,
+        address: Vec<u8>,
+        position: u64,
+    },
     LeasePut {
         key: Vec<u8>,
         token: u64,
@@ -653,7 +679,9 @@ impl OwnedMutation {
             Self::FlushDatabase
             | Self::FlushAll
             | Self::SwapDatabases { .. }
-            | Self::SlotsMoved { .. } => {}
+            | Self::SlotsMoved { .. }
+            | Self::SlotsIncoming { .. }
+            | Self::SlotsGiven { .. } => {}
 
             Self::SetBytes { key, .. }
             | Self::SetBytesExpiring { key, .. }
@@ -1098,6 +1126,20 @@ impl Mutation<'_> {
                 first,
                 last,
                 to,
+                position,
+            },
+            Self::SlotsIncoming { first, last, step } => {
+                OwnedMutation::SlotsIncoming { first, last, step }
+            }
+            Self::SlotsGiven {
+                first,
+                last,
+                address,
+                position,
+            } => OwnedMutation::SlotsGiven {
+                first,
+                last,
+                address: address.to_vec(),
                 position,
             },
             Self::LeasePut {

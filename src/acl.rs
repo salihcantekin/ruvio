@@ -940,6 +940,7 @@ const ACL_SUBCOMMANDS: &[&str] = &[
     "config|set",
     "ruvio|bigkeys",
     "ruvio|hotkeys",
+    "ruvio|migrate",
     "ruvio|moveslots",
     "ruvio|topology",
 ];
@@ -974,6 +975,7 @@ const SUBCOMMAND_CATEGORIES: &[(&str, &[&str])] = &[
     ("client|list", &["admin", "slow", "dangerous"]),
     ("ruvio|hotkeys", &["admin", "slow"]),
     ("ruvio|bigkeys", &["admin", "slow"]),
+    ("ruvio|migrate", &["admin", "slow", "dangerous"]),
     ("ruvio|moveslots", &["admin", "slow", "dangerous"]),
     ("ruvio|topology", &["admin", "slow", "dangerous"]),
 ];
@@ -1082,6 +1084,7 @@ pub fn command_acl_name(command: &Command<'_>) -> &'static str {
         Command::ReplicaOf { .. } => "replicaof",
         Command::MoveSlots(_) => "ruvio|moveslots",
         Command::Topology(_) => "ruvio|topology",
+        Command::Migrate(_) => "ruvio|migrate",
         Command::Role => "role",
         Command::Info(_) => "info",
         Command::Save => "save",

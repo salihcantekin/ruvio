@@ -552,6 +552,19 @@ fn redact_secrets(arguments: &mut [&[u8]]) {
 
             index += 2;
         }
+    } else if name.eq_ignore_ascii_case(b"RUVIO")
+        && arguments
+            .get(1)
+            .is_some_and(|sub| sub.eq_ignore_ascii_case(b"MIGRATE"))
+        && arguments
+            .get(2)
+            .is_some_and(|sub| sub.eq_ignore_ascii_case(b"EXPORT"))
+        && arguments
+            .get(8)
+            .is_some_and(|word| word.eq_ignore_ascii_case(b"AUTH"))
+    {
+        // `RUVIO MIGRATE EXPORT id first last host port AUTH [user] password`.
+        arguments[9..].fill(REDACTED);
     }
 }
 

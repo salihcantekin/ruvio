@@ -53,16 +53,44 @@ pub(super) struct SlotMover {
 
 #[derive(Default)]
 struct MoverState {
-    /// The `SLOTS` history and the directory it lives in; `None` without durability.
-    durable: Option<(SlotMoves, std::path::PathBuf)>,
+    /// The `SLOTS` history, and the directory it is saved in (`None` without a log: a
+    /// multi-node node then keeps it in memory only). `None` without durability and map.
+    durable: Option<(SlotMoves, Option<std::path::PathBuf>)>,
     current: Option<Arc<MoveSession>>,
     last: Option<Report>,
 }
 
 impl SlotMover {
     /// Keeps the history loaded at start, so moves are recorded in `data_dir`.
-    pub(super) fn set_durable(&self, history: SlotMoves, data_dir: std::path::PathBuf) {
+    pub(super) fn set_durable(&self, history: SlotMoves, data_dir: Option<std::path::PathBuf>) {
         self.lock().durable = Some((history, data_dir));
+    }
+
+    /// Runs `step` on the durable history and its directory; `None` when there is none.
+    pub(super) fn with_history<T>(
+        &self,
+        step: impl FnOnce(&mut SlotMoves, Option<&std::path::Path>) -> T,
+    ) -> Option<T> {
+        let mut state = self.lock();
+
+        state
+            .durable
+            .as_mut()
+            .map(|(history, data_dir)| step(history, data_dir.as_deref()))
+    }
+
+    /// Runs `step` unless a move between this process's shards is running, holding the
+    /// mover's lock so none starts meanwhile. Locks are taken mover first, then the moves
+    /// between nodes (as `RUVIO MOVESLOTS` does), never the other way round.
+    pub(super) fn unless_moving<T>(&self, step: impl FnOnce() -> T) -> Option<T> {
+        let state = self.lock();
+
+        state.current.is_none().then(step)
+    }
+
+    /// From now on shards check forwarded requests and commands that waited.
+    pub(super) fn mark_moved(&self) {
+        self.moved.store(true, Ordering::Release);
     }
 
     /// Whether any hand-over happened in this process.
@@ -148,10 +176,6 @@ impl MoveSession {
         true
     }
 
-    fn contains(&self, key: &[u8]) -> bool {
-        (self.first..=self.last).contains(&hash_slot(key))
-    }
-
     fn report(&self, state: &'static str, error: Option<String>) -> Report {
         let freeze_ms = match self.outcome() {
             Outcome::HandedOver { freeze } => Some(freeze.as_secs_f64() * 1000.0),
@@ -186,7 +210,24 @@ pub(super) struct CopyBatch {
 type KeyFrames<'a> = (&'a [u8], Vec<&'a [u8]>);
 
 impl CopyBatch {
-    fn push(&mut self, store: &KvShard, key: &[u8]) -> Result<(), crate::PersistenceError> {
+    /// A batch as another node sent it; [`CopyBatch::entries`] checks it.
+    pub(super) fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self { bytes, keys: 0 }
+    }
+
+    pub(super) fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(super) fn keys(&self) -> u32 {
+        self.keys
+    }
+
+    pub(super) fn push(
+        &mut self,
+        store: &KvShard,
+        key: &[u8],
+    ) -> Result<(), crate::PersistenceError> {
         let start = self.bytes.len();
 
         self.bytes
@@ -208,7 +249,7 @@ impl CopyBatch {
         }
     }
 
-    fn full(&self) -> bool {
+    pub(super) fn full(&self) -> bool {
         self.keys >= COPY_BATCH_KEYS || self.bytes.len() >= COPY_BATCH_BYTES
     }
 
@@ -255,6 +296,17 @@ pub(super) enum MoveMessage {
     Cancel(Arc<MoveSession>),
     /// Starts a move on its source shard.
     Start(Arc<MoveSession>),
+    /// Starts copying a range to another node on the shard that holds it.
+    Export(Arc<super::migrate::Export>),
+    /// Drops a cancelled range arriving from another node on its target shard.
+    CancelImport(Arc<super::migrate::Import>),
+    /// A newer cluster map was installed: settle this shard's ranges with it.
+    Settle,
+    /// Drops the keys of a range this shard no longer holds, in bounded steps.
+    Forget {
+        first: u16,
+        last: u16,
+    },
 }
 
 /// `RUVIO MOVESLOTS ...` on any shard of a multi-shard process.
@@ -334,7 +386,7 @@ fn start(
     {
         let mut mover = fabric.mover.lock();
 
-        if mover.current.is_some() {
+        if mover.current.is_some() || fabric.migrations.busy() {
             return Err(b"ERR RUVIO MOVESLOTS another move is in progress");
         }
         mover.current = Some(Arc::clone(&session));
@@ -430,6 +482,22 @@ pub(super) fn on_message(state: &Rc<ShardState>, message: MoveMessage) {
         MoveMessage::Cancel(session) => {
             tokio::task::spawn_local(forget_range(Rc::clone(state), session, "cancelled"));
         }
+        MoveMessage::Export(export) => super::migrate::start_export(state, export),
+        MoveMessage::CancelImport(import) => super::migrate::cancel_import(state, import),
+        MoveMessage::Settle => super::migrate::settle(state),
+        MoveMessage::Forget { first, last } => {
+            let state = Rc::clone(state);
+
+            tokio::task::spawn_local(async move { drop_slots(&state, first, last).await });
+        }
+    }
+}
+
+/// Saves `history` when it lives in a data directory.
+pub(super) fn save(history: &SlotMoves, data_dir: Option<&std::path::Path>) -> std::io::Result<()> {
+    match data_dir {
+        Some(data_dir) => history.save(data_dir),
+        None => Ok(()),
     }
 }
 
@@ -460,7 +528,7 @@ fn record_begin(state: &ShardState, session: &MoveSession) -> Result<(), String>
 
     next.begin(session.first, session.last, session.to as u16, since)
         .map_err(|error| format!("slot table refused the move: {error}"))?;
-    next.save(data_dir)
+    save(&next, data_dir.as_deref())
         .map_err(|error| format!("could not write the slot table: {error}"))?;
     *history = next;
     Ok(())
@@ -469,12 +537,24 @@ fn record_begin(state: &ShardState, session: &MoveSession) -> Result<(), String>
 /// Target: logs and applies each key as the source holds it. A key absent from a database
 /// there is removed here too.
 fn apply_copies(state: &ShardState, session: &MoveSession, batch: CopyBatch) {
+    match apply_batch(state, &batch) {
+        Ok(keys) => {
+            session.keys.fetch_add(keys, Ordering::AcqRel);
+        }
+        Err(reason) => {
+            session.fail(reason);
+        }
+    }
+}
+
+/// Logs and applies a batch of copies; the number of keys, or why the move must stop.
+pub(super) fn apply_batch(state: &ShardState, batch: &CopyBatch) -> Result<u64, String> {
     use crate::mutation::MutationSink;
 
     let Some(keys) = batch.entries() else {
-        session.fail("target received a damaged copy");
-        return;
+        return Err("target received a damaged copy".into());
     };
+    let count = keys.len() as u64;
     let mut store = state.store.borrow_mut();
     let databases = store.database_ids();
     let active = store.active_database();
@@ -525,20 +605,12 @@ fn apply_copies(state: &ShardState, session: &MoveSession, batch: CopyBatch) {
     };
 
     drop(persistence);
-    if let Err(reason) = applied {
-        drop(store);
-        session.fail(reason);
-        return;
-    }
+    applied?;
     if store.memory_admission_would_fail(0) {
-        drop(store);
-        session.fail("the range does not fit under the target shard's memory limit");
-        return;
+        return Err("the range does not fit under the target shard's memory limit".into());
     }
 
-    session
-        .keys
-        .fetch_add(u64::from(batch.keys), Ordering::AcqRel);
+    Ok(count)
 }
 
 /// One `SlotCopy` record per database that holds `key` on either side, carrying the
@@ -619,11 +691,11 @@ fn take_over(state: &Rc<ShardState>, session: &Arc<MoveSession>) {
             let saved = next
                 .complete(session.until.load(Ordering::Acquire))
                 .map_err(str::to_string)
-                .and_then(|()| next.save(data_dir).map_err(|error| error.to_string()));
+                .and_then(|()| save(&next, data_dir.as_deref()).map_err(|error| error.to_string()));
 
             if saved.is_ok() {
                 *history = next;
-            } else if let Err(error) = history.save(data_dir) {
+            } else if let Err(error) = save(history, data_dir.as_deref()) {
                 // The failed write may have replaced the file before it failed; without the
                 // old table back, a restart would give the range to the target.
                 error!(%error, "could not restore the slot table after a failed move");
@@ -644,7 +716,7 @@ fn take_over(state: &Rc<ShardState>, session: &Arc<MoveSession>) {
     for slot in session.first..=session.last {
         table.assign(slot, session.to);
     }
-    forwarding.fabric.mover.moved.store(true, Ordering::Release);
+    forwarding.fabric.mover.mark_moved();
     *outcome = Outcome::HandedOver {
         freeze: Duration::ZERO,
     };
@@ -917,23 +989,22 @@ fn log_moved(state: &ShardState, session: &MoveSession) {
 /// Source, after the hand-over: clients waiting on keys of the range here would wait for
 /// writes that now go to the target.
 fn release_range_clients(state: &ShardState, session: &MoveSession) {
-    let in_range = |key: &[u8]| session.contains(key);
+    release_clients(state, session.first, session.last);
+}
 
-    for waiter in state.waiters.borrow_mut().take_where(in_range) {
+/// Releases clients blocked on, watching or tracking keys of `first..=last`.
+pub(super) fn release_clients(state: &ShardState, first: u16, last: u16) {
+    let contains = |key: &[u8]| (first..=last).contains(&hash_slot(key));
+
+    for waiter in state.waiters.borrow_mut().take_where(contains) {
         waiter.fill(UNBLOCKED_REPLY.to_vec());
     }
 
     // A WATCH on a moved key fails its EXEC, and a retried blocking command wakes to find
     // its key gone from this shard.
-    state
-        .store
-        .borrow_mut()
-        .dirty_watches_in_slots(session.first, session.last);
+    state.store.borrow_mut().dirty_watches_in_slots(first, last);
 
-    let tracked = state
-        .tracker
-        .borrow()
-        .tracked_where(|key| session.contains(key));
+    let tracked = state.tracker.borrow().tracked_where(contains);
 
     if !tracked.is_empty() {
         let invalidations = state.tracker.borrow_mut().invalidate(&tracked);
@@ -945,6 +1016,12 @@ fn release_range_clients(state: &ShardState, session: &MoveSession) {
 /// Removes this shard's keys of the range in bounded steps, then ends the move: the source
 /// after a hand-over, the target after a cancel.
 async fn forget_range(state: Rc<ShardState>, session: Arc<MoveSession>, ended: &'static str) {
+    drop_slots(&state, session.first, session.last).await;
+    finish(&state, &session, ended);
+}
+
+/// Removes this shard's keys of `first..=last` in bounded steps, without logging it.
+pub(super) async fn drop_slots(state: &ShardState, first: u16, last: u16) {
     let databases = state.store.borrow().database_ids();
 
     for database in databases {
@@ -955,8 +1032,8 @@ async fn forget_range(state: Rc<ShardState>, session: Arc<MoveSession>, ended: &
 
             cursor = state.store.borrow().walk_slots(
                 database,
-                session.first,
-                session.last,
+                first,
+                last,
                 cursor,
                 CLEAN_UP_STEP,
                 &mut |key| keys.push(key.into()),
@@ -976,7 +1053,9 @@ async fn forget_range(state: Rc<ShardState>, session: Arc<MoveSession>, ended: &
             tokio::task::yield_now().await;
         }
     }
+}
 
+fn finish(state: &ShardState, session: &Arc<MoveSession>, ended: &'static str) {
     let Some(forwarding) = state.forwarding.as_ref() else {
         return;
     };
@@ -992,7 +1071,7 @@ async fn forget_range(state: Rc<ShardState>, session: Arc<MoveSession>, ended: &
     if mover
         .current
         .as_ref()
-        .is_some_and(|current| Arc::ptr_eq(current, &session))
+        .is_some_and(|current| Arc::ptr_eq(current, session))
     {
         mover.current = None;
     }
@@ -1060,5 +1139,6 @@ pub(super) fn request_owner(state: &ShardState, frames: &[u8], count: u32) -> Op
         }
     }
 
-    owner.filter(|owner| *owner != forwarding.me)
+    // A range on another node or frozen for a move runs here and answers its redirect.
+    owner.filter(|owner| *owner != forwarding.me && *owner < forwarding.fabric.shard_count())
 }

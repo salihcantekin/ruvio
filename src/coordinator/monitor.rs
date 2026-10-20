@@ -295,6 +295,7 @@ pub async fn lead(
     machine: StateMachine,
     sightings: Sightings,
     switches: Switches,
+    moves: super::migrate::Context,
 ) {
     let mut tick = tokio::time::interval(config.ping_interval);
 
@@ -332,7 +333,7 @@ pub async fn lead(
             if primary_age.is_none_or(|age| age > config.down_after)
                 && objectively_down(&config, &sightings, group, primary.member).await
             {
-                failover(&config, &raft, group, primary, &seen, &switches).await;
+                failover(&config, &raft, &machine, group, primary, &seen, &switches).await;
                 continue;
             }
 
@@ -340,6 +341,8 @@ pub async fn lead(
         }
 
         push_cluster_map(&config, &machine, &sightings).await;
+        // A move the previous leader began continues here.
+        super::migrate::resume(&moves);
     }
 }
 
@@ -356,7 +359,8 @@ async fn push_cluster_map(
     static WARNED: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
     const WARN_EVERY: Duration = Duration::from_secs(60);
 
-    let Some((version, map)) = config.cluster_map(&machine.primaries()) else {
+    let Some((version, map)) = config.cluster_map(&machine.primaries(), &machine.moves().moved)
+    else {
         return;
     };
     let map: Arc<[u8]> = map.into_bytes().into();
@@ -444,6 +448,7 @@ async fn propose(raft: &Raft, group: &Group, member: usize, epoch: u64) -> bool 
 async fn failover(
     config: &CoordinatorConfig,
     raft: &Raft,
+    machine: &StateMachine,
     group: &Group,
     primary: Primary,
     seen: &[Sighting],
@@ -466,6 +471,18 @@ async fn failover(
 
     let promoted = &group.members[candidate];
 
+    // The newest map first: a range the group gave away is then answered with `MOVED`
+    // before the promoted member takes writes.
+    if let Some((_, map)) = config.cluster_map(&machine.primaries(), &machine.moves().moved)
+        && let Err(error) = command(
+            promoted,
+            config.auth.as_deref(),
+            &[b"RUVIO", b"TOPOLOGY", b"SET", map.as_bytes()],
+        )
+        .await
+    {
+        warn!(group = %group.name, %error, "the chosen replica refused the cluster map before its promotion");
+    }
     if let Err(error) = command(
         promoted,
         config.auth.as_deref(),

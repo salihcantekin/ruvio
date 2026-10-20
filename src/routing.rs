@@ -5,6 +5,11 @@ pub const HASH_SLOT_COUNT: usize = 16_384;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CrossSlot;
 
+/// Slot table entries from here on mark a range frozen while it moves to another node:
+/// `FROZEN_BASE + shard` is still held by `shard`, but its commands answer `TRYAGAIN`.
+/// Entries between the shard count and this value are the other groups of the cluster.
+pub const FROZEN_BASE: usize = 0x8000;
+
 pub fn hash_slot(key: &[u8]) -> u16 {
     crc16(hash_tag(key)) % HASH_SLOT_COUNT as u16
 }
@@ -137,6 +142,7 @@ pub fn command_slot(command: &Command<'_>) -> Result<Option<u16>, CrossSlot> {
         | Command::ReplicaOf { .. }
         | Command::MoveSlots(_)
         | Command::Topology(_)
+        | Command::Migrate(_)
         | Command::Role
         | Command::Bgsave
         | Command::Scan { .. }
@@ -452,6 +458,7 @@ pub fn command_keys<'a>(command: &'a Command<'_>) -> Vec<&'a [u8]> {
         | Command::ReplicaOf { .. }
         | Command::MoveSlots(_)
         | Command::Topology(_)
+        | Command::Migrate(_)
         | Command::Role
         | Command::Bgsave
         | Command::Scan { .. }

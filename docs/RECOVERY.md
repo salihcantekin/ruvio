@@ -111,6 +111,21 @@ move is recorded, so a crash at any step leaves each key on exactly one shard. A
 to the formula. Back the file up with the rest of the directory. A server with a `SLOTS` file
 refuses to start with replication on.
 
+### Ranges moving between groups
+
+A multi-node cluster moves ranges between groups (`COORDINATOR MOVE`, see `docs/COORDINATOR.md`) with
+the same file. The target shard logs a `SlotsIncoming` record when a range begins to arrive, its copies
+as `SlotCopy` records, and a second `SlotsIncoming` record once the whole copy is synced (prepared);
+the `SLOTS` file names the range as gained from another node. A restart before the prepared record
+skips the copies. A prepared range is kept, not served, until a cluster map gives it to the group,
+which completes it, or `RUVIO MIGRATE CANCEL` drops it (a third record). The source logs a `SlotsGiven`
+record when a newer map gave the range away; its copy is dropped after replay. Both records are WAL
+format minor 5, and replicas follow both sides from them. While the map has not decided, each side
+also keeps the move in a small file of its data directory (`MIGRATE_IN` on the target, `MIGRATE_OUT`
+on the source): after a restart the source keeps the range frozen (`TRYAGAIN`) and both still accept
+`RUVIO MIGRATE CANCEL` with the move's id. A replica restarted with such a history keeps it with
+replication on.
+
 ## Recovery-Time Objective
 
 Startup time is the time to acquire `LOCK`, validate `CURRENT` and every
@@ -193,7 +208,8 @@ path.
 An upgrade keeps the data directory and replaces the `ruvio` binary. Shard
 count, durability profile, and format major must stay the same. A data directory whose
 shards moved slots (`RUVIO MOVESLOTS`) has WAL format minor 4 records and a `SLOTS` file, so
-it cannot go back to a release before slot moves. Changing
+it cannot go back to a release before slot moves. One that took part in a move between groups has
+format minor 5 records and cannot go back to a release before such moves. Changing
 `shards` is a new directory, not an in-place upgrade.
 
 1. Stop `ruvio`. `backup` takes an exclusive `LOCK` and fails immediately if the

@@ -532,6 +532,9 @@ pub enum Command<'a> {
     /// `RUVIO TOPOLOGY SET map` installs a multi-node cluster map; `RUVIO TOPOLOGY VERSION`
     /// (`None`) reports the version this node serves (0 without a map).
     Topology(Option<Bytes<'a>>),
+    /// `RUVIO MIGRATE ...`: the steps of moving a slot range to another node, sent by the
+    /// coordinators and by the source node; the runtime reads the arguments.
+    Migrate(Vec<Bytes<'a>>),
     Info(Option<Bytes<'a>>),
     Save,
     Bgsave,

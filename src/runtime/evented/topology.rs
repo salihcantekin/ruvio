@@ -10,7 +10,7 @@ use crate::{
 
 /// `RUVIO TOPOLOGY VERSION` (`map` is `None`) or `RUVIO TOPOLOGY SET map`.
 pub(super) fn command(
-    state: &ShardState,
+    state: &std::rc::Rc<ShardState>,
     map: Option<&[u8]>,
     output: &mut impl Write,
 ) -> io::Result<()> {
@@ -25,7 +25,14 @@ pub(super) fn command(
     };
 
     match install(state, map) {
-        Ok(()) => output.write_all(b"+OK\r\n"),
+        Ok(changed) => {
+            if changed {
+                // Every shard takes or gives up the ranges the new map moved.
+                super::migrate::map_installed(state);
+                super::migrate::settle(state);
+            }
+            output.write_all(b"+OK\r\n")
+        }
         Err(message) => {
             output.write_all(b"-")?;
             // A parse error may span lines; an error reply is one line.
@@ -35,7 +42,8 @@ pub(super) fn command(
     }
 }
 
-fn install(state: &ShardState, map: &[u8]) -> Result<(), String> {
+/// Installs `map`; true when it is newer than the current one.
+fn install(state: &ShardState, map: &[u8]) -> Result<bool, String> {
     // One install at a time per process: two shards checking the version and writing the
     // file at once could otherwise leave the older map on disk or in memory.
     static INSTALLING: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -61,7 +69,7 @@ fn install(state: &ShardState, map: &[u8]) -> Result<(), String> {
     }
     if next.version == current.version {
         return if next == *current {
-            Ok(())
+            Ok(false)
         } else {
             Err(format!(
                 "ERR RUVIO TOPOLOGY version {} is already in use with another map",
@@ -69,14 +77,8 @@ fn install(state: &ShardState, map: &[u8]) -> Result<(), String> {
             ))
         };
     }
-    // Data does not move between groups yet: only the other groups' addresses may change.
-    if next.groups[next.local].ranges != current.groups[current.local].ranges {
-        return Err(
-            "ERR RUVIO TOPOLOGY would change this group's slots; moving slots between \
-                    groups is not supported yet"
-                .into(),
-        );
-    }
+    // A slot may join this group only once its data is here (`RUVIO MIGRATE`).
+    super::migrate::map_fits(&forwarding.fabric, &next.placement(config.shards))?;
 
     // Kept even without persistence: a restart must not fall back to an older map.
     std::fs::create_dir_all(&config.persistence.data_dir)
@@ -87,5 +89,5 @@ fn install(state: &ShardState, map: &[u8]) -> Result<(), String> {
     tracing::info!(version = next.version, "installed cluster topology");
     forwarding.fabric.set_topology(next);
 
-    Ok(())
+    Ok(true)
 }
