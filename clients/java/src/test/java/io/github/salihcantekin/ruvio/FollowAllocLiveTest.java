@@ -14,17 +14,20 @@ import org.junit.jupiter.api.Test;
  * single seed. The calling thread's allocated bytes are counted over many commands after a warm-up, for the sync and
  * the async API. Runs against the failover pair of scripts/run_with_servers.sh (RUVIO_FAILOVER_ADDRS); skipped without it.
  *
- * <p>Tolerance: over 10 runs of this measurement the difference stayed within -38 KB and +75 KB (the largest one in the very
- * first run of a JVM, from JIT compilation), while the retained-frame design this test guards against cost 37 to 80 bytes per command,
- * 0.7 to 1.6 MB over {@link #OPS} commands. The limit is {@link #TOLERANCE} bytes in total: 10 bytes per command, about
- * 2.7 times the largest spread seen and a quarter to a tenth of the smallest regression.
+ * <p>Tolerances: the difference measured over 30 runs stayed within -85 KB and +52 KB for async (first run of a JVM:
+ * JIT compilation) and within -7 KB and +8 KB for sync, while the retained-frame design this test guards against cost 75 to 85 bytes
+ * per command: about 800 KB over {@link #ASYNC_OPS} async and 125 KB over {@link #SYNC_OPS} sync commands. The limits are
+ * {@link #ASYNC_TOLERANCE} (2.4 times the largest async spread) and {@link #SYNC_TOLERANCE} (6 times the largest sync spread, 2.6
+ * times under the regression). The sync half is short because a sync command waits a full round trip.
  */
 class FollowAllocLiveTest {
-    private static final int OPS = 20_000;
-    private static final int WARMUP = 6_000;
-    private static final int ASYNC_WARMUP = 20_000;
-    /** Total bytes the follower may allocate above the single-seed client over {@link #OPS} commands. */
-    private static final long TOLERANCE = 200 * 1024;
+    private static final int SYNC_OPS = 1_500;
+    private static final int SYNC_WARMUP = 600;
+    private static final int ASYNC_OPS = 10_000;
+    private static final int ASYNC_WARMUP = 8_000;
+    /** Total bytes the follower may allocate above the single-seed client over the measured commands. */
+    private static final long ASYNC_TOLERANCE = 128 * 1024;
+    private static final long SYNC_TOLERANCE = 48 * 1024;
 
     private static final com.sun.management.ThreadMXBean THREADS =
             (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
@@ -88,7 +91,7 @@ class FollowAllocLiveTest {
         return THREADS.getThreadAllocatedBytes(id) - before;
     }
 
-    private void compare(String label, Consumer<RuvioClient<String, String>> warm, Consumer<RuvioClient<String, String>> run) {
+    private void compare(String label, int ops, long tolerance, Consumer<RuvioClient<String, String>> warm, Consumer<RuvioClient<String, String>> run) {
         String[] seeds = pair();
         String primary = isMaster(seeds[0]) ? seeds[0] : seeds[1];
         String other = primary.equals(seeds[0]) ? seeds[1] : seeds[0];
@@ -100,18 +103,18 @@ class FollowAllocLiveTest {
         try (RuvioClient<String, String> c = following(primary, other)) {
             followed = measure(c, warm, run);
         }
-        String line = label + ": single seed " + plain + " bytes, following " + followed + " bytes over " + OPS + " commands, difference " + (followed - plain);
+        String line = label + ": single seed " + plain + " bytes, following " + followed + " bytes over " + ops + " commands, difference " + (followed - plain);
         System.out.println(line);
-        assertTrue(followed - plain <= TOLERANCE, line + " (tolerance " + TOLERANCE + ")");
+        assertTrue(followed - plain <= tolerance, line + " (tolerance " + tolerance + ")");
     }
 
     @Test
     void syncHealthyPathAllocatesNoMoreWhenFollowing() {
-        compare("sync", c -> syncOps(c, WARMUP), c -> syncOps(c, OPS));
+        compare("sync", SYNC_OPS, SYNC_TOLERANCE, c -> syncOps(c, SYNC_WARMUP), c -> syncOps(c, SYNC_OPS));
     }
 
     @Test
     void asyncHealthyPathAllocatesNoMoreWhenFollowing() {
-        compare("async", c -> asyncOps(c, ASYNC_WARMUP), c -> asyncOps(c, OPS));
+        compare("async", ASYNC_OPS, ASYNC_TOLERANCE, c -> asyncOps(c, ASYNC_WARMUP), c -> asyncOps(c, ASYNC_OPS));
     }
 }
