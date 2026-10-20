@@ -27,6 +27,7 @@ import ruvio
 import ruvio.asyncio
 import ruvio.asyncio.client as aclient
 import ruvio.client as sclient
+from ruvio._resp import encode
 from conftest import await_for
 from test_follow_failover import become, node, seeds
 
@@ -85,23 +86,45 @@ async def live_pair(kind: str) -> Tuple[Any, Any]:
 # ---- healthy path ------------------------------------------------------------------------------------
 
 
-async def transient(kind: str, c: Any, body: Callable[[], Any], n: int) -> int:
-    """Median over ``n`` calls of the bytes the call holds at its peak above what was held before it."""
-    out = []
+async def transient(kind: str, c: Any, body: Callable[[], Any], n: int) -> Tuple[int, int, int]:
+    """Medians over ``n`` calls of ``(send, wait, held)``. ``send``: the bytes the call holds at its peak above what
+    was held before it, until it returns (for sync the whole command; for asyncio the encoding and the write).
+    asyncio only, 0 for sync: ``wait``, the peak while the reply is awaited above what was held once the command
+    was sent, and ``held``, what the command in flight holds between the two (its future and pending entry, and
+    while following its frame, kept for a resend after ``READONLY``). Splitting at the send keeps the frame's
+    longer life out of the peaks: one peak over the whole call would count it only on interpreters whose peak
+    falls while the reply is awaited (3.9), not where it falls while encoding (3.13)."""
+    sends, waits, helds = [], [], []
     for _ in range(n):
         base = tracemalloc.get_traced_memory()[0]
         tracemalloc.reset_peak()
         r = body()
+        sent, peak = tracemalloc.get_traced_memory()
+        sends.append(peak - base)
         if kind == "async":
+            tracemalloc.reset_peak()
             await r
-        out.append(tracemalloc.get_traced_memory()[1] - base)
-    return int(statistics.median(out))
+            waits.append(tracemalloc.get_traced_memory()[1] - sent)
+            helds.append(sent - base)
+        del r
+    return (
+        int(statistics.median(sends)),
+        int(statistics.median(waits)) if waits else 0,
+        int(statistics.median(helds)) if helds else 0,
+    )
 
 
-# Measured (Python 3.13, three runs each): the peak above the level before the call is the same for one seed and
-# for two, to the byte and in every run: get 307 (sync) / 727 (asyncio), set 369 / 789, mget of 50 keys 21 412 for
-# both. Tracemalloc counts exactly, so the margin only has to absorb a different interpreter version; a frame
-# copied or kept per command adds at least its own size (30-100 bytes) to the peak.
+MGET_KEYS = ["mem:k%d" % i for i in range(50)]
+
+
+# Measured (Python 3.9 and 3.13, several runs each); send / wait / held in bytes, the same for one seed and for two
+# to the byte in every run except ``held``:
+#   sync, both versions:  get 307, set 369, mget of 50 keys 19 022 (send only)
+#   asyncio, 3.13:        get 727 / 104 / 136, set 789 / 104 / 136, mget 19 022 / 135 / 136
+#   asyncio, 3.9:         get 255 / 136 / 160, set 317 / 164 / 160, mget 19 022 / 164 / 160
+# Following holds exactly its frame more in flight (57 / 75 / 688 bytes). Tracemalloc counts exactly, so the 16-byte
+# margin only absorbs a different interpreter version; a frame copied per command adds at least its own size to a
+# peak (checked: +57 to +138 bytes on the GET), and anything held per command beyond the frame shows in ``held``.
 @pytest.mark.parametrize("kind", KINDS)
 async def test_following_adds_no_transient_allocation_per_command(kind):
     single, follow = await live_pair(kind)
@@ -116,14 +139,19 @@ async def test_following_adds_no_transient_allocation_per_command(kind):
             for name, c in (("single", single), ("follow", follow)):
                 get = await transient(kind, c, lambda c=c: c.get("mem:a"), 300)
                 put = await transient(kind, c, lambda c=c: c.set("mem:a", "value-12345"), 300)
-                many = await transient(kind, c, lambda c=c: c.mget(*["mem:k%d" % i for i in range(50)]), 100)
+                many = await transient(kind, c, lambda c=c: c.mget(*MGET_KEYS), 100)
                 results[name] = (get, put, many)
         finally:
             tracemalloc.stop()
         print(results)
+        frames = (encode("GET", ("mem:a",)), encode("SET", ("mem:a", "value-12345")), encode("MGET", tuple(MGET_KEYS)))
         for i, what in enumerate(("get", "set", "mget of 50")):
-            extra = results["follow"][i] - results["single"][i]
-            assert extra <= 16, f"{what}: following peaks {extra} bytes above one seed: {results}"
+            (send_s, wait_s, held_s), (send_f, wait_f, held_f) = results["single"][i], results["follow"][i]
+            assert send_f - send_s <= 16, f"{what}: following peaks {send_f - send_s} bytes above one seed: {results}"
+            assert wait_f - wait_s <= 16, f"{what}: following peaks {wait_f - wait_s} bytes above one seed: {results}"
+            # in flight, following may hold the command's own frame and nothing more
+            frame = sys.getsizeof(frames[i]) if kind == "async" else 0
+            assert held_f - held_s <= frame, f"{what}: following holds {held_f - held_s} bytes in flight: {results}"
     finally:
         await close(kind, single)
         await close(kind, follow)
