@@ -1117,6 +1117,8 @@ pub struct DurableAcks {
     slots: Mutex<Vec<Option<AckSlot>>>,
     /// Where clients reach the primary this shard follows, from the last accepted handshake.
     primary: Mutex<Option<Endpoint>>,
+    /// Whether this shard follows a primary now, known or not yet accepted.
+    following: AtomicBool,
     notify: tokio::sync::Notify,
 }
 
@@ -1125,6 +1127,7 @@ impl DurableAcks {
         Self {
             slots: Mutex::new(Vec::new()),
             primary: Mutex::new(None),
+            following: AtomicBool::new(false),
             notify: tokio::sync::Notify::new(),
         }
     }
@@ -1200,6 +1203,16 @@ impl DurableAcks {
             .primary
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = endpoint;
+    }
+
+    /// Records whether this shard follows a primary: set when its replica reader starts,
+    /// cleared when it is promoted.
+    pub fn set_following(&self, following: bool) {
+        self.following.store(following, Ordering::Release);
+    }
+
+    pub fn following(&self) -> bool {
+        self.following.load(Ordering::Acquire)
     }
 
     /// Where clients reach the primary this shard last followed, if it announced itself.
