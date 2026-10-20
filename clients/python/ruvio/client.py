@@ -256,7 +256,8 @@ class _Conn:
         """After a ``READONLY`` reply: rounds that avoid the address that answered, ``sleep`` between them, until
         a primary is found and the connection is moved to it. ``False`` when none is, the connection unchanged."""
         o = self.opts
-        refused = self.address()
+        # kept across rounds: cleared once the refusing node says it is a replica, so its promotion is taken
+        refused: List[Optional[Address]] = [self.address()]
         sentinel = o.sentinel_master is not None
         nodes = self.coord if sentinel else self.addrs
         for attempt in range(ROUNDS):
@@ -287,7 +288,7 @@ class _Conn:
         if self._following():
             sentinel = o.sentinel_master is not None
             if sentinel or self.at >= 0:
-                found = find_primary(self.coord if sentinel else self.addrs, self.pos, None, o)  # type: ignore[arg-type]
+                found = find_primary(self.coord if sentinel else self.addrs, self.pos, [None], o)  # type: ignore[arg-type]
                 if found is not None:
                     try:
                         return self.take(found)
@@ -415,20 +416,27 @@ def _probe(address: Address, o: _Options, command: str, args: Tuple[Any, ...]) -
         c.close()
 
 
-def find_primary(nodes: List[Address], start: int, avoid: Optional[Address], o: _Options) -> Optional[Address]:
+def find_primary(nodes: List[Address], start: int, avoid: List[Optional[Address]], o: _Options) -> Optional[Address]:
     """One round: the address of a node that answered ``master``, asking ``nodes`` in order from ``start``
     (a replica's reported primary is asked once, after them), or ``None``. With ``sentinel_master`` the nodes
-    are coordinators, each asked for the master's address, which ``ROLE`` must confirm. ``avoid`` is the
-    address that just answered ``READONLY``. Raises only when ``AUTH`` is refused."""
+    are coordinators, each asked for the master's address, which ``ROLE`` must confirm. ``avoid[0]`` is the
+    address that just answered ``READONLY``; it is not taken while it still says ``master`` (a replaced primary
+    does) and is cleared once it answers ``ROLE`` as a replica, so a later round takes it when it is promoted.
+    Raises only when ``AUTH`` is refused."""
     n = len(nodes)
     queue = [nodes[(start + k) % n] for k in range(n)]
     name = o.sentinel_master
     if name is not None:
         for coordinator in queue:
             named = parse_master_addr(_probe(coordinator, o, "SENTINEL", ("get-master-addr-by-name", name)))
-            if named is not None and named != avoid:
+            if named is not None:
                 role = parse_role(_probe(named, o, "ROLE", ()))
-                if role is not None and role[0] == MASTER:
+                if role is None:
+                    continue
+                if role[0] != MASTER:
+                    if named == avoid[0]:
+                        avoid[0] = None
+                elif named != avoid[0]:
                     return named
         return None
     seen = set(queue)
@@ -440,9 +448,12 @@ def find_primary(nodes: List[Address], start: int, avoid: Optional[Address], o: 
         if role is None:
             continue
         if role[0] == MASTER:
-            if address != avoid:
+            if address != avoid[0]:
                 return address
-        elif role[1] is not None and role[1] not in seen:
+            continue
+        if address == avoid[0]:
+            avoid[0] = None
+        if role[1] is not None and role[1] not in seen:
             seen.add(role[1])
             queue.append(role[1])
     return None

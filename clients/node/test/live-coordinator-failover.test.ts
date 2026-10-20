@@ -12,6 +12,8 @@ import { within } from './helpers.js';
 
 // The coordinators notice the kill after down_after_ms (1 s) and promote within a few ticks.
 const PATIENCE_MS = 15_000;
+/** Each client's first write after the kill comes within this, the seeds client included: the replica that refused is taken once it is promoted, not after the rounds run out (about 7 s). */
+const FOLLOW_BOUND_MS = 5_000;
 
 const list = (name: string): string[] | null => (process.env[name] ? process.env[name]!.split(',') : null);
 
@@ -77,6 +79,7 @@ test('live coordinator failover: clients reach the new primary after the coordin
           }),
         );
         console.log('first write after the kill (ms):', Object.fromEntries(took));
+        for (const [name, ms] of took) assert.ok(ms < FOLLOW_BOUND_MS, name + ': the first write took ' + ms + ' ms');
 
         assert.equal((await members[next]!.role())[0], 'master');
         for (const name of Object.keys(clients)) assert.equal(await members[next]!.get(key(name)), 'after');
