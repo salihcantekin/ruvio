@@ -82,7 +82,7 @@ fn only_completed_moves_change_owners() {
     assert_eq!(moves.owners()[150], 0);
 
     moves.complete(20).unwrap();
-    moves.apply(&table);
+    moves.apply(&table, |_| unreachable!());
     assert_eq!(
         table.ranges()[..3],
         [(0, 99, 0), (100, 199, 1), (200, 8191, 0)]
@@ -294,4 +294,153 @@ fn moves_saved_against_another_starting_table_are_refused() {
     // Saved again without a map: the base file goes away.
     moved_once().save(dir.path()).unwrap();
     assert!(!dir.path().join(BASE_FILE_NAME).exists());
+}
+
+/// Two shards; slots 0-8191 on this node by the formula, 8192-16383 another node's
+/// (table entry 2).
+fn half_node() -> SlotMoves {
+    let base: Vec<u16> = (0..HASH_SLOT_COUNT as u16)
+        .map(|slot| {
+            if slot < 8192 {
+                shard_for_slot(slot, 2) as u16
+            } else {
+                2
+            }
+        })
+        .collect();
+
+    SlotMoves::new(2).with_base(base.into())
+}
+
+#[test]
+fn a_range_from_another_node_is_kept_once_prepared_and_owned_once_completed() {
+    let mut moves = half_node();
+
+    assert!(moves.begin_gain(100, 200, 0, 5).is_err(), "already here");
+    moves.begin_gain(9000, 9100, 1, 40).unwrap();
+    assert!(moves.complete(60).is_err(), "not prepared");
+    assert_eq!(moves.owner(9000), 2);
+
+    // Before it is prepared, a restart skips the copies.
+    let filter = moves.replay_filter(1, 0).unwrap();
+    let key = key_in_slot(9000);
+    let mut filter_copy = filter;
+    assert!(!filter_copy.keeps_record(45, &set(&key), &mut |_| {}));
+
+    moves.prepare(55).unwrap();
+    assert_eq!(moves.pending_gain().map(|gain| gain.prepared), Some(55));
+    assert!(moves.begin(0, 10, 1, 70).is_err(), "waits for the map");
+    // Prepared: kept through a restart, but not served.
+    let mut filter = moves.replay_filter(1, 0).unwrap();
+    assert!(filter.keeps_record(45, &set(&key), &mut |_| {}));
+    assert!(filter.stale_slots().is_none());
+    assert_eq!(moves.owner(9000), 2);
+
+    moves.complete(60).unwrap();
+    assert_eq!(moves.owner(9000), 1);
+    assert_eq!(moves.owner(9101), 2);
+    assert!(moves.pending_gain().is_none());
+}
+
+#[test]
+fn a_cancelled_gain_skips_its_copies_on_restart() {
+    let mut moves = half_node();
+    let key = key_in_slot(9000);
+
+    moves.begin_gain(9000, 9100, 1, 40).unwrap();
+    moves.prepare(55).unwrap();
+    moves.cancel();
+
+    assert!(moves.pending_gain().is_none());
+    let mut filter = moves.replay_filter(1, 0).unwrap();
+    assert!(!filter.keeps_record(45, &set(&key), &mut |_| {}));
+}
+
+#[test]
+fn a_range_given_to_another_node_is_dropped_from_its_hand_over_on() {
+    let mut moves = half_node();
+    let key = key_in_slot(100);
+
+    assert!(moves.lose(100, 200, 1, 30).is_err(), "not on that shard");
+    moves.lose(100, 200, 0, 30).unwrap();
+    assert_eq!(moves.owner(100), REMOTE);
+    assert!(!moves.has_local_moves());
+
+    let mut filter = moves.replay_filter(0, 0).unwrap();
+    assert!(filter.keeps_record(29, &set(&key), &mut |_| {}));
+    assert!(!filter.keeps_record(31, &set(&key), &mut |_| {}));
+    let stale = filter.stale_slots().unwrap();
+    assert!(stale[100] && !stale[99]);
+
+    let table = SlotTable::from_formula(2);
+    moves.apply(&table, |slot| if slot >= 8192 { 2 } else { 3 });
+    assert_eq!(table.owner(100), 3);
+    assert_eq!(table.owner(9000), 2);
+    assert_eq!(table.owner(0), 0);
+}
+
+#[test]
+fn version_two_files_round_trip_remote_entries_and_version_one_files_still_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut moves = SlotMoves::new(2);
+
+    moves.lose(100, 200, 0, 30).unwrap();
+    moves.begin_gain(100, 150, 1, 40).unwrap();
+    moves.prepare(41).unwrap();
+    moves.save(dir.path()).unwrap();
+    assert_eq!(SlotMoves::load(dir.path(), 2).unwrap(), Some(moves));
+
+    // A file written before ranges could move between nodes.
+    let old = moved_once();
+    let mut bytes = MAGIC_V1.to_vec();
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    for value in [100u16, 100, 0, 1] {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes.extend_from_slice(&50u64.to_le_bytes());
+    bytes.extend_from_slice(&70u64.to_le_bytes());
+    bytes.extend_from_slice(&crc32c::crc32c(&bytes).to_le_bytes());
+    std::fs::write(dir.path().join(FILE_NAME), bytes).unwrap();
+    assert_eq!(SlotMoves::load(dir.path(), 2).unwrap(), Some(old));
+}
+
+#[test]
+fn the_map_completes_a_prepared_gain_and_refuses_slots_whose_data_is_elsewhere() {
+    let placement_with = |gained: bool| -> Vec<u16> {
+        (0..HASH_SLOT_COUNT as u16)
+            .map(|slot| match slot {
+                0..8192 => shard_for_slot(slot, 2) as u16,
+                9000..=9100 if gained => 1,
+                _ => 2,
+            })
+            .collect()
+    };
+    let mut moves = half_node();
+
+    moves.begin_gain(9000, 9100, 1, 40).unwrap();
+    moves.prepare(55).unwrap();
+
+    // The old map: the gain stays pending.
+    let (kept, changed) = moves
+        .clone()
+        .reconcile(&placement_with(false), true)
+        .unwrap();
+    assert!(!changed && kept.pending_gain().is_some());
+
+    // The new map gives the range: completed.
+    let (done, changed) = moves
+        .clone()
+        .reconcile(&placement_with(true), true)
+        .unwrap();
+    assert!(changed && done.owner(9000) == 1);
+
+    // A map that gives slots this node never received.
+    assert!(half_node().reconcile(&placement_with(true), true).is_err());
+
+    // A map that takes slots this node holds: only one the coordinators sent.
+    let mut fewer = placement_with(false);
+    fewer[100] = 2;
+    assert!(half_node().reconcile(&fewer, false).is_err());
+    assert!(half_node().reconcile(&fewer, true).is_ok());
 }

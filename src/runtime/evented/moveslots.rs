@@ -53,15 +53,16 @@ pub(super) struct SlotMover {
 
 #[derive(Default)]
 struct MoverState {
-    /// The `SLOTS` history and the directory it lives in; `None` without durability.
-    durable: Option<(SlotMoves, std::path::PathBuf)>,
+    /// The `SLOTS` history, and the directory it is saved in (`None` without a log: a
+    /// multi-node node then keeps it in memory only). `None` without durability and map.
+    durable: Option<(SlotMoves, Option<std::path::PathBuf>)>,
     current: Option<Arc<MoveSession>>,
     last: Option<Report>,
 }
 
 impl SlotMover {
     /// Keeps the history loaded at start, so moves are recorded in `data_dir`.
-    pub(super) fn set_durable(&self, history: SlotMoves, data_dir: std::path::PathBuf) {
+    pub(super) fn set_durable(&self, history: SlotMoves, data_dir: Option<std::path::PathBuf>) {
         self.lock().durable = Some((history, data_dir));
     }
 
@@ -433,6 +434,14 @@ pub(super) fn on_message(state: &Rc<ShardState>, message: MoveMessage) {
     }
 }
 
+/// Saves `history` when it lives in a data directory.
+pub(super) fn save(history: &SlotMoves, data_dir: Option<&std::path::Path>) -> std::io::Result<()> {
+    match data_dir {
+        Some(data_dir) => history.save(data_dir),
+        None => Ok(()),
+    }
+}
+
 fn applied(session: &MoveSession) {
     session.applied.fetch_add(1, Ordering::AcqRel);
     session.progress.notify_one();
@@ -460,7 +469,7 @@ fn record_begin(state: &ShardState, session: &MoveSession) -> Result<(), String>
 
     next.begin(session.first, session.last, session.to as u16, since)
         .map_err(|error| format!("slot table refused the move: {error}"))?;
-    next.save(data_dir)
+    save(&next, data_dir.as_deref())
         .map_err(|error| format!("could not write the slot table: {error}"))?;
     *history = next;
     Ok(())
@@ -619,11 +628,11 @@ fn take_over(state: &Rc<ShardState>, session: &Arc<MoveSession>) {
             let saved = next
                 .complete(session.until.load(Ordering::Acquire))
                 .map_err(str::to_string)
-                .and_then(|()| next.save(data_dir).map_err(|error| error.to_string()));
+                .and_then(|()| save(&next, data_dir.as_deref()).map_err(|error| error.to_string()));
 
             if saved.is_ok() {
                 *history = next;
-            } else if let Err(error) = history.save(data_dir) {
+            } else if let Err(error) = save(history, data_dir.as_deref()) {
                 // The failed write may have replaced the file before it failed; without the
                 // old table back, a restart would give the range to the target.
                 error!(%error, "could not restore the slot table after a failed move");

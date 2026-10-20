@@ -29,6 +29,10 @@ pub struct TopologyGroup {
     pub shards: usize,
     /// Slot ranges the group owns, as `(first, last)`, in slot order.
     pub ranges: Vec<(u16, u16)>,
+    /// For each of `ranges`, the shard that serves it when the map names one
+    /// (`"first-last@shard"`, written by the coordinators once a range has moved between
+    /// groups); the others are split over the shards as [`TopologyGroup::shard_of`] says.
+    pub placed_on: Vec<Option<u16>>,
     /// Its index in the map.
     index: u16,
     /// For every slot of the map, the owning group's index and the shard of that group that
@@ -39,23 +43,31 @@ pub struct TopologyGroup {
 /// Equal when the group is described the same way; its placement follows from that.
 impl PartialEq for TopologyGroup {
     fn eq(&self, other: &Self) -> bool {
-        (&self.name, &self.host, self.port, self.shards, &self.ranges)
-            == (
-                &other.name,
-                &other.host,
-                other.port,
-                other.shards,
-                &other.ranges,
-            )
+        (
+            &self.name,
+            &self.host,
+            self.port,
+            self.shards,
+            &self.ranges,
+            &self.placed_on,
+        ) == (
+            &other.name,
+            &other.host,
+            other.port,
+            other.shards,
+            &other.ranges,
+            &other.placed_on,
+        )
     }
 }
 
 impl Eq for TopologyGroup {}
 
 impl TopologyGroup {
-    /// The shard of this group that serves `slot`: the group's slots, in order, split into
-    /// `shards` equal runs, as the shard formula splits all 16384 (a group that owns every
-    /// slot places them exactly as the formula does). `None` when the group does not own it.
+    /// The shard of this group that serves `slot`: the shard a range names, or else the
+    /// group's other slots, in order, split into `shards` equal runs, as the shard formula
+    /// splits all 16384 (a group that owns every slot places them exactly as the formula
+    /// does). `None` when the group does not own it.
     pub fn shard_of(&self, slot: u16) -> Option<usize> {
         let (group, shard) = *self.placed.get(usize::from(slot))?;
 
@@ -64,19 +76,48 @@ impl TopologyGroup {
 
     /// Writes this group's slots into `placed`.
     fn place(&self, placed: &mut [(u16, u16)]) {
-        let total: usize = self
-            .ranges
-            .iter()
-            .map(|&(first, last)| usize::from(last - first) + 1)
+        let ranked = || {
+            self.ranges
+                .iter()
+                .zip(&self.placed_on)
+                .filter(|(_, shard)| shard.is_none())
+                .map(|(range, _)| *range)
+        };
+        let total: usize = ranked()
+            .map(|(first, last)| usize::from(last - first) + 1)
             .sum();
         let mut rank = 0;
 
-        for &(first, last) in &self.ranges {
+        for (first, last) in ranked() {
             for slot in first..=last {
                 placed[usize::from(slot)] = (self.index, (rank * self.shards / total) as u16);
                 rank += 1;
             }
         }
+        for (&(first, last), shard) in self.ranges.iter().zip(&self.placed_on) {
+            if let Some(shard) = *shard {
+                for slot in first..=last {
+                    placed[usize::from(slot)] = (self.index, shard);
+                }
+            }
+        }
+    }
+
+    /// The group's ranges as a map file writes them, each with the shard that serves it.
+    pub fn placed_ranges(&self) -> Vec<(u16, u16, u16)> {
+        let mut out: Vec<(u16, u16, u16)> = Vec::new();
+
+        for &(first, last) in &self.ranges {
+            for slot in first..=last {
+                let shard = self.shard_of(slot).unwrap_or(0) as u16;
+
+                match out.last_mut() {
+                    Some(run) if run.1 + 1 == slot && run.2 == shard => run.1 = slot,
+                    _ => out.push((slot, slot, shard)),
+                }
+            }
+        }
+        out
     }
 }
 
@@ -161,18 +202,18 @@ impl Topology {
     }
 
     /// The newer of the configured map and the one saved in `data_dir` by an earlier
-    /// `RUVIO TOPOLOGY SET`.
+    /// `RUVIO TOPOLOGY SET`, and whether it is the saved one (the coordinators').
     pub fn load_newest(
         path: &Path,
         data_dir: &Path,
         group: &str,
         local_shards: usize,
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, bool), String> {
         let configured = Self::load(path, group, local_shards)?;
         let saved = data_dir.join(TOPOLOGY_FILE);
 
         if !saved.exists() {
-            return Ok(configured);
+            return Ok((configured, false));
         }
         let saved = Self::load(&saved, group, local_shards)?;
 
@@ -183,9 +224,9 @@ impl Topology {
                 "using the newer cluster map received from the coordinators ({TOPOLOGY_FILE} in \
                  the data directory) instead of cluster_topology"
             );
-            saved
+            (saved, true)
         } else {
-            configured
+            (configured, false)
         })
     }
 
@@ -225,8 +266,15 @@ impl Topology {
             let mut ranges = Vec::with_capacity(entry.slots.len());
 
             for text in &entry.slots {
-                let (first, last) = parse_range(text)
+                let (first, last, shard) = parse_range(text)
                     .ok_or_else(|| format!("group {:?}: bad slot range {text:?}", entry.name))?;
+
+                if shard.is_some_and(|shard| usize::from(shard) >= entry.shards) {
+                    return Err(format!(
+                        "group {:?}: slot range {text:?} names a shard it does not have",
+                        entry.name
+                    ));
+                }
 
                 for slot in first..=last {
                     if let Some(other) = owner[usize::from(slot)].replace(index) {
@@ -239,9 +287,10 @@ impl Topology {
                         ));
                     }
                 }
-                ranges.push((first, last));
+                ranges.push(((first, last), shard));
             }
             ranges.sort_unstable();
+            let (ranges, placed_on): (Vec<_>, Vec<_>) = ranges.into_iter().unzip();
 
             groups.push(TopologyGroup {
                 name: entry.name,
@@ -252,6 +301,7 @@ impl Topology {
                 port,
                 shards: entry.shards,
                 ranges,
+                placed_on,
                 index: index as u16,
                 placed: std::sync::Arc::from(Vec::new()),
             });
@@ -339,7 +389,12 @@ impl Topology {
     }
 }
 
-fn parse_range(text: &str) -> Option<(u16, u16)> {
+/// `first-last`, `slot`, or either with `@shard`.
+fn parse_range(text: &str) -> Option<(u16, u16, Option<u16>)> {
+    let (text, shard) = match text.split_once('@') {
+        Some((range, shard)) => (range, Some(shard.trim().parse().ok()?)),
+        None => (text, None),
+    };
     let (first, last) = match text.split_once('-') {
         Some((first, last)) => (first.trim().parse().ok()?, last.trim().parse().ok()?),
         None => {
@@ -348,7 +403,7 @@ fn parse_range(text: &str) -> Option<(u16, u16)> {
         }
     };
 
-    (first <= last && usize::from(last) < HASH_SLOT_COUNT).then_some((first, last))
+    (first <= last && usize::from(last) < HASH_SLOT_COUNT).then_some((first, last, shard))
 }
 
 #[cfg(test)]
@@ -407,6 +462,39 @@ mod tests {
             topology.apply(&table, shards);
             assert!(table == SlotTable::from_formula(shards), "{shards} shards");
         }
+    }
+
+    #[test]
+    fn a_range_that_names_a_shard_stays_there_and_the_rest_keep_their_split() {
+        // Group a kept 0-8191 on two shards, then gained 8192-9000 on shard 0.
+        let text = TWO
+            .replace(
+                "[\"0-8191\"]",
+                "[\"0-4095@0\", \"4096-8191@1\", \"8192-9000@0\"]",
+            )
+            .replace("[\"8192-16000\", \"16001-16383\"]", "[\"9001-16383\"]");
+        let topology = Topology::parse(&text, "a", 2).unwrap();
+        let a = &topology.groups[0];
+
+        assert_eq!(a.shard_of(0), Some(0));
+        assert_eq!(a.shard_of(4096), Some(1));
+        assert_eq!(a.shard_of(8191), Some(1));
+        assert_eq!(a.shard_of(8192), Some(0));
+        assert_eq!(a.shard_of(9001), None);
+        assert_eq!(
+            a.placed_ranges(),
+            vec![(0, 4095, 0), (4096, 8191, 1), (8192, 9000, 0)]
+        );
+        // Unnamed ranges keep the rank split.
+        assert_eq!(
+            Topology::parse(TWO, "a", 2).unwrap().groups[0].placed_ranges(),
+            vec![(0, 4095, 0), (4096, 8191, 1)]
+        );
+        assert!(
+            Topology::parse(&text.replace("@1", "@2"), "a", 2)
+                .unwrap_err()
+                .contains("names a shard")
+        );
     }
 
     #[test]
