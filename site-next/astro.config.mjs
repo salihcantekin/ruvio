@@ -35,6 +35,7 @@ export default defineConfig({
         Footer: "./src/components/docs/DocsFooter.astro",
         MobileMenuFooter: "./src/components/docs/DocsMobileMenuFooter.astro",
         PageSidebar: "./src/components/docs/DocsPageSidebar.astro",
+        Head: "./src/components/docs/DocsHead.astro",
       },
     }),
   ],
