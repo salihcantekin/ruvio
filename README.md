@@ -29,6 +29,7 @@
   <a href="https://www.nuget.org/packages/Ruvio.Client"><img alt="NuGet" src="https://img.shields.io/nuget/v/Ruvio.Client?label=NuGet"></a>
   <a href="https://www.npmjs.com/package/ruvio-client"><img alt="npm" src="https://img.shields.io/npm/v/ruvio-client?label=npm"></a>
   <a href="https://pypi.org/project/ruvio-client/"><img alt="PyPI" src="https://img.shields.io/pypi/v/ruvio-client?label=PyPI"></a>
+  <a href="https://aur.archlinux.org/packages/ruvio-bin"><img alt="AUR package" src="https://img.shields.io/aur/version/ruvio-bin?label=AUR"></a>
 </p>
 
 <p align="center">
@@ -70,6 +71,27 @@ redis-cli -h 127.0.0.1 -p 6379 -a change-me PING
 ```
 
 `linux` and `latest` are the same Linux image, as is each version tag, built for linux/amd64 and linux/arm64 (Apple Silicon and other arm64 hosts run it natively). The image default durability is `memory`. A persistent deploy sets `RUVIO_DURABILITY` and keeps the volume.
+
+<details>
+<summary><b>Arch Linux (AUR)</b></summary>
+
+<br>
+
+Install the prebuilt binary package from the Arch User Repository (AUR):
+
+```bash
+yay -S ruvio-bin
+# or
+paru -S ruvio-bin
+```
+
+Start and enable the systemd service:
+
+```bash
+sudo systemctl enable --now ruvio
+```
+
+</details>
 
 <details>
 <summary><b>Prebuilt binary</b> (Linux x64/arm64, macOS arm64, Windows x64)</summary>

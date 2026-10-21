@@ -1,5 +1,22 @@
 # Setup
 
+## Arch Linux: AUR package
+
+On Arch Linux, install the prebuilt package using an AUR helper such as `yay` or `paru`:
+
+```bash
+yay -S ruvio-bin
+# or
+paru -S ruvio-bin
+```
+
+This installs `ruvio`, `ruvio-ctl`, sample configuration in `/etc/ruvio/ruvio.toml`, and configures systemd users and directories:
+
+```bash
+# Start and enable Ruvio as a system service
+sudo systemctl enable --now ruvio
+```
+
 ## Linux: prebuilt binaries
 
 Each [GitHub Release](https://github.com/salihcantekin/ruvio/releases/latest) carries ready-to-run archives for
