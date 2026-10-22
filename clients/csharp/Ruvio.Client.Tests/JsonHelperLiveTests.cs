@@ -51,4 +51,19 @@ public sealed class JsonHelperLiveTests
         FillResult second = await db.FillGetAsync("json:text", TimeSpan.FromSeconds(10));
         Assert.Equal("hello", second.Text);
     }
+
+    [LiveFact(Timeout = 30000)]
+    public async Task Idempotency_result_text_is_the_completed_result()
+    {
+        await using RuvioConnection connection = await LiveServer.ConnectAsync(Db);
+        RuvioClient db = await connection.GetDefaultDatabaseAsync();
+        string key = $"json:idem:{Guid.NewGuid():N}";
+
+        Assert.Equal("acquired", (await db.BeginIdempotencyAsync(key, "fp", "me", 10000)).Items![0].AsString());
+        Assert.True(await db.CompleteIdempotencyAsync(key, "fp", "me", "{\"ok\":true}"));
+
+        IdempotencyBegin replay = await db.TryBeginIdempotencyAsync(key, "fp", "you", TimeSpan.FromSeconds(10));
+        Assert.Equal(IdempotencyState.Completed, replay.State);
+        Assert.Equal("{\"ok\":true}", replay.ResultText);
+    }
 }
