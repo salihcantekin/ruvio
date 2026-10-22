@@ -160,7 +160,7 @@ GETEX session:9f3 1800000
 # [STALE, value, nil]   -> stale copy, another caller is refreshing
 FILLSET product:42 "{...}" 60000 <token> SWR 30000
 # 1 -> stored (0 if the token is no longer live)`,
-    body: "One round trip decides who loads from the database. <code>WAIT</code> holds a caller that would get <code>BUSY</code> until the filler writes, so there is no retry loop in the client.",
+    body: "One round trip decides who loads from the database. <code>WAIT</code> holds a caller that would get <code>BUSY</code> until the filler writes, so there is no retry loop in the client. On one shared connection use <code>GetOrCreate</code> (C# and the other clients): it polls without <code>WAIT</code>, so no other command waits behind a held connection.",
     note: "Fill markers live in memory only and lapse after <code>fill_ms</code>. <code>WAIT</code> is refused inside <code>MULTI</code> and scripts.",
     refs: [{ label: "FILLGET and FILLSET", href: commands }],
   },
