@@ -455,6 +455,127 @@ public static class RuvioClientHelpers
         return ran ? built! : JsonSerializer.Deserialize(json, typeInfo)!;
     }
 
+    /// <summary>Reads a string key and deserializes its JSON text into <typeparamref name="T"/>.</summary>
+    /// <typeparam name="T">The type to read.</typeparam>
+    /// <param name="client">The client to send the command on.</param>
+    /// <param name="key">The key.</param>
+    /// <param name="typeInfo">Source-generated JSON metadata for <typeparamref name="T"/>.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply.</param>
+    /// <returns>The value, or null when the key is missing.</returns>
+    /// <exception cref="RuvioException">The key holds a value that is not a string.</exception>
+    /// <exception cref="JsonException">The stored text is not valid JSON for <typeparamref name="T"/>.</exception>
+    /// <example>
+    /// <code>
+    /// Profile? p = await db.GetJsonAsync("profile:7", AppJson.Default.Profile);
+    /// </code>
+    /// </example>
+    public static async ValueTask<T?> GetJsonAsync<T>(
+        this IRuvioClient client,
+        string key,
+        JsonTypeInfo<T> typeInfo,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(typeInfo);
+        string? json = await client.GetStringAsync(key, cancellationToken).ConfigureAwait(false);
+
+        return json is null ? default : JsonSerializer.Deserialize(json, typeInfo);
+    }
+
+    /// <summary>Serializes <paramref name="value"/> as JSON and stores it with <c>SET</c>.</summary>
+    /// <typeparam name="T">The type to store.</typeparam>
+    /// <param name="client">The client to send the command on.</param>
+    /// <param name="key">The key.</param>
+    /// <param name="value">The value to serialize.</param>
+    /// <param name="typeInfo">Source-generated JSON metadata for <typeparamref name="T"/>.</param>
+    /// <param name="expiry">How long the value lives. Null stores it without an expiry.</param>
+    /// <param name="mode">Whether to write always, only when absent, or only when present.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply.</param>
+    /// <returns><see langword="true"/> when the value was written.</returns>
+    /// <example>
+    /// <code>
+    /// await db.SetJsonAsync("profile:7", profile, AppJson.Default.Profile, TimeSpan.FromMinutes(5));
+    /// </code>
+    /// </example>
+    public static ValueTask<bool> SetJsonAsync<T>(
+        this IRuvioClient client,
+        string key,
+        T value,
+        JsonTypeInfo<T> typeInfo,
+        TimeSpan? expiry = null,
+        SetMode mode = SetMode.Always,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(typeInfo);
+
+        return client.SetAsync(key, JsonSerializer.Serialize(value, typeInfo), expiry, mode, cancellationToken);
+    }
+
+    /// <summary>
+    /// <see cref="IRuvioClient.FillGetAsync"/> with the value read as JSON into <typeparamref name="T"/>.
+    /// </summary>
+    /// <typeparam name="T">The cached type.</typeparam>
+    /// <param name="client">The client to send the command on.</param>
+    /// <param name="key">The cache key.</param>
+    /// <param name="fill">How long the fill marker lives for the caller told to fill.</param>
+    /// <param name="typeInfo">Source-generated JSON metadata for <typeparamref name="T"/>.</param>
+    /// <param name="wait">Holds a <see cref="FillState.Busy"/> caller up to this long. Null does not wait; see <see cref="GetOrCreateAsync{T}(IRuvioClient, string, TimeSpan, Func{CancellationToken, ValueTask{T}}, JsonTypeInfo{T}, GetOrCreateOptions?, CancellationToken)"/> for the polling form that does not hold the connection.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply.</param>
+    /// <returns>The state, the decoded value when one is stored, and the fill token when this caller must build it.</returns>
+    /// <exception cref="JsonException">The stored text is not valid JSON for <typeparamref name="T"/>.</exception>
+    /// <example>
+    /// <code>
+    /// FillResult&lt;Profile&gt; r = await db.FillGetJsonAsync("profile:7", TimeSpan.FromSeconds(10), AppJson.Default.Profile);
+    /// if (r.State == FillState.Fill) await db.FillSetJsonAsync("profile:7", await LoadAsync(), TimeSpan.FromMinutes(5), r.Token!.Value, AppJson.Default.Profile);
+    /// </code>
+    /// </example>
+    public static async ValueTask<FillResult<T>> FillGetJsonAsync<T>(
+        this IRuvioClient client,
+        string key,
+        TimeSpan fill,
+        JsonTypeInfo<T> typeInfo,
+        TimeSpan? wait = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(typeInfo);
+        FillResult raw = await client.FillGetAsync(key, fill, wait, cancellationToken).ConfigureAwait(false);
+        T? value = raw.Value is null ? default : JsonSerializer.Deserialize(raw.Value, typeInfo);
+
+        return new FillResult<T>(raw.State, value, raw.Token);
+    }
+
+    /// <summary>
+    /// <see cref="IRuvioClient.FillSetAsync"/> with <paramref name="value"/> serialized as JSON.
+    /// </summary>
+    /// <typeparam name="T">The cached type.</typeparam>
+    /// <param name="client">The client to send the command on.</param>
+    /// <param name="key">The cache key.</param>
+    /// <param name="value">The value to serialize and store.</param>
+    /// <param name="ttl">How long the value is fresh.</param>
+    /// <param name="token">The token from <see cref="FillResult{T}.Token"/>.</param>
+    /// <param name="typeInfo">Source-generated JSON metadata for <typeparamref name="T"/>.</param>
+    /// <param name="stale">Stale-while-revalidate window. Null stores none.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply.</param>
+    /// <returns><see langword="true"/> when the token was still live and the value was stored.</returns>
+    /// <example>
+    /// <code>
+    /// bool stored = await db.FillSetJsonAsync("profile:7", profile, TimeSpan.FromMinutes(5), token, AppJson.Default.Profile);
+    /// </code>
+    /// </example>
+    public static ValueTask<bool> FillSetJsonAsync<T>(
+        this IRuvioClient client,
+        string key,
+        T value,
+        TimeSpan ttl,
+        long token,
+        JsonTypeInfo<T> typeInfo,
+        TimeSpan? stale = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(typeInfo);
+
+        return client.FillSetAsync(key, JsonSerializer.Serialize(value, typeInfo), ttl, token, stale, cancellationToken);
+    }
+
     // ---- Scan iterators ---------------------------------------------------------------------------
 
     /// <summary>Lazily walks <c>SCAN</c> pages. Keys added or removed during the walk may or may not appear.</summary>

@@ -417,13 +417,9 @@ if let FillOutcome::Fill(token) | FillOutcome::Stale { token: Some(token), .. } 
     csharp: `await using var connection = await RuvioConnection.ConnectAsync("127.0.0.1", 6379);
 var db = await connection.GetDefaultDatabaseAsync();
 
-FillResult fill = await db.FillGetAsync("product:42", TimeSpan.FromMilliseconds(5000), TimeSpan.FromMilliseconds(200));
-// fill.State: Hit (fill.Value), Fill (fill.Token), Busy, or Stale (fill.Value, and fill.Token when you refresh)
-if (fill.Token is long token)
-{
-    bool stored = await db.FillSetAsync("product:42", "{...}", TimeSpan.FromSeconds(60), token, TimeSpan.FromSeconds(30));
-    // true -> stored (false if the token is no longer live)
-}`,
+// One caller builds the value; the others poll with short FILLGET calls, so the connection is never held.
+string html = await db.GetOrCreateAsync("product:42", TimeSpan.FromSeconds(60),
+    async ct => await LoadProductHtmlAsync(42, ct));`,
     go: `c, err := ruvio.Connect(ctx, ruvio.Options{Addr: "127.0.0.1:6379"})
 if err != nil { return err }
 
