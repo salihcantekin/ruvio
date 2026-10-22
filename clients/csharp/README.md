@@ -43,6 +43,21 @@ await db.SetAsync("session:ada", "hello");
 string? value = await db.GetStringAsync("session:ada");
 ```
 
+## JSON and text values
+
+Values are `string` or a model serialized with a source-generated `JsonTypeInfo<T>`, so callers do not handle `byte[]`. The `byte[]` members (`GetAsync`, `DumpAsync`, `FillResult.Value`) stay for binary data.
+
+```csharp
+await db.SetJsonAsync("profile:7", profile, AppJson.Default.Profile, TimeSpan.FromMinutes(5));
+Profile? p = await db.GetJsonAsync("profile:7", AppJson.Default.Profile);
+
+FillResult<Profile> r = await db.FillGetJsonAsync("profile:7", TimeSpan.FromSeconds(10), AppJson.Default.Profile);
+if (r.State == FillState.Fill)
+    await db.FillSetJsonAsync("profile:7", await LoadAsync(), TimeSpan.FromMinutes(5), r.Token!.Value, AppJson.Default.Profile);
+```
+
+On a single connection, prefer `GetOrCreateAsync`: it polls with `FillGetAsync` and no `wait`, so it never holds the connection. `FillGetAsync(..., wait: ...)` holds the connection until the value is stored or the wait ends, and every other command on that connection waits behind it. Use `wait` only on a connection kept for it.
+
 ## TTL on create
 
 These commands take a `TimeSpan ttl` that is applied only when the call creates the key. A key that already exists keeps its own deadline. Whole seconds are sent as `EX`, anything with a sub-second part as `PX` (rounded up to milliseconds). A zero or negative `ttl` throws `ArgumentOutOfRangeException` before anything is sent.

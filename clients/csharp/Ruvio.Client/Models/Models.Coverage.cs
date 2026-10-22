@@ -121,7 +121,11 @@ public enum IdempotencyState
 /// <summary>The answer of <c>IDEM key BEGIN</c>.</summary>
 /// <param name="State">What the server decided.</param>
 /// <param name="Result">The stored result bytes for <see cref="IdempotencyState.Completed"/>; otherwise null.</param>
-public readonly record struct IdempotencyBegin(IdempotencyState State, byte[]? Result);
+public readonly record struct IdempotencyBegin(IdempotencyState State, byte[]? Result)
+{
+    /// <summary>The stored result decoded as UTF-8, for a result that was written as text; null otherwise.</summary>
+    public string? ResultText => Result is null ? null : System.Text.Encoding.UTF8.GetString(Result);
+}
 
 /// <summary>Options for the <c>GetOrCreateAsync</c> cache-aside helper.</summary>
 public sealed class GetOrCreateOptions
