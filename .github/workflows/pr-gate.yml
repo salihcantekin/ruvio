@@ -151,7 +151,8 @@ jobs:
   # The C#, Go, Node, Python and Java client suites need a live server (standalone
   # and a 3-shard cluster), so the server is built once and shared as an artifact.
   server-binary:
-    runs-on: ubuntu-latest
+    # Built on 24.04 so the binary also runs on the 24.04 python-client job (a binary built on a newer glibc would not).
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v6
@@ -192,7 +193,8 @@ jobs:
 
   python-client:
     needs: server-binary
-    runs-on: ubuntu-latest
+    # setup-python has no Python 3.9 for ubuntu-latest (26.04); the package still supports 3.9.
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     strategy:
       fail-fast: false
