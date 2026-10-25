@@ -2022,7 +2022,6 @@ fn parses_config_set_pairs_and_config_rewrite() {
 }
 
 #[test]
-<<<<<<< HEAD
 fn client_setinfo_takes_a_known_attribute_and_a_value() {
     let frame = |args: &[&str]| {
         let mut frame = format!("*{}\r\n", args.len()).into_bytes();
@@ -2045,7 +2044,9 @@ fn client_setinfo_takes_a_known_attribute_and_a_value() {
     ));
     assert!(parse(&["CLIENT", "SETINFO", "OTHER", "x"]).is_err());
     assert!(parse(&["CLIENT", "SETINFO", "LIB-NAME"]).is_err());
-=======
+}
+
+#[test]
 fn scan_count_is_capped() {
     let frame = b"*4\r\n$4\r\nSCAN\r\n$1\r\n0\r\n$5\r\nCOUNT\r\n$10\r\n9999999999\r\n";
     let Command::Scan { count, .. } = parse_command(frame).unwrap().unwrap().0.into_owned() else {
@@ -2054,7 +2055,6 @@ fn scan_count_is_capped() {
 
     assert_eq!(count, crate::protocol::MAX_SCAN_COUNT);
     assert_eq!(count, 10_000);
->>>>>>> origin/dev
 }
 
 #[test]
