@@ -335,6 +335,7 @@ public sealed class RuvioConnection : IRuvioConnection
         Database = database,
         DurabilityReplicas = options.DurabilityReplicas,
         DurabilityTimeout = options.DurabilityTimeout,
+        Tls = options.Tls,
         ConnectTimeout = options.ConnectTimeout,
         CommandTimeout = options.CommandTimeout,
         MaxInFlightRequests = options.MaxInFlightRequests,

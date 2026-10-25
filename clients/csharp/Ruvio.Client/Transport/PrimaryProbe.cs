@@ -99,6 +99,7 @@ internal static class PrimaryProbe
     {
         Username = options.Username,
         Password = options.Password,
+        Tls = options.Tls,
         ConnectTimeout = options.ConnectTimeout,
         CommandTimeout = ReplyWait(options),
         MaxInFlightRequests = options.MaxInFlightRequests,

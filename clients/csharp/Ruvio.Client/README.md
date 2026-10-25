@@ -755,6 +755,23 @@ A dropped socket is opened again before the next command, including a shard sock
 
 A password is sent as `AUTH` only when `RuvioClientOptions.Password` is set. One client runs commands one at a time. `ExecuteManyAsync` pipelines several commands on that connection. A server error reply leaves the connection usable. A broken read or write closes it.
 
+## TLS
+
+Plain TCP is the default. Set `RuvioClientOptions.Tls` to turn TLS on for every socket the client opens (reconnects, shards, replicas and Pub/Sub included). The certificate chain is checked against the system trust store and must name the host you connect to.
+
+```csharp
+var roots = new X509Certificate2Collection();
+roots.ImportFromPemFile("ca.pem");
+
+await using var connection = await RuvioConnection.ConnectAsync(new RuvioClientOptions
+{
+    Host = "cache.internal",
+    Tls = new RuvioTlsOptions { TrustedCertificates = roots },
+});
+```
+
+`TrustedCertificates` trusts only your private CA (revocation is not checked then); leave it null for a certificate from a public CA. `ClientCertificates` answers a server that demands mutual TLS. `ServerName` is the name the certificate carries, when you connect by IP address. `InsecureSkipVerify` accepts any certificate and removes the protection against someone in the middle; use it for a throwaway test only. The handshake is part of the connect: a refused certificate throws `AuthenticationException`. With TLS on, `DedicatedReaderThread` has no effect. Measured: the live TLS tests (`TlsLiveTests`); the latency TLS adds: not measured.
+
 ## Changes
 
 See [CHANGELOG.md](https://github.com/salihcantekin/ruvio/blob/main/clients/csharp/CHANGELOG.md).

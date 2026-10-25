@@ -70,6 +70,8 @@ builder.Services.AddRuvioClient(builder.Configuration.GetSection("Ruvio"));
 
 `Seeds` is an optional array of `host:port` strings (`["10.0.0.5:6379", "10.0.0.6:6379"]`; an IPv6 host in brackets). When it is not empty it replaces `Host` and `Port`: connect tries the seeds in order and a reconnect moves on to the next one; see the Ruvio.Client README ("Seed addresses").
 
+`Tls` (off by default) turns TLS on when it is `true`. `TlsServerName`, `TlsCaFile` (a PEM file of the CA to trust), `TlsClientCertFile` with `TlsClientKeyFile` (PEM files, for a server that demands a client certificate) and `TlsInsecureSkipVerify` refine it; see "TLS" in the Ruvio.Client README.
+
 `DedicatedReaderThread` (off by default) gives each command socket blocking I/O and a reader thread of its own, which lowers CPU per round trip at the cost of one thread per socket; see the Ruvio.Client README ("Concurrent commands").
 
 `Reconnect` defaults to true. A broken command or shard socket is opened again before the next command. The command that discovers the drop fails and is never sent again, so a write is not sent twice; reads and pipelines are not resent either. Pub/Sub channels are subscribed again on the new socket. Set `Reconnect` to false and call `IRuvioConnection.ReconnectAsync` when the application should own the timing. `ReconnectDelay` is a `Func<int, TimeSpan?>` and is not read from configuration; return null to stop. When it is set, `MaxReconnectAttempts` is not applied. The connection callback runs once, after the initial database client is open, so lifecycle handlers are attached before the singleton is handed out. `RuvioConnectionNotice` carries host, port, whether the socket is the Pub/Sub connection, and the error on a drop.
