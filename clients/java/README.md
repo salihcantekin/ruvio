@@ -318,6 +318,19 @@ RuvioOptions options = RuvioOptions.builder()
 `FollowFailoverFakeTest` runs scripted nodes; `FailoverLiveTest` runs on the pair `scripts/run_with_servers.sh` starts
 (`RUVIO_FAILOVER_ADDRS` and `RUVIO_FAILOVER_REPLICATION`, comma separated, primary first) and skips without them.
 
+## TLS
+
+Plain TCP is the default. `tls()` turns TLS on for every socket the client opens (first connect, reconnects, shards, replicas, Pub/Sub and failover probes), trusting the JVM's default certificates. The certificate chain and the host name are always verified.
+
+```java
+RuvioOptions options = RuvioOptions.builder()
+        .host("cache.internal")
+        .tls(RuvioTls.context(Path.of("ca.pem"), null, null))
+        .build();
+```
+
+`RuvioTls.context(caPem, clientCertPem, clientKeyPem)` builds the context from PEM files: `caPem` trusts only your private CA (null keeps the JVM's certificates), and the client certificate chain and an unencrypted PKCS#8 key (`BEGIN PRIVATE KEY`) answer a server that demands mutual TLS (`tls_client_auth`). Pass any `SSLContext` to `tls(SSLContext)` instead if you manage key stores yourself. `tlsServerName(name)` is the name the certificate carries when you connect by IP address. `tlsInsecure()` accepts any certificate and skips the host name check, which removes the protection against someone in the middle: use it for a throwaway test only. The handshake is part of the connect (bounded by `connectTimeoutMillis`), so a refused certificate fails the connect with a `RuvioConnectionException`. Measured: the live TLS tests (`TlsLiveTest`); the latency TLS adds: not measured.
+
 ## Tests and benchmark
 
 ```

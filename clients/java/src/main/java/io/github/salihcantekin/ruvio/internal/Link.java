@@ -269,7 +269,8 @@ public final class Link implements AutoCloseable {
     private Connection connectOne(Address a, String threadName, int db, boolean remember) {
         Connection c;
         try {
-            c = new Connection(a.host, a.port, options.connectTimeoutMillis, options.maxInFlight, threadName);
+            c = new Connection(a.host, a.port, options.connectTimeoutMillis, options.maxInFlight, threadName,
+                    options.sslContext, options.tlsServerName);
         } catch (IOException e) {
             throw new CannotConnect("cannot connect to " + a + ": " + e.getMessage(), e);
         }
@@ -625,7 +626,8 @@ public final class Link implements AutoCloseable {
     private Object ask(Address a, Object... command) {
         Connection c;
         try {
-            c = new Connection(a.host, a.port, options.connectTimeoutMillis, 16, name + "-probe");
+            c = new Connection(a.host, a.port, options.connectTimeoutMillis, 16, name + "-probe",
+                    options.sslContext, options.tlsServerName);
         } catch (IOException e) {
             return null;
         }
