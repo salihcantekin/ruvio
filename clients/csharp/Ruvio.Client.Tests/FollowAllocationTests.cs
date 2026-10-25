@@ -15,11 +15,12 @@ public class FollowAllocationTests
 {
     private const int Trials = 5;
     private const int Warmup = 30;
-    private const int Rounds = 100;
+    private const int Rounds = 500;
 
     // Bytes per round (a SET and a GET, or 16 pipelined commands) a following client may allocate beyond a single-seed
-    // one. Measured over 10 runs: the two differ by at most ten bytes per round in either direction, from pool and timer noise in the
-    // process-wide count. The smallest object, one per command, is 24 bytes, so a per-command allocation by following
+    // one. The process-wide count picks up a few KB of unrelated allocation (pool, timer and runner threads) now and
+    // then on a busy CI runner; spread over 500 rounds that stays under the slack, where 100 rounds let 24-35 bytes per round
+    // through. Locally the two differ by at most ten bytes per round in either direction. The smallest object, one per command, is 24 bytes, so a per-command allocation by following
     // mode shows up as at least 48 bytes per round and fails.
     private const double Slack = 16;
 
