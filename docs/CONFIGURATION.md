@@ -720,6 +720,8 @@ to it. `tls_client_auth` / `RUVIO_TLS_CLIENT_AUTH` / `--tls-client-auth`
 rejects a handshake that does not present one. Neither setting is consulted
 on a plaintext connection.
 
+All six first-party clients can connect over TLS (Rust with the `tls` cargo feature, the Operator UI with `RUVIO_UI_TLS`), checking the certificate chain and host name; each has a private CA option, a client certificate option for `tls_client_auth` and, for throwaway tests only, an option that skips the check. The options and a snippet per client are in [clients/README.md](../clients/README.md#tls) and each client's README.
+
 `tls_cert` covers client connections only. The replication port (WAL and snapshot
 stream, and the replication password in its handshake) is encrypted only when
 `replication.tls = true` (see below); otherwise keep it on a private network, a

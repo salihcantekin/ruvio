@@ -2,6 +2,8 @@
 import Page from "../layouts/Page.astro";
 import CodeBlock from "../components/content/CodeBlock.astro";
 import type { Lang } from "../lib/highlight";
+import CodeTabs from "../components/content/CodeTabs.astro";
+import { tlsExamples } from "../data/tls-examples";
 import SideNav from "../components/content/SideNav.astro";
 import Tabs from "../components/content/Tabs.astro";
 import PageIntro from "../components/PageIntro.astro";
@@ -29,6 +31,7 @@ const nav = [
   { id: "connect", label: "Connect with redis-cli" },
   { id: "durability", label: "Choose durability" },
   { id: "clients", label: "Add a client" },
+  { id: "tls", label: "Encrypt with TLS" },
   { id: "ui", label: "Operator UI" },
   { id: "next", label: "Next steps" },
 ];
@@ -197,6 +200,25 @@ cd ruvio-$v-linux-x64
         <p>
           For ASP.NET Core, <code>Ruvio.Client.AspNetCore</code> registers the connection with dependency injection:{" "}
           <code>dotnet add package Ruvio.Client.AspNetCore</code>.
+        </p>
+      </section>
+
+      <section class="step panel prose" id="tls" aria-labelledby="tls-h">
+        <h2 id="tls-h">Encrypt with TLS</h2>
+        <p>
+          TLS is off by default. Give the server a certificate and key and its client port speaks TLS only; every
+          first-party client can then connect with it, checking the certificate chain and the host name.
+        </p>
+        <CodeBlock lang="shell" code={`ruvio --tls-cert server.pem --tls-key server-key.pem
+# or RUVIO_TLS_CERT / RUVIO_TLS_KEY, or security.tls_cert / security.tls_key in ruvio.toml
+# add tls_client_ca and tls_client_auth to demand client certificates (mutual TLS)`} />
+        <CodeTabs id="tls-clients" label="Connect with TLS" tabs={clients.map((k) => ({ key: k.slug, label: k.language, lang: k.lang, code: tlsExamples[k.slug] }))} />
+        <p>
+          Every client also takes a client certificate for mutual TLS and a server name for connecting by IP address.
+          Skipping verification is a separate, clearly named option for throwaway tests only. The settings are in{" "}
+          <a href="/docs/configuration/">Configuration</a>, and each client guide has a TLS section:{" "}
+          <a href="/docs/clients/">Clients</a>. The operator UI connects to a TLS server with{" "}
+          <code>RUVIO_UI_TLS</code>; see <a href="/docs/ui-connections/">UI connections</a>.
         </p>
       </section>
 
