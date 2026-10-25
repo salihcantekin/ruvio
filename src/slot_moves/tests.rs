@@ -446,6 +446,35 @@ fn the_map_completes_a_prepared_gain_and_refuses_slots_whose_data_is_elsewhere()
 }
 
 #[test]
+fn a_completed_gain_is_kept_by_a_map_that_has_not_heard_of_it_yet() {
+    let old_map: Vec<u16> = (0..HASH_SLOT_COUNT as u16)
+        .map(|slot| match slot {
+            0..8192 => shard_for_slot(slot, 2) as u16,
+            _ => 2,
+        })
+        .collect();
+    let mut moves = half_node();
+
+    moves.begin_gain(9000, 9100, 1, 40).unwrap();
+    moves.prepare(55).unwrap();
+    // Nothing completed yet: the old map still refuses nothing, the data is only a copy.
+    assert!(moves.clone().reconcile(&old_map, false).is_ok());
+
+    moves.end_gain(9000, 9100, 1, Some(60)).unwrap();
+    // A replica that applied the completed gain waits for the coordinators' map.
+    assert!(moves.clone().reconcile(&old_map, false).is_ok());
+
+    // Other held slots the map takes away are still refused without the coordinators.
+    let mut fewer = old_map.clone();
+    fewer[100] = 2;
+    assert!(moves.clone().reconcile(&fewer, false).is_err());
+
+    // A range given away again after the gain is no longer held.
+    moves.lose(9000, 9100, 1, 80).unwrap();
+    assert!(moves.reconcile(&old_map, false).is_ok());
+}
+
+#[test]
 fn a_gain_ends_only_by_its_own_range_and_shard_and_only_once() {
     let mut moves = half_node();
 

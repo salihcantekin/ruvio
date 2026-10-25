@@ -107,6 +107,9 @@ struct ShardState {
     /// Signalled by that thread for every delivery, and by a drain that ran out of budget.
     replica_wake: Arc<tokio::sync::Notify>,
     replica_resync_sequence: Arc<AtomicU64>,
+    /// Slot ranges whose keys a background drop is still removing; a range arriving from
+    /// another node waits until its drop is done.
+    dropping: RefCell<Vec<(u16, u16)>>,
     /// The shard's replication role now: the configured one until `REPLICAOF` changes it.
     role: Cell<crate::config::ReplicationRole>,
     /// The primary this replica shard dials (its own port), for `ROLE`.
@@ -1230,6 +1233,7 @@ async fn serve_async(
         }),
         epoch: Cell::new(0),
         newer_epoch: Arc::new(AtomicU64::new(0)),
+        dropping: RefCell::new(Vec::new()),
         replica_resync_sequence: Arc::new(AtomicU64::new(if incomplete && !force {
             u64::MAX
         } else {

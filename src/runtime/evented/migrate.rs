@@ -25,7 +25,7 @@ use crate::slot_moves::{IncomingStep, SlotMove};
 use std::sync::atomic::AtomicBool;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-use super::moveslots::{CopyBatch, apply_batch, drop_slots, release_clients};
+use super::moveslots::{CopyBatch, apply_batch, drop_slots, is_dropping, release_clients};
 
 /// Copy messages the source keeps in flight before it waits for a reply.
 const IN_FLIGHT: usize = 4;
@@ -300,6 +300,14 @@ fn import(state: &Rc<ShardState>, args: &[&[u8]]) -> Reply {
         cancel(state, &import.id)?;
         return Err(
             "ERR RUVIO MIGRATE another range is arriving on this node; it is being cancelled"
+                .into(),
+        );
+    }
+    // A drop of the same range, left over from giving it away or cancelling it, would remove
+    // the new copies.
+    if is_dropping(state, first, last) {
+        return Err(
+            "ERR RUVIO MIGRATE this node is still dropping the keys of that range; retry shortly"
                 .into(),
         );
     }
