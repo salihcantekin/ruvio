@@ -99,6 +99,25 @@ checkpoint is running, a deleted or changed key keeps its old value in the
 snapshot journal until the checkpoint ends, so `charged_bytes` and process RSS
 can stay at or above the limit until then.
 
+## Peak memory: plan for up to twice the data
+
+Three moments can hold a second copy of data, so size the machine (or `maxmemory`) for them:
+
+- **A checkpoint under heavy writes.** The snapshot journal keeps the old value of each key
+  written during the walk. It starts small and grows only after a walk aborts, to a quarter of
+  the shard's data; a walk that keeps aborting under overload may grow it up to a full copy of
+  the data. With `maxmemory` set it also stays within the memory left under the limit. Without
+  `maxmemory`, nothing but the data size bounds it.
+- **A full sync.** The primary builds, and the replica receives, the whole snapshot as one
+  buffer (at most `snapshot_max_bytes`, 16 GiB by default) next to the live store, so each side
+  can briefly hold the data twice. Lower `snapshot_max_bytes` to the largest snapshot you
+  expect to refuse a runaway one early.
+- **`FLUSHALL`.** Every shard hands its data to the free thread at once, whatever is queued, so
+  that a flush stays constant time. The memory returns as the free thread works through it.
+
+Set `maxmemory` below about half of the machine's memory when you replicate or checkpoint a
+store that takes heavy writes.
+
 `maxmemory-policy` may be `allkeys-lru`, `allkeys-lfu`, `volatile-lru`, or
 `volatile-ttl`. Eviction is shard-local. The default examines 16 candidates
 (`maxmemory-samples`) per decision. A write that needs room evicts for up to
