@@ -27,7 +27,7 @@ public class LiveTests
         string key = prefix + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("4:livetenant")));
         using var firstServices = Services(first, prefix);
         using var secondServices = Services(second, prefix);
-        var middleware = new RuvioRateLimitingMiddleware(_ => Task.CompletedTask);
+        var middleware = MiddlewareTests.Create(_ => Task.CompletedTask, firstServices);
 
         try
         {

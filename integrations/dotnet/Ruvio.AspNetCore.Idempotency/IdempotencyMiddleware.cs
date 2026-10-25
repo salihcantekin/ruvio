@@ -150,10 +150,15 @@ public sealed class IdempotencyMiddleware
         if (context.Response.HasStarted)
             throw new InvalidOperationException("Idempotency must run before the response starts.");
 
+        BoundedResponseBody? pooledResponse = null;
+        byte[]? pooledRequest = null;
+
         try
         {
             var (bytes, length, rejectionStatus) = await RequestBuffer.ReadAsync(
                 originalRequest, request.ContentLength, options.MaxRequestBodyBytes, cancellation);
+
+            pooledRequest = bytes;
 
             if (rejectionStatus is int status)
             {
@@ -237,7 +242,7 @@ public sealed class IdempotencyMiddleware
                 return;
             }
 
-            var responseBody = new BoundedResponseBody(options.MaxResponseBodyBytes);
+            var responseBody = pooledResponse = new BoundedResponseBody(options.MaxResponseBodyBytes);
             var responseFeature = new BufferedResponseFeature(originalResponseFeature, responseBody.Stream);
 
             context.Features.Set<IHttpResponseFeature>(responseFeature);
@@ -321,6 +326,8 @@ public sealed class IdempotencyMiddleware
             request.Body = originalRequest;
             context.Features.Set(originalResponseFeature);
             context.Features.Set(originalBodyFeature);
+            pooledResponse?.Release();
+            RequestBuffer.Release(pooledRequest);
         }
     }
 

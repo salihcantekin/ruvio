@@ -15,8 +15,11 @@ namespace Ruvio.AspNetCore.RateLimiting;
 /// Middleware for enforcing Ruvio rate limiting on incoming HTTP requests.
 /// </summary>
 /// <param name="next">The next middleware in the pipeline.</param>
-public sealed class RuvioRateLimitingMiddleware(RequestDelegate next)
+/// <param name="options">The validated rate-limiting options, read once.</param>
+public sealed class RuvioRateLimitingMiddleware(RequestDelegate next, IOptions<RuvioRateLimitingOptions> options)
 {
+    private readonly RuvioRateLimitingOptions options = options.Value;
+
     /// <summary>
     /// Invokes the middleware for the given HTTP context, enforcing rate limiting if applicable.
     /// </summary>
@@ -31,7 +34,6 @@ public sealed class RuvioRateLimitingMiddleware(RequestDelegate next)
 
     private async Task InvokeLimitedAsync(HttpContext context, RuvioRateLimitAttribute policy)
     {
-        var options = context.RequestServices.GetRequiredService<IOptions<RuvioRateLimitingOptions>>().Value;
         string partition = options.PartitionKey!(context);
 
         // An empty partition is a configuration error, not a shared anonymous bucket: it would merge

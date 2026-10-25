@@ -35,7 +35,7 @@ public sealed class RuvioLockMiddleware(RequestDelegate next)
             return;
         }
 
-        var provider = context.RequestServices.GetService<RuvioLockProvider>()!;
+        var provider = context.RequestServices.GetRequiredService<RuvioLockProvider>();
         // A templated name is never a metric tag: one tag value per order id would explode cardinality.
         bool fixedName = metadata.Resource.IndexOf('{') < 0;
         var tags = new TagList { { "resource", fixedName ? resource : "(templated)" } };

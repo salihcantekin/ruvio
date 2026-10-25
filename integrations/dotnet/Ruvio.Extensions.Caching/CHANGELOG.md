@@ -4,6 +4,7 @@ Notable changes to the NuGet package `Ruvio.Extensions.Caching`. New entries go 
 
 ## Unreleased
 
+- Fewer allocations per call: `GetJsonAsync`, `SetAsync`, `SetStringAsync` and `SetJsonAsync` no longer allocate a closure and delegate for each call. Behaviour is unchanged.
 - `options.Outage`: `FailOpen` makes reads misses and drops writes and removals when Ruvio is unreachable (`GetOrCreate*` runs its factory without caching), and an optional circuit breaker stops calls to a Ruvio that is down. Default (`Throw`) unchanged. See the README.
 
 ## 0.1.2 - 2026-10-17

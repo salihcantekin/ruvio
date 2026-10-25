@@ -40,7 +40,7 @@ public class MiddlewareTests
     public async Task BypassHasNoServicesCommandsOrAllocations()
     {
         var context = new DefaultHttpContext();
-        var middleware = new RuvioRateLimitingMiddleware(static _ => Task.CompletedTask);
+        var middleware = new RuvioRateLimitingMiddleware(static _ => Task.CompletedTask, Options.Create(new RuvioRateLimitingOptions()));
 
         for (int i = 0; i < 100; i++)
         {
@@ -56,6 +56,30 @@ public class MiddlewareTests
         Assert.Equal(0, GC.GetAllocatedBytesForCurrentThread() - start);
     }
 
+    [Fact]
+    public void OptionsAreReadOnceWhenTheMiddlewareIsBuilt()
+    {
+        var options = new CountingOptions();
+
+        _ = new RuvioRateLimitingMiddleware(static _ => Task.CompletedTask, options);
+        Assert.Equal(1, options.Reads);
+    }
+
+    private sealed class CountingOptions : IOptions<RuvioRateLimitingOptions>
+    {
+        public int Reads { get; private set; }
+
+        public RuvioRateLimitingOptions Value
+        {
+            get
+            {
+                Reads++;
+
+                return new RuvioRateLimitingOptions();
+            }
+        }
+    }
+
     [Theory]
     [InlineData(0L, 200, 1)]
     [InlineData(4L, 200, 1)]
@@ -69,7 +93,7 @@ public class MiddlewareTests
         using var services = Services(client);
         var context = Context(services, "tenant");
         int calls = 0;
-        var middleware = new RuvioRateLimitingMiddleware(_ => { calls++; return Task.CompletedTask; });
+        var middleware = Create(_ => { calls++; return Task.CompletedTask; }, services);
 
         await middleware.InvokeAsync(context);
         Assert.Equal(status, context.Response.StatusCode);
@@ -93,7 +117,7 @@ public class MiddlewareTests
 
         using var services = Services(client);
         int calls = 0;
-        var middleware = new RuvioRateLimitingMiddleware(_ => { calls++; return Task.CompletedTask; });
+        var middleware = Create(_ => { calls++; return Task.CompletedTask; }, services);
 
         stub.Outcome = new LimitOutcome(true, 3, 0);
         var allowed = Context(services, "tenant", algorithm);
@@ -120,7 +144,7 @@ public class MiddlewareTests
 
         stub.Result = Task.FromException<long?>(new IOException("unavailable"));
         using var services = Services(client);
-        var middleware = new RuvioRateLimitingMiddleware(_ => throw new Exception("must not run"));
+        var middleware = Create(_ => throw new Exception("must not run"), services);
 
         await Assert.ThrowsAsync<IOException>(() => middleware.InvokeAsync(Context(services, "tenant")));
         Assert.Equal(1, stub.Calls);
@@ -132,7 +156,7 @@ public class MiddlewareTests
         var client = DispatchProxy.Create<IRuvioClient, Stub>();
         var stub = (Stub)client;
         using var services = Services(client);
-        var middleware = new RuvioRateLimitingMiddleware(_ => Task.CompletedTask);
+        var middleware = Create(_ => Task.CompletedTask, services);
         var first = Context(services, "one");
         using var cancel = new CancellationTokenSource();
 
@@ -150,7 +174,7 @@ public class MiddlewareTests
     {
         var client = DispatchProxy.Create<IRuvioClient, Stub>();
         using var services = Services(client);
-        var middleware = new RuvioRateLimitingMiddleware(_ => Task.CompletedTask);
+        var middleware = Create(_ => Task.CompletedTask, services);
 
         await Assert.ThrowsAsync<InvalidOperationException>(() => middleware.InvokeAsync(Context(services, "")));
         Assert.Equal(0, ((Stub)client).Calls);
@@ -165,7 +189,7 @@ public class MiddlewareTests
 
         ((Stub)client).Result = Task.FromResult<long?>(remaining);
         using var services = Services(client);
-        var middleware = new RuvioRateLimitingMiddleware(_ => throw new Exception("must not run"));
+        var middleware = Create(_ => throw new Exception("must not run"), services);
 
         await Assert.ThrowsAsync<RuvioException>(() => middleware.InvokeAsync(Context(services, "tenant")));
     }
@@ -184,6 +208,9 @@ public class MiddlewareTests
         Assert.Throws<ArgumentOutOfRangeException>(() => new RuvioRateLimitAttribute("x", 0, 1));
         Assert.Throws<ArgumentOutOfRangeException>(() => new RuvioRateLimitAttribute("x", 1, 0));
     }
+
+    internal static RuvioRateLimitingMiddleware Create(RequestDelegate next, IServiceProvider services)
+        => new(next, services.GetRequiredService<IOptions<RuvioRateLimitingOptions>>());
 
     private static ServiceProvider Services(IRuvioClient client)
     {
