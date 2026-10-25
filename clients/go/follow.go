@@ -242,12 +242,7 @@ func (c *Client) probe(ctx context.Context, addr string, args ...any) (v Value, 
 	}
 	dctx, cancel := context.WithTimeout(ctx, c.opts.DialTimeout)
 	var nc net.Conn
-	if c.opts.Dial != nil {
-		nc, err = c.opts.Dial(dctx, "tcp", addr)
-	} else {
-		var d net.Dialer
-		nc, err = d.DialContext(dctx, "tcp", addr)
-	}
+	nc, err = c.transport(dctx, addr)
 	cancel()
 	if err != nil {
 		return Value{}, false, nil
