@@ -1045,6 +1045,20 @@ pub(super) fn drop_slots_now(state: &ShardState, first: u16, last: u16) {
 
 /// Removes this shard's keys of `first..=last` in bounded steps, without logging it.
 pub(super) async fn drop_slots(state: &ShardState, first: u16, last: u16) {
+    struct Dropping<'a>(&'a ShardState, (u16, u16));
+
+    impl Drop for Dropping<'_> {
+        fn drop(&mut self) {
+            let mut running = self.0.dropping.borrow_mut();
+
+            if let Some(at) = running.iter().position(|range| *range == self.1) {
+                running.swap_remove(at);
+            }
+        }
+    }
+
+    state.dropping.borrow_mut().push((first, last));
+    let _running = Dropping(state, (first, last));
     let databases = state.store.borrow().database_ids();
 
     for database in databases {
@@ -1164,4 +1178,13 @@ pub(super) fn request_owner(state: &ShardState, frames: &[u8], count: u32) -> Op
 
     // A range on another node or frozen for a move runs here and answers its redirect.
     owner.filter(|owner| *owner != forwarding.me && *owner < forwarding.fabric.shard_count())
+}
+
+/// Whether a background drop is still removing keys of any slot of `first..=last`.
+pub(super) fn is_dropping(state: &ShardState, first: u16, last: u16) -> bool {
+    state
+        .dropping
+        .borrow()
+        .iter()
+        .any(|&(from, to)| from <= last && first <= to)
 }

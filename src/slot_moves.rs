@@ -245,7 +245,9 @@ impl SlotMoves {
     ///   which the map then completes;
     /// - a slot held here that the map gives another group is accepted only from a map the
     ///   coordinators sent (`pushed`): the node gave the range away and stopped before it
-    ///   recorded that; its shard records the loss once it has replayed its log.
+    ///   recorded that; its shard records the loss once it has replayed its log. A slot whose
+    ///   newest completed move is a gain is accepted from any map: a replica applied its
+    ///   primary's completed gain and restarted before the coordinators sent the new map.
     pub(crate) fn reconcile(
         mut self,
         placement: &[u16],
@@ -274,7 +276,7 @@ impl SlotMoves {
                      ({FILE_NAME} file); start with the cluster_topology this node had"
                 ));
             }
-            if held && !mapped && !pushed {
+            if held && !mapped && !pushed && !self.arrived_from_log(slot) {
                 return Err(format!(
                     "cluster_topology gives slot {slot} to another group, but this node holds \
                      its data ({FILE_NAME} file); move ranges between groups with the \
@@ -514,6 +516,15 @@ impl SlotMoves {
         self.moves.iter().any(|entry| {
             (entry.from == REMOTE || entry.to == REMOTE) && entry.slots().contains(&slot)
         })
+    }
+
+    /// Whether the newest completed move covering `slot` is a range gained from another node.
+    fn arrived_from_log(&self, slot: u16) -> bool {
+        self.moves
+            .iter()
+            .rev()
+            .find(|entry| entry.completed() && entry.slots().contains(&slot))
+            .is_some_and(SlotMove::gained)
     }
 
     /// The newest gain when the map has not completed it: arriving, prepared or cancelled.
