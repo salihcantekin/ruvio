@@ -363,6 +363,15 @@ returns to the shard-thread sync. The old `experimental_sync_worker` /
 `CONFIG GET sync-worker` shows the mode and `CONFIG GET sync-worker-active`
 the resolved value.
 
+**When to use it.** With `always` durability and the worker off, every write batch runs
+`fdatasync` on the shard thread before the reply, so every client of that shard waits for the
+disk (about 1 to 2 ms on ext4 with preallocated segments, more on network disks). On Linux with
+`always` and one shard the default `auto` already turns the worker on. With several shards `auto`
+keeps it off, because the multi-shard case is not measured; if you run `always` on several
+shards, set `sync_worker = "on"` and compare the p99 write latency with and without it on your
+disk. Watch `wal_unsynced_bytes` in `INFO` (see `docs/OBSERVABILITY.md`): a value that keeps
+growing means the disk cannot keep up.
+
 Each shard has one long-lived sync worker, one active sync and one coalescing
 pending slot. The shard retains WAL encoding, append and mutation ownership;
 the worker uses a segment-scoped cloned file handle without taking the shard's
