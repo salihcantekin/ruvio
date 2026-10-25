@@ -680,6 +680,42 @@ default `IRuvioClient`; both share the same DI lifetime boundary.
 
 `FlushDatabaseAsync`, `FlushAllDatabasesAsync`, `SwapDatabasesAsync`, and `MoveKeyAsync` send `FLUSHDB`, `FLUSHALL`, `SWAPDB`, and `MOVE`. See `docs/LOGICAL_DATABASES.md`.
 
+## When Ruvio is unreachable
+
+The client throws when it cannot reach Ruvio (`SocketException`, `IOException`, `TimeoutException`, or a `RuvioException` with
+`IsServerReply == false`). Applications that sit on top of it, such as the .NET integrations (caching, rate limiting,
+idempotency, locks, output caching), often want to decide what to do instead of failing the request. The client ships the
+pieces for that:
+
+- `RuvioOutageMode` (`Throw`, `FailClosed`, `FailOpen`) and `RuvioOutageOptions`, the `Outage` option of each integration.
+  `RuvioOutageOptions.IsOutage(exception, token)` tells an outage (unreachable server, dropped connection, timeout,
+  open circuit, `LOADING`, `MASTERDOWN`, `CLUSTERDOWN`) from a server error reply like `WRONGTYPE`, which is never an outage.
+- `RuvioCircuitBreaker`: after `FailureThreshold` outage failures in a row it opens and `TryAcquire()` returns false for
+  `BreakDuration`; then one trial call goes through and its outcome closes or reopens the circuit. Healthy, it costs a volatile read.
+
+```csharp
+var outage = new RuvioOutageOptions(RuvioOutageMode.FailOpen)
+{
+    CircuitBreaker = new RuvioCircuitBreakerOptions { FailureThreshold = 5, BreakDuration = TimeSpan.FromSeconds(30) },
+};
+
+if (!outage.TryEnter())
+    return Fallback();                                   // the circuit is open: Ruvio is not called
+
+try
+{
+    var value = await client.GetAsync(key, token);
+    outage.Succeeded();
+    return value;
+}
+catch (Exception error) when (outage.Failed(error, token) && outage.Mode == RuvioOutageMode.FailOpen)
+{
+    return Fallback();                                   // Ruvio is away; other errors still propagate
+}
+```
+
+See [the integrations README](../../../integrations/dotnet/README.md#when-ruvio-is-unreachable) for what each package does.
+
 ## Options
 
 | Command | Methods |

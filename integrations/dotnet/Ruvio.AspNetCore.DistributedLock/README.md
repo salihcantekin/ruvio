@@ -93,6 +93,27 @@ Fixed names are tagged `resource`; templated names are not, to keep cardinality 
 builder.Services.AddOpenTelemetry().WithMetrics(m => m.AddMeter(RuvioLockTelemetry.Name));
 ```
 
+## When Ruvio is unreachable
+
+If the lock cannot be asked for, `Outage.Mode` decides. The default (`Throw`) keeps today's behavior: the `[RuvioLock]`
+middleware answers `503` and the request does not run, while `WithDistributedLock` endpoints let the storage exception
+reach your exception handling.
+
+```csharp
+builder.Services.AddRuvioDistributedLock(options =>
+{
+    options.Outage.Mode = RuvioOutageMode.FailClosed;   // 503 on both paths, Retry-After while a circuit is open
+    // options.Outage.Mode = RuvioOutageMode.FailOpen;  // run the request with no lock: not exclusive while Ruvio is away
+    options.Outage.CircuitBreaker = new RuvioCircuitBreakerOptions();   // optional
+});
+```
+
+In the middleware, `Throw` and `FailClosed` differ only in the `Retry-After` header, and any storage error (not only an
+outage) answers `503`, as before; `FailOpen` bypasses on real outages only. `IRuvioLock` calls made in code still throw.
+A lock lost while the request runs is still reported through `LockLost`.
+
+See [When Ruvio is unreachable](../README.md#when-ruvio-is-unreachable) for the modes and the circuit breaker.
+
 ## Limits
 
 - One lock lives on one server. If a failover loses the key, two owners can overlap for up to a

@@ -120,6 +120,27 @@ invalidations and bring back stale responses; this is not durable application
 state or an authorization boundary. Never enable caching of user-specific content
 without an appropriate trusted variation policy.
 
+## When Ruvio is unreachable
+
+ASP.NET Core's output-cache middleware already treats a store error on a read or a write as a miss and serves the
+endpoint's own response. What `Outage` adds:
+
+- `FailOpen` also drops `EvictByTagAsync` calls instead of throwing. An eviction that was dropped is not repeated, so the
+  entries it should have removed can be served again once Ruvio is back; use it only when stale pages are acceptable.
+  `Throw` (the default) and `FailClosed` raise from `EvictByTagAsync`.
+- A circuit breaker (`options.Outage.CircuitBreaker`) stops every request from waiting out a timeout on a Ruvio that is
+  down: an open circuit answers reads as misses at once and skips writes.
+
+```csharp
+builder.Services.AddRuvioOutputCache(options =>
+{
+    options.Outage.Mode = RuvioOutageMode.FailOpen;
+    options.Outage.CircuitBreaker = new RuvioCircuitBreakerOptions();
+});
+```
+
+See [When Ruvio is unreachable](../README.md#when-ruvio-is-unreachable) for the modes and the circuit breaker.
+
 ## Development
 
 ```bash

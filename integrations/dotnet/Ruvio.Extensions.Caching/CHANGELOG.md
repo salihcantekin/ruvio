@@ -4,6 +4,8 @@ Notable changes to the NuGet package `Ruvio.Extensions.Caching`. New entries go 
 
 ## Unreleased
 
+- `options.Outage`: `FailOpen` makes reads misses and drops writes and removals when Ruvio is unreachable (`GetOrCreate*` runs its factory without caching), and an optional circuit breaker stops calls to a Ruvio that is down. Default (`Throw`) unchanged. See the README.
+
 ## 0.1.2 - 2026-10-17
 
 - `IDistributedCache` helpers beyond `byte[]`: `GetOrCreateStringAsync`, `SetJsonAsync`/`GetJsonAsync`/`GetOrCreateJsonAsync` (and sync `SetJson`/`GetJson`) taking `JsonSerializerOptions` or a source-generated `JsonTypeInfo<T>`. On `RuvioDistributedCache` they write straight into the stored record and read straight from the reply, with no intermediate `byte[]`; the class also gets `GetStringAsync`/`SetStringAsync`/`GetJsonAsync`/`SetJsonAsync` instance methods.

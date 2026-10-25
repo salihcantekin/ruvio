@@ -159,6 +159,26 @@ envelope and the `SET` command; increasing provider limits does not raise
 server limits. Only a sliding renewal sends `EVAL`, and that script is one fixed
 text cached on the shard.
 
+## When Ruvio is unreachable
+
+By default a storage error reaches the caller (`Outage.Mode = Throw`). With `FailOpen` the cache steps aside:
+
+```csharp
+builder.Services.AddRuvioDistributedCache(options =>
+{
+    options.InstanceName = "orders";
+    options.Outage.Mode = RuvioOutageMode.FailOpen;
+    options.Outage.CircuitBreaker = new RuvioCircuitBreakerOptions();   // optional
+});
+```
+
+A read is a miss, a write and a removal are dropped (a dropped removal can leave a stale entry that is read again once Ruvio
+is back), and `GetOrCreate*` runs its factory without caching, exactly once. An exception thrown by your factory is never
+taken for an outage. `FailClosed` behaves as `Throw`: a cache has no response to refuse. Session state stored through the
+cache is lost for the requests made during an outage in `FailOpen`.
+
+See [When Ruvio is unreachable](../README.md#when-ruvio-is-unreachable) for the modes and the circuit breaker.
+
 ## Tests
 
 ```sh

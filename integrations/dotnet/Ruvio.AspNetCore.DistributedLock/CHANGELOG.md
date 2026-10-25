@@ -4,6 +4,8 @@ Notable changes to the NuGet package `Ruvio.AspNetCore.DistributedLock`. New ent
 
 ## Unreleased
 
+- `options.Outage`: choose what happens when Ruvio is unreachable (`Throw`, the default and unchanged: the `[RuvioLock]` middleware answers 503, `WithDistributedLock` raises; `FailClosed`, 503 on both; `FailOpen`, the request runs with no lock) and optionally stop calling Ruvio after repeated failures with a circuit breaker. See the README.
+
 ## 0.1.1 - 2026-10-16
 
 - Built against Ruvio.Client 0.3.3 (cheaper cluster routing, on-demand reply reading, opt-in `DedicatedReaderThread`). No change to this package's own API.

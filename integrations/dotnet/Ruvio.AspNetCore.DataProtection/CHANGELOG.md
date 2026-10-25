@@ -4,6 +4,8 @@ Notable changes to the NuGet package `Ruvio.AspNetCore.DataProtection`. New entr
 
 ## Unreleased
 
+- README: explains why the key ring has no outage mode (fail open or closed) like the other integrations.
+
 ## 0.1.2 - 2026-10-16
 
 - Built against Ruvio.Client 0.3.3 (cheaper cluster routing, on-demand reply reading, opt-in `DedicatedReaderThread`). No change to this package's own API.
