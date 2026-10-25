@@ -88,6 +88,15 @@ public sealed class RuvioClientOptions
     /// </summary>
     public System.Text.Json.JsonSerializerOptions? JsonSerializerOptions { get; set; }
 
+    /// <summary>
+    /// When set, every socket the client opens (reconnects, pooled, per-node, replica and Pub/Sub sockets included) is
+    /// wrapped in TLS, and the server certificate is verified; see <see cref="RuvioTlsOptions"/>. The TLS handshake is
+    /// part of the connect, so a refused certificate fails the connect with an
+    /// <see cref="System.Security.Authentication.AuthenticationException"/>. With TLS on, <see cref="DedicatedReaderThread"/>
+    /// has no effect (the sockets use async I/O). Null (the default) is plain TCP.
+    /// </summary>
+    public RuvioTlsOptions? Tls { get; set; }
+
     /// <summary>How long TCP connect may take.</summary>
     public TimeSpan ConnectTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
