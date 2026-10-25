@@ -1,6 +1,7 @@
 name: Nightly faults
 
-# Coordinator fault scenarios on real processes and real Docker network partitions.
+# Coordinator fault scenarios on real processes and real Docker network partitions, and the
+# RustSec advisory check.
 # Every night (GitHub runs schedules from the default branch only) and by manual dispatch;
 # the only automatic workflow besides the PR gate.
 # Secrets: none. On failure it opens one issue labelled nightly-failure, or comments on the
@@ -73,8 +74,18 @@ jobs:
           for _ in $(seq "$RUNS"); do list="$list leader lease-off lease-on"; done
           scripts/docker_partition.sh ./ruvio $list
 
+  # RustSec advisories change daily, so they are checked here and not on pull requests.
+  advisories:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check advisories
+
   report:
-    needs: [faults, docker]
+    needs: [faults, docker, advisories]
     if: failure() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
     permissions:
