@@ -96,6 +96,24 @@ pub(in crate::protocol) fn parse_client<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
         return parse_client_kill(args);
     }
 
+    if subcommand.eq_ignore_ascii_case(b"SETINFO") {
+        if rest != 2 {
+            return Err(ProtocolError::Invalid(
+                "wrong number of arguments for 'client|setinfo' command",
+            ));
+        }
+
+        let attribute = args.bytes(1);
+
+        if !attribute.eq_ignore_ascii_case(b"LIB-NAME")
+            && !attribute.eq_ignore_ascii_case(b"LIB-VER")
+        {
+            return Err(ProtocolError::Invalid("Unrecognized option"));
+        }
+
+        return Ok(Command::ClientSetInfo);
+    }
+
     if subcommand.eq_ignore_ascii_case(b"SETNAME") {
         if rest != 1 {
             return Err(ProtocolError::Invalid("CLIENT SETNAME expects a name"));

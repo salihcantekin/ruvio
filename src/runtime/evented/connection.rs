@@ -1490,6 +1490,7 @@ fn plain_command(command: &Command<'_>) -> bool {
                 | Command::Acl(_)
                 | Command::ClientGetName
                 | Command::ClientId
+                | Command::ClientSetInfo
                 | Command::ClientList { .. }
                 | Command::ClientInfo
                 | Command::ClientKill { .. }

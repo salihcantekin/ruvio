@@ -2242,6 +2242,7 @@ mod tests {
         "ChangesSubscribe",
         "ClientGetName",
         "ClientId",
+        "ClientSetInfo",
         "ClientInfo",
         "ClientKill",
         "ClientList",

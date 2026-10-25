@@ -73,7 +73,7 @@ full-text search; those are planned work, not part of this compatibility contrac
   `HELLO` accepts `AUTH username password` and `SETNAME` after the version.
   A bad version returns `NOPROTO` and changes nothing. A bad password leaves
   the previous protocol and name in place. `CLIENT GETNAME` and
-  `CLIENT SETNAME` are connection-local. `CLIENT TRACKING ON` requires RESP3
+  `CLIENT SETNAME` are connection-local. `CLIENT SETINFO LIB-NAME|LIB-VER value` answers `OK` and keeps nothing; it exists so client libraries that announce themselves at connect are not refused, and no first-party client sends it. `CLIENT TRACKING ON` requires RESP3
   and records `GET` and `MGET` on this shard, including misses. A completed
   write of a tracked key pushes one `invalidate` and forgets it. `OFF` clears
   that connection's keys. `REDIRECT`, `BCAST`, `PREFIX`, `OPTIN`, `OPTOUT`,

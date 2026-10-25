@@ -480,6 +480,8 @@ pub enum Command<'a> {
     },
     ClientGetName,
     ClientId,
+    /// `CLIENT SETINFO LIB-NAME|LIB-VER value`: accepted and answered `OK`; nothing is kept.
+    ClientSetInfo,
     /// `CLIENT LIST [ID id ...]`; empty `ids` lists every connection of the shard.
     ClientList {
         ids: Vec<u64>,
