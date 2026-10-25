@@ -14,7 +14,10 @@ vulnerability.
 - **bans** — no version wildcards; multiple versions of the same crate warn
 - **sources** — crates.io only; git and unknown registries are denied
 
-CI runs this when the workflow is started by hand. Locally:
+The PR gate runs `cargo deny check bans licenses sources` on every pull request, and the
+nightly workflow runs `cargo deny check advisories` (a new RustSec entry should not fail an
+unrelated pull request; a failing night opens the `nightly-failure` issue). The manual CI
+workflow runs the full check. Locally:
 
 ```bash
 cargo install cargo-deny --locked
@@ -54,6 +57,13 @@ python3 scripts/generate_sbom.py --output dist/sbom.cdx.json
 The generated bill of materials lists crate name, version, and purl for every
 package in the resolved graph, including optional Linux `io-uring` crates.
 Signed SLSA provenance is not wired yet; see `docs/RELEASE_EVIDENCE.md`.
+
+## Keeping dependencies and images current
+
+Dependabot opens weekly pull requests for GitHub Actions, the Docker base images (server and
+`ruvio-ui`, both pinned by digest), the Rust crates of the server, the Rust client and the UI, and
+the UI's npm packages. The Go, Java, Node, Python and C# clients have no runtime dependencies, so
+Dependabot does not watch them.
 
 ## Scanner image
 
