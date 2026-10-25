@@ -167,7 +167,7 @@ These classes of bugs were found by this testing and are fixed:
 | `a_kill_at_any_point_recovers_every_acknowledged_write_as_a_prefix` (`tests/process_live.rs`) | Kill at a random point recovers acknowledged writes as a prefix |
 | `tests/recovery_live.rs` | Restart and recovery of the real binary |
 | `tests/storage_properties.rs` and property tests in `src/` | Store operations match a reference map (proptest) |
-| `tests/concurrency_model.rs` | Cross-thread protocols under the loom model checker |
+| `tests/concurrency_model.rs` | A loom model of the shutdown and queue-admission counters (one test; not the shard code) |
 | `fuzz/` | Fuzzing of the RESP and JSON parsers (cargo-fuzz) |
 
 ## Known limits
