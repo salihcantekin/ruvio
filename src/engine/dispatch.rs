@@ -134,6 +134,7 @@ pub fn execute_in_database<'a, C: Clock, I: StorageIndex, S: MutationSink, W: Li
         Command::Hello { .. }
         | Command::ClientGetName
         | Command::ClientId
+        | Command::ClientSetInfo
         | Command::ClientList { .. }
         | Command::ClientInfo
         | Command::ClientKill { .. }

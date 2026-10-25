@@ -1413,6 +1413,7 @@ fn scriptable(command: &Command<'_>) -> bool {
                 | Command::FunctionList
                 | Command::FunctionDelete(_)
                 | Command::ClientId
+                | Command::ClientSetInfo
                 | Command::ClientInfo
                 | Command::ClientList { .. }
                 | Command::ClientKill { .. }

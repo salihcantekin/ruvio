@@ -53,6 +53,7 @@ impl<'a> Command<'a> {
             },
             Self::ClientGetName => Command::ClientGetName,
             Self::ClientId => Command::ClientId,
+            Self::ClientSetInfo => Command::ClientSetInfo,
             Self::ClientList { ids } => Command::ClientList { ids },
             Self::ClientInfo => Command::ClientInfo,
             Self::ClientKill {
@@ -1291,6 +1292,7 @@ pub(crate) fn command_mutates_store(command: &Command<'_>) -> bool {
             | Command::Exists(_)
             | Command::Keys(_)
             | Command::ClientId
+            | Command::ClientSetInfo
             | Command::ClientList { .. }
             | Command::ClientInfo
             | Command::Slowlog(_)

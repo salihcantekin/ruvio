@@ -2263,6 +2263,16 @@
       ]
     },
     {
+      "name": "CLIENT SETINFO",
+      "family": "connection",
+      "status": "supported",
+      "same_slot": false,
+      "limitations": "LIB-NAME and LIB-VER are accepted and answered OK; nothing is stored or shown in CLIENT LIST.",
+      "coverage": [
+        "src/runtime/session.rs"
+      ]
+    },
+    {
       "name": "CLIENT SETNAME",
       "family": "connection",
       "status": "supported",

@@ -1124,7 +1124,7 @@ pub fn command_acl_name(command: &Command<'_>) -> &'static str {
         Command::Keys(_) => "keys",
         Command::ClientList { .. } => "client|list",
         Command::ClientKill { .. } => "client|kill",
-        Command::ClientId | Command::ClientInfo => "client",
+        Command::ClientId | Command::ClientInfo | Command::ClientSetInfo => "client",
         Command::Slowlog(_) => "slowlog",
         Command::LatencyLatest => "latency",
         Command::Echo(_) => "echo",

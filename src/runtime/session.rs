@@ -212,6 +212,11 @@ fn admit<'a>(ctx: &mut SessionCtx<'_>, command: &Command<'a>) -> SessionAction<'
         return SessionAction::Reply(Response::Simple(b"OK"));
     }
 
+    // CLIENT SETINFO: library name and version are accepted and not kept.
+    if matches!(command, Command::ClientSetInfo) {
+        return SessionAction::Reply(Response::Simple(b"OK"));
+    }
+
     // CLIENT ID: the connection id, answered here because only the session knows it.
     if matches!(command, Command::ClientId) {
         return SessionAction::Reply(Response::Integer(ctx.tx.id as i64));

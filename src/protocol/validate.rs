@@ -77,6 +77,7 @@ pub(super) fn validate_command_payloads(
         | Command::DbSize
         | Command::RandomKey
         | Command::ClientId
+        | Command::ClientSetInfo
         | Command::ClientList { .. }
         | Command::ClientInfo
         | Command::Slowlog(_)
