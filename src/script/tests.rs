@@ -615,14 +615,18 @@ fn a_command_whose_reply_passes_the_memory_limit_is_not_kept() {
 }
 
 #[test]
-fn lua_global_is_named_ruvio() {
+fn lua_global_is_named_ruvio_with_a_redis_alias() {
     assert_eq!(
         eval_body(b"return type(ruvio.call)", ScriptLimits::default()),
         Response::Bulk(Some(Cow::Borrowed(b"function")))
     );
+    // `redis` exists only as an alias of the same table.
     assert_eq!(
-        eval_body(b"return type(redis)", ScriptLimits::default()),
-        Response::Bulk(Some(Cow::Borrowed(b"nil")))
+        eval_body(
+            b"return tostring(redis.call == ruvio.call)",
+            ScriptLimits::default()
+        ),
+        Response::Bulk(Some(Cow::Borrowed(b"true")))
     );
 }
 
