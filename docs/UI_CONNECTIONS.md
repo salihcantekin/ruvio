@@ -55,7 +55,7 @@ itself; `host.docker.internal` is the machine that runs Docker. Docker Desktop o
 Windows and macOS defines that name. On Linux add
 `--add-host=host.docker.internal:host-gateway` to the `docker run` command.
 
-The `RUVIO_UI_TARGET_*` variables only fill in the sign-in form. You can leave
+The `RUVIO_UI_TARGET_*` variables only fill in the sign-in form. The UI sends `RUVIO_UI_TARGET_PASSWORD` to Ruvio when you sign in to that host and port with an empty password field; it is never sent to the browser. Anyone who can open the UI port can sign in that way, so publish the port only to machines you trust (`-p 127.0.0.1:8080:8080`). You can leave
 them out and type the host, port and password on the sign-in screen. When
 `RUVIO_UI_TARGET_HOST` or `RUVIO_UI_TARGET_PORT` is set, it overrides the
 address the browser remembers from an earlier sign-in. If the form still shows
