@@ -15,6 +15,7 @@ import random
 from typing import Any, Awaitable, Dict, List, Optional, Tuple
 
 from .. import _cluster as cl
+from .._blocking import pipeline_wait
 from .._commands import Conv
 from .._pipeline import _EXEC, _MULTI
 from ..client import _Options, _ReplicaOptions
@@ -193,10 +194,13 @@ class ClusterRuvio(Ruvio):
         entry = (_Batch(fut, n), None, dec, None)
         proto.pending.extend([entry] * n)
         data = frames[0] if n == 1 else b"".join(frames)
+        wait = pipeline_wait(frames) if proto.timeout is not None else 0.0
         if idle:
+            if proto.timeout is not None:
+                proto.watch(wait)
             proto.transport.write(data)
         else:
-            proto.send(data)
+            proto.send(data, wait)
         return fut
 
     # ---------------------------------------------------------------- topology
@@ -991,7 +995,7 @@ class ClusterRuvio(Ruvio):
         Returns:
             A new :class:`ClusterRuvio`; close it with ``await worker.aclose()``.
         """
-        opts = {k: v for k, v in self._st.opts.as_dict().items() if k != "socket_timeout"}
+        opts = self._st.opts.as_dict()
         return ClusterRuvio(decode_responses=self._decode, cluster=True, **opts)
 
     async def pubsub(self, ignore_subscribe_messages: bool = False) -> "ClusterPubSub":  # type: ignore[override]
