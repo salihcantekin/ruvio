@@ -131,16 +131,21 @@ Settings merge in this order: built-in defaults, `ruvio.toml` (template: [`ruvio
 
 ## Built-in building blocks
 
-These commands run on the shard that owns the key. A key that never uses them stores nothing extra. `GET`, `SET`, and `INCR` do not consult them.
+These commands run on the shard that owns the key. [`examples/09_building_blocks_tour.py`](examples/09_building_blocks_tour.py) runs the main ones in a few seconds against a local server; the [use cases](https://ruviodb.com/use-cases/) page shows each job with all six clients. A key that never uses them stores nothing extra. `GET`, `SET`, and `INCR` do not consult them.
 
 | Command | What it replaces a second system for |
 | --- | --- |
 | `LEASE` / `RELEASE` | A fencing token for one key. The shard is the holder. Tokens only grow: after expiry, `RELEASE`, `DEL`, a restart, a failover or a slot move, the next grant is larger. The grant is a WAL record. `GET` of a lease is `WRONGTYPE`. |
 | `SEMAPHORE` / `RELEASE` | At most N holders at once, each with its own TTL. A crashed holder frees its slot when its TTL passes. The first holder stays in the object; each further holder is 16 bytes. The key goes away with the last one. |
+| `RENEW` | Extends a `LEASE` or `SEMAPHORE` holder by its token without releasing it, so a long job keeps its slot and its fencing token. |
 | `INCRBY ... MAX` | A counter that never passes a capacity. A refused call returns nil and changes nothing, so no compensating `DECR`. |
 | `SETV` | A conditional string write. The call succeeds only when the caller still has the current version, so two clients cannot both turn 12 into 11. The version exists only on keys written with `SETV`. |
 | `CHANGES` | `CHANGES START` arms an in-memory feed of later `SET`, `SETV`, `LEASE`, and `RELEASE` notes on that shard. Nothing is recorded before `START`. The feed is not the WAL, and it is empty after restart. |
 | `XADD DELAY` | The stream entry is stored now. `XREADGROUP` skips it until the delay passes. `XREAD` can still see it. The hold is a WAL record and a snapshot trailer, and it is written only when a delay is set. |
+| `SET ... IFEQ` / `IFGT` / `IFLT`, `DELEX ... IFEQ` | A compare-and-set, a watermark that only moves forward or a delete that checks the value, without a script. A refused call writes nothing. |
+| `ZPOPBYSCORE` / `ZMOVEDUE` | Take the due members of a sorted set, or move them to a list, in one command: the due-job queue without a scheduler. |
+| `LPUSHCAP` / `RPUSHCAP` | Push to a list and trim it to a length in one call: a capped recent-items list. |
+| `RUVIO HOTKEYS` / `RUVIO BIGKEYS` | Which keys take the traffic and which values are large, sampled; off unless `key_stats` is on. |
 | `LIMIT` | A fixed-window, sliding-window or token-bucket rate limit in one call, with fixed state per key. A refused call writes nothing. |
 | `IDEM` | Request de-duplication on the shard that owns the key: `BEGIN` tells a caller to run, wait or conflict, and a repeat of a finished request gets the saved result. |
 | `FILLGET` / `FILLSET` | One caller refills a missing or stale cache entry while the others get `BUSY` or the stale value. The markers live in memory only. |

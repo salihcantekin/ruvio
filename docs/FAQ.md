@@ -208,6 +208,36 @@ MGET {order:7}:items {order:7}:total
 EVAL "return ruvio.call('GET', KEYS[1])" 1 {order:7}:total
 ```
 
+## Building blocks instead of scripts
+
+### How do I take a lock, and what does the fencing token do?
+
+`LEASE key ttl_ms` returns a token if you now hold the key and a null reply if someone else does. The token only grows: after expiry, `RELEASE`, `DEL`, a restart, a failover or a slot move the next grant is larger, so a storage system can refuse a write that carries an older token. `RENEW key token ttl_ms` extends a held lease without giving it up. This is a single-key lock held by the shard that owns the key, not a multi-node Redlock; see [Data types](DATA_TYPES.md) and the [use case](https://ruviodb.com/use-cases/#locks).
+
+### Do I still need a Lua script for a rate limit, a counter with a cap or a conditional write?
+
+Usually not. `LIMIT` is a fixed, sliding or token-bucket limiter in one call, `INCRBY ... MAX` is a counter that never passes a capacity, `SET ... IFEQ|IFGT|IFLT` and `DELEX ... IFEQ` are conditional writes, and `TRANSFER` moves an amount between two integer strings. A refused call writes nothing. Scripts still work (`EVAL`, `FCALL`) when a job needs several steps.
+
+### What does `IDEM` give me, and what does it not?
+
+`IDEM key BEGIN fingerprint owner ttl_ms` tells a caller to run (`acquired`), wait (`pending`), stop (`conflict`) or replay the saved result (`completed`), and `COMPLETE` publishes that result. It deduplicates requests on the shard that owns the key. It does not make the side effects of your handler exactly-once: if the handler crashes after charging a card and before `COMPLETE`, the record stays pending until its TTL passes. Details and the wire contract are in [IDEM](IDEM.md).
+
+### How is `CHANGES SUBSCRIBE` different from keyspace notifications?
+
+Keyspace notifications ride Pub/Sub and are lost when nobody listens. `CHANGES SUBSCRIBE` reads the write-ahead log, so it needs a durability profile other than `memory`, gives every change a cursor (`generation:shard:seq`) and resumes from a saved cursor after a disconnect or restart, with `MATCH`, `TYPES` and `VALUES` filters. `CHANGES START` is the lighter in-memory feed that is empty after a restart. See the [change stream settings](CONFIGURATION.md#change-stream).
+
+### How do I run delayed jobs?
+
+`XADD stream DELAY ms * ...` stores the entry now and `XREADGROUP` skips it until the delay passes. For a plain schedule, keep due times as sorted-set scores and take them with `ZPOPBYSCORE` or `ZMOVEDUE` (which moves them to a list in the same call).
+
+### When should I stay on Redis?
+
+When you need Redis modules, full Sentinel behavior, or RDB/AOF file compatibility: Ruvio speaks RESP2 and supports a large part of the command set, but it is not a complete Redis (see the [compatibility notes](COMPATIBILITY.md)). Ruvio's own building blocks are not available on Redis, so code that uses them does not move back without changes.
+
+### Can I try these in a few minutes?
+
+Start a server (`deploy/local.sh up`, or `ruvio` with its defaults) and run `python3 examples/09_building_blocks_tour.py`. With `RUVIO_DURABILITY=everysec` and `RUVIO_DATA_DIR` set, the tour also reads its writes back through `CHANGES SUBSCRIBE`.
+
 ## Replicas and failover
 
 ### Can another machine hold a copy of the data?
