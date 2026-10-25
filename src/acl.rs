@@ -152,7 +152,7 @@ impl ConnectionAuth {
             .find_user(b"default")
             .unwrap_or_else(|| AclUser::default_user(&security.requirepass));
 
-        if default.enabled && !default.has_password() {
+        if default.enabled && default.nopass {
             Self {
                 authenticated: true,
                 username: default.name.into(),
@@ -330,10 +330,6 @@ impl AclUser {
 
         for candidate in &self.passwords {
             matched |= constant_time_eq(&digest, candidate);
-        }
-
-        if self.passwords.is_empty() {
-            matched |= constant_time_eq(password, b"");
         }
 
         matched
@@ -1630,6 +1626,32 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn user_without_password_hashes_matches_no_password() {
+        let user = AclUser::parse("worker", "on ~* +@all").unwrap();
+
+        assert!(!user.nopass);
+        assert!(!user.password_matches(b""));
+        assert!(!user.password_matches(b"anything"));
+        assert!(AclUser::parse("open", "on nopass ~* +@all")
+            .unwrap()
+            .password_matches(b""));
+    }
+
+    #[test]
+    fn resetpass_on_default_user_stops_auto_login() {
+        let security = SecurityConfig::default();
+        assert!(ConnectionAuth::from_security(&security).authenticated);
+
+        security
+            .directory()
+            .set_user(b"default", &[b"resetpass"])
+            .unwrap();
+
+        assert!(!ConnectionAuth::from_security(&security).authenticated);
+        assert!(security.authenticate(None, b"").is_err());
     }
 
     #[test]
