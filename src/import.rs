@@ -124,6 +124,23 @@ pub fn parse_endpoint(url: &str) -> Result<Endpoint, String> {
     })
 }
 
+/// The endpoint of `url`; a URL without a password takes it from the environment variable, so
+/// the password need not appear in the process list.
+fn endpoint_from_env(url: &str, variable: &str) -> Result<Endpoint, String> {
+    let mut endpoint = parse_endpoint(url)?;
+
+    if endpoint.password.as_deref().is_none_or(str::is_empty) {
+        endpoint.password = std::env::var(variable)
+            .ok()
+            .filter(|value| !value.is_empty());
+    } else {
+        eprintln!(
+            "warning: a password in the URL is visible in the process list; set {variable} instead"
+        );
+    }
+    Ok(endpoint)
+}
+
 impl Connection {
     fn open(endpoint: &Endpoint) -> Result<Self, String> {
         let stream = TcpStream::connect(&endpoint.address)
@@ -560,8 +577,14 @@ pub fn run(
     options: &ImportOptions,
     progress: &mut dyn FnMut(&ImportReport),
 ) -> Result<ImportReport, String> {
-    let mut source = Connection::open(&parse_endpoint(&options.from)?)?;
-    let mut target = Connection::open(&parse_endpoint(&options.to)?)?;
+    let mut source = Connection::open(&endpoint_from_env(
+        &options.from,
+        "RUVIO_IMPORT_SOURCE_PASSWORD",
+    )?)?;
+    let mut target = Connection::open(&endpoint_from_env(
+        &options.to,
+        "RUVIO_IMPORT_TARGET_PASSWORD",
+    )?)?;
     let batch = options.batch.max(1).to_string();
     let mut report = ImportReport {
         by_type: TYPES.map(|name| (name, 0)),
@@ -699,6 +722,26 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_password_missing_from_the_url_comes_from_the_variable() {
+        // Variable names unique to this test, so no other test reads or sets them.
+        let variable = "RUVIO_IMPORT_TEST_ONLY_PASSWORD";
+
+        assert!(
+            super::endpoint_from_env("redis://u:@h:1", variable)
+                .unwrap()
+                .password
+                .is_none()
+        );
+        assert_eq!(
+            super::endpoint_from_env("redis://u:pw@h:1", variable)
+                .unwrap()
+                .password
+                .as_deref(),
+            Some("pw")
+        );
+    }
+
     use super::*;
 
     #[test]
