@@ -5,11 +5,15 @@ import io.github.salihcantekin.ruvio.internal.Connection;
 
 import io.github.salihcantekin.ruvio.internal.Address;
 
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 import java.util.function.Consumer;
+
+import javax.net.ssl.SSLContext;
 
 /**
  * Connection settings. Immutable once built; create them with {@link #builder()} or {@link #of(String)}.
@@ -63,6 +67,10 @@ public final class RuvioOptions {
     public final boolean followPrimary;
     /** The master name asked of the coordinators in {@link #seeds}, or {@code null} (default) when the seeds are data nodes. */
     public final String sentinelMaster;
+    /** The TLS context every connection uses, or {@code null} (default) for plain TCP; see {@link Builder#tls(SSLContext)}. */
+    public final SSLContext sslContext;
+    /** The name the server certificate must carry when it differs from the host, or {@code null} to use the host. */
+    public final String tlsServerName;
 
     private RuvioOptions(Builder b) {
         this.host = b.host;
@@ -82,6 +90,8 @@ public final class RuvioOptions {
         this.readPolicy = b.readPolicy;
         this.followPrimary = b.followPrimary;
         this.sentinelMaster = b.sentinelMaster;
+        this.sslContext = b.sslContext;
+        this.tlsServerName = b.tlsServerName;
     }
 
     /**
@@ -180,6 +190,8 @@ public final class RuvioOptions {
         b.readPolicy = readPolicy;
         b.followPrimary = followPrimary;
         b.sentinelMaster = sentinelMaster;
+        b.sslContext = sslContext;
+        b.tlsServerName = tlsServerName;
         return b;
     }
 
@@ -206,6 +218,8 @@ public final class RuvioOptions {
         private ReadPolicy readPolicy = ReadPolicy.PRIMARY;
         private boolean followPrimary = true;
         private String sentinelMaster;
+        private SSLContext sslContext;
+        private String tlsServerName;
 
         /**
          * Sets the server host.
@@ -436,6 +450,58 @@ public final class RuvioOptions {
          */
         public Builder sentinelMaster(String masterName) {
             this.sentinelMaster = masterName;
+            return this;
+        }
+
+        /**
+         * Turns TLS on for every socket the client opens (first connect, reconnects, shards, replicas, Pub/Sub and
+         * failover probes), trusting the JVM's default certificates. The server certificate chain and host name are
+         * verified. Plain TCP is the default.
+         *
+         * @return this builder
+         * @throws RuvioException when the JVM has no default TLS context
+         */
+        public Builder tls() {
+            try {
+                return tls(SSLContext.getDefault());
+            } catch (NoSuchAlgorithmException e) {
+                throw new RuvioException("no default TLS context: " + e.getMessage(), e);
+            }
+        }
+
+        /**
+         * Turns TLS on with your own context, for a private CA or a client certificate (see
+         * {@link RuvioTls#context(java.nio.file.Path, java.nio.file.Path, java.nio.file.Path)}). The server certificate
+         * chain is checked by the context's trust managers and the host name is always checked. The handshake is part of
+         * the connect, so a refused certificate fails the connect.
+         *
+         * @param context the TLS context
+         * @return this builder
+         */
+        public Builder tls(SSLContext context) {
+            this.sslContext = Objects.requireNonNull(context, "context");
+            return this;
+        }
+
+        /**
+         * Turns TLS on and accepts any server certificate without checking it or the host name. This removes the
+         * protection TLS gives against someone in the middle: use it for a throwaway test, never in production.
+         *
+         * @return this builder
+         */
+        public Builder tlsInsecure() {
+            return tls(RuvioTls.insecureContext());
+        }
+
+        /**
+         * The name the server certificate must carry, when it differs from the host you connect to (for example a
+         * connection by IP address to a certificate issued for a DNS name). Used only with TLS; default the host.
+         *
+         * @param name the certificate name
+         * @return this builder
+         */
+        public Builder tlsServerName(String name) {
+            this.tlsServerName = name;
             return this;
         }
 

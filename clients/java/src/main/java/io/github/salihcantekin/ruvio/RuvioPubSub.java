@@ -98,7 +98,7 @@ public final class RuvioPubSub implements AutoCloseable {
             Address a = addresses[index];
             SubConnection c;
             try {
-                c = new SubConnection(this, a.host, a.port, options.connectTimeoutMillis);
+                c = new SubConnection(this, a.host, a.port, options);
             } catch (IOException e) {
                 last = new RuvioConnectionException("cannot connect to " + a + ": " + e.getMessage(), e);
                 continue;
@@ -484,8 +484,8 @@ public final class RuvioPubSub implements AutoCloseable {
     static final class SubConnection extends Connection {
         private final RuvioPubSub owner;
 
-        SubConnection(RuvioPubSub owner, String host, int port, int connectTimeoutMillis) throws IOException {
-            super(host, port, connectTimeoutMillis, 1024, "ruvio-pubsub");
+        SubConnection(RuvioPubSub owner, String host, int port, RuvioOptions options) throws IOException {
+            super(host, port, options.connectTimeoutMillis, 1024, "ruvio-pubsub", options.sslContext, options.tlsServerName);
             this.owner = owner;
         }
 
