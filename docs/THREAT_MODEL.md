@@ -122,6 +122,11 @@ Default ACL until `requirepass` or a `default` user with a password is
 misconfiguration; protected mode rejects non-loopback peers when no password
 is set.
 
+Key patterns (`~tenant:*`) scope commands that name their keys. Commands that list or
+wipe the keyspace (`KEYS`, `SCAN`, `RANDOMKEY`, `FLUSHDB`, `FLUSHALL`, `SWAPDB`) need `allkeys`;
+a pattern-limited user gets `NOPERM`. Pub/Sub channels are not scoped by key patterns, so do
+not give `+@all` to a tenant that must not see other tenants' messages.
+
 `CONFIG GET` still returns filesystem paths (`data-dir`, `tls-cert`,
 `tls-key`). Restrict `@admin` for tenants that must not see host layout.
 

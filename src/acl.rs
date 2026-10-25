@@ -995,10 +995,17 @@ fn commands_in_category(category: &str) -> Vec<&'static str> {
         .collect()
 }
 
-/// Key names a key-restricted user must not see: the change feed, the key statistics and the
-/// keyspace notification channels report keys of every pattern.
+/// Key names a key-restricted user must not see, and keyspace-wide writes it must not make: the
+/// listing commands, the change feed, the key statistics and the keyspace notification channels
+/// report keys of every pattern, and `FLUSH*` and `SWAPDB` touch all of them. These need `allkeys`.
 fn exposes_any_key_name(command: &Command<'_>) -> bool {
     match command {
+        Command::Keys(_)
+        | Command::Scan { .. }
+        | Command::RandomKey
+        | Command::FlushDb
+        | Command::FlushAll
+        | Command::SwapDb(_, _) => true,
         Command::Changes(_) | Command::ChangesSubscribe(_) => true,
         Command::Ruvio(Some(word)) => {
             word.eq_ignore_ascii_case(b"hotkeys") || word.eq_ignore_ascii_case(b"bigkeys")
@@ -1562,6 +1569,18 @@ mod tests {
         let everyone = AclUser::parse("ops", "on >pw ~* +@all").unwrap();
         let refused = [
             Command::Changes(Some(0)),
+            Command::Keys(Cow::Borrowed(b"*")),
+            Command::Scan {
+                cursor: 0,
+                pattern: None,
+                count: 10,
+                type_name: None,
+                slot: None,
+            },
+            Command::RandomKey,
+            Command::FlushDb,
+            Command::FlushAll,
+            Command::SwapDb(0, 1),
             Command::Ruvio(Some(Cow::Borrowed(b"hotkeys"))),
             Command::Ruvio(Some(Cow::Borrowed(b"BIGKEYS"))),
             Command::Subscribe(vec![Cow::Borrowed(b"__keyspace@0__:secret")]),
