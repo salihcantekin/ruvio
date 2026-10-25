@@ -41,10 +41,12 @@ enum Command {
     },
     /// Copy keys from a running Redis or Ruvio into another server with ordinary commands.
     Import {
-        /// Source, for example redis://user:password@host:6379/0.
+        /// Source, for example redis://user:@host:6379/0. The password comes from
+        /// RUVIO_IMPORT_SOURCE_PASSWORD (a password in the URL shows in the process list).
         #[arg(long)]
         from: String,
-        /// Target, for example ruvio://host:6379/0.
+        /// Target, for example ruvio://host:6379/0. The password comes from
+        /// RUVIO_IMPORT_TARGET_PASSWORD.
         #[arg(long)]
         to: String,
         /// Only keys matching this glob.
