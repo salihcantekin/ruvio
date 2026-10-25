@@ -615,14 +615,18 @@ fn a_command_whose_reply_passes_the_memory_limit_is_not_kept() {
 }
 
 #[test]
-fn lua_global_is_named_ruvio() {
+fn lua_global_is_named_ruvio_with_a_redis_alias() {
     assert_eq!(
         eval_body(b"return type(ruvio.call)", ScriptLimits::default()),
         Response::Bulk(Some(Cow::Borrowed(b"function")))
     );
+    // `redis` exists only as an alias of the same table.
     assert_eq!(
-        eval_body(b"return type(redis)", ScriptLimits::default()),
-        Response::Bulk(Some(Cow::Borrowed(b"nil")))
+        eval_body(
+            b"return tostring(redis.call == ruvio.call)",
+            ScriptLimits::default()
+        ),
+        Response::Bulk(Some(Cow::Borrowed(b"true")))
     );
 }
 
@@ -1271,6 +1275,29 @@ fn eval_body(body: &[u8], limits: ScriptLimits) -> Response<'static> {
         0,
     )
     .unwrap()
+}
+
+#[test]
+fn redis_is_an_alias_of_the_ruvio_table_and_is_read_only() {
+    let run = |body: &[u8]| eval_body(body, ScriptLimits::default());
+
+    assert_eq!(
+        run(b"redis.call('SET', KEYS[1], 'v') return redis.call('GET', KEYS[1])"),
+        Response::Bulk(Some(std::borrow::Cow::Borrowed(b"v"))),
+    );
+    assert_eq!(
+        run(b"local r = redis.pcall('NOPE') return r.err ~= nil and 1 or 0"),
+        Response::Integer(1)
+    );
+    assert_eq!(
+        run(b"return redis.status_reply('PONG')"),
+        run(b"return ruvio.status_reply('PONG')")
+    );
+    // Like `ruvio`, the table cannot be changed by a script.
+    assert!(matches!(
+        run(b"redis.call = function() end"),
+        Response::OwnedError(_) | Response::Error(_)
+    ));
 }
 
 #[test]
