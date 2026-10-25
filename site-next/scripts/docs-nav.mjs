@@ -96,6 +96,7 @@ export const GROUPS = [
       { src: "docs/COORDINATOR.md", label: "Automatic failover" },
       { src: "docs/RESILIENCE.md", label: "Resilience tests" },
       { src: "docs/OBSERVABILITY.md", label: "Observability" },
+      { src: "docs/LIMITS.md", label: "Limits" },
       { src: "docs/THREAT_MODEL.md", label: "Threat model" },
       { src: "docs/SUPPLY_CHAIN.md", label: "Supply chain" },
     ],

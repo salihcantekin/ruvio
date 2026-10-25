@@ -1030,6 +1030,8 @@ fn seal_globals(lua: &Lua, commands: Table) -> LuaResult<Table> {
     };
     let globals = lua.globals();
 
+    // `redis` is the same table under the name scripts written for Redis use.
+    globals.raw_set("redis", &commands)?;
     globals.raw_set("ruvio", commands)?;
     let libraries: Vec<(Value, Table)> = globals
         .pairs::<Value, Value>()

@@ -1,10 +1,33 @@
 # Memory Accounting
 
-Ruvio maintains deterministic memory charges inside each shard. The charge
-model is intended for future admission control, `maxmemory`, and eviction. It
-is not an RSS estimator: allocator metadata, page fragmentation, runtime
-buffers, and platform-specific collection internals can make process RSS
-different.
+Ruvio maintains deterministic memory charges inside each shard. The charges
+drive admission control, `maxmemory` and eviction. They are not an RSS
+estimator: allocator metadata, page fragmentation, runtime buffers, and
+platform-specific collection internals can make process RSS different.
+
+## What `maxmemory` means
+
+`maxmemory` (`memory.max_process_bytes`) is a budget for the **data the shards
+hold**, not a cap on the process. Ruvio divides it evenly across the shards
+(`max_shard_bytes` sets one shard's budget directly). A write that would push a
+shard past its share is refused with `OOM` (policy `noeviction`) or makes room
+by evicting keys (any other `maxmemory-policy`).
+
+What counts against the budget (`charged_memory_bytes` in `INFO`): keys, values,
+collection storage, the key index, the pooled value buffers and, while a
+checkpoint runs, the snapshot journal.
+
+What does **not** count: client connection buffers, unsent replies, Pub/Sub
+queues, client-tracking tables, the Lua heap, WAL bytes not yet synced
+(`wal_unsynced_bytes`), allocator overhead and the process's own baseline. The
+process can therefore use more memory than `maxmemory`. Leave room: set
+`maxmemory` well below the memory the container or host gives Ruvio (a common
+starting point is 60 to 70 percent), then under real load compare the
+process memory your platform reports (RSS, or the container's usage) with
+`charged_memory_bytes`. The server does not read cgroup limits. Buffers are
+bounded separately: unsent replies by `max_output_buffer_bytes` per connection
+and the number of connections by `max_global` and `max_per_ip`; see
+`docs/CONFIGURATION.md`.
 
 ## Categories
 
@@ -49,15 +72,17 @@ This is intentional: both states consume the shard's memory budget.
 ## Expiration
 
 Passive expiration makes a key logically absent, but its allocation remains
-charged until a mutation or the future active-expiration scheduler physically
-removes it. This prevents memory limits from ignoring expired-but-retained
+charged until a mutation or active expiration (see below) physically removes
+it. This prevents memory limits from ignoring expired-but-retained
 allocations.
 
 ## Limits
 
 Configured `max_shard_bytes` minus `reserved_headroom_bytes` is the admission
-budget. Connection, output, WAL dirty, and snapshot journal bytes are included
-in `charged_bytes`. The default policy is `noeviction`: writes that would
+budget. The snapshot journal is included in `charged_bytes`. The connection and
+output fields of the charge exist but are not filled in by the running server
+(they stay zero), and WAL dirty bytes are reported, not charged (see *What
+`maxmemory` means*). The default policy is `noeviction`: writes that would
 exceed the budget return `OOM command not allowed when used memory > 'maxmemory'.`
 and do not record a mutation.
 
@@ -76,8 +101,12 @@ can stay at or above the limit until then.
 
 `maxmemory-policy` may be `allkeys-lru`, `allkeys-lfu`, `volatile-lru`, or
 `volatile-ttl`. Eviction is shard-local. The default examines 16 candidates
-(`maxmemory-samples`) and deletes at most 16 keys per command. Active expiry
-reaps `active-expire-keys` (default 16) per command or idle tick. After a
+(`maxmemory-samples`) per decision. A write that needs room evicts for up to
+2 ms. With an all-keys policy (`allkeys-lru`, `allkeys-lfu`), if the time runs out
+while the shard is at most a quarter of its limit over, the write is admitted
+anyway and the remaining debt is paid off by maintenance between requests; past
+that quarter, or with a `volatile-*` policy, the write is refused with `OOM`.
+Active expiry reaps `active-expire-keys` (default 16) per command or idle tick. After a
 delete or a much smaller overwrite, the key index, set, hash, sorted-set
 member map, list ring, compact hash vector, and string buffer shrink once
 they are under a quarter full. The hot-key map uses the same rule. Victims are persisted as WAL `Delete` records. Evicted byte values are
@@ -98,6 +127,7 @@ and a policy change resets every key's access bits once per shard.
 ## Active Expiration
 
 A bounded active-expiration cycle removes a small number of already-due keys
-on each command and on the WAL sync interval. Passive expiration still treats
+before each command (`active_expire_keys`) and on the maintenance tick
+(`active_expire_maintenance_keys`). Passive expiration still treats
 due keys as absent on lookup. Physical charges remain until the entry is
 removed.

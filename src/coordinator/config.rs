@@ -123,6 +123,10 @@ struct FileConfig {
     /// read the topology and take part in the coordinators' votes.
     #[serde(default)]
     secret: Option<String>,
+    /// Start without a `secret` on a `listen` address that is not loopback. Only for a test or a
+    /// network where nobody else can reach the port.
+    #[serde(default)]
+    insecure_no_secret: bool,
     /// TLS on the coordinator port (Raft and the Sentinel API), and on the calls to the other
     /// coordinators, which must all have it. The pair is also the client certificate shown
     /// to data nodes that ask for one.
@@ -349,6 +353,19 @@ impl CoordinatorConfig {
             )?;
         }
 
+        let secret = std::env::var("RUVIO_COORDINATOR_SECRET")
+            .ok()
+            .or(file.secret)
+            .filter(|secret| !secret.is_empty());
+
+        if secret.is_none() && !file.listen.ip().is_loopback() && !file.insecure_no_secret {
+            return Err(format!(
+                "coordinator listens on {} without a secret: set `secret` (or RUVIO_COORDINATOR_SECRET), \
+                 listen on a loopback address, or set insecure_no_secret = true",
+                file.listen
+            ));
+        }
+
         Ok(Self {
             id: file.id,
             listen: file.listen,
@@ -359,10 +376,7 @@ impl CoordinatorConfig {
             unclean_failover: file.unclean_failover,
             primary_lease,
             auth: file.auth.filter(|auth| !auth.is_empty()),
-            secret: std::env::var("RUVIO_COORDINATOR_SECRET")
-                .ok()
-                .or(file.secret)
-                .filter(|secret| !secret.is_empty()),
+            secret,
             tls: TlsSettings::parse(file.tls_cert, file.tls_key, file.tls_ca, file.node_tls)?,
             groups: file.groups,
             join: file.join,
@@ -579,6 +593,21 @@ members = [
     }
 
     #[test]
+    fn a_public_listener_needs_a_secret_unless_opted_out() {
+        let public = SAMPLE.replace("127.0.0.1:26401", "0.0.0.0:26401");
+
+        // Same variable the config reads; skip when the environment sets one.
+        if std::env::var_os("RUVIO_COORDINATOR_SECRET").is_some() {
+            return;
+        }
+        assert!(CoordinatorConfig::parse(&public).is_err());
+        assert!(CoordinatorConfig::parse(&format!("secret = \"s\"\n{public}")).is_ok());
+        assert!(CoordinatorConfig::parse(&format!("insecure_no_secret = true\n{public}")).is_ok());
+        // Loopback needs none.
+        assert!(CoordinatorConfig::parse(SAMPLE).is_ok());
+    }
+
+    #[test]
     fn the_binary_install_example_parses() {
         let config =
             CoordinatorConfig::parse(include_str!("../../deploy/coordinator.toml")).unwrap();
@@ -605,7 +634,9 @@ members = [
                 include_str!("../../deploy/coordinator/coordinator-3.toml"),
             ),
         ] {
-            let config = CoordinatorConfig::parse(text).unwrap();
+            // The compose file supplies the secret through RUVIO_COORDINATOR_SECRET.
+            let text = text.replace("secret = \"\"", "secret = \"from-the-environment\"");
+            let config = CoordinatorConfig::parse(&text).unwrap();
 
             assert_eq!(config.id, id);
             assert_eq!(config.groups[0].members[0].address.host, "ruvio-1");
