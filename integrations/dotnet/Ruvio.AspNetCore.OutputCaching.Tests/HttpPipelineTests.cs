@@ -82,7 +82,7 @@ public class HttpPipelineTests
             .CacheOutput(policy => policy.Expire(TimeSpan.FromSeconds(10)).Tag("catalog"));
         app.MapGet("/cookies", (HttpContext context) =>
         {
-            context.Response.Cookies.Append("private", "value");
+            context.Response.Cookies.Append("private", "value", new CookieOptions { Secure = true });
 
             return identity + "-" + Interlocked.Increment(ref calls);
         }).CacheOutput();

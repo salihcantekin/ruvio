@@ -391,6 +391,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: false
           workspaces: clients/ruvio-client
       - name: Stamp the preview version
         if: needs.versions.outputs.preview == 'true'
@@ -442,6 +443,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: false
           key: cluster-server
       - run: cargo build --locked --bin ruvio
       - uses: actions/upload-artifact@v6
@@ -597,6 +599,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: false
           key: server-binaries-${{ matrix.platform }}
       - name: Stamp the preview version
         if: needs.versions.outputs.preview == 'true'
@@ -678,6 +681,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: false
           workspaces: clients/ruvio-ui
       - name: Build the screens
         working-directory: clients/ruvio-ui/web

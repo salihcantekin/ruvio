@@ -145,8 +145,13 @@ function convertAlerts(text) {
 
 /** Plain text of a markdown or HTML snippet, for titles and descriptions. */
 function plain(s) {
+  // Strip tags until stable so nested input like "<scr<b>ipt>" cannot reassemble a tag.
+  let previous;
+  do {
+    previous = s;
+    s = s.replace(/<[^>]*>/g, "");
+  } while (s !== previous);
   return s
-    .replace(/<[^>]+>/g, "")
     .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
     .replace(/`([^`]*)`/g, "$1")
@@ -323,7 +328,7 @@ const matrix = JSON.parse(readFileSync(path.join(REPO_ROOT, "docs/compatibility-
   // Same rule as the heading ids Starlight generates (github-slugger).
   const anchor = (s) => s.toLowerCase().replace(/[^\p{L}\p{N}\s-]/gu, "").replace(/\s/g, "-");
   const nameOf = (f) => familyNames[f] ?? f.charAt(0).toUpperCase() + f.slice(1);
-  const cell = (s) => escapeStrayTags(String(s ?? "")).replace(/\|/g, "\\|").replace(/\s*\n\s*/g, " ");
+  const cell = (s) => escapeStrayTags(String(s ?? "")).replace(/[\\|]/g, "\\$&").replace(/\s*\n\s*/g, " ");
 
   const byFamily = new Map();
   for (const c of matrix.commands) {

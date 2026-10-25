@@ -9,7 +9,7 @@ import os, signal, socket, subprocess, sys, tempfile, time
 
 BIN = os.path.abspath(sys.argv[1]); MODE = sys.argv[2] if len(sys.argv) > 2 else "on"; SIZE = int(sys.argv[3]) if len(sys.argv) > 3 else 48
 PORT = 6851
-img = tempfile.mktemp(suffix=".img", dir="/var/tmp"); mnt = tempfile.mkdtemp(prefix="enospc-", dir="/mnt" if os.path.isdir("/mnt") else "/tmp")
+img_fd, img = tempfile.mkstemp(suffix=".img", dir="/var/tmp"); os.close(img_fd); mnt = tempfile.mkdtemp(prefix="enospc-", dir="/mnt" if os.path.isdir("/mnt") else "/tmp")
 
 
 def sh(*a, **k):

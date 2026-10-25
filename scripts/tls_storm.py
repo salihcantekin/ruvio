@@ -4,7 +4,7 @@ Usage: tls_storm.py <ruvio-binary> <cert.pem> <key.pem> [seconds]. One shard; pr
 import multiprocessing, os, socket, ssl, statistics, subprocess, sys, tempfile, time
 BIN, CERT, KEY = [os.path.abspath(a) for a in sys.argv[1:4]]; SECS = float(sys.argv[4]) if len(sys.argv) > 4 else 5
 PORT = 6741
-ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.minimum_version = ssl.TLSVersion.TLSv1_2; ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
 d = tempfile.mkdtemp()
 env = dict(os.environ, RUVIO_ADDR=f"127.0.0.1:{PORT}", RUVIO_SHARDS="1", RUVIO_TLS_CERT=CERT, RUVIO_TLS_KEY=KEY, RUVIO_DATA_DIR=d + "/data")
 p = subprocess.Popen([BIN], env=env, cwd=d, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

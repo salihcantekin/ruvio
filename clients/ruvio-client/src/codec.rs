@@ -129,7 +129,7 @@ fn read_array(reader: &mut impl BufRead) -> Result<RespValue, Error> {
         return Err(Error::Protocol("array length is out of range".to_owned()));
     }
 
-    let mut items = Vec::with_capacity(length as usize);
+    let mut items = Vec::with_capacity((length as usize).min(1024));
 
     for _ in 0..length {
         items.push(read_value(reader)?);
