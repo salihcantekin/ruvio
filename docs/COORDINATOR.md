@@ -391,9 +391,11 @@ primary under three coordinators, and the first write through the coordinators l
 ## Security
 
 The coordinator port carries the Raft traffic and the Sentinel API. With `secret` set, a coordinator
-refuses calls from coordinators that do not send it, and clients must `AUTH` with it. Without `secret`
-anyone who reaches the port can read the topology and send votes: always set it, and keep the port on a
-private network. Without TLS the secret travels in clear text.
+refuses calls from coordinators that do not send it, and clients must `AUTH` with it. A coordinator
+whose `listen` address is not loopback refuses to start without `secret` (or `RUVIO_COORDINATOR_SECRET`);
+`insecure_no_secret = true` starts it anyway, for a test or a network nobody else can reach. Without
+`secret` anyone who reaches the port can read the topology and send votes: always set it, and keep the
+port on a private network. Without TLS the secret travels in clear text.
 
 TLS is off by default; with everything off nothing changes. Three settings turn it on:
 

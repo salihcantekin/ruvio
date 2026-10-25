@@ -36,6 +36,7 @@ coord_toml() { # file id ping down extra-line member-prefix
   cat > "$1" <<EOF
 id = $2
 listen = "0.0.0.0:26400"
+insecure_no_secret = true
 data_dir = "/data/coordinator"
 peers = ["1@r1:26400", "2@r2:26400", "3@r3:26400"]
 ping_interval_ms = $3
