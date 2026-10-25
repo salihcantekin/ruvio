@@ -244,7 +244,6 @@ pub(super) fn set_range<'a, C: Clock, I: StorageIndex, S: MutationSink>(
     Ok(Response::Integer(length as i64))
 }
 
-
 pub(super) fn transfer<'a, C: Clock, I: StorageIndex, S: MutationSink>(
     shard: &'a mut KvShard<C, I>,
     sink: &mut S,
