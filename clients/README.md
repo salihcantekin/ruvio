@@ -55,8 +55,9 @@ Plain TCP is the default everywhere. TLS is always an explicit choice, and once 
 | --- | --- | --- | --- |
 | Rust | cargo feature `tls`, then `ClientOptions::tls = Some(TlsOptions::default())` | `TlsOptions::ca_pem`, `client_cert_pem`, `client_key_pem` | `TlsOptions::insecure_skip_verify` |
 | Node.js | `tls: true`, `rediss://` or `ruvios://` | see the Node.js README | see the Node.js README |
+| Python | `tls=True` or a `ruvios://` URL | `tls_ca_file`, `tls_cert_file`, `tls_key_file`, or an `ssl.SSLContext` | `tls_insecure_skip_verify=True` |
 | Java | `RuvioOptions.builder().tls()` | `RuvioTls.context(caPem, clientCertPem, clientKeyPem)` or your own `SSLContext` | `tlsInsecure()` |
-| C#, Go, Python | not yet | not yet | not yet |
+| C#, Go | not yet | not yet | not yet |
 
 The Rust `tls` feature pulls in `rustls` (with the `ring` provider) and `webpki-roots`; the default build of `ruvio-client` still has no dependencies. Without a private CA the built-in public roots are used; with `ca_pem` set only that CA is trusted. `ruvio-ui` is built with the feature (`RUVIO_UI_TLS`, see `docs/UI_CONNECTIONS.md`). A connect to a server whose certificate fails the check returns `Error::Io`; asking for TLS in a build without the feature returns `Error::Protocol`. Measured: the TLS tests in `clients/ruvio-client/tests/tls_live.rs` against live servers; the latency TLS adds: not measured.
 

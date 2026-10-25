@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import socket
+import ssl
 import time
 import uuid
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
@@ -34,6 +35,7 @@ from ._follow import MASTER, ROUNDS, WAITS, Address, parse_master_addr, parse_ro
 from ._models import Message
 from ._pipeline import PipelineBase
 from ._resp import NEED, Push, encode, make_parser
+from ._tls import make_context
 from .errors import ConnectionError, LockError, NoScriptError, ProtocolError, ResponseError, RuvioError, TimeoutError
 
 __all__ = ["Ruvio", "Pipeline", "PubSub", "Lock", "parse_url"]
@@ -43,14 +45,15 @@ def parse_url(url: str) -> Dict[str, Any]:
     """Turns a connection URL into keyword arguments for :class:`Ruvio`.
 
     Accepted forms: ``ruvio://[user:pass@]host[:port][/db]`` (``redis://`` and ``tcp://`` are the
-    same), and ``unix:///path/to/socket``. The port defaults to 6379, the database to 0. User and
-    password are percent-decoded. TLS URLs (``rediss://``) are not supported.
+    same), ``ruvios://`` (``rediss://`` is the same; TLS with the certificate and host name checked), and
+    ``unix:///path/to/socket``. The port defaults to 6379, the database to 0. User and password are
+    percent-decoded.
 
     Args:
         url: The URL.
 
     Returns:
-        A dict with some of ``host``, ``port``, ``db``, ``username``, ``password`` and
+        A dict with some of ``host``, ``port``, ``db``, ``username``, ``password``, ``tls`` and
         ``unix_socket_path``.
 
     Raises:
@@ -65,8 +68,10 @@ def parse_url(url: str) -> Dict[str, Any]:
     if u.scheme == "unix":
         opts["unix_socket_path"] = u.path
     else:
-        if u.scheme not in ("ruvio", "redis", "tcp"):
+        if u.scheme not in ("ruvio", "redis", "tcp", "ruvios", "rediss"):
             raise ValueError(f"unsupported URL scheme {u.scheme!r}")
+        if u.scheme in ("ruvios", "rediss"):
+            opts["tls"] = True
         opts["host"] = u.hostname or "127.0.0.1"
         opts["port"] = u.port or 6379
         path = u.path.lstrip("/")
@@ -137,6 +142,8 @@ class _Options:
         "read_policy",
         "follow_primary",
         "sentinel_master",
+        "tls_context",
+        "tls_server_name",
     )
 
     def __init__(self, **kw: Any) -> None:
@@ -165,6 +172,12 @@ class _Options:
 
     def as_dict(self) -> Dict[str, Any]:
         return {n: getattr(self, n) for n in _Options.__slots__}
+
+    def for_constructor(self) -> Dict[str, Any]:
+        """The options as the arguments of a new ``Ruvio`` (the TLS context goes in as ``tls``)."""
+        d = self.as_dict()
+        d["tls"] = d.pop("tls_context") or False
+        return d
 
     def stop_following(self) -> None:
         """A cluster node keeps its own address: it never looks for a primary."""
@@ -223,6 +236,13 @@ class _Conn:
             else:
                 sock = socket.create_connection((host, port), timeout=o.connect_timeout)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                if o.tls_context is not None:
+                    # The handshake is bounded by the connect timeout the socket still has.
+                    try:
+                        sock = o.tls_context.wrap_socket(sock, server_hostname=o.tls_server_name or host)
+                    except BaseException:
+                        sock.close()
+                        raise
             sock.settimeout(o.socket_timeout)
         except socket.timeout as exc:
             raise TimeoutError(f"connect to {host}:{port} timed out") from exc
@@ -559,6 +579,12 @@ class Ruvio(Commands):
         read_policy: Union[None, str, ReadPolicy] = None,
         follow_primary: bool = True,
         sentinel_master: Optional[str] = None,
+        tls: Union[bool, ssl.SSLContext] = False,
+        tls_ca_file: Optional[str] = None,
+        tls_cert_file: Optional[str] = None,
+        tls_key_file: Optional[str] = None,
+        tls_server_name: Optional[str] = None,
+        tls_insecure_skip_verify: bool = False,
     ) -> None:
         """Creates the client. See the class docstring for the meaning of every argument.
 
@@ -585,6 +611,13 @@ class Ruvio(Commands):
             read_policy: ``"primary"`` (default), ``"prefer-replica"`` or ``"replica"``; cluster clients only.
             follow_primary: Find the primary again after a failover (default ``True``).
             sentinel_master: Master name to ask coordinators for; see the class docstring.
+            tls: ``True`` wraps every socket in TLS, checking the certificate chain and host name against the
+                system roots; pass an ``ssl.SSLContext`` to use your own. Default ``False``: plain TCP.
+            tls_ca_file: PEM file of the CA to trust instead of the system roots (needs ``tls=True``).
+            tls_cert_file: PEM client certificate for a server that demands one (needs ``tls=True``).
+            tls_key_file: PEM private key of ``tls_cert_file``; may be left out when the key is in the certificate file.
+            tls_server_name: The name the certificate carries, when it differs from the host.
+            tls_insecure_skip_verify: Accept any certificate and skip the host name check (throwaway tests only).
 
         Raises:
             ValueError: A seed has an empty host or a port outside 1-65535, ``read_policy`` is unknown, or
@@ -597,6 +630,7 @@ class Ruvio(Commands):
             if unix_socket_path:
                 raise ValueError("seeds cannot be combined with unix_socket_path")
             host, port = seed_list[0]
+        tls_context = make_context(tls, tls_ca_file, tls_cert_file, tls_key_file, tls_insecure_skip_verify, unix_socket_path)
         policy_code(read_policy)  # rejects an unknown value now rather than at the first command
         if sentinel_master is not None:
             if not isinstance(sentinel_master, str) or not sentinel_master:
@@ -623,6 +657,8 @@ class Ruvio(Commands):
             read_policy=read_policy,
             follow_primary=bool(follow_primary),
             sentinel_master=sentinel_master,
+            tls_context=tls_context,
+            tls_server_name=tls_server_name,
         )
         self._conn = _Conn(opts)
         self._decode = decode_responses
@@ -894,7 +930,7 @@ class Ruvio(Commands):
             with client.dedicated() as worker:
                 item = worker.blpop("jobs", timeout=30)
         """
-        opts = self._conn.opts.as_dict()
+        opts = self._conn.opts.for_constructor()
         return Ruvio(decode_responses=self._decode, **opts)
 
     def pipeline(self, transaction: bool = False) -> "Pipeline":

@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import ssl
 import time
 import uuid
 import weakref
@@ -46,6 +47,7 @@ from .._commands import Arg, Commands, Conv, KeyT, KeyTypeT
 from .._models import Message
 from .._pipeline import PipelineBase
 from .._resp import NEED, Push, encode, make_parser
+from .._tls import make_context
 from .._blocking import FOREVER, blocking_wait, pipeline_wait
 from .._cluster import ReadPolicy, policy_code
 from .._follow import MASTER, ROUNDS, WAITS, Address, parse_master_addr, parse_role, probe_wait
@@ -311,7 +313,16 @@ async def _dial(
         if opts.unix_socket_path:
             coro = loop.create_unix_connection(lambda: _Proto(parser, loop, on_push), opts.unix_socket_path)
         else:
-            coro = loop.create_connection(lambda: _Proto(parser, loop, on_push), host, port)
+            if opts.tls_context is not None:
+                coro = loop.create_connection(
+                    lambda: _Proto(parser, loop, on_push),
+                    host,
+                    port,
+                    ssl=opts.tls_context,
+                    server_hostname=opts.tls_server_name or host,
+                )
+            else:
+                coro = loop.create_connection(lambda: _Proto(parser, loop, on_push), host, port)
         _, proto = await asyncio.wait_for(coro, opts.connect_timeout)
     except asyncio.TimeoutError as exc:
         raise TimeoutError(f"connect to {host}:{port} timed out") from exc
@@ -581,6 +592,12 @@ class Ruvio(Commands):
         read_policy: Union[None, str, ReadPolicy] = None,
         follow_primary: bool = True,
         sentinel_master: Optional[str] = None,
+        tls: Union[bool, ssl.SSLContext] = False,
+        tls_ca_file: Optional[str] = None,
+        tls_cert_file: Optional[str] = None,
+        tls_key_file: Optional[str] = None,
+        tls_server_name: Optional[str] = None,
+        tls_insecure_skip_verify: bool = False,
     ) -> None:
         """Creates the client (nothing is connected yet). See the class docstring for every argument.
 
@@ -605,6 +622,13 @@ class Ruvio(Commands):
             read_policy: ``"primary"`` (default), ``"prefer-replica"`` or ``"replica"``; cluster clients only.
             follow_primary: Find the primary again after a failover (default ``True``).
             sentinel_master: Master name to ask coordinators for; see the class docstring.
+            tls: ``True`` wraps the connection in TLS, checking the certificate chain and host name against the
+                system roots; pass an ``ssl.SSLContext`` to use your own. Default ``False``: plain TCP.
+            tls_ca_file: PEM file of the CA to trust instead of the system roots (needs ``tls=True``).
+            tls_cert_file: PEM client certificate for a server that demands one (needs ``tls=True``).
+            tls_key_file: PEM private key of ``tls_cert_file``; may be left out when the key is in the certificate file.
+            tls_server_name: The name the certificate carries, when it differs from the host.
+            tls_insecure_skip_verify: Accept any certificate and skip the host name check (throwaway tests only).
 
         Raises:
             ValueError: A seed has an empty host or a port outside 1-65535, ``read_policy`` is unknown, or
@@ -615,6 +639,7 @@ class Ruvio(Commands):
             if unix_socket_path:
                 raise ValueError("seeds cannot be combined with unix_socket_path")
             host, port = seed_list[0]
+        tls_context = make_context(tls, tls_ca_file, tls_cert_file, tls_key_file, tls_insecure_skip_verify, unix_socket_path)
         policy_code(read_policy)  # rejects an unknown value now rather than at the first command
         if sentinel_master is not None:
             if not isinstance(sentinel_master, str) or not sentinel_master:
@@ -642,6 +667,8 @@ class Ruvio(Commands):
                 read_policy=read_policy,
                 follow_primary=bool(follow_primary),
                 sentinel_master=sentinel_master,
+                tls_context=tls_context,
+                tls_server_name=tls_server_name,
             )
         )
         self._decode = decode_responses
@@ -999,7 +1026,7 @@ class Ruvio(Commands):
             async with client.dedicated() as worker:
                 item = await worker.blpop("jobs", timeout=30)
         """
-        return Ruvio(decode_responses=self._decode, **self._st.opts.as_dict())
+        return Ruvio(decode_responses=self._decode, **self._st.opts.for_constructor())
 
     def pipeline(self, transaction: bool = False) -> "Pipeline":
         """Creates a pipeline: commands are queued locally and sent in one write.
