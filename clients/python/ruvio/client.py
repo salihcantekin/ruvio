@@ -20,6 +20,7 @@ Example:
 
 from __future__ import annotations
 
+import hashlib
 import socket
 import time
 import uuid
@@ -28,12 +29,12 @@ from urllib.parse import unquote, urlparse
 
 from ._blocking import FOREVER, blocking_wait, pipeline_wait
 from ._cluster import ReadPolicy, policy_code
-from ._commands import Commands, Conv, KeyT, KeyTypeT, _s
+from ._commands import Arg, Commands, Conv, KeyT, KeyTypeT, _s
 from ._follow import MASTER, ROUNDS, WAITS, Address, parse_master_addr, parse_role, probe_wait
 from ._models import Message
 from ._pipeline import PipelineBase
 from ._resp import NEED, Push, encode, make_parser
-from .errors import ConnectionError, LockError, ProtocolError, ResponseError, RuvioError, TimeoutError
+from .errors import ConnectionError, LockError, NoScriptError, ProtocolError, ResponseError, RuvioError, TimeoutError
 
 __all__ = ["Ruvio", "Pipeline", "PubSub", "Lock", "parse_url"]
 
@@ -1131,6 +1132,28 @@ Acquire is ``SET NX PX``, renew is ``SET IFEQ PX`` and release is ``DELEX IFEQ``
             self.idem_complete(key, fingerprint, owner, result)
             return "executed", result
         return r.state, r.result
+
+    def eval_cached(self, script: str, keys: Sequence[KeyT] = (), args: Sequence[Arg] = ()) -> Any:
+        """``EVALSHA``, then ``EVAL`` once on ``NOSCRIPT``: sends the whole script only when the shard does not have it.
+
+        The SHA1 is computed here, and ``EVAL`` also caches the script on that shard. The retry is safe because
+        ``NOSCRIPT`` is answered before any command of the script ran, so a script never runs twice.
+
+        Args:
+            script: Lua source.
+            keys: Keys the script uses (``KEYS`` in Lua).
+            args: Extra arguments (``ARGV`` in Lua).
+
+        Returns:
+            The raw script result, as :meth:`eval`.
+
+        Raises:
+            ResponseError: As :meth:`eval`.
+        """
+        try:
+            return self.evalsha(hashlib.sha1(script.encode()).hexdigest(), keys, args)
+        except NoScriptError:
+            return self.eval(script, keys, args)
 
     def scan_iter(self, match: Optional[str] = None, count: Optional[int] = None, type: Optional[KeyTypeT] = None) -> Iterator[Any]:  # noqa: A002
         """Iterates over all keys by calling :meth:`scan` page by page.

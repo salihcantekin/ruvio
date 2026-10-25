@@ -159,7 +159,7 @@ func TestLiveClusterCommands(t *testing.T) {
 
 func TestLiveScripting(t *testing.T) {
 	c, ctx := live(t)
-	// Ruvio's Lua API is ruvio.call (redis.call is not defined).
+	// Ruvio's Lua API is ruvio.call (redis.call is an alias).
 	v, err := c.Eval(ctx, "ruvio.call('SET', KEYS[1], ARGV[1]); return ruvio.call('GET', KEYS[1])", []string{"ek"}, "val")
 	noErr(t, err)
 	eq(t, v.Str(), "val")
@@ -172,6 +172,11 @@ func TestLiveScripting(t *testing.T) {
 	var se *Error
 	if _, err := c.EvalSHA(ctx, sha, nil); !errors.As(err, &se) || se.Prefix() != "NOSCRIPT" {
 		t.Fatalf("want NOSCRIPT, got %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		v, err = c.EvalCached(ctx, "return ARGV[1]", nil, "again")
+		noErr(t, err)
+		eq(t, v.Str(), "again")
 	}
 	if err := c.ScriptKill(ctx); !errors.As(err, &se) || se.Prefix() != "NOTBUSY" {
 		t.Fatalf("want NOTBUSY, got %v", err)

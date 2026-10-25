@@ -503,6 +503,17 @@ fn databases_transactions_and_scripts() {
             .as_deref(),
         Some("2")
     );
+    db.script_flush().unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            db.eval_cached("return ARGV[1]", &[], &["again"])
+                .unwrap()
+                .as_string()
+                .unwrap()
+                .as_deref(),
+            Some("again")
+        );
+    }
     db.function_load("echo_first", "return ARGV[1]").unwrap();
     assert_eq!(
         db.fcall("echo_first", &[], &["x"])

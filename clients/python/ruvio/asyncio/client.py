@@ -34,20 +34,21 @@ Example:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import time
 import uuid
 from collections import deque
 from typing import Any, AsyncIterator, Awaitable, Callable, Deque, Dict, List, Optional, Sequence, Tuple, Union
 
-from .._commands import Commands, Conv, KeyT, KeyTypeT
+from .._commands import Arg, Commands, Conv, KeyT, KeyTypeT
 from .._models import Message
 from .._pipeline import PipelineBase
 from .._resp import NEED, Push, encode, make_parser
 from .._cluster import ReadPolicy, policy_code
 from .._follow import MASTER, ROUNDS, WAITS, Address, parse_master_addr, parse_role, probe_wait
 from ..client import _SUB_KINDS, _message, _Options, _parse_seeds, parse_url
-from ..errors import ConnectionError, LockError, ProtocolError, ResponseError, RuvioError, TimeoutError, WatchError
+from ..errors import ConnectionError, LockError, NoScriptError, ProtocolError, ResponseError, RuvioError, TimeoutError, WatchError
 
 __all__ = ["Ruvio", "Pipeline", "PubSub", "Lock"]
 
@@ -1162,6 +1163,28 @@ This is a coroutine: ``ps = await client.pubsub()``.
             raise RuvioError("transaction retries exhausted")
         finally:
             await conn.aclose()
+
+    async def eval_cached(self, script: str, keys: Sequence[KeyT] = (), args: Sequence[Arg] = ()) -> Any:
+        """``EVALSHA``, then ``EVAL`` once on ``NOSCRIPT``: sends the whole script only when the shard does not have it.
+
+        The SHA1 is computed here, and ``EVAL`` also caches the script on that shard. The retry is safe because
+        ``NOSCRIPT`` is answered before any command of the script ran, so a script never runs twice.
+
+        Args:
+            script: Lua source.
+            keys: Keys the script uses (``KEYS`` in Lua).
+            args: Extra arguments (``ARGV`` in Lua).
+
+        Returns:
+            The raw script result, as :meth:`eval`.
+
+        Raises:
+            ResponseError: As :meth:`eval`.
+        """
+        try:
+            return await self.evalsha(hashlib.sha1(script.encode()).hexdigest(), keys, args)
+        except NoScriptError:
+            return await self.eval(script, keys, args)
 
     async def scan_iter(
         self, match: Optional[str] = None, count: Optional[int] = None, type: Optional[KeyTypeT] = None  # noqa: A002

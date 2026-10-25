@@ -807,6 +807,8 @@ async def test_scripts(c):
     assert await c.script_flush() is True
     with pytest.raises(ruvio.NoScriptError):
         await c.evalsha(sha)
+    for _ in range(2):
+        assert await c.eval_cached("return ARGV[1]", [], ["again"]) == "again"
     assert await c.function_load("pyfn", "return KEYS[1]") == "pyfn"
     assert "pyfn" in str(await c.function_list())
     assert await c.fcall("pyfn", ["k1"]) == "k1"

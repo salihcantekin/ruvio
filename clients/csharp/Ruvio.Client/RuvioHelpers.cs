@@ -153,6 +153,41 @@ public static class RuvioClientHelpers
 {
     private const int MaxBackoffMilliseconds = 25;
 
+    // ---- Scripts -------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Runs a script by its SHA1 and sends the whole script only when the shard does not have it: <c>EVALSHA</c>, then <c>EVAL</c> once on <c>NOSCRIPT</c>.
+    /// The digest is computed here, and <c>EVAL</c> also caches the script on that shard.
+    /// </summary>
+    /// <param name="client">The client to send the commands on.</param>
+    /// <param name="script">The Lua source.</param>
+    /// <param name="keyCount">How many of <paramref name="arguments"/> are key names.</param>
+    /// <param name="arguments">The key names first, then the other arguments.</param>
+    /// <returns>The script's result as a <see cref="RespValue"/>.</returns>
+    /// <remarks>The retry is safe because <c>NOSCRIPT</c> is answered before any command of the script ran, so a script never runs twice.</remarks>
+    /// <exception cref="RuvioException">As for <see cref="IRuvioClient.EvaluateAsync"/>.</exception>
+    /// <example>
+    /// <code>
+    /// RespValue value = await db.EvaluateCachedAsync("return ARGV[1]", 0, "x");
+    /// </code>
+    /// </example>
+    public static async ValueTask<RespValue> EvaluateCachedAsync(this IRuvioClient client, string script, long keyCount, params string[] arguments)
+    {
+        ArgumentNullException.ThrowIfNull(client);
+        ArgumentNullException.ThrowIfNull(script);
+
+        string sha = Convert.ToHexString(SHA1.HashData(Encoding.UTF8.GetBytes(script))).ToLowerInvariant();
+
+        try
+        {
+            return await client.EvaluateShaAsync(sha, keyCount, arguments).ConfigureAwait(false);
+        }
+        catch (RuvioException error) when (error.Message.StartsWith("NOSCRIPT", StringComparison.Ordinal))
+        {
+            return await client.EvaluateAsync(script, keyCount, arguments).ConfigureAwait(false);
+        }
+    }
+
     // ---- Locks, leases, semaphores -------------------------------------------------------------
 
     /// <summary>

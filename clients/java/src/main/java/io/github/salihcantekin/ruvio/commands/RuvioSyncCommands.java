@@ -4958,6 +4958,24 @@ public abstract class RuvioSyncCommands<K, V> {
     }
 
     /**
+     * Runs a script by its SHA1 and sends the whole script only when the shard does not have it: {@code EVALSHA}, then {@code EVAL} once on {@code NOSCRIPT}. The digest is computed here, and {@code EVAL} also caches the script on that shard. The retry is safe because {@code NOSCRIPT} is answered before any command of the script ran, so a script never runs twice.
+     *
+     * <pre>{@code
+     * Object v = client.evalCached("return ARGV[1]", new String[0], "x");
+     * }</pre>
+     *
+     * @param script the Lua source
+     * @param keys the keys the script may touch (pass an empty array for none)
+     * @param arguments extra values available as {@code ARGV}
+     * @return the script result, converted as for {@link #eval}
+     * @throws RuvioServerException as for {@link #eval}
+     */
+    @SafeVarargs
+    public final Object evalCached(String script, K[] keys, V... arguments) {
+        return await(async.evalCached(script, keys, arguments));
+    }
+
+    /**
      * Sends {@code SCRIPT LOAD script}: compiles a script into the cache of the shard the command reaches, without running it. In a cluster, load it on every node you call {@code evalsha} on (see {@link io.github.salihcantekin.ruvio.RuvioClient#onNode}).
      *
      * @param script the Lua source
