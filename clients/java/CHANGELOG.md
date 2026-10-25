@@ -4,6 +4,7 @@ Notable changes to the Java client `io.github.salihcantekin:ruvio-client`. New e
 
 ## Unreleased
 
+- TLS: `RuvioOptions.Builder.tls()` (JVM default certificates), `tls(SSLContext)`, `tlsServerName(name)` and `tlsInsecure()` wrap every socket the client opens (first connect, reconnects, shards, replicas, Pub/Sub and failover probes) in TLS, verifying the certificate chain and the host name. `RuvioTls.context(caPem, clientCertPem, clientKeyPem)` builds a context from PEM files for a private CA or mutual TLS. The handshake runs inside the connect. Default off: plain TCP, nothing changes.
 - The reply parser refuses a bulk string over 64 MiB and an array, set, push or map over 1,048,576 elements as a protocol error before it allocates, the same limits as the Rust and C# clients. Before, Java had no limit.
 - `evalCached(script, keys, arguments)` (blocking and `CompletableFuture`) runs a script by its SHA1 and sends the whole script only when the shard answers `NOSCRIPT` (`EVALSHA`, then `EVAL` once). The SHA1 is computed in the client; nothing changes for `eval` and `evalsha`.
 - A cluster client now retries `-TRYAGAIN` up to 7 times, after waits doubling from 5 ms to 320 ms (635 ms in all), instead of 3 times after 5, 10 and 20 ms. A slot range moving between the nodes of a cluster is frozen for a few hundred milliseconds (about 170-240 ms in a local test), so the caller saw `TRYAGAIN` on every such move before. Only `TRYAGAIN` replies wait; other replies are unchanged.

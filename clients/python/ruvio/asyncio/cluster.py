@@ -995,7 +995,7 @@ class ClusterRuvio(Ruvio):
         Returns:
             A new :class:`ClusterRuvio`; close it with ``await worker.aclose()``.
         """
-        opts = self._st.opts.as_dict()
+        opts = self._st.opts.for_constructor()
         return ClusterRuvio(decode_responses=self._decode, cluster=True, **opts)
 
     async def pubsub(self, ignore_subscribe_messages: bool = False) -> "ClusterPubSub":  # type: ignore[override]

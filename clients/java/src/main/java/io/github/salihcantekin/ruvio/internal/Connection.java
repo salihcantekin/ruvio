@@ -6,14 +6,23 @@ import io.github.salihcantekin.ruvio.RuvioException;
 import io.github.salihcantekin.ruvio.RuvioServerException;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.net.StandardSocketOptions;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
+
+import javax.net.ssl.SNIHostName;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLSocket;
 
 /**
  * One multiplexed socket shared by every caller.
@@ -48,6 +57,10 @@ public class Connection implements AutoCloseable {
     private long keptWritten;
     private volatile long keptReleased;
     private final SocketChannel channel;
+    /** With TLS, the streams of the TLS socket the reader and writer use instead of {@link #channel}; all null otherwise. */
+    private final InputStream tlsIn;
+    private final OutputStream tlsOut;
+    private final SSLSocket tlsSocket;
     private final ReentrantLock lock = new ReentrantLock();
     private final Thread writer;
     private final Thread reader;
@@ -85,21 +98,53 @@ public class Connection implements AutoCloseable {
      */
     @SuppressWarnings("this-escape") // the writer and reader threads start here on purpose
     public Connection(String host, int port, int connectTimeoutMs, int maxInFlight, String name) throws IOException {
+        this(host, port, connectTimeoutMs, maxInFlight, name, null, null);
+    }
+
+    /**
+     * Opens the socket, wrapped in TLS when {@code tls} is given, and starts the reader and writer threads. The TLS
+     * handshake is part of the connect, and the server certificate must carry {@code serverName} (the host when null).
+     *
+     * @param host the server host
+     * @param port the server port
+     * @param connectTimeoutMs the connect timeout in milliseconds (the handshake gets the same)
+     * @param maxInFlight the most replies outstanding at once (rounded up to a power of two)
+     * @param name the name used for the threads
+     * @param tls the TLS context, or null for plain TCP
+     * @param serverName the name the certificate must carry, or null for {@code host}
+     * @throws IOException when the socket cannot be opened or the handshake fails
+     */
+    @SuppressWarnings("this-escape") // the writer and reader threads start here on purpose
+    public Connection(String host, int port, int connectTimeoutMs, int maxInFlight, String name, SSLContext tls,
+            String serverName) throws IOException {
         this.host = host;
         this.port = port;
         int cap = Integer.highestOneBit(Math.max(16, maxInFlight - 1)) << 1;
         this.ring = new Request<?>[cap];
         this.mask = cap - 1;
         SocketChannel ch = SocketChannel.open();
+        SSLSocket secure = null;
         try {
             ch.setOption(StandardSocketOptions.TCP_NODELAY, true);
             ch.setOption(StandardSocketOptions.SO_KEEPALIVE, true);
             ch.socket().connect(new InetSocketAddress(host, port), connectTimeoutMs);
-        } catch (IOException e) {
+            if (tls != null) {
+                secure = handshake(ch.socket(), tls, serverName == null ? host : serverName, port, connectTimeoutMs);
+            }
+        } catch (IOException | RuntimeException e) {
             ch.close();
             throw e;
         }
         this.channel = ch;
+        if (secure != null) {
+            this.tlsIn = secure.getInputStream();
+            this.tlsOut = secure.getOutputStream();
+            this.tlsSocket = secure;
+        } else {
+            this.tlsIn = null;
+            this.tlsOut = null;
+            this.tlsSocket = null;
+        }
         out.owner = this;
         spare.owner = this;
         writer = new Thread(this::writeLoop, name + "-writer");
@@ -108,6 +153,25 @@ public class Connection implements AutoCloseable {
         reader.setDaemon(true);
         writer.start();
         reader.start();
+    }
+
+    /** Wraps the connected socket in TLS and finishes the handshake, with the host name checked against {@code name}. */
+    private static SSLSocket handshake(Socket plain, SSLContext tls, String name, int port, int timeoutMs) throws IOException {
+        SSLSocket socket = (SSLSocket) tls.getSocketFactory().createSocket(plain, name, port, true);
+        SSLParameters parameters = socket.getSSLParameters();
+        parameters.setEndpointIdentificationAlgorithm("HTTPS");
+        if (!isIpAddress(name)) {
+            parameters.setServerNames(List.of(new SNIHostName(name)));
+        }
+        socket.setSSLParameters(parameters);
+        socket.setSoTimeout(timeoutMs);
+        socket.startHandshake();
+        socket.setSoTimeout(0);
+        return socket;
+    }
+
+    private static boolean isIpAddress(String name) {
+        return name.indexOf(':') >= 0 || (!name.isEmpty() && name.chars().allMatch(c -> c == '.' || (c >= '0' && c <= '9')));
     }
 
     /**
@@ -427,6 +491,11 @@ public class Connection implements AutoCloseable {
     /** Writes the whole buffer. Returns false (and fails the connection) on an I/O error. */
     private boolean writeBuffer(RespOut b) {
         try {
+            if (tlsOut != null) {
+                tlsOut.write(b.buf, 0, b.pos);
+                tlsOut.flush();
+                return true;
+            }
             ByteBuffer bb = view(b.buf);
             bb.limit(b.pos).position(0);
             while (bb.hasRemaining()) {
@@ -458,8 +527,13 @@ public class Connection implements AutoCloseable {
         int lim = 0;
         try {
             for (;;) {
-                bb.limit(buf.length).position(lim);
-                int n = channel.read(bb);
+                int n;
+                if (tlsIn != null) {
+                    n = tlsIn.read(buf, lim, buf.length - lim);
+                } else {
+                    bb.limit(buf.length).position(lim);
+                    n = channel.read(bb);
+                }
                 if (n < 0) {
                     throw new RuvioConnectionException("connection closed by server");
                 }
@@ -608,7 +682,11 @@ public class Connection implements AutoCloseable {
             lock.unlock();
         }
         try {
+            // The plain socket first: closing a TLS socket sends a close_notify, which can wait behind a blocked write.
             channel.close();
+            if (tlsSocket != null) {
+                tlsSocket.close();
+            }
         } catch (IOException ignored) {
             // closing anyway
         }
