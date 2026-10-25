@@ -11,6 +11,7 @@ use crate::blocking::{Wait, blocking_wait, pipeline_wait};
 use crate::client::{ClientOptions, NoticeHook, ReadPolicy};
 use crate::codec::read_value;
 use crate::command_keys::{COMMAND_KEY_RULES, KeyRule};
+use crate::tls::Stream;
 
 use crate::error::Error;
 use crate::value::RespValue;
@@ -376,7 +377,7 @@ fn rule_keys<'a>(rule: KeyRule, arguments: &[&'a str]) -> Vec<&'a str> {
 }
 
 pub(crate) struct Connection {
-    stream: BufReader<TcpStream>,
+    stream: BufReader<Stream>,
     scratch: Vec<u8>,
     host: String,
     port: u16,
@@ -395,9 +396,13 @@ impl Connection {
                 Ok(stream) => {
                     stream.set_nodelay(true)?;
 
-                    if options.command_timeout.is_some() {
-                        stream.set_read_timeout(options.command_timeout)?;
-                    }
+                    let stream = match &options.tls {
+                        Some(tls) => Stream::tls(stream, host, tls, options.connect_timeout)?,
+                        None => Stream::Plain(stream),
+                    };
+
+                    // Back to the command timeout (or none) after the handshake's.
+                    stream.set_read_timeout(options.command_timeout)?;
 
                     let mut connection = Self {
                         stream: BufReader::new(stream),

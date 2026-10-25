@@ -8,6 +8,7 @@ use crate::args::{Args, Num};
 use crate::cluster::{ClusterRouter, Connection, Discovery, throw_error};
 
 use crate::error::Error;
+use crate::tls::TlsOptions;
 use crate::value::RespValue;
 
 /// Condition for [`Client::set_with`] and the other `SET` variants.
@@ -117,6 +118,11 @@ pub struct ClientOptions {
     /// server without replication). Replies are then held until that many replicas have the
     /// writes on disk. Defaults to `None` (nothing is sent).
     pub durability: Option<Durability>,
+    /// When set, every connection this client opens (including reconnects and per-shard and
+    /// replica sockets) is wrapped in TLS, and the server's certificate is verified; see
+    /// [`TlsOptions`]. Needs the `tls` cargo feature: without it the connect fails with
+    /// [`Error::Protocol`]. Defaults to `None` (plain TCP).
+    pub tls: Option<TlsOptions>,
     /// When true (the default) a standalone client finds the primary again after a failover:
     /// on a reconnect with several seeds (or a [`Self::sentinel_master`]) it asks the seeds
     /// `ROLE` and connects to the one that answers `master`, and on a `READONLY` reply to a
@@ -379,6 +385,7 @@ impl Default for ClientOptions {
             reconnect_max_delay: Duration::from_secs(2),
             read_policy: ReadPolicy::Primary,
             durability: None,
+            tls: None,
             follow_primary: true,
             sentinel_master: None,
         }

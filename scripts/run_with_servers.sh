@@ -22,6 +22,10 @@
 # replication ports +92, +93), node 1 the primary, watched by three `ruvio coordinator`
 # processes (+94, +95, +96, no secret) that fail it over. A test may kill a member: the group is
 # meant for one failover per run of this script.
+# TLS servers for the client TLS tests: a standalone server with TLS (<base-port>+100) and one that
+# also demands a client certificate (+101), certificates from scripts/make_test_tls.sh. Exports
+# RUVIO_TLS_ADDR / RUVIO_TLS_CLIENT_AUTH_ADDR and the PEM files RUVIO_TLS_CA / RUVIO_TLS_CLIENT_CERT /
+# RUVIO_TLS_CLIENT_KEY.
 # The repository ruvio.example.toml is copied, never edited.
 #
 # Each port must answer PING with PONG from the server this script started
@@ -188,6 +192,16 @@ CONFIG
   pids+=("$!")
 done
 
+# The TLS servers (see the header); the certificates live in the work directory.
+"$root/scripts/make_test_tls.sh" "$work/tls"
+RUVIO_TLS_CERT="$work/tls/server.pem" RUVIO_TLS_KEY="$work/tls/server.key" \
+  "$binary" --config "$work/standalone.toml" --address "127.0.0.1:$((base + 100))" --data-dir "$work/tls-server" >"$work/tls-server.log" 2>&1 &
+pids+=("$!")
+RUVIO_TLS_CERT="$work/tls/server.pem" RUVIO_TLS_KEY="$work/tls/server.key" \
+  RUVIO_TLS_CLIENT_CA="$work/tls/ca.pem" RUVIO_TLS_CLIENT_AUTH=true \
+  "$binary" --config "$work/standalone.toml" --address "127.0.0.1:$((base + 101))" --data-dir "$work/tls-client-auth" >"$work/tls-client-auth.log" 2>&1 &
+pids+=("$!")
+
 ready() {
   python3 "$root/scripts/_ruvio.py" wait-ready --timeout 30 --port "$@"
 }
@@ -218,6 +232,9 @@ for index in 0 1 2; do
   python3 "$root/scripts/_ruvio.py" wait-primary --timeout 30 --port "$((base + 94 + index))" \
     --pid "${pids[$((11 + index))]}" --master main --primary "127.0.0.1:$((base + 90))"
 done
+ready "$((base + 100))" --pid "${pids[14]}" --data-dir "$work/tls-server" --tls-ca "$work/tls/ca.pem"
+ready "$((base + 101))" --pid "${pids[15]}" --data-dir "$work/tls-client-auth" --tls-ca "$work/tls/ca.pem" \
+  --tls-cert "$work/tls/client.pem" --tls-key "$work/tls/client.key"
 
 export RUVIO_ADDR="127.0.0.1:$base"
 export RUVIO_TEST_ADDR="127.0.0.1:$base"
@@ -233,6 +250,11 @@ export RUVIO_COORDINATOR_ADDRS="127.0.0.1:$((base + 94)),127.0.0.1:$((base + 95)
 export RUVIO_COORDINATOR_MASTER=main
 export RUVIO_COORDINATOR_GROUP_ADDRS="127.0.0.1:$((base + 90)),127.0.0.1:$((base + 91))"
 export RUVIO_COORDINATOR_GROUP_PIDS="${group_nodes[0]},${group_nodes[1]}"
+export RUVIO_TLS_ADDR="127.0.0.1:$((base + 100))"
+export RUVIO_TLS_CLIENT_AUTH_ADDR="127.0.0.1:$((base + 101))"
+export RUVIO_TLS_CA="$work/tls/ca.pem"
+export RUVIO_TLS_CLIENT_CERT="$work/tls/client.pem"
+export RUVIO_TLS_CLIENT_KEY="$work/tls/client.key"
 # The servers run on throwaway copies of the config file, so live tests may rewrite it.
 export RUVIO_TEST_CONFIG_REWRITE=1
 "$@"

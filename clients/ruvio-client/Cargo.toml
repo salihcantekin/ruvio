@@ -15,10 +15,15 @@ categories = ["network-programming"]
 [dependencies]
 serde = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
 
 [features]
 # Typed JSON.* helpers: pass any serde value instead of JSON text.
 serde = ["dep:serde", "dep:serde_json"]
+# TLS (`ClientOptions::tls`): rustls with the ring provider and the public web roots. Off by
+# default, so the default build has no dependencies.
+tls = ["dep:rustls", "dep:webpki-roots"]
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
