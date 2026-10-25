@@ -57,14 +57,16 @@ class TlsLiveTest {
 
     @Test
     void anUntrustedCertificateIsRefused() {
+        env("RUVIO_TLS_ADDR");
         // The JVM's default certificates do not know the test CA.
         assertThrows(RuvioException.class, () -> RuvioClient.connect(to("RUVIO_TLS_ADDR").tls().build()));
     }
 
     @Test
     void aNameTheCertificateLacksIsRefused() {
+        Path ca = ca();
         assertThrows(RuvioException.class, () -> RuvioClient.connect(
-                to("RUVIO_TLS_ADDR").tls(RuvioTls.context(ca(), null, null)).tlsServerName("elsewhere.example").build()));
+                to("RUVIO_TLS_ADDR").tls(RuvioTls.context(ca, null, null)).tlsServerName("elsewhere.example").build()));
     }
 
     @Test
@@ -94,9 +96,11 @@ class TlsLiveTest {
 
     @Test
     void aMissingClientCertificateIsRefused() {
+        Path ca = ca();
+        env("RUVIO_TLS_CLIENT_AUTH_ADDR");
         assertThrows(RuntimeException.class, () -> {
             try (RuvioClient<String, String> c = RuvioClient.connect(
-                    to("RUVIO_TLS_CLIENT_AUTH_ADDR").tls(RuvioTls.context(ca(), null, null)).build())) {
+                    to("RUVIO_TLS_CLIENT_AUTH_ADDR").tls(RuvioTls.context(ca, null, null)).build())) {
                 // With TLS 1.3 the refusal can arrive with the first read.
                 c.ping();
             }
@@ -105,6 +109,7 @@ class TlsLiveTest {
 
     @Test
     void plainTcpToATlsPortFails() {
+        env("RUVIO_TLS_ADDR");
         assertThrows(RuntimeException.class, () -> {
             try (RuvioClient<String, String> c = RuvioClient.connect(to("RUVIO_TLS_ADDR").commandTimeoutMillis(2_000).build())) {
                 c.ping();
