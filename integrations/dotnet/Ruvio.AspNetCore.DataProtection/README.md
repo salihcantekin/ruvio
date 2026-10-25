@@ -114,6 +114,10 @@ XML parsing prohibits DTDs/external entity resolution and limits document size.
 Corrupt XML, wrong server types, capacity errors and transport failures propagate
 to Data Protection; none are treated as a successful empty read.
 
+No outage mode: a key ring that cannot be read or written cannot be replaced by "carry on", because requests would
+fail to decrypt, or new keys would be issued that other instances never see. Keep the framework's in-process key-ring
+cache and `OperationTimeout`, and run the ring on storage that stays up.
+
 ## Session integration
 
 This package protects the **session cookie**, while

@@ -4,6 +4,8 @@ Notable changes to the NuGet package `Ruvio.AspNetCore.RateLimiting`. New entrie
 
 ## Unreleased
 
+- `options.Outage`: choose what happens when Ruvio is unreachable (`Throw`, the default and unchanged; `FailClosed`, 503; `FailOpen`, the request runs unlimited) and optionally stop calling Ruvio after repeated failures with a circuit breaker. See the README.
+
 - `Algorithm` on `[RuvioRateLimit]` and an `algorithm` argument on `WithRuvioRateLimit`: fixed window (default, unchanged), `SlidingWindow` or `TokenBucket`. The other two send `LIMIT ... WITHRETRY`, so `Retry-After` is the exact wait. Needs a Ruvio server with the LIMIT modes.
 
 ## 0.1.2 - 2026-10-17

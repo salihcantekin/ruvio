@@ -41,11 +41,21 @@ public sealed class RuvioRateLimitingMiddleware(RequestDelegate next)
 
         string key = StorageKey(options.KeyPrefix, policy.Policy, partition);
         var client = context.RequestServices.GetRequiredService<IRuvioClient>();
+        var outage = options.Outage;
+
+        if (!outage.TryEnter())
+        {
+            await Outage(context, outage, null);
+
+            return;
+        }
+
         using var activity = Telemetry.Source.StartActivity("ruvio.rate_limit");
         long? remaining;
         long retryAfterMs = 0;
         long started = Stopwatch.GetTimestamp();
         string outcome = "error";
+        Exception? unreachable = null;
 
         try
         {
@@ -68,14 +78,21 @@ public sealed class RuvioRateLimitingMiddleware(RequestDelegate next)
                 retryAfterMs = result.RetryAfterMs;
             }
 
+            outage.Succeeded();
             outcome = remaining is null ? "rejected" : "accepted";
         }
         catch (Exception error)
         {
+            bool isOutage = outage.Failed(error, context.RequestAborted);
+
             activity?.SetStatus(ActivityStatusCode.Error, error.GetType().Name);
             Telemetry.Errors.Add(1);
 
-            throw;
+            if (!isOutage || outage.Mode == RuvioOutageMode.Throw)
+                throw;
+
+            unreachable = error;
+            remaining = 0;
         }
         finally
         {
@@ -84,6 +101,13 @@ public sealed class RuvioRateLimitingMiddleware(RequestDelegate next)
             Telemetry.StorageDuration.Record(
                 Stopwatch.GetElapsedTime(started).TotalMilliseconds,
                 new TagList { { "outcome", outcome } });
+        }
+
+        if (unreachable is not null)
+        {
+            await Outage(context, outage, unreachable);
+
+            return;
         }
 
         if (remaining is < 0 || remaining >= policy.Permits)
@@ -105,6 +129,38 @@ public sealed class RuvioRateLimitingMiddleware(RequestDelegate next)
 
         Telemetry.Accepted.Add(1);
         await next(context);
+    }
+
+    // Ruvio could not be reached (or the circuit is open): let the request through or answer 503.
+    private Task Outage(HttpContext context, RuvioOutageOptions outage, Exception? cause)
+    {
+        var mode = outage.Mode;
+
+        Telemetry.Outage.Add(1, new TagList
+        {
+            { "mode", mode == RuvioOutageMode.FailOpen ? "fail_open" : "fail_closed" },
+            { "reason", cause is null ? "circuit_open" : "error" },
+        });
+
+        switch (mode)
+        {
+            case RuvioOutageMode.FailOpen:
+                return next(context);
+
+            case RuvioOutageMode.FailClosed:
+                context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+
+                if (outage.RetryAfter > TimeSpan.Zero)
+                {
+                    context.Response.Headers.RetryAfter = Math.Max(1, (long)Math.Ceiling(outage.RetryAfter.TotalSeconds))
+                        .ToString(CultureInfo.InvariantCulture);
+                }
+
+                return Task.CompletedTask;
+
+            default:
+                throw new RuvioCircuitOpenException(outage.RetryAfter);
+        }
     }
 
     /// <summary>
@@ -174,6 +230,7 @@ public sealed class RuvioRateLimitingMiddleware(RequestDelegate next)
         private static readonly Meter Meter = new("Ruvio.AspNetCore.RateLimiting");
         internal static readonly Counter<long> Accepted = Meter.CreateCounter<long>("ruvio.rate_limit.accepted");
         internal static readonly Counter<long> Rejected = Meter.CreateCounter<long>("ruvio.rate_limit.rejected");
+        internal static readonly Counter<long> Outage = Meter.CreateCounter<long>("ruvio.rate_limit.outage");
         internal static readonly Counter<long> Errors = Meter.CreateCounter<long>("ruvio.rate_limit.errors");
         internal static readonly Counter<long> StorageCalls = Meter.CreateCounter<long>("ruvio.rate_limit.storage_calls");
         internal static readonly Counter<long> StorageCommands = Meter.CreateCounter<long>("ruvio.rate_limit.storage_commands");

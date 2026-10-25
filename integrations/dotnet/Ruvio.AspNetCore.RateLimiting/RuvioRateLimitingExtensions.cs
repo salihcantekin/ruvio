@@ -25,6 +25,7 @@ public static class RuvioRateLimitingExtensions
                 && options.KeyPrefix.Length <= 128
                 && !options.KeyPrefix.Contains('{') && !options.KeyPrefix.Contains('}'),
                 "KeyPrefix must have 1-128 characters and no cluster hash tags.")
+            .Validate(options => options.Outage.IsValid(), "Outage options are out of range.")
             .ValidateOnStart();
 
         return services;

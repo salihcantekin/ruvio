@@ -13,6 +13,16 @@ internal static class IdempotencyStore
     private static readonly Histogram<double> StorageDuration = Meter.CreateHistogram<double>(
         "ruvio.idempotency.storage_duration", "ms");
 
+    private static readonly Counter<long> Outages = Meter.CreateCounter<long>("ruvio.idempotency.outage");
+
+    internal static void RecordOutage(RuvioOutageMode mode, string reason, string stage) =>
+        Outages.Add(1, new TagList
+        {
+            { "mode", mode == RuvioOutageMode.FailOpen ? "fail_open" : "fail_closed" },
+            { "reason", reason },
+            { "stage", stage },
+        });
+
     internal static async Task<(string State, string? Result)> AcquireAsync(
         IRuvioClient client, string key, string fingerprint, string owner, TimeSpan ttl, CancellationToken token)
     {

@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
+using Ruvio.Client;
 
 namespace Ruvio.AspNetCore.Idempotency;
 
@@ -49,7 +50,17 @@ public sealed class IdempotencyOptions
     /// <summary>Whether to emit middleware activities through the <c>Ruvio.AspNetCore.Idempotency</c> activity source.</summary>
     public bool EnableInstrumentation { get; set; }
 
+    /// <summary>
+    /// What happens when Ruvio cannot be reached. The default, <see cref="RuvioOutageMode.Throw"/>, lets the storage
+    /// exception reach the application; <see cref="RuvioOutageMode.FailClosed"/> answers 503 and
+    /// <see cref="RuvioOutageMode.FailOpen"/> runs the request without idempotency, so a client retry during the
+    /// outage can run the operation twice. Add a circuit breaker with <see cref="RuvioOutageOptions.CircuitBreaker"/> to
+    /// stop waiting on a Ruvio that is down.
+    /// </summary>
+    public RuvioOutageOptions Outage { get; } = new();
+
     internal bool IsValid() =>
+        Outage.IsValid() &&
         !string.IsNullOrWhiteSpace(Namespace) && Namespace.Length <= 128 &&
         ScopeSelector is not null &&
         Retention >= TimeSpan.FromMilliseconds(1) && Retention <= MaximumRetention &&

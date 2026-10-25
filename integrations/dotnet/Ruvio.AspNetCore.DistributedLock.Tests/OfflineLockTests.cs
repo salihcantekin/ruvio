@@ -450,7 +450,7 @@ public class OfflineLockTests
         RespValue reply = Resp.Simple("OK");
 
         script.Handler = (_, _) => reply;
-        IRuvioLock? held = await RuvioLockHttp.TryTakeAsync(context, "res", TimeSpan.FromSeconds(3), TimeSpan.Zero);
+        IRuvioLock? held = (await RuvioLockHttp.TryTakeAsync(context, "res", TimeSpan.FromSeconds(3), TimeSpan.Zero)).Held;
 
         Assert.NotNull(held);
         Assert.Same(held, context.GetRuvioLock());
@@ -460,7 +460,7 @@ public class OfflineLockTests
         reply = Resp.Null();
         var other = new DefaultHttpContext { RequestServices = context.RequestServices };
 
-        Assert.Null(await RuvioLockHttp.TryTakeAsync(other, "res", null, null));
+        Assert.Null((await RuvioLockHttp.TryTakeAsync(other, "res", null, null)).Held);
         Assert.Null(other.GetRuvioLock());
         Assert.Equal(409, RuvioLockHttp.ConflictStatus(other, null));
         Assert.Equal(429, RuvioLockHttp.ConflictStatus(other, 429));

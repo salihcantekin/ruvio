@@ -83,6 +83,54 @@ atomically without widening ordinary entries. Upgrade servers, replicas and
 recovery tools together. Earlier unpublished Lua hash records fail closed; see
 the idempotency package README for the drain-before-upgrade requirement.
 
+## When Ruvio is unreachable
+
+Every integration except Data Protection lets you choose what happens when Ruvio cannot be reached, with
+`options.Outage.Mode`:
+
+| Mode | HTTP middleware | Caches |
+| --- | --- | --- |
+| `Throw` (default) | The storage exception reaches your exception handling, as before. | The storage exception reaches the caller, as before. |
+| `FailClosed` | `503 Service Unavailable` (with `Retry-After` while a circuit is open); the request does not run. | Same as `Throw`: a cache has no response to refuse. |
+| `FailOpen` | The request runs without the check: no replay, no rate limit, no lock. | A read is a miss, a write or removal is dropped, `GetOrCreate` runs its factory without caching. |
+
+`FailOpen` trades safety for availability, and each package says what it risks: an idempotent operation can run twice
+if the client retries during the outage, a rate limit is lifted, a lock is not exclusive, and a dropped cache removal can
+leave a stale entry that is served again once Ruvio is back. `DistributedLock` keeps its `503` default (see its README).
+
+Only outages count: an unreachable server, a dropped connection, a timeout, an open circuit and the `LOADING`,
+`MASTERDOWN` and `CLUSTERDOWN` replies. A server error reply such as `WRONGTYPE` is a bug and always reaches the caller,
+in every mode, and so does an exception thrown by your own code (a `GetOrCreate` factory, a request handler).
+
+### Circuit breaker
+
+Without a breaker, every request during an outage waits out a connect or command timeout. Turn one on to stop calling
+Ruvio for a while after repeated failures:
+
+```csharp
+builder.Services.AddRuvioRateLimiting(options =>
+{
+    options.PartitionKey = context => context.User.Identity?.Name ?? "anonymous";
+    options.Outage.Mode = RuvioOutageMode.FailOpen;
+    options.Outage.CircuitBreaker = new RuvioCircuitBreakerOptions
+    {
+        FailureThreshold = 5,                       // outage failures in a row that open the circuit
+        BreakDuration = TimeSpan.FromSeconds(30),   // Ruvio is not called for this long
+    };
+});
+```
+
+After `FailureThreshold` outage failures in a row the circuit opens and requests take the chosen mode's path at once,
+without touching Ruvio. When `BreakDuration` is over, one request is let through as a trial: if Ruvio answers, the circuit
+closes; if not, it stays open for another `BreakDuration`, and the other requests keep taking the mode's path while the
+trial runs. With the breaker off (the default) the cost is one field read per call; with it on, a healthy circuit adds one
+volatile read. Each package has its own circuit, so the packages notice an outage independently. In `Throw` mode a request
+refused by an open circuit gets `RuvioCircuitOpenException`.
+
+Metrics: each package counts these requests in `ruvio.<feature>.outage` (`ruvio.rate_limit.outage`, `ruvio.idempotency.outage`,
+`ruvio.lock.outage`, `ruvio.output_cache.outage`, `ruvio.cache.outage`), tagged with `mode` and `reason` (`error` or
+`circuit_open`).
+
 ## Cost and correctness boundaries
 
 The custom middleware is opt-in. Unselected endpoints bypass service resolution, network

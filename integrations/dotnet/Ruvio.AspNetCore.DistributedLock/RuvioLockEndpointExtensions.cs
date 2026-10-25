@@ -88,7 +88,20 @@ public static class RuvioLockEndpointExtensions
         {
             HttpContext context = invocation.HttpContext;
             string name = resource(context);
-            IRuvioLock? held = await RuvioLockHttp.TryTakeAsync(context, name, lease, wait).ConfigureAwait(false);
+            var take = await RuvioLockHttp.TryTakeAsync(context, name, lease, wait).ConfigureAwait(false);
+
+            if (take.Unavailable is not null)
+            {
+                return take.Unavailable;
+            }
+
+            if (take.Bypass)
+            {
+                // Ruvio is away and the application chose availability: no lock, so no exclusion.
+                return await next(invocation).ConfigureAwait(false);
+            }
+
+            IRuvioLock? held = take.Held;
 
             if (held is null)
             {

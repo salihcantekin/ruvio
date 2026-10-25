@@ -95,7 +95,7 @@ await store.EvictByTagAsync("catalog", cancellationToken);`),
   },
   "Ruvio.AspNetCore.RateLimiting": {
     summary:
-      "Distributed fixed-window budgets per endpoint with one atomic LIMIT call. Rejected requests get 429 with Retry-After; endpoints without the attribute pay nothing.",
+      "Distributed fixed-window budgets per endpoint with one atomic LIMIT call. Rejected requests get 429 with Retry-After; endpoints without the attribute pay nothing. Choose what happens when Ruvio is unreachable: throw, answer 503, or let requests through, with an optional circuit breaker.",
     useCases: ["rate-limits"],
     example: cs(`builder.Services.AddRuvioClient(builder.Configuration.GetSection("Ruvio"));
 builder.Services.AddRuvioRateLimiting(options =>
@@ -116,7 +116,7 @@ app.MapPost("/orders", HandleOrder)
   },
   "Ruvio.AspNetCore.Idempotency": {
     summary:
-      "HTTP request deduplication and response replay on the native IDEM command. A retried request with the same Idempotency-Key gets the stored response instead of running twice.",
+      "HTTP request deduplication and response replay on the native IDEM command. A retried request with the same Idempotency-Key gets the stored response instead of running twice. Choose what happens when Ruvio is unreachable: throw, answer 503, or run unchecked, with an optional circuit breaker.",
     useCases: ["idempotency"],
     example: cs(`builder.Services.AddRuvioClient(builder.Configuration.GetSection("Ruvio"));
 builder.Services.AddRuvioIdempotency(options =>
@@ -136,7 +136,7 @@ app.MapPost("/orders", HandleOrder)
   },
   "Ruvio.AspNetCore.DistributedLock": {
     summary:
-      "Locks with owner-checked release and automatic renewal, plus a [RuvioLock] endpoint attribute: 409 when taken, request cancelled if the lock is lost.",
+      "Locks with owner-checked release and automatic renewal, plus a [RuvioLock] endpoint attribute: 409 when taken, request cancelled if the lock is lost. Choose what happens when Ruvio is unreachable: 503, throw, or run without the lock, with an optional circuit breaker.",
     useCases: ["locks"],
     example: cs(`services.AddRuvioDistributedLock(options => options.KeyPrefix = "myapp:lock:");
 

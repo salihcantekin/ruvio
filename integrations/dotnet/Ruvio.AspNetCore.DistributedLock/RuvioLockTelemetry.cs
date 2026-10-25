@@ -14,7 +14,8 @@ namespace Ruvio.AspNetCore.DistributedLock;
 /// link) and <c>ruvio.lock.errors</c> (storage failures), all tagged with <c>resource</c> only when
 /// the endpoint uses a fixed name (templated names are not tagged, to keep cardinality bounded), plus
 /// the histogram <c>ruvio.lock.wait_duration</c> in milliseconds: how long requests waited to get or
-/// give up the lock.
+/// give up the lock. <c>ruvio.lock.outage</c> counts requests that met an unreachable Ruvio or an open circuit
+/// breaker, tagged with <c>mode</c> and <c>reason</c>.
 /// </remarks>
 public static class RuvioLockTelemetry
 {
@@ -28,5 +29,6 @@ public static class RuvioLockTelemetry
     internal static readonly Counter<long> Rejected = Meter.CreateCounter<long>("ruvio.lock.rejected", description: "Requests rejected because the lock stayed taken.");
     internal static readonly Counter<long> Lost = Meter.CreateCounter<long>("ruvio.lock.lost", description: "Locks lost while the request was running.");
     internal static readonly Counter<long> Errors = Meter.CreateCounter<long>("ruvio.lock.errors", description: "Lock storage failures.");
+    internal static readonly Counter<long> Outage = Meter.CreateCounter<long>("ruvio.lock.outage", description: "Requests that met an unreachable Ruvio or an open circuit.");
     internal static readonly Histogram<double> WaitDuration = Meter.CreateHistogram<double>("ruvio.lock.wait_duration", unit: "ms", description: "Time spent acquiring (or giving up on) the lock.");
 }

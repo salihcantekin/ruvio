@@ -85,3 +85,20 @@ user/key tags. No exporters or telemetry worker are installed by this package.
 
 Build/package with `dotnet pack -c Release`. Targets .NET 8; requires the client
 and server `LIMIT` command. The package is versioned separately from the server.
+
+## When Ruvio is unreachable
+
+By default a storage error reaches your exception handling (`Outage.Mode = Throw`). Choose what to do instead:
+
+```csharp
+builder.Services.AddRuvioRateLimiting(options =>
+{
+    options.PartitionKey = context => context.User.Identity?.Name ?? "anonymous";
+    options.Outage.Mode = RuvioOutageMode.FailOpen;   // or FailClosed: 503, the request does not run
+    options.Outage.CircuitBreaker = new RuvioCircuitBreakerOptions();   // optional: stop calling Ruvio for 30 s after 5 failures in a row
+});
+```
+
+`FailOpen` lets requests through **unlimited** while Ruvio is away, and the budgets are whatever Ruvio holds once it is
+back. `FailClosed` answers `503` with `Retry-After` while a circuit is open. An error reply such as `WRONGTYPE` is never
+treated as an outage. See [When Ruvio is unreachable](../README.md#when-ruvio-is-unreachable) for the modes and the circuit breaker.

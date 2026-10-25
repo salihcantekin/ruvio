@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
+using Ruvio.Client;
 
 namespace Ruvio.AspNetCore.DistributedLock;
 
@@ -12,22 +13,68 @@ internal static class RuvioLockHttp
 {
     private const string ItemKey = "Ruvio.AspNetCore.DistributedLock.Lock";
 
-    internal static async ValueTask<IRuvioLock?> TryTakeAsync(
+    /// <summary>The outcome of taking the lock for a request: held, taken by another request (both null), or Ruvio away.</summary>
+    internal readonly record struct Take(IRuvioLock? Held, bool Bypass, IResult? Unavailable);
+
+    internal static async ValueTask<Take> TryTakeAsync(
         HttpContext context, string resource, TimeSpan? lease, TimeSpan? wait)
     {
         var provider = context.RequestServices.GetRequiredService<RuvioLockProvider>();
         RuvioLockOptions options = provider.Options;
-        
-        IRuvioLock? held = await provider.TryAcquireAsync(
-            resource, lease ?? options.DefaultLease, wait ?? options.DefaultWait, context.RequestAborted)
-            .ConfigureAwait(false);
+        var outage = options.Outage;
+        IRuvioLock? held = null;
+        Exception? unreachable = null;
+        bool circuitOpen = !outage.TryEnter();
+
+        if (!circuitOpen)
+        {
+            try
+            {
+                held = await provider.TryAcquireAsync(
+                    resource, lease ?? options.DefaultLease, wait ?? options.DefaultWait, context.RequestAborted)
+                    .ConfigureAwait(false);
+                outage.Succeeded();
+            }
+            catch (Exception error) when (outage.Failed(error, context.RequestAborted) && outage.Mode != RuvioOutageMode.Throw)
+            {
+                RuvioLockTelemetry.Errors.Add(1);
+                unreachable = error;
+            }
+        }
+
+        if (circuitOpen || unreachable is not null)
+        {
+            RuvioLockTelemetry.Outage.Add(1, new System.Diagnostics.TagList
+            {
+                { "mode", outage.Mode == RuvioOutageMode.FailOpen ? "fail_open" : "fail_closed" },
+                { "reason", circuitOpen ? "circuit_open" : "error" },
+            });
+
+            switch (outage.Mode)
+            {
+                case RuvioOutageMode.FailOpen:
+                    return new Take(null, Bypass: true, null);
+
+                case RuvioOutageMode.FailClosed:
+                    if (outage.RetryAfter > TimeSpan.Zero)
+                    {
+                        context.Response.Headers.RetryAfter = Math.Max(1, (long)Math.Ceiling(outage.RetryAfter.TotalSeconds))
+                            .ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    }
+
+                    return new Take(null, Bypass: false, Results.StatusCode(StatusCodes.Status503ServiceUnavailable));
+
+                default:
+                    throw new RuvioCircuitOpenException(outage.RetryAfter);
+            }
+        }
 
         if (held is not null)
         {
             context.Items[ItemKey] = held;
         }
 
-        return held;
+        return new Take(held, Bypass: false, null);
     }
 
     internal static IRuvioLock? Get(HttpContext context) =>

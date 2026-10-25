@@ -1,4 +1,5 @@
 using System.Text;
+using Ruvio.Client;
 
 namespace Ruvio.AspNetCore.OutputCaching;
 
@@ -27,6 +28,15 @@ public sealed class RuvioOutputCacheOptions
     /// </summary>
     public int MaxTagsPerEntry { get; set; } = 32;
 
+    /// <summary>
+    /// What happens when Ruvio cannot be reached. The default, <see cref="RuvioOutageMode.Throw"/>, lets the storage
+    /// exception reach the output-cache middleware (<see cref="RuvioOutageMode.FailClosed"/> does the same). With
+    /// <see cref="RuvioOutageMode.FailOpen"/> a read is a miss and writes are dropped, so the endpoint runs and answers;
+    /// an eviction by tag that was dropped can leave stale entries to be served once Ruvio is back. Add a circuit breaker
+    /// with <see cref="RuvioOutageOptions.CircuitBreaker"/> to stop waiting on a Ruvio that is down.
+    /// </summary>
+    public RuvioOutageOptions Outage { get; } = new();
+
     internal static readonly Encoding Utf8 = new UTF8Encoding(false, true);
 
     internal void Validate()
@@ -39,6 +49,8 @@ public sealed class RuvioOutputCacheOptions
 
         if (MaxKeyBytes is < 1 or > 64 * 1024)
             throw new ArgumentOutOfRangeException(nameof(MaxKeyBytes));
+
+        Outage.Validate();
 
         if (MaxTagsPerEntry is < 0 or > 32)
             throw new ArgumentOutOfRangeException(nameof(MaxTagsPerEntry));

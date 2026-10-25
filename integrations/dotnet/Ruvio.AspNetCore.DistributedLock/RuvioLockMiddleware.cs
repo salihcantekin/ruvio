@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Text;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
+using Ruvio.Client;
 
 namespace Ruvio.AspNetCore.DistributedLock;
 
@@ -40,29 +41,67 @@ public sealed class RuvioLockMiddleware(RequestDelegate next)
         var tags = new TagList { { "resource", fixedName ? resource : "(templated)" } };
         using Activity? activity = RuvioLockTelemetry.Source.StartActivity("ruvio.lock");
         long start = Stopwatch.GetTimestamp();
-        IRuvioLock? held;
+        IRuvioLock? held = null;
+        var outage = provider.Options.Outage;
+        Exception? unreachable = null;
+        bool circuitOpen = !outage.TryEnter();
 
-        try
+        if (!circuitOpen)
         {
-            held = await provider.TryAcquireAsync(
-                resource,
-                TimeSpan.FromSeconds(metadata.LeaseSeconds),
-                TimeSpan.FromMilliseconds(metadata.WaitMilliseconds),
-                context.RequestAborted).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
-        {
-            return; // The client left while we waited; nothing to answer.
-        }
-        catch (Exception exception) when (exception is not OperationCanceledException)
-        {
-            // Fail closed: when we cannot tell whether someone else holds the lock, running could break
-            // the exclusion the endpoint asked for.
-            RuvioLockTelemetry.Errors.Add(1, tags);
-            activity?.SetStatus(ActivityStatusCode.Error, exception.Message);
-            context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            try
+            {
+                held = await provider.TryAcquireAsync(
+                    resource,
+                    TimeSpan.FromSeconds(metadata.LeaseSeconds),
+                    TimeSpan.FromMilliseconds(metadata.WaitMilliseconds),
+                    context.RequestAborted).ConfigureAwait(false);
+                outage.Succeeded();
+            }
+            catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+            {
+                outage.Abandoned();
 
-            return;
+                return; // The client left while we waited; nothing to answer.
+            }
+            catch (Exception exception) when (Unreachable(outage, exception, context.RequestAborted))
+            {
+                RuvioLockTelemetry.Errors.Add(1, tags);
+                activity?.SetStatus(ActivityStatusCode.Error, exception.Message);
+                unreachable = exception;
+            }
+        }
+
+        if (circuitOpen || unreachable is not null)
+        {
+            RuvioLockTelemetry.Outage.Add(1, new TagList
+            {
+                { "mode", outage.Mode == RuvioOutageMode.FailOpen ? "fail_open" : "fail_closed" },
+                { "reason", circuitOpen ? "circuit_open" : "error" },
+            });
+
+            switch (outage.Mode)
+            {
+                case RuvioOutageMode.FailOpen:
+                    // The application chose availability: the handler runs with no lock, so it is not
+                    // exclusive while Ruvio is away and LockLost never fires.
+                    activity?.SetTag("ruvio.lock.outcome", "bypassed");
+                    await next(context).ConfigureAwait(false);
+
+                    return;
+
+                default:
+                    // Throw and fail closed (the default): when we cannot tell whether someone else holds the lock, running
+                    // could break the exclusion the endpoint asked for.
+                    context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+
+                    if (outage.RetryAfter > TimeSpan.Zero)
+                    {
+                        context.Response.Headers.RetryAfter = Math.Max(1, (long)Math.Ceiling(outage.RetryAfter.TotalSeconds))
+                            .ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    }
+
+                    return;
+            }
         }
 
         RuvioLockTelemetry.WaitDuration.Record(Stopwatch.GetElapsedTime(start).TotalMilliseconds, tags);
@@ -117,6 +156,17 @@ public sealed class RuvioLockMiddleware(RequestDelegate next)
 
             await held.DisposeAsync().ConfigureAwait(false);
         }
+    }
+
+    // The middleware has always answered 503 for every storage error, not only outages, so the default (and fail
+    // closed) keeps doing that; fail open acts on real outages only and lets any other error through.
+    private static bool Unreachable(RuvioOutageOptions outage, Exception exception, CancellationToken token)
+    {
+        bool isOutage = outage.Failed(exception, token);
+
+        return outage.Mode == RuvioOutageMode.FailOpen
+            ? isOutage
+            : isOutage || exception is not OperationCanceledException;
     }
 
     // Fixed names are returned as they are. Templates replace {name} by route value, query value, or

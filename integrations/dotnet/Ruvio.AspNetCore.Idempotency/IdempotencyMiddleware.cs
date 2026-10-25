@@ -171,7 +171,48 @@ public sealed class IdempotencyMiddleware
             string fingerprint = Fingerprint(identityParts, requestParts, bytes.AsSpan(0, length));
             string owner = NewOwner();
             var client = context.RequestServices.GetRequiredService<IRuvioClient>();
-            var (State, Result) = await IdempotencyStore.AcquireAsync(client, storageKey, fingerprint, owner, options.Retention, cancellation);
+            var outage = options.Outage;
+            (string State, string? Result) acquired = default;
+            Exception? unreachable = null;
+            bool circuitOpen = !outage.TryEnter();
+
+            if (!circuitOpen)
+            {
+                try
+                {
+                    acquired = await IdempotencyStore.AcquireAsync(client, storageKey, fingerprint, owner, options.Retention, cancellation);
+                    outage.Succeeded();
+                }
+                catch (Exception error) when (outage.Failed(error, cancellation) && outage.Mode != RuvioOutageMode.Throw)
+                {
+                    unreachable = error;
+                }
+            }
+
+            if (circuitOpen || unreachable is not null)
+            {
+                activity?.SetTag("idempotency.state", "outage");
+                IdempotencyStore.RecordOutage(outage.Mode, circuitOpen ? "circuit_open" : "error", "acquire");
+
+                switch (outage.Mode)
+                {
+                    case RuvioOutageMode.FailOpen:
+                        // The request body is still the buffered copy; the handler runs once, unchecked.
+                        await next(context);
+
+                        return;
+
+                    case RuvioOutageMode.FailClosed:
+                        Unavailable(context, outage);
+
+                        return;
+
+                    default:
+                        throw new RuvioCircuitOpenException(outage.RetryAfter);
+                }
+            }
+
+            var (State, Result) = acquired;
 
             activity?.SetTag("idempotency.state", State);
 
@@ -232,7 +273,41 @@ public sealed class IdempotencyMiddleware
 
             // Nothing reaches the client until the result is recorded, so a replay never disagrees with
             // what the first caller received.
-            await IdempotencyStore.CompleteAsync(client, storageKey, fingerprint, owner, encoded, cancellation);
+            Exception? notRecorded = null;
+            bool recordRefused = !outage.TryEnter();
+
+            if (!recordRefused)
+            {
+                try
+                {
+                    await IdempotencyStore.CompleteAsync(client, storageKey, fingerprint, owner, encoded, cancellation);
+                    outage.Succeeded();
+                }
+                catch (Exception error) when (outage.Failed(error, cancellation) && outage.Mode != RuvioOutageMode.Throw)
+                {
+                    notRecorded = error;
+                }
+            }
+
+            if (recordRefused || notRecorded is not null)
+            {
+                IdempotencyStore.RecordOutage(outage.Mode, recordRefused ? "circuit_open" : "error", "complete");
+
+                // The handler has run. Fail open delivers its response without a stored copy, so a retry with the
+                // same key finds the request still pending (409) and never runs it twice.
+                if (outage.Mode == RuvioOutageMode.FailClosed)
+                {
+                    // Back to the real response first: the buffered one is dropped.
+                    context.Features.Set(originalResponseFeature);
+                    context.Features.Set(originalBodyFeature);
+                    Unavailable(context, outage);
+
+                    return;
+                }
+
+                if (outage.Mode == RuvioOutageMode.Throw)
+                    throw new RuvioCircuitOpenException(outage.RetryAfter);
+            }
 
             context.Features.Set(originalResponseFeature);
             context.Features.Set(originalBodyFeature);
@@ -246,6 +321,18 @@ public sealed class IdempotencyMiddleware
             request.Body = originalRequest;
             context.Features.Set(originalResponseFeature);
             context.Features.Set(originalBodyFeature);
+        }
+    }
+
+    // The handler's own output is discarded: the finally block restores the original response features.
+    private static void Unavailable(HttpContext context, RuvioOutageOptions outage)
+    {
+        context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+
+        if (outage.RetryAfter > TimeSpan.Zero)
+        {
+            context.Response.Headers.RetryAfter = Math.Max(1, (long)Math.Ceiling(outage.RetryAfter.TotalSeconds))
+                .ToString(System.Globalization.CultureInfo.InvariantCulture);
         }
     }
 

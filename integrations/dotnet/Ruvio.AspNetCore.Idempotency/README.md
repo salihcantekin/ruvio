@@ -147,6 +147,30 @@ converted or replayed via Lua. Drain old admissions, handlers and retry retentio
 before switching all application instances. Do not delete old keys or change
 namespace to bypass this safety barrier. See [the native contract](../../../docs/IDEM.md).
 
+## When Ruvio is unreachable
+
+By default a storage error reaches your exception handling (`Outage.Mode = Throw`). Choose what to do instead:
+
+```csharp
+builder.Services.AddRuvioIdempotency(options =>
+{
+    options.Namespace = "orders";
+    options.ScopeSelector = context => context.User.FindFirst("tenant_id")?.Value;
+    options.Outage.Mode = RuvioOutageMode.FailOpen;   // or FailClosed: 503, the request does not run
+    options.Outage.CircuitBreaker = new RuvioCircuitBreakerOptions();   // optional
+});
+```
+
+- `FailClosed`: `503 Service Unavailable` and the handler does not run, so a retry later is safe.
+- `FailOpen`: the handler runs **without idempotency**. A client that retries with the same key during the outage runs the
+  operation again; accept this only where a duplicate is cheaper than refusing the request. If Ruvio is lost after the
+  handler ran, so its result cannot be recorded, the response is still delivered, and a retry with the same key finds the
+  request pending (409) rather than running it twice.
+- With `FailClosed`, the same loss after the handler ran answers `503` although the operation happened: the key stays
+  pending, so a retry gets `409` until the retention ends.
+
+See [When Ruvio is unreachable](../README.md#when-ruvio-is-unreachable) for the modes and the circuit breaker.
+
 ## Bounds and pipeline caveats
 
 - Defaults: 64 KiB request and response; configurable 1 byte–1 MiB each.
