@@ -48,7 +48,7 @@ impl SnapshotWriter {
     ) -> Result<Self, PersistenceError> {
         let file_name = format!("shard-{shard_id:04}.snap");
         let temporary = directory.join(format!(".{file_name}.tmp"));
-        let file = OpenOptions::new()
+        let file = crate::persistence::private_file_options()
             .create(true)
             .truncate(true)
             .write(true)
