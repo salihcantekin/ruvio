@@ -44,7 +44,7 @@ A blocking command gets its own wait on top of the command timeout, so it never 
 | C# | `ConnectTimeout` | `CommandTimeout`; `TimeSpan.Zero` | `TimeoutException` |
 | Go | `Options.DialTimeout` | `Options.CommandTimeout` (or a context deadline); a negative value | `context.DeadlineExceeded` |
 | Java | `connectTimeoutMillis` | `commandTimeoutMillis` (synchronous calls and the async futures); `0` | `RuvioException` |
-| Python | `connect_timeout` | `socket_timeout` (sync client; asyncio: wrap calls in `asyncio.wait_for`); `None` | `ruvio.TimeoutError` |
+| Python | `connect_timeout` | `socket_timeout` (sync and asyncio clients); `None` | `ruvio.TimeoutError` |
 | Node.js | `connectTimeoutMs` | `commandTimeoutMs`; `0` | `ConnectionError` |
 
 ## TLS

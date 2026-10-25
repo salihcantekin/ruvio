@@ -38,6 +38,7 @@ import hashlib
 import inspect
 import time
 import uuid
+import weakref
 from collections import deque
 from typing import Any, AsyncIterator, Awaitable, Callable, Deque, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -45,6 +46,7 @@ from .._commands import Arg, Commands, Conv, KeyT, KeyTypeT
 from .._models import Message
 from .._pipeline import PipelineBase
 from .._resp import NEED, Push, encode, make_parser
+from .._blocking import FOREVER, blocking_wait, pipeline_wait
 from .._cluster import ReadPolicy, policy_code
 from .._follow import MASTER, ROUNDS, WAITS, Address, parse_master_addr, parse_role, probe_wait
 from ..client import _SUB_KINDS, _message, _Options, _parse_seeds, parse_url
@@ -72,6 +74,13 @@ class _Batch:
             self.fut.set_result(self.items)
 
 
+def _expire(ref: "weakref.ReferenceType[_Proto]") -> None:
+    """The timer's callback holds the connection weakly, so an idle connection that is dropped is still collected."""
+    proto = ref()
+    if proto is not None:
+        proto._expire()
+
+
 class _Proto(asyncio.BufferedProtocol):
     def __init__(self, parser: Any, loop: asyncio.AbstractEventLoop, on_push: Optional[Callable[[Any], None]]) -> None:
         self.parser = parser
@@ -89,6 +98,14 @@ class _Proto(asyncio.BufferedProtocol):
         #: to a command that kept its frame; the future is left pending for the callback to complete.
         self.on_refused: Optional[Callable[..., None]] = None
         self.lost_exc: Optional[BaseException] = None
+        #: Seconds the oldest unanswered command may wait for any reply (``None``: no limit), set by ``_dial``.
+        self.timeout: Optional[float] = None
+        #: A command is unanswered; ``alive`` is the loop time of the send or reply that started the wait, and ``hold``
+        #: the loop time before which a blocking command's own wait lets the reply be late (``inf``: no bound).
+        self.busy = False
+        self.alive = 0.0
+        self.hold = 0.0
+        self.timer: Optional[asyncio.TimerHandle] = None
 
     # -- transport callbacks -------------------------------------------------
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
@@ -114,6 +131,11 @@ class _Proto(asyncio.BufferedProtocol):
                     self.transport.close()
                 return
             if v is NEED:
+                if self.timeout is not None:
+                    if pending:
+                        self.alive = self.loop.time()
+                    else:
+                        self.busy = False
                 return
             if not pending or type(v) is Push:
                 if self.on_push is not None:
@@ -143,6 +165,9 @@ class _Proto(asyncio.BufferedProtocol):
 
     def connection_lost(self, exc: Optional[BaseException]) -> None:
         self.closed = True
+        if self.timer is not None:
+            self.timer.cancel()
+            self.timer = None
         self.wbuf = None
         self._fail(ConnectionError(f"connection lost: {exc}" if exc else "connection closed by server"))
         if self.on_lost is not None:
@@ -157,8 +182,38 @@ class _Proto(asyncio.BufferedProtocol):
             if not fut.done():
                 fut.set_exception(exc)
 
+    # -- command timeout -----------------------------------------------------
+    def watch(self, wait: float) -> None:
+        """Starts the clock for a command (or several) about to be written. The reply must start within ``timeout`` seconds of
+        the last reply, or of this write if nothing else waits, plus ``wait``, the blocking wait they carry (see :func:`blocking_wait`)."""
+        if not self.busy:
+            self.busy = True
+            self.alive = self.loop.time()
+            self.hold = 0.0
+            if self.timer is None:
+                self.timer = self.loop.call_later(self.timeout, _expire, weakref.ref(self))  # type: ignore[arg-type]
+        if wait:
+            self.hold = float("inf") if wait == FOREVER else max(self.hold, self.loop.time() + wait)
+
+    def _expire(self) -> None:
+        self.timer = None
+        if not self.pending or self.closed:
+            return
+        now = self.loop.time()
+        due = max(self.alive, self.hold) + self.timeout  # type: ignore[operator]
+        if now < due:
+            self.timer = self.loop.call_later(min(due - now, self.timeout), _expire, weakref.ref(self))  # type: ignore[type-var]
+            return
+        # closed first: the callers woken by the failure then find the connection gone and open a new one
+        if self.transport is not None:
+            self.transport.close()
+        self._fail(TimeoutError("timed out waiting for the reply"))
+
     # -- writing -------------------------------------------------------------
-    def send(self, data: bytes) -> None:
+    def send(self, data: bytes, wait: Optional[float] = None) -> None:
+        """Writes ``data``, one command or several. ``wait`` is their blocking wait when the caller has already worked it out."""
+        if self.timeout is not None:
+            self.watch(blocking_wait(data) if wait is None else wait)
         wbuf = self.wbuf
         if wbuf is not None:
             wbuf.append(data)
@@ -262,6 +317,7 @@ async def _dial(
         raise TimeoutError(f"connect to {host}:{port} timed out") from exc
     except OSError as exc:
         raise ConnectionError(f"cannot connect to {host}:{port}: {exc}") from exc
+    proto.timeout = opts.socket_timeout
     return proto
 
 
@@ -453,8 +509,11 @@ class Ruvio(Commands):
             holds each reply until ``n`` replicas have the writes on disk. Needs a server with replication.
         durability_timeout_ms: Milliseconds the server waits for the replicas (its default is 5000); used only with
             ``durability_replicas``.
-        connect_timeout: Seconds allowed to open the connection (default 5.0, ``None`` for no limit). There is
-            no per-command socket timeout; wrap calls in :func:`asyncio.wait_for` instead.
+        connect_timeout: Seconds allowed to open the connection (default 5.0, ``None`` for no limit).
+        socket_timeout: Seconds a command may wait for its reply (default 30.0, ``None`` for no limit). A blocking
+            command (``BLPOP``, ``XREAD ... BLOCK``, ``WAIT`` ...) gets its own wait on top, and one that blocks with no
+            bound has no deadline. On expiry every command waiting on the connection fails with
+            :class:`ruvio.TimeoutError` and the connection is closed; the next command opens it again.
         decode_responses: ``True`` (default) returns ``str``, ``False`` returns ``bytes``.
         unix_socket_path: Connect to this Unix socket instead of host/port.
         parser: ``"auto"`` (hiredis when installed), ``"python"`` or ``"hiredis"``.
@@ -512,6 +571,7 @@ class Ruvio(Commands):
         durability_replicas: Optional[int] = None,
         durability_timeout_ms: Optional[int] = None,
         connect_timeout: Optional[float] = 5.0,
+        socket_timeout: Optional[float] = 30.0,
         decode_responses: bool = True,
         unix_socket_path: Optional[str] = None,
         parser: str = "auto",
@@ -534,6 +594,7 @@ class Ruvio(Commands):
             durability_replicas: Replicas that must have the writes on disk before a reply (``CLIENT DURABILITY``).
             durability_timeout_ms: Milliseconds to wait for them; ``None`` keeps the server default.
             connect_timeout: Seconds to open the connection; ``None`` for no limit.
+            socket_timeout: Seconds to wait for a reply (default 30.0, plus a blocking command's own wait); ``None`` for no limit.
             decode_responses: Return ``str`` (``True``) or ``bytes`` (``False``).
             unix_socket_path: Unix socket to use instead of host/port.
             parser: ``"auto"``, ``"python"`` or ``"hiredis"``.
@@ -574,6 +635,7 @@ class Ruvio(Commands):
                 durability_replicas=durability_replicas,
                 durability_timeout_ms=durability_timeout_ms,
                 connect_timeout=connect_timeout,
+                socket_timeout=socket_timeout,
                 unix_socket_path=unix_socket_path,
                 parser=parser,
                 on_push=on_push,
@@ -767,9 +829,11 @@ class Ruvio(Commands):
         proto.pending.extend([entry] * len(payload))
         data = b"".join(payload)
         if idle:
+            if proto.timeout is not None:
+                proto.watch(pipeline_wait(payload))
             proto.transport.write(data)  # type: ignore[union-attr]
         else:
-            proto.send(data)
+            proto.send(data, pipeline_wait(payload) if proto.timeout is not None else 0.0)
         return fut
 
     async def _connect_batch(self, payload: List[bytes]) -> List[Any]:
@@ -935,7 +999,7 @@ class Ruvio(Commands):
             async with client.dedicated() as worker:
                 item = await worker.blpop("jobs", timeout=30)
         """
-        return Ruvio(decode_responses=self._decode, **{k: v for k, v in self._st.opts.as_dict().items() if k != "socket_timeout"})
+        return Ruvio(decode_responses=self._decode, **self._st.opts.as_dict())
 
     def pipeline(self, transaction: bool = False) -> "Pipeline":
         """Creates a pipeline: commands are queued locally and sent in one write.
