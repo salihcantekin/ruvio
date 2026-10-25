@@ -53,7 +53,7 @@ The shard that owns a key parses, records, applies, and replies. The hot path do
 | --- | --- |
 | **Owner-per-shard engine** | One owner per shard, no lock on apply. A feature allocates only when a key uses it: twenty thousand leases added about 3.6 MB, twenty thousand versioned 64-byte strings about 7.2 MB, body included. |
 | **Durability you name** | `memory`, `snapshot`, `everysec` or `always`, chosen at startup. A write is checked, appended, then applied. If the log cannot take the record, the key stays as it was and later writes return `MISCONF`. |
-| **Wire compatible** | RESP2 subset; `redis-cli` and existing RESP clients connect. The command list that CI checks is [docs/compatibility-matrix.json](docs/compatibility-matrix.json). |
+| **Wire compatible** | RESP2, and RESP3 after `HELLO 3`; `redis-cli` and existing RESP clients connect. The command list that CI checks is [docs/compatibility-matrix.json](docs/compatibility-matrix.json). |
 | **Six first-party clients** | Rust, C#, Go, Java, Python and Node.js, each with a typed method for every one of the 299 listed commands and cluster routing from one seed address. |
 | **Operator UI** | A browser view of one running server: data, command forms, Pub/Sub and ACL users. |
 
@@ -141,6 +141,13 @@ These commands run on the shard that owns the key. A key that never uses them st
 | `SETV` | A conditional string write. The call succeeds only when the caller still has the current version, so two clients cannot both turn 12 into 11. The version exists only on keys written with `SETV`. |
 | `CHANGES` | `CHANGES START` arms an in-memory feed of later `SET`, `SETV`, `LEASE`, and `RELEASE` notes on that shard. Nothing is recorded before `START`. The feed is not the WAL, and it is empty after restart. |
 | `XADD DELAY` | The stream entry is stored now. `XREADGROUP` skips it until the delay passes. `XREAD` can still see it. The hold is a WAL record and a snapshot trailer, and it is written only when a delay is set. |
+| `LIMIT` | A fixed-window, sliding-window or token-bucket rate limit in one call, with fixed state per key. A refused call writes nothing. |
+| `IDEM` | Request de-duplication on the shard that owns the key: `BEGIN` tells a caller to run, wait or conflict, and a repeat of a finished request gets the saved result. |
+| `FILLGET` / `FILLSET` | One caller refills a missing or stale cache entry while the others get `BUSY` or the stale value. The markers live in memory only. |
+| `TRANSFER` | Moves an amount between two integer strings of one slot in one WAL record, with an optional cap on the destination. |
+| `CHANGES SUBSCRIBE` | A resumable push stream of this shard's WAL, with a cursor to continue from after a disconnect or restart. |
+| `JSON.INDEX` | A field index over JSON documents with a key prefix, so a lookup by field does not scan. |
+| `CLIENT DURABILITY` | Holds this connection's replies until `n` replicas have the writes on disk; `ruvio coordinator` fails over only to a replica that has them. |
 
 `SET` replaces a versioned string with a plain string. `INCR` does not accept a versioned string.
 

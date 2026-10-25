@@ -1,6 +1,6 @@
 # Releasing
 
-No release runs on its own. Every workflow in `.github/workflows/` is started by hand from the Actions tab (`workflow_dispatch`). Only `pr-gate` also runs on pull requests and on pushes to `main`; it publishes nothing.
+No release runs on its own. Every workflow in `.github/workflows/` is started by hand from the Actions tab (`workflow_dispatch`). Only `pr-gate` also runs on pull requests and on pushes to `main` and `dev`, and `nightly` runs on a schedule (02:17 UTC, from `main`); neither publishes anything.
 
 | Workflow | What it does |
 | --- | --- |
