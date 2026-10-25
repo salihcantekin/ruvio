@@ -633,6 +633,25 @@ pub(super) fn lease_command(
         Some(_) if state.role.get() == crate::config::ReplicationRole::Replica => {
             Response::Error(crate::primary_lease::Refused::NotPrimary.message())
         }
+        Some(grant)
+            if !state
+                .published_config
+                .replication
+                .primary_lease_coordinators
+                .contains(&grant.coordinator) =>
+        {
+            Response::Error(crate::primary_lease::Refused::UnknownCoordinator.message())
+        }
+        Some(grant)
+            if u64::from(grant.voters)
+                != state
+                    .published_config
+                    .replication
+                    .primary_lease_coordinators
+                    .len() as u64 =>
+        {
+            Response::Error(crate::primary_lease::Refused::VotersMismatch.message())
+        }
         Some(grant) => match state.primary_lease.with(|leases| {
             leases.grant(
                 grant.token,

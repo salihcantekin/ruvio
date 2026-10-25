@@ -2089,3 +2089,54 @@ fn scan_takes_a_slot_and_routes_to_it() {
         assert!(parse(&[b"SCAN", b"0", b"SLOT", bad]).is_err());
     }
 }
+
+#[test]
+fn stream_trim_limit_is_read_with_an_approximate_trim_and_ignored() {
+    let frame = |args: &[&str]| {
+        let mut frame = format!("*{}\r\n", args.len()).into_bytes();
+
+        for arg in args {
+            frame.extend_from_slice(format!("${}\r\n{arg}\r\n", arg.len()).as_bytes());
+        }
+        frame
+    };
+    let parse =
+        |args: &[&str]| parse_command(&frame(args)).map(|parsed| parsed.unwrap().0.into_owned());
+
+    assert!(matches!(
+        parse(&[
+            "XADD", "s", "MAXLEN", "~", "10", "LIMIT", "5", "*", "f", "v"
+        ]),
+        Ok(Command::StreamAdd {
+            max_len: Some(10),
+            ..
+        })
+    ));
+    assert!(matches!(
+        parse(&[
+            "XADD", "s", "MINID", "~", "1-1", "LIMIT", "5", "*", "f", "v"
+        ]),
+        Ok(Command::StreamAdd {
+            min_id: Some((1, 1)),
+            ..
+        })
+    ));
+    assert!(matches!(
+        parse(&["XTRIM", "s", "MAXLEN", "~", "10", "LIMIT", "5"]),
+        Ok(Command::StreamTrim { max_len: 10, .. })
+    ));
+    assert!(matches!(
+        parse(&["XTRIM", "s", "MINID", "~", "1-1", "LIMIT", "5"]),
+        Ok(Command::StreamTrimMinId { id: (1, 1), .. })
+    ));
+    // As in Redis, LIMIT needs `~`, a count, and nothing after it.
+    assert!(parse(&["XTRIM", "s", "MAXLEN", "10", "LIMIT", "5"]).is_err());
+    assert!(parse(&["XTRIM", "s", "MAXLEN", "=", "10", "LIMIT", "5"]).is_err());
+    assert!(parse(&["XTRIM", "s", "MAXLEN", "~", "10", "LIMIT"]).is_err());
+    assert!(parse(&["XTRIM", "s", "MAXLEN", "~", "10", "LIMIT", "x"]).is_err());
+    assert!(parse(&["XTRIM", "s", "MAXLEN", "~", "10", "LIMIT", "5", "extra"]).is_err());
+    assert!(matches!(
+        parse(&["XTRIM", "s", "MAXLEN", "~", "10"]),
+        Ok(Command::StreamTrim { max_len: 10, .. })
+    ));
+}

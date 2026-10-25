@@ -131,6 +131,8 @@ impl Group {
                 self.replication[index].to_string(),
             )
             .env("RUVIO_SHARDS", self.shards.to_string())
+            // The three coordinators the lease tests start (ids 1 to 3).
+            .env("RUVIO_PRIMARY_LEASE_COORDINATORS", "1,2,3")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         match follow {

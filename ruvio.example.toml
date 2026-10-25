@@ -55,6 +55,7 @@ announced = true
 min_replicas_max_lag = 10
 min_replicas_to_write = 0
 primary_lease = false
+primary_lease_coordinators = []
 role = "off"
 
 [requests]
