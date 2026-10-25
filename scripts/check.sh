@@ -45,7 +45,8 @@ for patch in scripts/model_check_mutants/*.patch; do
 done
 # Workflows install the toolchain rust-toolchain.toml pins, so CI downloads one toolchain.
 pinned="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
-if grep -n 'dtolnay/rust-toolchain@' .github/workflows/*.yml | grep -v '@nightly' | grep -v "@$pinned\$"; then
+# Actions are pinned to a commit SHA; the trailing comment names the toolchain tag.
+if grep -n 'dtolnay/rust-toolchain@' .github/workflows/*.yml | grep -v '# nightly$' | grep -v "# $pinned\$"; then
 	echo "workflows above install a toolchain other than $pinned (rust-toolchain.toml)" >&2
 	exit 1
 fi
