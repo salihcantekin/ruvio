@@ -13,3 +13,38 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+  # The UI image bases are pinned by digest like the server's.
+  - package-ecosystem: docker
+    directory: /clients/ruvio-ui
+    schedule:
+      interval: weekly
+  # Rust crates: the server, the Rust client and the UI. Updates arrive as pull requests that
+  # run the PR gate; advisories are checked nightly (cargo deny).
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+  - package-ecosystem: cargo
+    directory: /clients/ruvio-client
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+  - package-ecosystem: cargo
+    directory: /clients/ruvio-ui
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+  - package-ecosystem: npm
+    directory: /clients/ruvio-ui/web
+    schedule:
+      interval: weekly
+    groups:
+      npm:
+        patterns: ["*"]

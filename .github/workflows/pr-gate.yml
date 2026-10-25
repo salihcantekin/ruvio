@@ -58,6 +58,19 @@ jobs:
           cargo bench --locked --bench hot_path 2>&1 | tee bench.log
           python3 scripts/check_instruction_baseline.py bench.log
 
+  # Licenses, banned crates and sources do not change under a pull request that leaves the
+  # dependencies alone, so this check is repeatable. Advisories change every day and run in the
+  # nightly workflow instead; a new RustSec entry must not fail an unrelated pull request.
+  supply-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check bans licenses sources
+      - run: python3 scripts/test_supply_chain.py
+
   rust-client-and-cluster:
     runs-on: ubuntu-latest
     timeout-minutes: 25
