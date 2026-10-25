@@ -916,7 +916,7 @@ class ClusterRuvio(Ruvio):
         Returns:
             A new :class:`ClusterRuvio`; close it when done.
         """
-        opts = self._conn.opts.as_dict()
+        opts = self._conn.opts.for_constructor()
         opts["seeds"] = self._cl.seeds
         return ClusterRuvio(decode_responses=self._decode, cluster=True, **opts)
 
