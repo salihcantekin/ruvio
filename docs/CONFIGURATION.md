@@ -573,8 +573,12 @@ after can return a write no replica holds yet. See
 for more than 300 ms more; otherwise writes get
 `NOREPLICAS Primary lease expired: too few coordinators renewed it.`. A primary
 starts, and a promoted replica begins, refusing writes until the first grants
-arrive. It is checked on the same 100 ms tick and changes with `CONFIG SET`;
-see [COORDINATOR.md](COORDINATOR.md#primary-lease) for the guarantee and the
+arrive. It is checked on the same 100 ms tick and changes with `CONFIG SET`.
+A script (`EVAL`, `EVALSHA`, `FCALL`, or one inside `MULTI`) is checked when it
+starts, and its `script-max-time-ms` is cut to what the lease still holds past
+those 300 ms, so it cannot keep writing after the gate would close; a script
+that runs out of that time stops with the usual script timeout error and its
+writes stay. See [COORDINATOR.md](COORDINATOR.md#primary-lease) for the guarantee and the
 order to turn it on or off.
 
 **Replicas in the topology.** A replica sends its primary the address clients
