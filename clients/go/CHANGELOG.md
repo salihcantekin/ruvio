@@ -4,6 +4,7 @@ Notable changes to the Go client `github.com/salihcantekin/ruvio/clients/go`. A 
 
 ## Unreleased
 
+- The reply parser refuses a bulk string over 64 MiB and an array, set, push or map over 1,048,576 elements as a protocol error before it allocates, the same limits as the Rust and C# clients. Before, Go allowed 512 MiB for both.
 - `EvalCached(ctx, script, keys, args...)` runs a script by its SHA1 and sends the whole script only when the shard answers `NOSCRIPT` (`EVALSHA`, then `EVAL` once). The SHA1 is computed in the client; nothing changes for `eval` and `evalsha`.
 - A cluster client now retries `-TRYAGAIN` up to 7 times, after waits doubling from 5 ms to 320 ms (635 ms in all), instead of 3 times after 5, 10 and 20 ms. A slot range moving between the nodes of a cluster is frozen for a few hundred milliseconds (about 170-240 ms in a local test), so the caller saw `TRYAGAIN` on every such move before. Only `TRYAGAIN` replies wait; other replies are unchanged.
 - Fixed: following a failover after a `READONLY` reply skipped the node that refused in every round of the search, so a replica promoted a moment later (the usual case after the primary dies: the reconnect lands on the replica during the election) was used only once all rounds had run out, about 7 s with the default backoff. The refusing node is now skipped only while it still says `master` (a replaced primary does); once it answers `ROLE` as a replica, a later round takes it when it says `master`. Nothing changes while the connection is healthy.

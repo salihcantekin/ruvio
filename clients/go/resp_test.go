@@ -131,7 +131,7 @@ func TestParseResumable(t *testing.T) {
 }
 
 func TestParseErrors(t *testing.T) {
-	for _, in := range []string{"?x\r\n", ":abc\r\n", "$3\r\nabcd\r\n", "+a\rb"} {
+	for _, in := range []string{"?x\r\n", ":abc\r\n", "$3\r\nabcd\r\n", "+a\rb", "$67108865\r\n", "*1048577\r\n", "%1048577\r\n"} {
 		_, _, err := ParseReply([]byte(in))
 		if !errors.Is(err, ErrProtocol) {
 			t.Fatalf("%q: want protocol error, got %v", in, err)

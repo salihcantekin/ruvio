@@ -19,6 +19,10 @@ from typing import Any, Dict, List, Tuple
 from ._constants import KEYWORD_TYPES
 from .errors import ProtocolError, ResponseError, make_error
 
+# What one reply may announce, the same in every client: a bulk string up to 64 MiB, an aggregate of up to 1,048,576 elements.
+MAX_BULK_BYTES = 64 * 1024 * 1024
+MAX_ELEMENTS = 1 << 20
+
 __all__ = ["encode", "head", "Parser", "NEED", "Push", "HiredisParser", "make_parser"]
 
 _CRLF = b"\r\n"
@@ -203,6 +207,8 @@ class Parser:
             t = buf[pos]
             if t == 36:  # '$' bulk string
                 n = int(buf[pos + 1 : nl])
+                if n > MAX_BULK_BYTES:
+                    raise ProtocolError(f"bulk length {n} is over the limit of {MAX_BULK_BYTES}")
                 if n < 0:
                     v: Any = None
                     pos = nl + 2
@@ -229,6 +235,8 @@ class Parser:
                 pos = nl + 2
             elif t == 42 or t == 37 or t == 126 or t == 62:  # '*' '%' '~' '>'
                 n = int(buf[pos + 1 : nl])
+                if n > MAX_ELEMENTS:
+                    raise ProtocolError(f"element count {n} is over the limit of {MAX_ELEMENTS}")
                 pos = nl + 2
                 if n > 0:
                     if t == 37:
@@ -256,6 +264,8 @@ class Parser:
                                 if nl < 0:
                                     break
                                 m = int(buf[pos + 1 : nl])
+                                if m > MAX_BULK_BYTES:
+                                    raise ProtocolError(f"bulk length {m} is over the limit of {MAX_BULK_BYTES}")
                             if m < 0:
                                 add(None)
                                 pos = nl + 2
@@ -321,6 +331,8 @@ class Parser:
                 pos = nl + 2
             elif t == 61 or t == 33:  # '=' verbatim, '!' blob error
                 n = int(buf[pos + 1 : nl])
+                if n > MAX_BULK_BYTES:
+                    raise ProtocolError(f"bulk length {n} is over the limit of {MAX_BULK_BYTES}")
                 s = nl + 2
                 e = s + n
                 if e + 2 > end:
