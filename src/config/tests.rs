@@ -1017,6 +1017,10 @@ fn every_template_setting_answers_config_get() {
         ("replication.min_replicas_max_lag", "min-replicas-max-lag"),
         ("replication.min_replicas_to_write", "min-replicas-to-write"),
         ("replication.primary_lease", "primary-lease"),
+        (
+            "replication.primary_lease_coordinators",
+            "primary-lease-coordinators",
+        ),
         ("replication.role", "replication-role"),
         (
             "requests.max_output_buffer_bytes",
@@ -1253,4 +1257,34 @@ fn replication_tls_needs_its_material_and_stops_the_cleartext_warning() {
     config.replication.role = ReplicationRole::Primary;
     config.replication.listen = Some("127.0.0.1:7000".parse().unwrap());
     assert!(config.validate().unwrap_err().contains("tls_cert"));
+}
+
+#[test]
+fn the_primary_lease_needs_the_coordinator_ids() {
+    let mut config = super::AppConfig::default();
+
+    config.replication.primary_lease = true;
+    assert!(config.validate().is_err(), "a lease without coordinators");
+
+    config
+        .apply_environment(|name| {
+            (name == "RUVIO_PRIMARY_LEASE_COORDINATORS").then(|| "1, 2,3".into())
+        })
+        .unwrap();
+
+    assert_eq!(config.replication.primary_lease_coordinators, [1, 2, 3]);
+    config.validate().unwrap();
+
+    let mut twice = config.clone();
+
+    twice.replication.primary_lease_coordinators = vec![1, 1];
+    assert!(twice.validate().is_err(), "an id listed twice");
+
+    // The lease cannot be turned on live while the list is empty.
+    let off = super::AppConfig::default();
+
+    assert!(
+        off.with_live_changes(&[(b"primary-lease", b"yes")])
+            .is_err()
+    );
 }

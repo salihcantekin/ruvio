@@ -49,6 +49,11 @@ pub struct ReplicationConfig {
     /// A primary takes writes only while a majority of `ruvio coordinator`s renewed its lease
     /// (`RUVIO LEASE`); off by default.
     pub primary_lease: bool,
+    /// The ids (`id` in `coordinator.toml`) of the `ruvio coordinator`s whose lease grants this
+    /// node takes. `RUVIO LEASE GRANT` from any other id, or naming another coordinator count,
+    /// is refused, so a client with `ruvio|lease` rights cannot fake a majority. Required
+    /// while `primary_lease` is on; the grants are refused while it is empty.
+    pub primary_lease_coordinators: Vec<u64>,
     /// A replica announces its client address to its primary, which lists it in
     /// `CLUSTER SLOTS`, `ROLE` and `INFO`; off keeps it out of the topology.
     pub announced: bool,
@@ -73,6 +78,7 @@ impl Default for ReplicationConfig {
             min_replicas_to_write: 0,
             min_replicas_max_lag: Duration::from_secs(10),
             primary_lease: false,
+            primary_lease_coordinators: Vec::new(),
             announced: true,
             tls: false,
             tls_ca: PathBuf::new(),
@@ -558,6 +564,11 @@ impl AppConfig {
         apply_u64(&get, "RUVIO_MIN_REPLICAS_MAX_LAG", &mut max_lag)?;
         self.replication.min_replicas_max_lag = Duration::from_secs(max_lag);
 
+        if let Some(value) = get("RUVIO_PRIMARY_LEASE_COORDINATORS") {
+            self.replication.primary_lease_coordinators =
+                parse_coordinator_ids(&value, "RUVIO_PRIMARY_LEASE_COORDINATORS")?;
+        }
+
         if let Some(value) = get("RUVIO_PRIMARY_LEASE") {
             self.replication.primary_lease = parse_bool(&value, "RUVIO_PRIMARY_LEASE")?;
         }
@@ -650,6 +661,29 @@ impl AppConfig {
                     && self.sync_worker_supported()
             }
         };
+    }
+
+    /// `primary_lease_coordinators`: distinct ids, at most [`crate::primary_lease::MAX_VOTERS`],
+    /// and some when the lease is on.
+    fn validate_primary_lease(&self) -> Result<(), String> {
+        let ids = &self.replication.primary_lease_coordinators;
+        let mut sorted = ids.clone();
+
+        sorted.sort_unstable();
+        sorted.dedup();
+        if sorted.len() != ids.len() || ids.len() > crate::primary_lease::MAX_VOTERS as usize {
+            return Err(format!(
+                "primary_lease_coordinators must list each coordinator id once, at most {}",
+                crate::primary_lease::MAX_VOTERS
+            ));
+        }
+        if self.replication.primary_lease && ids.is_empty() {
+            return Err(
+                "primary_lease needs primary_lease_coordinators: the ids of the coordinators whose grants this node takes"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     fn validate_replication_tls(&self) -> Result<(), String> {
@@ -746,6 +780,8 @@ impl AppConfig {
         if self.replication.tls && self.replication.role != ReplicationRole::Off {
             self.validate_replication_tls()?;
         }
+
+        self.validate_primary_lease()?;
 
         if self.shards == 0 {
             return Err("shard count must be greater than zero".into());
@@ -1129,6 +1165,15 @@ impl AppConfig {
             (
                 "primary-lease".into(),
                 yes_no(self.replication.primary_lease),
+            ),
+            (
+                "primary-lease-coordinators".into(),
+                self.replication
+                    .primary_lease_coordinators
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
             ),
             (
                 "replica-announced".into(),
@@ -1605,6 +1650,7 @@ struct ReplicationFileConfig {
     /// Seconds, as Redis's `min-replicas-max-lag`.
     min_replicas_max_lag: Option<u64>,
     primary_lease: Option<bool>,
+    primary_lease_coordinators: Option<Vec<u64>>,
     announced: Option<bool>,
     tls: Option<bool>,
     tls_ca: Option<PathBuf>,
@@ -1646,6 +1692,10 @@ impl ReplicationFileConfig {
         }
 
         assign(&mut replication.primary_lease, self.primary_lease);
+        assign(
+            &mut replication.primary_lease_coordinators,
+            self.primary_lease_coordinators,
+        );
         if let Some(announced) = self.announced {
             replication.announced = announced;
         }
@@ -2853,6 +2903,18 @@ fn remove_toml(table: &mut toml::Table, path: &[&str]) {
     };
 
     remove_toml(child, &path[1..]);
+}
+
+fn parse_coordinator_ids(value: &str, name: &str) -> Result<Vec<u64>, String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| {
+            id.parse()
+                .map_err(|_| format!("{name} must be a comma-separated list of coordinator ids"))
+        })
+        .collect()
 }
 
 fn parse_bool(value: &str, name: &str) -> Result<bool, String> {
