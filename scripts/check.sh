@@ -51,7 +51,7 @@ if grep -n 'dtolnay/rust-toolchain@' .github/workflows/*.yml | grep -v '# nightl
 	exit 1
 fi
 run cargo check -q --all-targets
-run cargo clippy -q --lib -- -D warnings
+run cargo clippy -q --all-targets -- -D warnings
 
 # Each filter names the test that holds one standard; a renamed test must be renamed here.
 standards=(
