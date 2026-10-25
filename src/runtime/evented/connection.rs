@@ -2156,7 +2156,7 @@ async fn dispatch_inner<'s>(
                     &mut *persistence,
                     &mut *waiters,
                     &mut scripts,
-                    state.live.with(|live| live.scripts),
+                    script_limits(state),
                     command,
                     session.database,
                 ) {
@@ -2510,7 +2510,7 @@ async fn dispatch_inner<'s>(
 
                     crate::engine::TransactionScripts {
                         cache,
-                        limits: state.live.with(|live| live.scripts),
+                        limits: script_limits(state),
                         rules: (!(rules.all_commands && rules.all_keys))
                             .then(|| std::sync::Arc::clone(rules)),
                     }
@@ -3027,4 +3027,22 @@ async fn finish_retry(
 fn command_may_write(command: &Command<'_>) -> bool {
     crate::protocol::command_spec(crate::acl::command_acl_name(command).as_bytes())
         .is_none_or(|spec| spec.flags & crate::protocol::flags::WRITE != 0)
+}
+
+/// The script limits of this shard. With `primary-lease` a script may run only while the
+/// write gate stays open, so its time is cut to what the lease holds past the gate margin;
+/// with the lease off this is the configured limits.
+fn script_limits(state: &ShardState) -> crate::config::ScriptLimits {
+    let (limits, lease) = state
+        .live
+        .with(|live| (live.scripts, live.replication.primary_lease));
+
+    if !lease {
+        return limits;
+    }
+    let left = state
+        .primary_lease
+        .with(|leases| leases.remaining(crate::primary_lease::now()));
+
+    crate::primary_lease::limit_script_time(limits, left)
 }

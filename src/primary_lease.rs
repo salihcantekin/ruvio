@@ -26,6 +26,20 @@ pub const MAX_LEASE: Duration = Duration::from_secs(60);
 /// as much again and more for a tick that runs late (a long script, a slow log sync).
 pub const GATE_MARGIN: Duration = Duration::from_millis(300);
 
+/// `limits` with the script time cut to what a lease with `left` to run holds past
+/// [`GATE_MARGIN`] (at least 1 ms), so a script cannot keep writing after the gate closes.
+pub fn limit_script_time(
+    mut limits: crate::config::ScriptLimits,
+    left: Duration,
+) -> crate::config::ScriptLimits {
+    let room = left.saturating_sub(GATE_MARGIN).as_millis();
+
+    limits.max_time_ms = limits
+        .max_time_ms
+        .min(usize::try_from(room).unwrap_or(usize::MAX).max(1));
+    limits
+}
+
 /// The lease clock: on Linux `CLOCK_BOOTTIME`, which keeps counting while the host is
 /// suspended (Rust's `Instant` uses `CLOCK_MONOTONIC`, which stops); on macOS
 /// `CLOCK_MONOTONIC`, which counts sleep there. Elsewhere `Instant`. The value is time since an
@@ -472,5 +486,14 @@ mod tests {
         std::thread::sleep(ms(2));
 
         assert!(now() > first);
+    }
+
+    #[test]
+    fn script_time_stops_at_the_gate_margin() {
+        let limits = crate::config::ScriptLimits::default();
+
+        assert_eq!(limit_script_time(limits, ms(1000)).max_time_ms, 700);
+        assert_eq!(limit_script_time(limits, ms(30_000)).max_time_ms, 1000);
+        assert_eq!(limit_script_time(limits, ms(100)).max_time_ms, 1);
     }
 }
