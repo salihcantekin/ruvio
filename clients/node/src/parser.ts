@@ -19,6 +19,10 @@ const HAS_FAST = typeof (Buffer.prototype as BufferFast).utf8Slice === 'function
 
 const EMPTY = Buffer.alloc(0) as BufferFast;
 
+// What one reply may announce, the same in every client: a bulk string up to 64 MiB, an aggregate of up to 1,048,576 elements.
+const MAX_BULK_BYTES = 64 * 1024 * 1024;
+const MAX_ELEMENTS = 1 << 20;
+
 // Container kinds on the resumable stack.
 const K_ARRAY = 0;
 const K_MAP = 1;
@@ -208,6 +212,7 @@ export class Parser {
         const cr = this.eol(start + 1);
         if (cr < 0) return this.incomplete(start, 0);
         const n = this.int(start + 1, cr) as number;
+        if (n > MAX_BULK_BYTES) throw new RuvioError(`ERR protocol: bulk length ${n} is over the limit of ${MAX_BULK_BYTES}`);
         if (n < 0) {
           v = null;
           this.pos = cr + 2;
@@ -242,6 +247,7 @@ export class Parser {
         const cr = this.eol(start + 1);
         if (cr < 0) return this.incomplete(start, 0);
         const n = this.int(start + 1, cr) as number;
+        if (n > MAX_ELEMENTS) throw new RuvioError(`ERR protocol: element count ${n} is over the limit of ${MAX_ELEMENTS}`);
         this.pos = cr + 2;
         if (n < 0) v = null;
         else {
@@ -289,6 +295,7 @@ export class Parser {
         const cr = this.eol(start + 1);
         if (cr < 0) return this.incomplete(start, 0);
         const n = this.int(start + 1, cr) as number;
+        if (n > MAX_BULK_BYTES) throw new RuvioError(`ERR protocol: bulk length ${n} is over the limit of ${MAX_BULK_BYTES}`);
         const s = cr + 2;
         const e = s + n;
         if (e + 2 > this.end) return this.incomplete(start, e + 2 - start);

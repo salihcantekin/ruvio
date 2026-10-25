@@ -331,6 +331,14 @@ test('parser: protocol violations throw RuvioError', () => {
   }
 });
 
+test('parser: a bulk or aggregate over the limit throws before it is read', () => {
+  for (const wire of ['$67108865\r\n', '*1048577\r\n', '%1048577\r\n', '=67108865\r\n', '*1\r\n$67108865\r\n']) {
+    const p = new Parser();
+    p.feed(Buffer.from(wire, 'latin1'));
+    assert.throws(() => p.next(), (e: unknown) => e instanceof RuvioError && /over the limit/.test((e as Error).message), JSON.stringify(wire));
+  }
+});
+
 test('parser: reset drops a half-read reply and a huge accumulator', () => {
   const p = new Parser();
   p.feed(Buffer.from('*2\r\n$3\r\nab'));

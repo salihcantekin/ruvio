@@ -4,7 +4,7 @@
 
 <h1 align="center">Ruvio clients</h1>
 
-<p align="center">First-party application clients for six languages. They speak RESP2, never send <code>CLIENT SETINFO</code>, cover every command in <code>docs/compatibility-matrix.json</code> and discover a sharded server from one seed.</p>
+<p align="center">First-party application clients for six languages. They speak RESP2, never send <code>CLIENT SETINFO</code>, cover every command in <code>docs/compatibility-matrix.json</code> and route a sharded server from one seed (Rust and C# discover it by default; Go, Java, Python and Node.js turn it on with an option).</p>
 
 <p align="center">
   <a href="https://github.com/salihcantekin/ruvio/blob/main/clients/LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green"></a>
@@ -71,7 +71,7 @@ The script runs the Rust and C# unit tests. Set `RUVIO_TEST_ADDR` (the script do
 
 - Pub/Sub uses a **second TCP socket**. `GET`, `SET`, `PING`, and `PUBLISH` stay on the command connection.
 - A dropped socket, including a shard socket, is opened again before the next command. The command that sees the drop fails.
-- The C# client sends one `GET`, `MGET`, `EXISTS`, `HGET`, `TTL`, or `PTTL` again when the socket closes before any reply byte; a pipeline is not retried. The Rust client does not retry that command.
+- A command whose socket dropped before any reply byte is not sent again, reads included, in every client; the next command opens the socket again.
 - Subscriptions are sent again on the new Pub/Sub socket.
 - A seed list (`Seeds` / `seeds`) can replace the single host and port in every client. Reconnects start with the seed after the one that dropped; a cluster reloads its slot map from another known node or seed. See [docs/CLIENT_BEHAVIOR.md](../docs/CLIENT_BEHAVIOR.md).
 - A read policy (`primary` by default, `prefer-replica`, `replica`) lets a cluster client send read-only commands to the replicas the server lists in `CLUSTER SLOTS`. Replication is asynchronous, so such a read may miss recent writes. See [docs/CLIENT_BEHAVIOR.md](../docs/CLIENT_BEHAVIOR.md#reads-from-replicas).

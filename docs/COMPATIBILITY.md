@@ -65,7 +65,7 @@ full-text search; those are planned work, not part of this compatibility contrac
 - Required baseline: RESP2 arrays of bulk strings for client commands.
 - Keys and values are binary-safe.
 - Pipelining is supported.
-- Inline commands are not supported.
+- Inline commands (a plain text line such as `PING` or `SET a "b c"`, quoted like Redis, up to 64 KiB) are accepted next to RESP arrays, so `telnet` and `nc` work.
 - RESP3 is negotiated per connection with `HELLO 3` and switched back with
   `HELLO 2`. The default stays RESP2, and RESP2 replies are unchanged.
   RESP3 adds null (`_`), booleans, doubles (`ZSCORE`, `ZINCRBY`), maps
@@ -324,7 +324,7 @@ tail continues. A gap with no usable checkpoint still stops the replica. A
 hot-key `SET` or `DEL` is copied into the hot store. `PUBLISH`
 and `SPUBLISH` are copied live to replicas of the same shard and are not
 replayed from the WAL. `CLIENT TRACKING` on a replica observes a copied write.
-Functions, scripts, and `ACL SETUSER` are refused while replication is enabled.
+`FUNCTION LOAD` and `ACL SETUSER` are refused while replication is enabled. Scripts (`EVAL`, `EVALSHA`) run on a primary, and the writes they make are replicated; the script bodies are not, so a replica that becomes primary answers `NOSCRIPT` until a script is loaded again.
 
 ## Persistence Compatibility
 

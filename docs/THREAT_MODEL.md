@@ -5,8 +5,9 @@ document is the Milestone 6 threat model for standalone operation. It covers
 the RESP parser, persistence files, administrative commands, cluster
 discovery, and denial-of-service paths.
 
-Cluster membership, a cluster bus, and failover are not implemented. Those
-surfaces are listed so they are not mistaken for existing controls. WAL tail
+There is no cluster bus. Failover and slot moves between machines are done by
+`ruvio coordinator` (see the coordinator sections below); the surfaces that
+still have no control are listed so they are not mistaken for one. WAL tail
 replication is a separate listener, described under Replication port.
 
 Snapshot date: 2026-09-27. Revisit this file when a wire, persistence, or

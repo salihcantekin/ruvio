@@ -374,8 +374,11 @@ func AppendCommand(b []byte, args ...any) ([]byte, error) {
 // Parsing
 // ---------------------------------------------------------------------------
 
-// maxBulk bounds a single bulk length the parser will accept (512 MiB like Redis).
-const maxBulk = 512 << 20
+// maxBulk bounds a single bulk length the parser will accept (64 MiB, as in the other clients).
+const maxBulk = 64 << 20
+
+// maxArray bounds the element count of one array, set, push or map (1,048,576, as in the other clients).
+const maxArray = 1 << 20
 
 type frame struct {
 	arr  []Value
@@ -497,7 +500,7 @@ outer:
 			after = end + 2
 		case '*', '~', '>', '%':
 			n, ok := parseLineInt(line)
-			if !ok || n > maxBulk {
+			if !ok || n > maxArray {
 				return Value{}, pos, false, ErrProtocol
 			}
 			if n < 0 {
