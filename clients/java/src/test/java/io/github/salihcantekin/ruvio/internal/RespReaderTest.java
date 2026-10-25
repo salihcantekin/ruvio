@@ -20,6 +20,15 @@ class RespReaderTest {
     }
 
     @Test
+    void oversizedHeadersAreRefusedBeforeAnythingIsAllocated() {
+        assertThrows(RuvioException.class, () -> reader("$67108865\r\n").readString());
+        assertThrows(RuvioException.class, () -> reader("*1048577\r\n").arrayLength());
+        assertThrows(RuvioException.class, () -> reader("%1048577\r\n").arrayLength());
+        assertThrows(RuvioException.class, () -> reader("*1048577\r\n").readObject());
+        assertEquals(1048576, reader("*1048576\r\n").arrayLength());
+    }
+
+    @Test
     void stringLikeReplies() {
         assertEquals("hello", reader("$5\r\nhello\r\n").readString());
         assertEquals("", reader("$0\r\n\r\n").readString());
