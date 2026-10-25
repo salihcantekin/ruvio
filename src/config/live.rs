@@ -80,6 +80,7 @@ pub const RESTART_ONLY_SETTINGS: &[&str] = &[
     "metrics-token",
     "migration-max-bytes-per-sec",
     "port-mode",
+    "primary-lease-coordinators",
     "protected-mode",
     "replica-announced",
     "replica-retain-max-bytes",
@@ -201,7 +202,17 @@ impl AppConfig {
             "min-replicas-max-lag" => {
                 self.replication.min_replicas_max_lag = Duration::from_secs(unsigned(value)?);
             }
-            "primary-lease" => self.replication.primary_lease = parse_bool(value, "the value")?,
+            "primary-lease" => {
+                let on = parse_bool(value, "the value")?;
+
+                if on && self.replication.primary_lease_coordinators.is_empty() {
+                    return Err(
+                        "primary_lease_coordinators is empty; set it in the configuration and restart"
+                            .into(),
+                    );
+                }
+                self.replication.primary_lease = on;
+            }
             _ => return Err("not a live setting".into()),
         }
 

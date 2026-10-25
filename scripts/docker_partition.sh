@@ -125,8 +125,8 @@ run_lease() {
   echo "== lease-$MODE"
   workdir lease-$MODE; lease_cleanup
   docker network create rp-all >/dev/null; docker network create rp-left >/dev/null; docker network create rp-right >/dev/null
-  lease_env="-e RUVIO_PRIMARY_LEASE=no"; lease_toml=""
-  if [ "$MODE" = on ]; then lease_env="-e RUVIO_PRIMARY_LEASE=yes"; lease_toml="primary_lease_ms = 2000"; fi
+  lease_env="-e RUVIO_PRIMARY_LEASE=no -e RUVIO_PRIMARY_LEASE_COORDINATORS=1,2,3"; lease_toml=""
+  if [ "$MODE" = on ]; then lease_env="-e RUVIO_PRIMARY_LEASE=yes -e RUVIO_PRIMARY_LEASE_COORDINATORS=1,2,3"; lease_toml="primary_lease_ms = 2000"; fi
   # n3 is created on rp-right so its published port keeps working after the cut.
   for i in 1 2 3; do
     role=replica; prim="-e RUVIO_REPLICATION_PRIMARY=rp-l1:26379"

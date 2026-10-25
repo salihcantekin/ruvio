@@ -70,6 +70,7 @@ primary = "127.0.0.1:26379"   # replica dials this base address; a hostname is a
 min_replicas_to_write = 0     # a primary refuses writes with fewer good replicas; 0 = off
 min_replicas_max_lag = 10     # seconds since a replica's last acknowledgement
 primary_lease = false         # take writes only under a lease from ruvio coordinator
+primary_lease_coordinators = [] # ids of the coordinators whose grants are taken; required with primary_lease
 announced = true              # a replica tells its primary where clients reach it
 tls = false                   # encrypt the replication link; see Replication TLS
 
@@ -305,6 +306,7 @@ Each variable overrides one file setting, and a command-line flag, where there i
 | `RUVIO_MIN_REPLICAS_TO_WRITE` | `min-replicas-to-write` | | `replication.min_replicas_to_write` | |
 | `RUVIO_MIN_REPLICAS_MAX_LAG` | `min-replicas-max-lag` | | `replication.min_replicas_max_lag` | Seconds, as in Redis |
 | `RUVIO_PRIMARY_LEASE` | `primary-lease` | | `replication.primary_lease` | `yes`/`no`; see [COORDINATOR.md](COORDINATOR.md#primary-lease) |
+| `RUVIO_PRIMARY_LEASE_COORDINATORS` | no | | `replication.primary_lease_coordinators` | Comma-separated coordinator ids, for example `1,2,3`; restart to change |
 | `RUVIO_REPLICA_ANNOUNCED` | no | | `replication.announced` | `CONFIG GET replica-announced` |
 
 Flags with no variable:
@@ -576,6 +578,13 @@ starts, and a promoted replica begins, refusing writes until the first grants
 arrive. It is checked on the same 100 ms tick and changes with `CONFIG SET`;
 see [COORDINATOR.md](COORDINATOR.md#primary-lease) for the guarantee and the
 order to turn it on or off.
+
+`replication.primary_lease_coordinators` (default empty, restart to change) lists the ids
+(`id` in `coordinator.toml`) of the coordinators whose grants this node takes. It is required
+while `primary_lease` is on. A `RUVIO LEASE GRANT` from any other id, or from a coordinator
+that counts a different number of coordinators than the list holds, is refused, so a client that
+merely has the `ruvio|lease` right cannot invent a majority (the right is still part of `+@all`
+and `@admin`; leave it out of application users).
 
 **Replicas in the topology.** A replica sends its primary the address clients
 reach it on: `advertised_host`, and `advertised_port` (else the bind port) plus

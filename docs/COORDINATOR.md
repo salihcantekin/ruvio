@@ -224,14 +224,19 @@ What it assumes and what it does not cover:
   applied. This is normally one round of reads, but it has no fixed bound in time or count.
 - When a majority of the coordinators are down or cannot reach the primary, every primary stops
   taking writes after its lease: a coordinator outage becomes a write outage.
-- Anyone with `ruvio|lease` on a data node can send `RUVIO LEASE BEGIN`: the node keeps the last 64
+- A data node takes `RUVIO LEASE GRANT` only from the coordinator ids in its `primary_lease_coordinators`
+  and only with a coordinator count equal to that list's length, so a client with `ruvio|lease` rights
+  cannot invent a majority; it can still send `RUVIO LEASE BEGIN`: the node keeps the last 64
   BEGIN tokens of all connections together, so a flood of them makes the coordinators' grants
   arrive with unknown tokens and lets the lease run out. Give it only to the coordinators' user.
 
 Turning it on:
 
 1. Upgrade the data nodes (they accept `RUVIO LEASE` and ignore grants while `primary-lease` is off).
-   The coordinators' data-node user needs `RUVIO` (`ruvio|lease`).
+   Set `primary_lease_coordinators` on every data node to the ids of your coordinators (`[1, 2, 3]`, or
+   `RUVIO_PRIMARY_LEASE_COORDINATORS=1,2,3`) and restart it: grants from other ids, or from a coordinator
+   that counts a different number of coordinators, are refused. The coordinators' data-node user needs
+   `RUVIO` (`ruvio|lease`).
 2. Upgrade all coordinators together (see *Upgrading*), then set `primary_lease_ms` on each and
    restart them one at a time. Mixed versions do not work with the lease: a coordinator of an older
    version neither grants nor answers the new lease query, so a failover waits for a majority that

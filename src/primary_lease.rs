@@ -84,6 +84,11 @@ pub enum Refused {
     Invalid,
     /// The node does not take writes of its own: it follows a primary.
     NotPrimary,
+    /// The grant names a coordinator this node was not configured to take grants from
+    /// (`replication.primary_lease_coordinators`).
+    UnknownCoordinator,
+    /// The grant's coordinator count differs from the configured list.
+    VotersMismatch,
 }
 
 impl Refused {
@@ -94,6 +99,12 @@ impl Refused {
             Self::OldEpoch => b"ERR RUVIO LEASE GRANT is for an older epoch",
             Self::Invalid => b"ERR RUVIO LEASE GRANT voters or lease_ms is out of range",
             Self::NotPrimary => b"ERR RUVIO LEASE GRANT on a replica",
+            Self::UnknownCoordinator => {
+                b"ERR RUVIO LEASE GRANT from a coordinator not in primary_lease_coordinators"
+            }
+            Self::VotersMismatch => {
+                b"ERR RUVIO LEASE GRANT names a coordinator count that differs from primary_lease_coordinators"
+            }
         }
     }
 }
