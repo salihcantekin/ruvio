@@ -4,6 +4,9 @@ package ruvio
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
+	"errors"
 	"time"
 )
 
@@ -835,6 +838,23 @@ func (c *cmds) EvalSHA(ctx context.Context, sha string, keys []string, args ...a
 		return Value{}, err
 	}
 	return c.value(ctx, r)
+}
+
+// EvalCached runs a script by its SHA1 and sends the whole script only when the shard
+// does not have it: EVALSHA, then EVAL once on NOSCRIPT. The SHA1 is computed here, and
+// EVAL also caches the script on that shard. The retry is safe because NOSCRIPT is
+// answered before any command of the script ran, so a script never runs twice.
+//
+//	v, err := c.EvalCached(ctx, "return ARGV[1]", nil, "x")
+func (c *cmds) EvalCached(ctx context.Context, script string, keys []string, args ...any) (Value, error) {
+	sum := sha1.Sum([]byte(script))
+	v, err := c.EvalSHA(ctx, hex.EncodeToString(sum[:]), keys, args...)
+
+	var se *Error
+	if errors.As(err, &se) && se.Prefix() == "NOSCRIPT" {
+		return c.Eval(ctx, script, keys, args...)
+	}
+	return v, err
 }
 
 // ScriptLoad caches a script and returns its SHA1 (SCRIPT LOAD) without running it. In

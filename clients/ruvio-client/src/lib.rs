@@ -93,6 +93,7 @@ mod json_value;
 mod keywords;
 mod models;
 mod scan;
+mod sha1;
 #[cfg(test)]
 mod test_support;
 mod ttl;

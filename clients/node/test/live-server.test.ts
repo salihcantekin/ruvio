@@ -123,6 +123,7 @@ test('scripts and functions', { skip: SKIP }, async () => {
     assert.deepEqual(await c.scriptExists(sha, '0'.repeat(40)), [true, false]);
     assert.equal(await c.scriptFlush(), 'OK');
     assert.equal((await rejects(c.evalsha(sha, ['ek']))).code, 'NOSCRIPT');
+    for (let i = 0; i < 2; i++) assert.equal(await c.evalCached('return ARGV[1]', [], ['again']), 'again');
     assert.equal((await rejects(c.scriptKill())).code, 'NOTBUSY');
     await c.functionLoad('nodefn', "return 'fn:' .. ARGV[1]");
     assert.ok(JSON.stringify(await c.functionList()).includes('nodefn'));

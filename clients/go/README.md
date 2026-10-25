@@ -455,4 +455,4 @@ Server deviations found while testing (Ruvio 0.3.0), handled or documented by th
 - A blocked `XREAD`/`XREADGROUP` that is woken by a later `XADD` replies
   `[[stream, [id, fields]]]` instead of `[[stream, [[id, fields]]]]`; the client accepts both.
 - `ZRANGE key max min BYSCORE REV` takes the high bound first, as Redis does (the server fixed this on `dev`; older builds expected `min max`).
-- Scripts must use `ruvio.call`; `redis.call` is undefined.
+- Scripts call commands with `ruvio.call`; `redis.call` is an alias of it.

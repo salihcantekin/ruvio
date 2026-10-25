@@ -15,6 +15,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 
 /**
  * Lua scripts and functions, bitmaps and HyperLogLog.
@@ -104,6 +105,42 @@ public abstract class ScriptingCommands<K, V> extends JsonCommands<K, V> {
     @SafeVarargs
     public final CompletableFuture<Object> evalsha(String sha1, K[] keys, V... arguments) {
         return send(script(Cmd.EVALSHA, sha1, keys, arguments), SCRIPT);
+    }
+
+    /**
+     * Runs a script by its SHA1 and sends the whole script only when the shard does not have it: {@code EVALSHA}, then {@code EVAL} once on {@code NOSCRIPT}. The digest is computed here, and {@code EVAL} also caches the script on that shard. The retry is safe because {@code NOSCRIPT} is answered before any command of the script ran, so a script never runs twice.
+     *
+     * <pre>{@code
+     * Object v = client.evalCached("return ARGV[1]", new String[0], "x");
+     * }</pre>
+     *
+     * @param script the Lua source
+     * @param keys the keys the script may touch (pass an empty array for none)
+     * @param arguments extra values available as {@code ARGV}
+     * @return the script result, converted as for {@link #eval}
+     * @throws RuvioServerException as for {@link #eval}
+     */
+    @SafeVarargs
+    public final CompletableFuture<Object> evalCached(String script, K[] keys, V... arguments) {
+        return evalsha(sha1Hex(script), keys, arguments).handle((value, error) -> {
+            if (error == null) {
+                return CompletableFuture.completedFuture(value);
+            }
+            Throwable cause = error instanceof CompletionException && error.getCause() != null ? error.getCause() : error;
+
+            if (cause instanceof RuvioServerException && "NOSCRIPT".equals(((RuvioServerException) cause).code())) {
+                return eval(script, keys, arguments);
+            }
+            return CompletableFuture.<Object>failedFuture(cause);
+        }).thenCompose(next -> next);
+    }
+
+    private static String sha1Hex(String script) {
+        try {
+            return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-1").digest(script.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
     }
 
     /**

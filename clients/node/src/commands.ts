@@ -2,7 +2,9 @@
 // Typed methods for every command in docs/compatibility-matrix.json.
 // Shared by the client (returns promises), pipelines and transactions (queue frames).
 
+import { createHash } from 'node:crypto';
 import { C } from './command-names.js';
+import { RuvioError } from './errors.js';
 import { cmd, Encoder, type Arg, type Cmd } from './encoder.js';
 import { T, type Tf } from './transforms.js';
 import type {
@@ -5821,6 +5823,30 @@ export abstract class Commands {
    */
   evalsha(sha1: string, keys: Key[] = [], args: Value[] = []): R<unknown> {
     return this._v(null, C.EVALSHA, pushAll(pushAll([sha1, keys.length], keys), args));
+  }
+  /**
+   * Runs a script by its SHA-1 and sends the whole script only when the shard does not have it: `EVALSHA`, then `EVAL` once on `NOSCRIPT`.
+   * The hash is computed here, and `EVAL` also caches the script on that shard.
+   * The retry is safe because `NOSCRIPT` is answered before any command of the script ran.
+   *
+   * @param script Lua source.
+   * @param keys Keys (`KEYS`).
+   * @param args Other arguments (`ARGV`).
+   * @returns The script's result.
+   * @throws {@link RuvioError} as {@link eval}.
+   *
+   * @example
+   * ```ts
+   * await client.evalCached('return ARGV[1]', [], ['x']);
+   * ```
+   */
+  async evalCached(script: string, keys: Key[] = [], args: Value[] = []): Promise<unknown> {
+    try {
+      return await this.evalsha(createHash('sha1').update(script).digest('hex'), keys, args);
+    } catch (error) {
+      if (error instanceof RuvioError && error.code === 'NOSCRIPT') return this.eval(script, keys, args);
+      throw error;
+    }
   }
   /**
    * Caches a script without running it (`SCRIPT LOAD`). The cache is not durable.

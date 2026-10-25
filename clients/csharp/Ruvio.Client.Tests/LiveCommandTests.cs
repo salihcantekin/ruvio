@@ -580,6 +580,8 @@ public sealed class LiveCommandTests(ITestOutputHelper output)
         Assert.Equal(2, (await db.EvaluateShaAsync(sha, 0)).Integer);
         Assert.Equal([true], await db.ScriptExistsAsync(sha));
         await db.FlushScriptsAsync();
+        Assert.Equal("again", (await db.EvaluateCachedAsync("return ARGV[1]", 0, "again")).AsString());
+        Assert.Equal("again", (await db.EvaluateCachedAsync("return ARGV[1]", 0, "again")).AsString());
         RuvioException notBusy = await Assert.ThrowsAsync<RuvioException>(async () => await db.KillScriptAsync());
         Assert.Contains("NOTBUSY", notBusy.Message, StringComparison.Ordinal);
         await db.LoadFunctionAsync("livefn", "return 7");

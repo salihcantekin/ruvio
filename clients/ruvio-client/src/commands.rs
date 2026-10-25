@@ -3021,6 +3021,31 @@ impl Client {
         self.run(script_arguments("EVALSHA", sha, keys, arguments))
     }
 
+    /// Runs a script by its SHA1 and sends the whole script only when the shard does not have
+    /// it: `EVALSHA`, then `EVAL` once on `NOSCRIPT`. The SHA1 is computed here, and `EVAL`
+    /// also caches the script on that shard. Arguments as [`Client::eval`].
+    ///
+    /// The retry is safe because `NOSCRIPT` is answered before any command of the script ran,
+    /// so a script never runs twice.
+    ///
+    /// # Errors
+    /// As [`Client::eval`].
+    pub fn eval_cached(
+        &mut self,
+        script: &str,
+        keys: &[&str],
+        arguments: &[&str],
+    ) -> Result<RespValue, Error> {
+        let sha = crate::sha1::hex_digest(script.as_bytes());
+
+        match self.evalsha(&sha, keys, arguments) {
+            Err(Error::Server(message)) if message.starts_with("NOSCRIPT") => {
+                self.eval(script, keys, arguments)
+            }
+            other => other,
+        }
+    }
+
     /// Sends `SCRIPT LOAD`: caches a script and returns its SHA1 for [`Client::evalsha`].
     pub fn script_load(&mut self, script: &str) -> Result<String, Error> {
         self.text(["SCRIPT", "LOAD", script])
