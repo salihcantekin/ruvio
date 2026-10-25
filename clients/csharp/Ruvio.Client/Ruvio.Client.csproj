@@ -4,7 +4,7 @@
     <TargetFramework>net8.0</TargetFramework>
     <RootNamespace>Ruvio.Client</RootNamespace>
     <AssemblyName>Ruvio.Client</AssemblyName>
-    <Version>0.3.4</Version>
+    <Version>0.4.0</Version>
     <Description>RESP2 client for Ruvio. It does not send CLIENT SETINFO.</Description>
     <PackageId>Ruvio.Client</PackageId>
     <PackageReadmeFile>README.md</PackageReadmeFile>
