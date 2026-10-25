@@ -220,7 +220,8 @@ fn parse_scan_arguments<'a>(
             let parsed = parse_i64(args.bytes(index + 1))?;
 
             count = usize::try_from(parsed)
-                .map_err(|_| ProtocolError::Invalid("value is not an integer"))?;
+                .map_err(|_| ProtocolError::Invalid("value is not an integer"))?
+                .min(MAX_SCAN_COUNT);
         } else {
             return Err(ProtocolError::Invalid("syntax error"));
         }

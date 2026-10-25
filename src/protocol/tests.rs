@@ -2022,6 +2022,17 @@ fn parses_config_set_pairs_and_config_rewrite() {
 }
 
 #[test]
+fn scan_count_is_capped() {
+    let frame = b"*4\r\n$4\r\nSCAN\r\n$1\r\n0\r\n$5\r\nCOUNT\r\n$10\r\n9999999999\r\n";
+    let Command::Scan { count, .. } = parse_command(frame).unwrap().unwrap().0.into_owned() else {
+        panic!("not a scan");
+    };
+
+    assert_eq!(count, crate::protocol::MAX_SCAN_COUNT);
+    assert_eq!(count, 10_000);
+}
+
+#[test]
 fn scan_takes_a_slot_and_routes_to_it() {
     fn frame(args: &[&[u8]]) -> Vec<u8> {
         let mut frame = format!("*{}\r\n", args.len()).into_bytes();

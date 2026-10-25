@@ -51,6 +51,10 @@ pub(in crate::protocol) fn parse_timeout_ms(bytes: &[u8]) -> Result<Option<u64>,
     Ok(Some((seconds * 1_000.0).ceil() as u64))
 }
 
+/// The most keys, members or fields one `SCAN`, `HSCAN`, `SSCAN` or `ZSCAN` call examines; a larger
+/// `COUNT` is lowered to it. One call runs on the shard's thread, so it must stay short.
+pub const MAX_SCAN_COUNT: usize = 10_000;
+
 pub(in crate::protocol) fn parse_scan<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
     if args.len() == 0 {
         return Err(ProtocolError::Invalid("SCAN expects a cursor"));
@@ -76,7 +80,8 @@ pub(in crate::protocol) fn parse_scan<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
             let parsed = parse_i64(args.bytes(index + 1))?;
 
             count = usize::try_from(parsed)
-                .map_err(|_| ProtocolError::Invalid("value is not an integer"))?;
+                .map_err(|_| ProtocolError::Invalid("value is not an integer"))?
+                .min(MAX_SCAN_COUNT);
         } else if name.eq_ignore_ascii_case(b"TYPE") {
             type_name = Some(args.arg(index + 1));
         } else if name.eq_ignore_ascii_case(b"SLOT") {

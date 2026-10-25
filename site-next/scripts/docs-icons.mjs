@@ -35,6 +35,7 @@ const PAGE_ICON = {
   coordinator: "shield",
   resilience: "shield",
   observability: "activity",
+  limits: "gauge",
   "threat-model": "alert",
   "supply-chain": "link",
   "client-behavior": "compare",
