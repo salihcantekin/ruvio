@@ -421,6 +421,17 @@ client = Ruvio(seeds=["10.0.0.9:26379"], sentinel_master="main")             # a
 - `follow_primary=False` restores the plain seed behavior: `READONLY` is returned as an error and no `ROLE` is
   sent. The Python clients have no connection-lost or connection-restored hooks, so nothing is reported.
 
+## TLS
+
+Plain TCP is the default. `tls=True` wraps every socket the client opens (the sync and the asyncio client, cluster nodes, replicas, Pub/Sub and failover probes) in TLS. The server certificate chain and host name are verified against the system roots.
+
+```python
+client = ruvio.Ruvio("cache.internal", 6379, tls=True, tls_ca_file="ca.pem")
+client = ruvio.Ruvio.from_url("ruvios://cache.internal:6379")   # rediss:// is the same
+```
+
+`tls_ca_file` (PEM) trusts your private CA instead of the system roots. `tls_cert_file` and `tls_key_file` (PEM) answer a server that demands mutual TLS (`tls_client_auth`). `tls_server_name` is the name the certificate carries when you connect by IP address. Pass a ready `ssl.SSLContext` as `tls=` to control everything yourself. `tls_insecure_skip_verify=True` accepts any certificate and skips the host name check, which removes the protection against someone in the middle: use it for a throwaway test only. The handshake is part of the connect (bounded by `connect_timeout`), so a refused certificate raises `ruvio.ConnectionError`. A TLS option without `tls=True`, or `tls` with `unix_socket_path`, raises `ValueError`. Measured: the live TLS tests (`tests/test_tls_live.py`, sync and asyncio); the latency TLS adds: not measured.
+
 ## Tests
 
 ```bash
