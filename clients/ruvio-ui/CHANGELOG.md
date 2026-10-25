@@ -4,6 +4,7 @@ Notable changes to `ruvio-ui`, the web console (Docker image and host binaries).
 
 ## Unreleased
 
+- Security: `GET /api/defaults` no longer returns `RUVIO_UI_TARGET_PASSWORD`. The UI applies it itself when you sign in to the configured target host and port with an empty password field, so the sign-in form now shows an empty password. API calls without an `x-ruvio-session` header are refused (the page and its assets do not need one) instead of sharing one `default` session. Every response carries `X-Content-Type-Options`, `X-Frame-Options: DENY`, a `frame-ancestors 'none'` content security policy and `Referrer-Policy`. The UI still connects to any host and port typed into the sign-in form; publish its port only to machines you trust.
 - New workbench form for `SET … IFGT` and `IFLT` (keep the highest or lowest number). The forms for TRANSFER, HTRANSFER, RENEW, ZPOPBYSCORE, ZMOVEDUE, LIMIT SLIDING and TOKENS, and the lifetime on INCR were already there.
 
 ## 0.1.9 - 2026-10-17
