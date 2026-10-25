@@ -1,4 +1,5 @@
 using System.Text;
+using Ruvio.Client;
 
 namespace Ruvio.Extensions.Caching;
 
@@ -20,6 +21,16 @@ public sealed class RuvioCacheOptions
     /// <summary>How long other callers of <c>GetOrCreateAsync</c> wait for the builder before building the value themselves. Defaults to 10 seconds.</summary>
     public TimeSpan FillWait { get; set; } = TimeSpan.FromSeconds(10);
 
+    /// <summary>
+    /// What happens when Ruvio cannot be reached. The default, <see cref="RuvioOutageMode.Throw"/>, lets the storage
+    /// exception reach the caller (<see cref="RuvioOutageMode.FailClosed"/> does the same, a cache has no response to
+    /// refuse). With <see cref="RuvioOutageMode.FailOpen"/> a read is a miss, a write or removal is dropped and
+    /// <c>GetOrCreate</c> runs its factory without caching; a dropped removal can leave a stale entry to be read once
+    /// Ruvio is back. Add a circuit breaker with <see cref="RuvioOutageOptions.CircuitBreaker"/> to stop waiting
+    /// on a Ruvio that is down.
+    /// </summary>
+    public RuvioOutageOptions Outage { get; } = new();
+
     internal const string VersionPrefix = ":ruvio:cache:v1:";
     internal static readonly Encoding Utf8 = new UTF8Encoding(false, true);
 
@@ -27,6 +38,8 @@ public sealed class RuvioCacheOptions
     {
         if (string.IsNullOrWhiteSpace(InstanceName))
             throw new ArgumentException("InstanceName must not be empty.", nameof(InstanceName));
+
+        Outage.Validate();
 
         if (MaxValueBytes is < 0 or > 64 * 1024 * 1024 - 64)
             throw new ArgumentOutOfRangeException(nameof(MaxValueBytes));

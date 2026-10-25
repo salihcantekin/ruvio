@@ -46,6 +46,9 @@ public sealed class RuvioDistributedCache : IDistributedCache
     private readonly int _maxKeyBytes;
     private readonly long _fillMilliseconds;
     private readonly long _waitMilliseconds;
+    private readonly RuvioOutageOptions _outage;
+    private static readonly System.Diagnostics.Metrics.Meter Meter = new("Ruvio.Extensions.Caching");
+    private static readonly System.Diagnostics.Metrics.Counter<long> Outages = Meter.CreateCounter<long>("ruvio.cache.outage");
 
     /// <summary>Constructs a provider with validated, snapshotted options and a borrowed client.</summary>
     public RuvioDistributedCache(IRuvioClient client, IOptions<RuvioCacheOptions> options)
@@ -61,7 +64,19 @@ public sealed class RuvioDistributedCache : IDistributedCache
         _maxKeyBytes = settings.MaxKeyBytes;
         _fillMilliseconds = (long)settings.FillTimeout.TotalMilliseconds;
         _waitMilliseconds = (long)settings.FillWait.TotalMilliseconds;
+        _outage = settings.Outage;
     }
+
+    // Without an outage mode or a circuit breaker the operations run unwrapped.
+    private bool Guarded => _outage.Mode == RuvioOutageMode.FailOpen || _outage.CircuitBreaker is not null;
+
+    private void CountOutage(string operation, Exception? cause) =>
+        Outages.Add(1, new System.Diagnostics.TagList
+        {
+            { "operation", operation },
+            { "mode", _outage.Mode == RuvioOutageMode.FailOpen ? "fail_open" : "fail_closed" },
+            { "reason", cause is null ? "circuit_open" : "error" },
+        });
 
     /// <inheritdoc />
     public byte[]? Get(string key) => Task.Run(() => GetAsync(key)).GetAwaiter().GetResult();
@@ -96,7 +111,35 @@ public sealed class RuvioDistributedCache : IDistributedCache
     }
 
     /// <summary>One read plus expiry bookkeeping; <paramref name="convert"/> maps the stored bytes and payload offset to the result.</summary>
-    private async Task<T?> ReadAsync<T>(string key, Func<byte[], int, T> convert, CancellationToken token)
+    private Task<T?> ReadAsync<T>(string key, Func<byte[], int, T> convert, CancellationToken token)
+        => Guarded ? ReadGuardedAsync(key, convert, token) : ReadCoreAsync(key, convert, token);
+
+    private async Task<T?> ReadGuardedAsync<T>(string key, Func<byte[], int, T> convert, CancellationToken token)
+    {
+        if (!_outage.TryEnter())
+        {
+            CountOutage("get", null);
+
+            // A fail-open cache that cannot be reached has nothing: a miss.
+            return _outage.Mode == RuvioOutageMode.FailOpen ? default : throw new RuvioCircuitOpenException(_outage.RetryAfter);
+        }
+
+        try
+        {
+            T? value = await ReadCoreAsync(key, convert, token).ConfigureAwait(false);
+            _outage.Succeeded();
+
+            return value;
+        }
+        catch (Exception error) when (_outage.Failed(error, token) && _outage.Mode == RuvioOutageMode.FailOpen)
+        {
+            CountOutage("get", error);
+
+            return default;
+        }
+    }
+
+    private async Task<T?> ReadCoreAsync<T>(string key, Func<byte[], int, T> convert, CancellationToken token)
     {
         ReadOnlyMemory<byte> encoded = Key(key);
 
@@ -189,7 +232,35 @@ public sealed class RuvioDistributedCache : IDistributedCache
                 typeInfo.Options), token).ConfigureAwait(false);
     }
 
-    private async Task WriteAsync(string key, DistributedCacheEntryOptions options,
+    private Task WriteAsync(string key, DistributedCacheEntryOptions options,
+        Func<long, long, ReadOnlyMemory<byte>> envelope, CancellationToken token)
+        => Guarded ? WriteGuardedAsync(key, options, envelope, token) : WriteCoreAsync(key, options, envelope, token);
+
+    private async Task WriteGuardedAsync(string key, DistributedCacheEntryOptions options,
+        Func<long, long, ReadOnlyMemory<byte>> envelope, CancellationToken token)
+    {
+        if (!_outage.TryEnter())
+        {
+            CountOutage("set", null);
+
+            if (_outage.Mode == RuvioOutageMode.FailOpen)
+                return; // dropped: the value is simply not cached
+
+            throw new RuvioCircuitOpenException(_outage.RetryAfter);
+        }
+
+        try
+        {
+            await WriteCoreAsync(key, options, envelope, token).ConfigureAwait(false);
+            _outage.Succeeded();
+        }
+        catch (Exception error) when (_outage.Failed(error, token) && _outage.Mode == RuvioOutageMode.FailOpen)
+        {
+            CountOutage("set", error);
+        }
+    }
+
+    private async Task WriteCoreAsync(string key, DistributedCacheEntryOptions options,
         Func<long, long, ReadOnlyMemory<byte>> envelope, CancellationToken token)
     {
         ReadOnlyMemory<byte> encoded = Key(key);
@@ -277,7 +348,70 @@ public sealed class RuvioDistributedCache : IDistributedCache
                 typeInfo.Options), token).ConfigureAwait(false);
     }
 
-    private async Task<T> GetOrCreateCore<T>(string key, Func<CancellationToken, Task<T>> factory,
+    private Task<T> GetOrCreateCore<T>(string key, Func<CancellationToken, Task<T>> factory,
+        DistributedCacheEntryOptions options, Func<byte[], int, T> read,
+        Func<T, long, long, ReadOnlyMemory<byte>> envelope, CancellationToken token)
+        => Guarded
+            ? GetOrCreateGuardedAsync(key, factory, options, read, envelope, token)
+            : GetOrCreateStoredAsync(key, factory, options, read, envelope, token);
+
+    private async Task<T> GetOrCreateGuardedAsync<T>(string key, Func<CancellationToken, Task<T>> factory,
+        DistributedCacheEntryOptions options, Func<byte[], int, T> read,
+        Func<T, long, long, ReadOnlyMemory<byte>> envelope, CancellationToken token)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+
+        if (!_outage.TryEnter())
+        {
+            CountOutage("get_or_create", null);
+
+            if (_outage.Mode != RuvioOutageMode.FailOpen)
+                throw new RuvioCircuitOpenException(_outage.RetryAfter);
+
+            return await factory(token).ConfigureAwait(false);
+        }
+
+        // A storage outage must not run the factory twice, and an error from the factory is not an outage.
+        T built = default!;
+        bool factoryRan = false;
+        bool factoryFailed = false;
+
+        async Task<T> Tracked(CancellationToken cancellation)
+        {
+            // The lookup got its answer; whatever the factory throws says nothing about Ruvio.
+            _outage.Succeeded();
+
+            try
+            {
+                built = await factory(cancellation).ConfigureAwait(false);
+                factoryRan = true;
+
+                return built;
+            }
+            catch
+            {
+                factoryFailed = true;
+
+                throw;
+            }
+        }
+
+        try
+        {
+            T value = await GetOrCreateStoredAsync(key, Tracked, options, read, envelope, token).ConfigureAwait(false);
+            _outage.Succeeded();
+
+            return value;
+        }
+        catch (Exception error) when (!factoryFailed && _outage.Failed(error, token) && _outage.Mode == RuvioOutageMode.FailOpen)
+        {
+            CountOutage("get_or_create", error);
+
+            return factoryRan ? built : await factory(token).ConfigureAwait(false);
+        }
+    }
+
+    private async Task<T> GetOrCreateStoredAsync<T>(string key, Func<CancellationToken, Task<T>> factory,
         DistributedCacheEntryOptions options, Func<byte[], int, T> read,
         Func<T, long, long, ReadOnlyMemory<byte>> envelope, CancellationToken token)
     {
@@ -384,7 +518,34 @@ public sealed class RuvioDistributedCache : IDistributedCache
     public void Remove(string key) => Task.Run(() => RemoveAsync(key)).GetAwaiter().GetResult();
 
     /// <inheritdoc />
-    public async Task RemoveAsync(string key, CancellationToken token = default)
+    public Task RemoveAsync(string key, CancellationToken token = default)
+        => Guarded ? RemoveGuardedAsync(key, token) : RemoveCoreAsync(key, token);
+
+    private async Task RemoveGuardedAsync(string key, CancellationToken token)
+    {
+        if (!_outage.TryEnter())
+        {
+            CountOutage("remove", null);
+
+            if (_outage.Mode == RuvioOutageMode.FailOpen)
+                return;
+
+            throw new RuvioCircuitOpenException(_outage.RetryAfter);
+        }
+
+        try
+        {
+            await RemoveCoreAsync(key, token).ConfigureAwait(false);
+            _outage.Succeeded();
+        }
+        catch (Exception error) when (_outage.Failed(error, token) && _outage.Mode == RuvioOutageMode.FailOpen)
+        {
+            // The removal is lost: a stale entry can be read again once Ruvio is back.
+            CountOutage("remove", error);
+        }
+    }
+
+    private async Task RemoveCoreAsync(string key, CancellationToken token)
     {
         ReadOnlyMemory<byte> encoded = Key(key);
 
@@ -532,7 +693,7 @@ public sealed class RuvioDistributedCache : IDistributedCache
     private static void CheckReply(RespValue reply)
     {
         if (reply.Kind == RespKind.Error)
-            throw new RuvioException(reply.Text ?? "Cache command failed.");
+            throw new RuvioException(reply.Text ?? "Cache command failed.", isServerReply: true);
     }
 
     private async Task<RespValue> Execute(IReadOnlyList<ReadOnlyMemory<byte>> arguments, CancellationToken token)
@@ -540,7 +701,7 @@ public sealed class RuvioDistributedCache : IDistributedCache
         RespValue reply = await _client.ExecuteBinaryAsync(arguments, token).ConfigureAwait(false);
 
         if (reply.Kind == RespKind.Error)
-            throw new RuvioException(reply.Text ?? "Cache command failed.");
+            throw new RuvioException(reply.Text ?? "Cache command failed.", isServerReply: true);
 
         return reply;
     }
@@ -583,5 +744,5 @@ public sealed class RuvioDistributedCache : IDistributedCache
         return digits[..written].ToArray();
     }
 
-    private static RuvioException UnexpectedReply() => new("Unexpected cache command response.");
+    private static RuvioException UnexpectedReply() => new("Unexpected cache command response.", isServerReply: true);
 }

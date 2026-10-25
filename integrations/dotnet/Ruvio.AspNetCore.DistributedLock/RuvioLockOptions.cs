@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Http;
+using Ruvio.Client;
 
 namespace Ruvio.AspNetCore.DistributedLock;
 
@@ -46,8 +47,21 @@ public sealed class RuvioLockOptions
     /// </summary>
     public TimeProvider TimeProvider { get; set; } = TimeProvider.System;
 
+    /// <summary>
+    /// What an HTTP request does when Ruvio cannot be reached. The default, <see cref="RuvioOutageMode.Throw"/>, keeps
+    /// today's behavior: the <see cref="RuvioLockAttribute"/> middleware answers 503 and the request does not run, while
+    /// <c>WithDistributedLock</c> endpoints let the storage exception reach the application.
+    /// <see cref="RuvioOutageMode.FailClosed"/> makes both answer 503 (with <c>Retry-After</c> while a circuit is open).
+    /// <see cref="RuvioOutageMode.FailOpen"/> runs the request with no lock, so it is not exclusive while Ruvio is away.
+    /// Add a circuit breaker with <see cref="RuvioOutageOptions.CircuitBreaker"/> to stop waiting on a Ruvio that is down.
+    /// Applies to the HTTP integrations only; <see cref="IRuvioLock"/> calls made in code still throw.
+    /// </summary>
+    public RuvioOutageOptions Outage { get; } = new();
+
     internal void Validate()
     {
+        Outage.Validate();
+
         ArgumentNullException.ThrowIfNull(TimeProvider);
 
         if (string.IsNullOrEmpty(KeyPrefix))
