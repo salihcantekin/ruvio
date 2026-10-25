@@ -89,8 +89,8 @@ you want `bytes`.
 Server errors raise `ruvio.ResponseError` or a more specific class: `WrongTypeError`,
 `NoScriptError`, `NoGroupError`, `BusyError`, `ExecAbortError` or `MovedError`. Each one has
 a `.code` such as `"WRONGTYPE"`. Socket problems raise `ruvio.ConnectionError` or
-`ruvio.TimeoutError`. The sync client's `socket_timeout` is 30 seconds by default (`None` waits
-forever); a blocking command such as `blpop(key, 5)` gets its own wait on top, and `0` (wait forever)
+`ruvio.TimeoutError`. `socket_timeout` is 30 seconds by default on the sync and the asyncio client (`None` waits
+forever; on expiry the waiting commands fail and the connection is closed, and the next command opens it again); a blocking command such as `blpop(key, 5)` gets its own wait on top, and `0` (wait forever)
 has no limit. See [Timeouts](../README.md#timeouts).
 
 For any other command, `execute_command("CMD", arg, …)` sends it as written and returns the
