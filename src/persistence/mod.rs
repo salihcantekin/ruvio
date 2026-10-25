@@ -121,7 +121,7 @@ pub(crate) fn validate_shard_layout(
     // Written beside the final name and renamed, so a crash leaves either no file or a whole
     // one; a partial `SHARD_LAYOUT` would make every later start refuse the directory.
     let temporary = config.data_dir.join(".SHARD_LAYOUT.tmp");
-    let mut file = OpenOptions::new()
+    let mut file = private_file_options()
         .write(true)
         .create(true)
         .truncate(true)
@@ -146,8 +146,8 @@ impl DataDirectoryLock {
             return Ok(None);
         }
 
-        fs::create_dir_all(&config.data_dir)?;
-        let file = OpenOptions::new()
+        create_private_directory(&config.data_dir)?;
+        let file = private_file_options()
             .create(true)
             .truncate(false)
             .read(true)
@@ -994,6 +994,35 @@ fn apply_in_active(
 /// mix: write a temporary file next to it, sync it, rename it over `path`, sync the directory.
 /// The temporary name is unique per call, so concurrent writers (one per shard) do not share
 /// it. `private` creates the file readable by its owner only (Unix).
+/// Options for a file that holds user data: created readable by the owner only, not by whatever
+/// the process umask allows. An existing file keeps its mode.
+pub(crate) fn private_file_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+    options
+}
+
+/// Creates the data directory (and missing parents) readable by the owner only. A directory that
+/// exists keeps its mode.
+pub(crate) fn create_private_directory(path: &std::path::Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
 pub(crate) fn write_file_atomically(
     path: &std::path::Path,
     bytes: &[u8],
@@ -1052,6 +1081,30 @@ pub(crate) fn write_file_atomically(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn data_files_and_new_directories_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let data = base.path().join("data/wal");
+        let file = data.join("segment");
+
+        create_private_directory(&data).unwrap();
+        private_file_options()
+            .create_new(true)
+            .write(true)
+            .open(&file)
+            .unwrap();
+
+        let mode =
+            |path: &std::path::Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(mode(&data), 0o700);
+        assert_eq!(mode(&base.path().join("data")), 0o700);
+    }
 
     #[test]
     fn the_shard_layout_file_is_written_whole_and_a_leftover_temporary_is_harmless() {

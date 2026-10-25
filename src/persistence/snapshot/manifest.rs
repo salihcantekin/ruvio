@@ -250,7 +250,7 @@ pub(super) fn write_through_temporary(
     bytes: &[u8],
 ) -> Result<(), PersistenceError> {
     // A leftover temp file from an interrupted write is overwritten, never fatal.
-    let mut file = OpenOptions::new()
+    let mut file = crate::persistence::private_file_options()
         .create(true)
         .truncate(true)
         .write(true)
