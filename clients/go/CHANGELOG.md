@@ -4,6 +4,7 @@ Notable changes to the Go client `github.com/salihcantekin/ruvio/clients/go`. A 
 
 ## Unreleased
 
+- TLS: `Options.TLS` (a `*tls.Config`) wraps every connection the default dialer opens (shared, dedicated, Pub/Sub, cluster nodes, replicas and failover probes) in TLS, verifying the certificate chain and host name against `RootCAs` (system roots when nil) unless the config sets `InsecureSkipVerify`. `ServerName` defaults to the host being dialed. The handshake runs inside the connect. It does not apply when `Options.Dial` is set. Default nil: plain TCP, nothing changes.
 - The reply parser refuses a bulk string over 64 MiB and an array, set, push or map over 1,048,576 elements as a protocol error before it allocates, the same limits as the Rust and C# clients. Before, Go allowed 512 MiB for both.
 - `EvalCached(ctx, script, keys, args...)` runs a script by its SHA1 and sends the whole script only when the shard answers `NOSCRIPT` (`EVALSHA`, then `EVAL` once). The SHA1 is computed in the client; nothing changes for `eval` and `evalsha`.
 - A cluster client now retries `-TRYAGAIN` up to 7 times, after waits doubling from 5 ms to 320 ms (635 ms in all), instead of 3 times after 5, 10 and 20 ms. A slot range moving between the nodes of a cluster is frozen for a few hundred milliseconds (about 170-240 ms in a local test), so the caller saw `TRYAGAIN` on every such move before. Only `TRYAGAIN` replies wait; other replies are unchanged.

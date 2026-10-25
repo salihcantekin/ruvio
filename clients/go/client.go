@@ -4,6 +4,7 @@ package ruvio
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -66,8 +67,19 @@ type Options struct {
 	CommandTimeout time.Duration
 	// Dial overrides the dialer (for TLS, unix sockets, tests). The network argument
 	// is always "tcp" and addr is the address being tried: Options.Addr, the seed (with
-	// Seeds) or the node address in cluster mode. Return a *tls.Conn here when the server requires TLS.
+	// Seeds) or the node address in cluster mode. Set Options.TLS instead of dialing TLS here, unless you need your own dialer.
 	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	// TLS, when not nil, wraps every connection the default dialer opens (first connect,
+	// reconnects, pooled and dedicated connections, cluster nodes, replicas and failover
+	// probes) in TLS. The server's certificate chain and host name are verified against
+	// the config's RootCAs (the system roots when nil) unless the config sets
+	// InsecureSkipVerify, which removes the protection TLS gives against someone in the
+	// middle and is meant for throwaway tests. ServerName defaults to the host of the
+	// address being dialed. Set RootCAs for a private CA and Certificates for a server
+	// that demands client certificates. The handshake is part of the connect, so a refused
+	// certificate fails the connect. It does not apply when Dial is set: return your own
+	// *tls.Conn from Dial then. Default nil: plain TCP.
+	TLS *tls.Config
 	// MaxIdleDedicated is how many dedicated connections (blocking commands,
 	// transactions) are kept for reuse. Default 4.
 	MaxIdleDedicated int
@@ -351,20 +363,27 @@ func (c *Client) dialAt(ctx context.Context, onPush func(Value), start int) (*co
 	return nil, last
 }
 
+// transport opens the network connection to addr: Options.Dial when set, otherwise TCP, wrapped in TLS
+// when Options.TLS is set.
+func (c *Client) transport(ctx context.Context, addr string) (net.Conn, error) {
+	if c.opts.Dial != nil {
+		return c.opts.Dial(ctx, "tcp", addr)
+	}
+	if c.opts.TLS != nil {
+		d := tls.Dialer{Config: c.opts.TLS}
+		return d.DialContext(ctx, "tcp", addr)
+	}
+	var d net.Dialer
+	return d.DialContext(ctx, "tcp", addr)
+}
+
 func (c *Client) dialAddr(ctx context.Context, onPush func(Value), idx int, addr string) (*conn, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, c.opts.DialTimeout)
 		defer cancel()
 	}
-	var nc net.Conn
-	var err error
-	if c.opts.Dial != nil {
-		nc, err = c.opts.Dial(ctx, "tcp", addr)
-	} else {
-		var d net.Dialer
-		nc, err = d.DialContext(ctx, "tcp", addr)
-	}
+	nc, err := c.transport(ctx, addr)
 	if err != nil {
 		return nil, &connectError{err}
 	}

@@ -388,6 +388,23 @@ Run them yourself:
 RUVIO_TEST_ADDR=127.0.0.1:6461 go test -run '^$' -bench . -benchmem -benchtime=1s
 ```
 
+## TLS
+
+Plain TCP is the default. Set `Options.TLS` to a `*tls.Config` to wrap every connection the client opens (shared, dedicated, Pub/Sub, cluster nodes, replicas, failover probes) in TLS. The server certificate chain and host name are verified against `RootCAs` (the system roots when nil), and `ServerName` defaults to the host of the address being dialed.
+
+```go
+pem, _ := os.ReadFile("ca.pem")
+roots := x509.NewCertPool()
+roots.AppendCertsFromPEM(pem)
+
+c, err := ruvio.Connect(ctx, ruvio.Options{
+	Addr: "cache.internal:6379",
+	TLS:  &tls.Config{RootCAs: roots},
+})
+```
+
+`RootCAs` trusts a private CA, `Certificates` answers a server that demands mutual TLS (`tls_client_auth`), `ServerName` is the name the certificate carries when you dial by IP address, and `InsecureSkipVerify` accepts any certificate and removes the protection against someone in the middle (throwaway tests only). The handshake is part of the connect, so a refused certificate fails `Connect`. `Options.TLS` does not apply when `Options.Dial` is set: return your own `*tls.Conn` from `Dial` then. Measured: the live TLS tests (`tls_live_test.go`); the latency TLS adds: not measured.
+
 ## Tests
 
 ```sh
