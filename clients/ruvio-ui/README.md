@@ -193,7 +193,7 @@ not used to publish them while this repository is private.
 | `RUVIO_UI_ADDR` | `127.0.0.1:8080` | HTTP bind |
 | `RUVIO_UI_TARGET_HOST` | `127.0.0.1` | Ruvio server host, the host in `RUVIO_ADDR` |
 | `RUVIO_UI_TARGET_PORT` | `6379` | Ruvio server port, the port in `RUVIO_ADDR` |
-| `RUVIO_UI_TARGET_PASSWORD` | empty | Pre-filled password |
+| `RUVIO_UI_TARGET_PASSWORD` | empty | Password used when the sign-in form leaves it empty for `RUVIO_UI_TARGET_HOST` and `RUVIO_UI_TARGET_PORT`; the browser never receives it |
 
 The first argument can be a directory of built screens, used instead of the
 files embedded in the binary. `npm run dev` in `web/` proxies `/api` to the
