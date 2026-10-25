@@ -1,7 +1,9 @@
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using System.Globalization;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
 
 namespace Ruvio.Client;
 
@@ -32,12 +34,12 @@ internal sealed class RuvioSocket : IDisposable
     private volatile bool _broken;
     private volatile bool _disposed;
 
-    private RuvioSocket(TcpClient tcp, string host, int port, int maxInFlight, bool dedicatedReader, TimeSpan commandTimeout)
+    private RuvioSocket(TcpClient tcp, Stream? secure, string host, int port, int maxInFlight, bool dedicatedReader, TimeSpan commandTimeout)
     {
         _commandTimeout = commandTimeout;
         _tcp = tcp;
         _dedicatedReader = dedicatedReader;
-        _stream = dedicatedReader ? new BlockingSocketStream(tcp.Client) : tcp.GetStream();
+        _stream = secure ?? (dedicatedReader ? new BlockingSocketStream(tcp.Client) : tcp.GetStream());
         _reader = new RespReader(_stream);
         Host = host;
         Port = port;
@@ -62,9 +64,11 @@ internal sealed class RuvioSocket : IDisposable
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(options.MaxInFlightRequests);
         
         var tcp = new TcpClient { NoDelay = true };
-        bool dedicatedReader = options.DedicatedReaderThread && !subscriber;
+        bool dedicatedReader = options.DedicatedReaderThread && !subscriber && options.Tls is null;
         using var connect = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         connect.CancelAfter(options.ConnectTimeout);
+
+        Stream? secure = null;
 
         try
         {
@@ -80,6 +84,11 @@ internal sealed class RuvioSocket : IDisposable
             {
                 await tcp.ConnectAsync(host, port, connect.Token);
             }
+
+            if (options.Tls is { } tls)
+            {
+                secure = await AuthenticateAsync(tcp, host, tls, connect.Token);
+            }
         }
         catch (Exception error) when (dedicatedReader && connect.Token.IsCancellationRequested && error is not OperationCanceledException)
         {
@@ -88,11 +97,12 @@ internal sealed class RuvioSocket : IDisposable
         }
         catch
         {
+            secure?.Dispose();
             tcp.Dispose();
             throw;
         }
 
-        var connection = new RuvioSocket(tcp, host, port, options.MaxInFlightRequests, dedicatedReader, options.CommandTimeout);
+        var connection = new RuvioSocket(tcp, secure, host, port, options.MaxInFlightRequests, dedicatedReader, options.CommandTimeout);
 
         if (options.Password is null && options.DurabilityReplicas <= 0)
         {
@@ -131,6 +141,45 @@ internal sealed class RuvioSocket : IDisposable
         connection._initialized = true;
 
         return connection;
+    }
+
+    /// <summary>Wraps the connected socket in TLS and finishes the handshake, so a refused certificate fails the connect.</summary>
+    private static async Task<SslStream> AuthenticateAsync(TcpClient tcp, string host, RuvioTlsOptions tls, CancellationToken cancellationToken)
+    {
+        var secure = new SslStream(tcp.GetStream(), leaveInnerStreamOpen: false);
+        var authentication = new SslClientAuthenticationOptions
+        {
+            TargetHost = tls.ServerName ?? host,
+            ClientCertificates = tls.ClientCertificates,
+        };
+
+        if (tls.InsecureSkipVerify)
+        {
+            authentication.RemoteCertificateValidationCallback = static (_, _, _, _) => true;
+        }
+        else if (tls.TrustedCertificates is { Count: > 0 } roots)
+        {
+            var policy = new X509ChainPolicy
+            {
+                TrustMode = X509ChainTrustMode.CustomRootTrust,
+                RevocationMode = X509RevocationMode.NoCheck,
+            };
+
+            policy.CustomTrustStore.AddRange(roots);
+            authentication.CertificateChainPolicy = policy;
+        }
+
+        try
+        {
+            await secure.AuthenticateAsClientAsync(authentication, cancellationToken);
+        }
+        catch
+        {
+            secure.Dispose();
+            throw;
+        }
+
+        return secure;
     }
 
     /// <summary>The <c>CLIENT DURABILITY</c> command the options ask for, with <c>TIMEOUT</c> only when one is set.</summary>

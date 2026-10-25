@@ -100,7 +100,7 @@ public static class RuvioServiceCollectionExtensions
     /// Binds <see cref="RuvioClientOptions"/> from configuration and registers a singleton <see cref="RuvioClient"/>.
     /// </summary>
     /// <param name="services">The service collection.</param>
-    /// <param name="configuration">A configuration section whose keys are option names: <c>Host</c>, <c>Port</c>, <c>Seeds</c> (an array of <c>host:port</c> strings), <c>Username</c>, <c>Password</c>, <c>Database</c>, <c>ConnectTimeout</c>, <c>MaxInFlightRequests</c>, <c>DedicatedReaderThread</c>, <c>DiscoverCluster</c>, <c>Reconnect</c>, <c>MaxReconnectAttempts</c>, <c>ReconnectBaseDelay</c> and <c>ReconnectMaxDelay</c>. Missing keys keep the defaults. Time spans use the <c>hh:mm:ss</c> form.</param>
+    /// <param name="configuration">A configuration section whose keys are option names: <c>Host</c>, <c>Port</c>, <c>Seeds</c> (an array of <c>host:port</c> strings), <c>Username</c>, <c>Password</c>, <c>Database</c>, <c>ConnectTimeout</c>, <c>MaxInFlightRequests</c>, <c>DedicatedReaderThread</c>, <c>DiscoverCluster</c>, <c>Reconnect</c>, <c>MaxReconnectAttempts</c>, <c>ReconnectBaseDelay</c> and <c>ReconnectMaxDelay</c>, plus the TLS keys <c>Tls</c> (true turns TLS on), <c>TlsServerName</c>, <c>TlsCaFile</c>, <c>TlsClientCertFile</c>, <c>TlsClientKeyFile</c> (PEM files) and <c>TlsInsecureSkipVerify</c>. Missing keys keep the defaults. Time spans use the <c>hh:mm:ss</c> form.</param>
     /// <returns>The same collection, for chaining.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="services"/> or <paramref name="configuration"/> is null.</exception>
     /// <exception cref="FormatException">A numeric, boolean or time value in the section cannot be parsed (raised when the options are first read).</exception>
@@ -173,6 +173,47 @@ public static class RuvioServiceCollectionExtensions
 
         if (Span(configuration, "ReconnectMaxDelay") is { } maxDelay)
             options.ReconnectMaxDelay = maxDelay;
+
+        BindTls(configuration, options);
+    }
+
+    // TLS is off unless "Tls" is true; the files are PEM.
+    private static void BindTls(IConfiguration configuration, RuvioClientOptions options)
+    {
+        if (Flag(configuration, "Tls") is not true)
+            return;
+
+        var tls = new RuvioTlsOptions();
+
+        if (configuration["TlsServerName"] is { Length: > 0 } serverName)
+            tls.ServerName = serverName;
+
+        if (configuration["TlsCaFile"] is { Length: > 0 } caFile)
+        {
+            var roots = new System.Security.Cryptography.X509Certificates.X509Certificate2Collection();
+
+            roots.ImportFromPemFile(caFile);
+            tls.TrustedCertificates = roots;
+        }
+
+        if (configuration["TlsClientCertFile"] is { Length: > 0 } certFile)
+        {
+            using var pem = System.Security.Cryptography.X509Certificates.X509Certificate2.CreateFromPemFile(
+                certFile,
+                configuration["TlsClientKeyFile"]);
+
+            // The Windows TLS stack needs the key in a persisted form; the round trip gives it.
+            tls.ClientCertificates =
+            [
+                new System.Security.Cryptography.X509Certificates.X509Certificate2(
+                    pem.Export(System.Security.Cryptography.X509Certificates.X509ContentType.Pfx)),
+            ];
+        }
+
+        if (Flag(configuration, "TlsInsecureSkipVerify") is { } skip)
+            tls.InsecureSkipVerify = skip;
+
+        options.Tls = tls;
     }
 
     private static int? Number(IConfiguration configuration, string key)
