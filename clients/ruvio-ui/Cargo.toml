@@ -10,6 +10,6 @@ publish = false
 
 [dependencies]
 include_dir = "0.7"
-ruvio-client = { path = "../ruvio-client" }
+ruvio-client = { path = "../ruvio-client", features = ["tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

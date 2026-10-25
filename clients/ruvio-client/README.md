@@ -24,6 +24,21 @@
 
 Blocking RESP2 client for [Ruvio](https://ruviodb.com/). Connecting does not send `CLIENT SETINFO` or `HELLO`. Give the client one address; it sends `CLUSTER SLOTS` and, on a sharded server, opens one socket per shard and routes by hash slot. `MOVED` is followed up to three times per command. `MGET` / `MSET` / `DEL` / `EXISTS` / `UNLINK` / `TOUCH` split across slots; other commands whose keys span slots fail with `CROSSSLOT` before anything is sent. Methods take `&mut self` and are named after the command they send. They cover every command in [`docs/compatibility-matrix.json`](../../docs/compatibility-matrix.json) (299/299, checked by `tests/coverage.rs`) plus the options that change what Ruvio does. `execute` and `execute_many` send any argument list, as `redis-cli` would; `execute_binary` does the same with raw byte arguments.
 
+TLS is off unless you ask for it: build with the `tls` cargo feature and set `ClientOptions::tls`. The server certificate chain and host name are checked; `TlsOptions::ca_pem` trusts a private CA, `client_cert_pem` and `client_key_pem` give a client certificate, and `insecure_skip_verify` (for throwaway tests only) skips the check. The default build has no dependencies; the feature adds `rustls` and `webpki-roots`.
+
+```rust
+use ruvio_client::{Client, ClientOptions, TlsOptions};
+
+let mut db = Client::connect_with(ClientOptions {
+    host: "cache.internal".to_owned(),
+    tls: Some(TlsOptions {
+        ca_pem: Some(std::fs::read("ca.pem")?),
+        ..TlsOptions::default()
+    }),
+    ..ClientOptions::default()
+})?;
+```
+
 ```rust
 use std::time::Duration;
 use ruvio_client::Client;

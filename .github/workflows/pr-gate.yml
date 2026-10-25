@@ -91,6 +91,9 @@ jobs:
       # real servers (standalone plus a 3-shard cluster).
       - name: Rust client tests against a live server
         run: scripts/run_with_servers.sh "$GITHUB_WORKSPACE/target/debug/ruvio" 17400 -- cargo test --manifest-path clients/ruvio-client/Cargo.toml --locked
+      # The TLS tests need the `tls` feature and the TLS servers the script starts.
+      - name: Rust client over TLS against live servers
+        run: scripts/run_with_servers.sh "$GITHUB_WORKSPACE/target/debug/ruvio" 17400 -- cargo test --manifest-path clients/ruvio-client/Cargo.toml --features tls --test tls_live --locked
       - name: Verify shard routing and live Rust client
         run: |
           set -euo pipefail
