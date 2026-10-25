@@ -4,6 +4,7 @@ Notable changes to the Ruvio server (`ruvio`, `ruvio-ctl`, the Docker image and 
 
 ## Unreleased
 
+- `XADD` and `XTRIM` accept `LIMIT count` after `MAXLEN ~` or `MINID ~` instead of answering an error. The count is read and ignored: the stream is always trimmed to its threshold. `LIMIT` without `~` is still a syntax error, as in Redis. `XREADGROUP` over several streams is not part of this change.
 - `ruvio-ctl import`: the source and target passwords can come from `RUVIO_IMPORT_SOURCE_PASSWORD` and `RUVIO_IMPORT_TARGET_PASSWORD` instead of the URL (`redis://user:@host`), and a password written in a URL now prints a warning that it shows in the process list. The import connections are still plain TCP; `docs/IMPORT.md` says so. Nothing changes for the server.
 - Persistence: WAL segments, snapshot files, the shard layout file and a data directory the server creates are now owner-only (`0600` files, `0700` directories) instead of following the process umask. Files and directories that already exist keep their mode. Nothing changes per command.
 - ACL: an enabled user with no password hashes (for example after `ACL SETUSER default resetpass`, or a `user` line without `nopass` or a password) no longer accepts an empty `AUTH`, and new connections only log in as `default` without `AUTH` while `default` is `nopass`. Before, `resetpass` on `default` left the listener open to unauthenticated clients. Set `nopass` or a password on the user to log in. Nothing changes per command.
