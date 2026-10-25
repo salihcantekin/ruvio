@@ -167,10 +167,10 @@ pub(super) fn create_segment(
     shard_id: u32,
     first_sequence: u64,
 ) -> Result<(File, u64, u64, u64), PersistenceError> {
-    fs::create_dir_all(directory)?;
+    crate::persistence::create_private_directory(directory)?;
     let segment_id = first_sequence;
     let path = segment_path(directory, first_sequence);
-    let mut file = match OpenOptions::new()
+    let mut file = match crate::persistence::private_file_options()
         .create_new(true)
         .read(true)
         .write(true)

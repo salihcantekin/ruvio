@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim AS web
+FROM node:22-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS web
 
 WORKDIR /web
 COPY ruvio-ui/web/package.json ruvio-ui/web/package-lock.json ./
@@ -6,7 +6,7 @@ RUN npm ci
 COPY ruvio-ui/web/ ./
 RUN npm run build
 
-FROM rust:1.97.1-slim-bookworm AS rust
+FROM rust:1.97.1-slim-bookworm@sha256:2775a09d208ff0d7c1f50490c45b62db929e87ba1dcbc3f2132ac71a704bcdd3 AS rust
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends pkg-config \
@@ -20,7 +20,7 @@ COPY --from=web /web/dist /src/ruvio-ui/web/dist
 WORKDIR /src/ruvio-ui
 RUN cargo build --locked --release
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 
 LABEL org.opencontainers.image.title="Ruvio UI" \
       org.opencontainers.image.description="Browser operator console for a Ruvio server." \

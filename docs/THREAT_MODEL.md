@@ -90,7 +90,9 @@ Residual:
 
 - No encryption at rest. Anyone who can read the data directory reads every
   key. Protect the directory with host permissions and, if needed, volume
-  encryption.
+  encryption. New WAL segments, snapshot files and a data directory the server
+  creates are owner-only (`0600` / `0700`); a directory or file that already
+  exists keeps its mode, so check a mounted volume's permissions once.
 - Restore trusts a source that passes checksums. An attacker who can write a
   well-formed WAL can plant values. Treat backup provenance as an operational
   control.
