@@ -119,7 +119,7 @@ slows a command or raises RSS for the same data does not land.
     Measure prolonged slow-replica WAL retention and disk use, then define and
     test a bounded retention/backpressure/resync policy before promising a
     disk bound; never silently promote an incomplete replica.
-- [ ] **Selected JSON field indexes.** Each explicitly named index selects a
+- [ ] **Selected JSON field indexes.** (First version shipped on `dev`: `JSON.INDEX CREATE` and `JSON.FIND`, exact equality on one scalar path; see `docs/COMPATIBILITY.md`. The open part is below.) Each explicitly named index selects a
   binary key prefix and one simple JSON path. The first version supports exact
   equality of scalar JSON values only (no ranges, wildcard paths, or implicit
   indexing). Queries return bounded pages with a continuation cursor, not

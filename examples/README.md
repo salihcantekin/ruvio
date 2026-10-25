@@ -11,6 +11,7 @@ Small programs that exercise one part of the server in-process or against a runn
 | `05_eviction_pressure.rs` | In-process eviction pressure |
 | `06_expiry_backlog.rs` | In-process expiry backlog |
 | `07_expiry_live.py`, `08_expiry_sustained.py` | Live expiry probes against a built server |
+| `09_building_blocks_tour.py` | A few-second tour of `LEASE`/`RENEW`, `LIMIT`, `IDEM`, `XADD DELAY`, `ZMOVEDUE`, `SET IFGT` and `CHANGES SUBSCRIBE` against a running server (deletes only its own `tour:` keys) |
 | `big_payload_cost.rs`, `cmd_cost.rs`, `del_cost.rs`, `heavy_cmd_cost.rs` | Shard-thread cost of one command, large payloads, collection drops and O(N) multi-key commands |
 | `hot_count.rs` | Instructions retired per call (macOS only; use `cargo test --lib --bins --tests` rather than all targets on Linux) |
 | `mem_per_key.rs` | Heap bytes per key in a bare shard |
