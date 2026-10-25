@@ -244,40 +244,6 @@ pub(super) fn set_range<'a, C: Clock, I: StorageIndex, S: MutationSink>(
     Ok(Response::Integer(length as i64))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::float_text;
-
-    #[test]
-    fn floats_print_like_redis() {
-        for (value, text) in [
-            (10.6, "10.6"),
-            (0.1 + 0.2, "0.3"),
-            (3.0, "3"),
-            (-2.5, "-2.5"),
-            (1e20, "100000000000000000000"),
-            (3.0e-5, "0.00003"),
-            (5.0e3, "5000"),
-            (0.0, "0"),
-            (1234567.891234567891, "1234567.891234568"),
-            (12345678901234.51, "12345678901234.51"),
-        ] {
-            assert_eq!(float_text(value), text, "{value}");
-        }
-    }
-
-    #[test]
-    fn small_increments_survive_sixteen_digits() {
-        let mut stored = 12345678901234.5_f64;
-
-        for _ in 0..3 {
-            stored = float_text(stored + 0.01).parse().unwrap();
-        }
-
-        assert_eq!(float_text(stored), "12345678901234.53");
-    }
-}
-
 pub(super) fn transfer<'a, C: Clock, I: StorageIndex, S: MutationSink>(
     shard: &'a mut KvShard<C, I>,
     sink: &mut S,
@@ -332,4 +298,38 @@ pub(super) fn transfer<'a, C: Clock, I: StorageIndex, S: MutationSink>(
         Response::Integer(from),
         Response::Integer(to),
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::float_text;
+
+    #[test]
+    fn floats_print_like_redis() {
+        for (value, text) in [
+            (10.6, "10.6"),
+            (0.1 + 0.2, "0.3"),
+            (3.0, "3"),
+            (-2.5, "-2.5"),
+            (1e20, "100000000000000000000"),
+            (3.0e-5, "0.00003"),
+            (5.0e3, "5000"),
+            (0.0, "0"),
+            (1234567.891234568, "1234567.891234568"),
+            (12345678901234.51, "12345678901234.51"),
+        ] {
+            assert_eq!(float_text(value), text, "{value}");
+        }
+    }
+
+    #[test]
+    fn small_increments_survive_sixteen_digits() {
+        let mut stored = 12345678901234.5_f64;
+
+        for _ in 0..3 {
+            stored = float_text(stored + 0.01).parse().unwrap();
+        }
+
+        assert_eq!(float_text(stored), "12345678901234.53");
+    }
 }
