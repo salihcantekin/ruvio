@@ -1635,9 +1635,11 @@ mod tests {
         assert!(!user.nopass);
         assert!(!user.password_matches(b""));
         assert!(!user.password_matches(b"anything"));
-        assert!(AclUser::parse("open", "on nopass ~* +@all")
-            .unwrap()
-            .password_matches(b""));
+        assert!(
+            AclUser::parse("open", "on nopass ~* +@all")
+                .unwrap()
+                .password_matches(b"")
+        );
     }
 
     #[test]
