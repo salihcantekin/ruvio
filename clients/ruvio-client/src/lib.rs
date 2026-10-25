@@ -96,6 +96,7 @@ mod scan;
 mod sha1;
 #[cfg(test)]
 mod test_support;
+mod tls;
 mod ttl;
 mod value;
 
@@ -119,6 +120,7 @@ pub use models::{
     StreamEntry, StreamPendingEntry, StreamPendingFilter, StreamReadOptions, StreamReadResult,
 };
 pub use scan::ScanIter;
+pub use tls::TlsOptions;
 
 pub use value::RespValue;
 

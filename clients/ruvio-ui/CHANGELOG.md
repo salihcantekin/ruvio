@@ -4,6 +4,7 @@ Notable changes to `ruvio-ui`, the web console (Docker image and host binaries).
 
 ## Unreleased
 
+- TLS to the target: set `RUVIO_UI_TLS=true` to connect to the Ruvio server over TLS, with the certificate chain and host name checked. `RUVIO_UI_TLS_CA` (PEM file of the CA to trust), `RUVIO_UI_TLS_CLIENT_CERT` and `RUVIO_UI_TLS_CLIENT_KEY` (mutual TLS), `RUVIO_UI_TLS_SERVER_NAME` and `RUVIO_UI_TLS_INSECURE=true` (skip verification, tests only) refine it. Without `RUVIO_UI_TLS` the UI connects as before.
 - Security: `GET /api/defaults` no longer returns `RUVIO_UI_TARGET_PASSWORD`. The UI applies it itself when you sign in to the configured target host and port with an empty password field, so the sign-in form now shows an empty password. API calls without an `x-ruvio-session` header are refused (the page and its assets do not need one) instead of sharing one `default` session. Every response carries `X-Content-Type-Options`, `X-Frame-Options: DENY`, a `frame-ancestors 'none'` content security policy and `Referrer-Policy`. The UI still connects to any host and port typed into the sign-in form; publish its port only to machines you trust.
 - New workbench form for `SET … IFGT` and `IFLT` (keep the highest or lowest number). The forms for TRANSFER, HTRANSFER, RENEW, ZPOPBYSCORE, ZMOVEDUE, LIMIT SLIDING and TOKENS, and the lifetime on INCR were already there.
 

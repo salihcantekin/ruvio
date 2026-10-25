@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import os
 import socket
+import ssl
 import sys
 import time
 
@@ -99,6 +100,8 @@ def wait_ready(
     pid: int | None = None,
     data_dir: str | None = None,
     cluster: bool = False,
+    tls_ca: str | None = None,
+    tls_client: tuple[str, str] | None = None,
 ) -> None:
     """Waits until `host:port` answers `PING` with `+PONG`.
 
@@ -107,15 +110,22 @@ def wait_ready(
     yet", until `timeout` seconds pass. With `process` (a `subprocess.Popen`) or `pid`, fails as
     soon as that process exits. With `data_dir`, the server must also report that directory in
     `CONFIG GET dir`, so a stranger already on the port is never taken for ours. With `cluster`,
-    `CLUSTER INFO` must also report `cluster_state:ok`.
+    `CLUSTER INFO` must also report `cluster_state:ok`. With `tls_ca` (a PEM file) the connection
+    is TLS, verified against that CA; `tls_client` is a `(certificate, key)` pair for mutual TLS.
     """
+    context = None
+    if tls_ca is not None:
+        context = ssl.create_default_context(cafile=tls_ca)
+        if tls_client is not None:
+            context.load_cert_chain(*tls_client)
     deadline = time.monotonic() + timeout
     last = "no answer"
     while True:
         if not _alive(process, pid):
             raise RuntimeError(f"the server for {host}:{port} exited before it answered PING")
         try:
-            with socket.create_connection((host, port), timeout=2) as client:
+            with socket.create_connection((host, port), timeout=2) as raw:
+                client = context.wrap_socket(raw, server_hostname=host) if context else raw
                 stream = client.makefile("rwb")
                 reply = request(stream, b"PING")
                 if reply != (b"+", b"PONG"):
@@ -201,6 +211,9 @@ def main(argv: list[str]) -> int:
     ready.add_argument("--pid", type=int, help="fail at once when this process exits")
     ready.add_argument("--data-dir", help="the data directory the server must report")
     ready.add_argument("--cluster", action="store_true", help="also wait for cluster_state:ok")
+    ready.add_argument("--tls-ca", help="connect with TLS, verified against this PEM file")
+    ready.add_argument("--tls-cert", help="client certificate (PEM) for mutual TLS; needs --tls-key")
+    ready.add_argument("--tls-key", help="private key (PEM) of --tls-cert")
     replicas = commands.add_parser("wait-replicas")
     replicas.add_argument("--host", default="127.0.0.1")
     replicas.add_argument("--port", type=int, required=True)
@@ -238,6 +251,8 @@ def main(argv: list[str]) -> int:
             pid=options.pid,
             data_dir=options.data_dir,
             cluster=options.cluster,
+            tls_ca=options.tls_ca,
+            tls_client=(options.tls_cert, options.tls_key) if options.tls_cert else None,
         )
     except (RuntimeError, TimeoutError) as error:
         print(error, file=sys.stderr)

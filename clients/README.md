@@ -47,6 +47,18 @@ A blocking command gets its own wait on top of the command timeout, so it never 
 | Python | `connect_timeout` | `socket_timeout` (sync client; asyncio: wrap calls in `asyncio.wait_for`); `None` | `ruvio.TimeoutError` |
 | Node.js | `connectTimeoutMs` | `commandTimeoutMs`; `0` | `ConnectionError` |
 
+## TLS
+
+Plain TCP is the default everywhere. TLS is always an explicit choice, and once it is on the client checks the server's certificate chain and host name; skipping the check takes a separate, clearly named option. A server turns TLS on with `tls_cert` and `tls_key` (and `tls_client_ca` plus `tls_client_auth` to demand client certificates); see `docs/CONFIGURATION.md`.
+
+| Client | Turn it on | Private CA / client certificate | Skip verification (tests only) |
+| --- | --- | --- | --- |
+| Rust | cargo feature `tls`, then `ClientOptions::tls = Some(TlsOptions::default())` | `TlsOptions::ca_pem`, `client_cert_pem`, `client_key_pem` | `TlsOptions::insecure_skip_verify` |
+| Node.js | `tls: true`, `rediss://` or `ruvios://` | see the Node.js README | see the Node.js README |
+| C#, Go, Java, Python | not yet | not yet | not yet |
+
+The Rust `tls` feature pulls in `rustls` (with the `ring` provider) and `webpki-roots`; the default build of `ruvio-client` still has no dependencies. Without a private CA the built-in public roots are used; with `ca_pem` set only that CA is trusted. `ruvio-ui` is built with the feature (`RUVIO_UI_TLS`, see `docs/UI_CONNECTIONS.md`). A connect to a server whose certificate fails the check returns `Error::Io`; asking for TLS in a build without the feature returns `Error::Protocol`. Measured: the TLS tests in `clients/ruvio-client/tests/tls_live.rs` against live servers; the latency TLS adds: not measured.
+
 Also here: [`ruvio-ui`](ruvio-ui/README.md), the browser operator UI (AGPL-3.0). The clients are MIT licensed ([license](LICENSE)).
 
 Live tests skip unless `RUVIO_TEST_ADDR` is set; cluster tests need `RUVIO_CLUSTER_ADDR` (a server started with `shards = 3` and `port_mode = "per-shard"`). Details are in each client's README.

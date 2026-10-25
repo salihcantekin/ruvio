@@ -208,6 +208,10 @@ jobs:
       - name: Rust client
         timeout-minutes: 15
         run: scripts/run_with_servers.sh "$PWD/target/debug/ruvio" 17400 -- cargo test --locked --manifest-path clients/ruvio-client/Cargo.toml
+      # The TLS tests need the `tls` feature and the TLS servers the script starts.
+      - name: Rust client over TLS
+        timeout-minutes: 15
+        run: scripts/run_with_servers.sh "$PWD/target/debug/ruvio" 17400 -- cargo test --locked --manifest-path clients/ruvio-client/Cargo.toml --features tls --test tls_live
       - name: C# client and .NET integrations
         timeout-minutes: 15
         run: |

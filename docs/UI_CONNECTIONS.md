@@ -61,6 +61,21 @@ them out and type the host, port and password on the sign-in screen. When
 address the browser remembers from an earlier sign-in. If the form still shows
 an old host, update the UI image.
 
+## Ruvio with TLS
+
+When the server has `tls_cert` and `tls_key` set, its client port speaks TLS only, and the UI must be told so, because the UI connects with plain TCP by default:
+
+```text
+docker run --rm -p 127.0.0.1:8080:8080 \
+  -v /path/to/ca.pem:/ca.pem:ro \
+  -e RUVIO_UI_TARGET_HOST=ruvio.internal \
+  -e RUVIO_UI_TLS=true \
+  -e RUVIO_UI_TLS_CA=/ca.pem \
+  salihcantekin/ruvio-ui:linux
+```
+
+The UI checks the certificate chain and that the certificate names the host you sign in to. `RUVIO_UI_TLS_CA` is the PEM file of the CA that signed the server certificate (leave it out for a certificate from a public CA). If the server demands client certificates, add `RUVIO_UI_TLS_CLIENT_CERT` and `RUVIO_UI_TLS_CLIENT_KEY`. When the certificate is issued for a DNS name but you sign in by IP address, set `RUVIO_UI_TLS_SERVER_NAME` to that name. `RUVIO_UI_TLS_INSECURE=true` skips the check and removes the protection TLS gives against someone in the middle; use it only for a throwaway test. The setting applies to every connection the UI opens, so all shards and nodes it reaches must use TLS.
+
 If you do not need a container, the UI is also released as a plain binary for
 Windows, macOS and Linux. It runs on the same machine as Ruvio and connects to
 `127.0.0.1`, with no Docker networking involved.

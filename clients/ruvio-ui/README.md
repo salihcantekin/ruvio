@@ -194,6 +194,11 @@ not used to publish them while this repository is private.
 | `RUVIO_UI_TARGET_HOST` | `127.0.0.1` | Ruvio server host, the host in `RUVIO_ADDR` |
 | `RUVIO_UI_TARGET_PORT` | `6379` | Ruvio server port, the port in `RUVIO_ADDR` |
 | `RUVIO_UI_TARGET_PASSWORD` | empty | Password used when the sign-in form leaves it empty for `RUVIO_UI_TARGET_HOST` and `RUVIO_UI_TARGET_PORT`; the browser never receives it |
+| `RUVIO_UI_TLS` | off | `true` connects to Ruvio over TLS (every connection the UI opens, including to other shards); the certificate chain and host name are checked |
+| `RUVIO_UI_TLS_CA` | empty | PEM file of the CA to trust; when empty the public web roots are used |
+| `RUVIO_UI_TLS_CLIENT_CERT`, `RUVIO_UI_TLS_CLIENT_KEY` | empty | PEM files for a server that demands a client certificate (`tls_client_auth`) |
+| `RUVIO_UI_TLS_SERVER_NAME` | empty | The name the certificate carries, when it differs from the host you sign in to |
+| `RUVIO_UI_TLS_INSECURE` | off | `true` skips the certificate check; for a throwaway test only |
 
 The first argument can be a directory of built screens, used instead of the
 files embedded in the binary. `npm run dev` in `web/` proxies `/api` to the
