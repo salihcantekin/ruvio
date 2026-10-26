@@ -183,18 +183,18 @@ impl SecurityConfig {
     }
 }
 
+/// Compares two secrets without leaking where they differ or how long either one is: both are
+/// hashed to 32 bytes first, then the digests are compared byte by byte with no early exit.
 pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let longest = left.len().max(right.len());
-    let mut diff = left.len() ^ right.len();
+    let left = blake3::hash(left);
+    let right = blake3::hash(right);
+    let mut diff = 0u8;
 
-    for index in 0..longest {
-        let left_byte = left.get(index).copied().unwrap_or(0);
-        let right_byte = right.get(index).copied().unwrap_or(0);
-
-        diff |= usize::from(left_byte ^ right_byte);
+    for (left_byte, right_byte) in left.as_bytes().iter().zip(right.as_bytes()) {
+        diff |= left_byte ^ right_byte;
     }
 
-    diff == 0
+    std::hint::black_box(diff) == 0
 }
 
 pub fn bind_is_loopback(address: &str) -> bool {
@@ -230,6 +230,8 @@ mod tests {
         assert!(constant_time_eq(b"secret", b"secret"));
         assert!(!constant_time_eq(b"secret", b"secrets"));
         assert!(!constant_time_eq(b"secret", b"secrat"));
+        assert!(!constant_time_eq(b"", b"secret"));
+        assert!(constant_time_eq(b"", b""));
     }
 
     #[test]
