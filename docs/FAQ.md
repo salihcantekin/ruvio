@@ -255,6 +255,15 @@ promote the replica with the most data and repoint the rest, usually within a fe
 old primary comes back it becomes a replica. Clients with Redis Sentinel support ask the coordinators
 where the primary is. See [COORDINATOR.md](COORDINATOR.md).
 
+### Can a failover lose acknowledged writes?
+
+On a plain connection, yes. Replication is asynchronous, so when a primary crashes, the last writes
+it acknowledged but had not yet sent to a replica are gone from the new primary. Reads from a
+primary that was cut off from the coordinators can also be stale until the failover finishes. The
+primary lease shortens that window but does not close it. A connection that sends
+`CLIENT DURABILITY REPLICAS n` gets its replies only after `n` replicas hold the writes, and the
+coordinator promotes only a replica that holds them. See [COORDINATOR.md](COORDINATOR.md).
+
 ### Do I need the coordinator?
 
 Only for automatic failover. A single server, or a primary with replicas you promote by hand, runs
