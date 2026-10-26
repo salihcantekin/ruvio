@@ -4,6 +4,7 @@ Notable changes to the Ruvio server (`ruvio`, `ruvio-ctl`, the Docker image and 
 
 ## Unreleased
 
+- Security: the comparison of the `requirepass`, replication, metrics and coordinator secrets no longer depends on the length of either secret: both sides are hashed to a fixed size before the compare. Nothing changes for correct secrets or per command.
 - `CLIENT DURABILITY`: after a reply timed out with `-NOREPLICAS`, the connection's next replies, reads included, now wait again for the replicas (and time out until they hold the write). Before, they left at once and could show a write that a failover then lost, so a reader could see a value go backwards. While replicas are down, a connection with durability on cannot read once any write has been logged; read on a connection without it. Connections that did not ask for durability, and replies after a successful wait, are unchanged. Nothing changes in the log or the protocol.
 - Docs: `docs/FAQ.md` says that a failover can lose writes acknowledged on a plain connection (asynchronous replication), that the primary lease only narrows the stale-read window, and that `CLIENT DURABILITY` is the guarantee. No code change.
 - `ruvio-ctl import`: the source and target passwords can come from `RUVIO_IMPORT_SOURCE_PASSWORD` and `RUVIO_IMPORT_TARGET_PASSWORD` instead of the URL (`redis://user:@host`), and a password written in a URL now prints a warning that it shows in the process list. The import connections are still plain TCP; `docs/IMPORT.md` says so. Nothing changes for the server.
