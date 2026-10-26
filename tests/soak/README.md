@@ -42,10 +42,17 @@ controller has a public IP, and SSH reaches it only from one address.
    within `recovery_timeout_s`: every process runs, one coordinator leads, the coordinators agree
    on each group's primary, every member reports the right role and names that primary in
    `CLUSTER SLOTS`, and the primary takes a write. A process that exits by itself is a failure.
-4. Samples `INFO` of every process and its RSS every `metrics_interval_s` into `metrics.jsonl`;
-   the RSS slope of each process since its last start goes into `status.json` once the series
-   spans `rss_min_window_s`.
-5. Stops the load, heals everything, reads every key back and checks the history.
+4. Samples every process every `metrics_interval_s` into `metrics.jsonl`: the `INFO` fields
+   (every byte count the server reports: `charged_memory_bytes`, the key, value, collection and
+   index parts, buffers, persistence) and the process memory from `/proc/<pid>/status` (RSS,
+   peak, anonymous and file-backed parts, threads). Once a series spans `rss_min_window_s`,
+   `status.json` gets each process's RSS slope since its last start and the slope of
+   `charged_memory_bytes`, the server's own count of its data. RSS climbing while the data stays
+   flat points at the allocator or a leak; both climbing together is the data growing.
+5. Uploads `events.jsonl` and `metrics.jsonl` to Blob every `artifact_interval_s` (default 600).
+6. Stops the load, heals everything, reads every key back, uploads the history, events and
+   metrics, then checks the history and uploads `check.json`. The phases in `status.json` are
+   `final`, `uploading`, `checking`, `done`.
 
 | Fault | What happens | Backends |
 | --- | --- | --- |
@@ -89,7 +96,7 @@ primary lease (see [COORDINATOR.md](../../docs/COORDINATOR.md)); they are counte
 ```bash
 cargo build --bin ruvio
 python3 tests/soak/run.py run tests/soak/plans/local-smoke.json --binary target/debug/ruvio --out /tmp/soak-runs
-python3 tests/soak/test_soak.py     # the tool's own unit tests, under a second
+python3 tests/soak/test_soak.py     # the tool's own unit tests, about a second
 ```
 
 `local-smoke.json` takes about 80 s: 60 s of load with each local fault kind once, then random
@@ -137,16 +144,22 @@ ssh -i ~/.ssh/ruvio_azure soak@$CTL 'cd ruvio && ~/.cargo/bin/rustup toolchain i
 ssh -i ~/.ssh/ruvio_azure soak@$CTL "tmux new -d -s soak 'cd ruvio && python3 tests/soak/run.py run tests/soak/plans/azure-mini.json --backend ssh --binary target/release-fast/ruvio --out ~/soak-runs 2>&1 | tee ~/soak.log'"
 ```
 
-The run uploads `<run-id>/status.json` and `current/status.json` every `status_interval_s`, and at
-the end `check.json` and the gzipped history, events and metrics. To follow it without SSH, make a
+The run uploads `<run-id>/status.json` and `current/status.json` every `status_interval_s`, the
+gzipped events and metrics every `artifact_interval_s`, the gzipped history before the check and
+`check.json` after it. The check of a 3-hour history (about 9 million operations) needs a few
+minutes and a few GB of memory on the controller. To follow it without SSH, make a
 read-only SAS (`--permissions r`, short expiry) and read
 `https://<account>.blob.core.windows.net/soak/current/status.json?<sas>`. Keep both SAS strings
 out of the repository, issues and chat logs that outlive the run.
 
-After the run: copy what you need from `~/soak-runs`, then `az group delete -n rg-ruvio-soak --yes`.
+After the run: wait for `"phase": "done"` in `status.json` and `check.json` in Blob (or copy
+`~/soak-runs` from the controller), then `az group delete -n rg-ruvio-soak --yes`. A scheduled
+backup delete should check for `check.json` first and give the check time to finish; the run
+files live only on the controller and in Blob.
 The auto-shutdown deallocates every VM at `autoShutdownTimeUtc` if that is forgotten; the disks
 still cost a little until the group is deleted.
 
+`plans/azure-short.json` is the same in 30 minutes (faults every 2-4 minutes), to try the tool.
 `plans/azure-mini.json` is a 3-hour run: every fault kind every 5-10 minutes, faults lasting
 5-30 s, `durable` writes waiting for both replicas. The cloud-init data-disk detection and the
 `nft`/`tc` faults have not been run on Azure yet.

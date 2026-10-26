@@ -45,8 +45,10 @@ class BlobUploader:
             method="PUT",
             headers={"x-ms-blob-type": "BlockBlob", "Content-Type": content_type, "x-ms-version": "2021-08-06"},
         )
+        # A large file gets a second per 2 MB on top of the base timeout.
+        timeout = self.timeout + len(data) / (2 << 20)
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 ok = 200 <= response.status < 300
         except (urllib.error.URLError, OSError) as error:
             code = getattr(error, "code", None)

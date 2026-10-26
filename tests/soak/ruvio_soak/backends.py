@@ -19,6 +19,26 @@ from .cluster import COORDINATOR, Cluster, env_file
 NETWORK_FAULTS = ("isolate-host", "netem")
 
 
+PROC_FIELDS = ("VmRSS", "VmHWM", "RssAnon", "RssFile", "RssShmem", "VmData", "VmSwap", "Threads")
+
+
+def parse_proc_status(text: str) -> dict[str, int]:
+    """The memory lines of `/proc/<pid>/status` (kB, `Threads` a count) as `rss_kib`,
+    `rss_anon_kib`, ...: anonymous memory that keeps growing while the server's own count of
+    its data stays flat points at the allocator or a leak, not at the data."""
+    names = {"VmRSS": "rss_kib", "VmHWM": "rss_peak_kib", "RssAnon": "rss_anon_kib", "RssFile": "rss_file_kib",
+             "RssShmem": "rss_shmem_kib", "VmData": "data_kib", "VmSwap": "swap_kib", "Threads": "threads"}
+    values = {}
+    for line in text.splitlines():
+        field, _, rest = line.partition(":")
+        if field in names and rest.split():
+            try:
+                values[names[field]] = int(rest.split()[0])
+            except ValueError:
+                pass
+    return values
+
+
 class Unsupported(Exception):
     """The backend cannot inject this fault."""
 
@@ -75,19 +95,17 @@ class LocalBackend:
         process = self.processes.get((host, role))
         return process is not None and process.poll() is None
 
-    def rss_kib(self, host: int, role: str) -> int | None:
+    def memory(self, host: int, role: str) -> dict[str, int] | None:
         process = self.processes.get((host, role))
         if process is None or process.poll() is not None:
             return None
         try:
-            for line in Path(f"/proc/{process.pid}/status").read_text().splitlines():
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1])
+            return parse_proc_status(Path(f"/proc/{process.pid}/status").read_text()) or None
         except OSError:
             pass
         try:
             out = subprocess.run(["ps", "-o", "rss=", "-p", str(process.pid)], capture_output=True, text=True)
-            return int(out.stdout.strip())
+            return {"rss_kib": int(out.stdout.strip())}
         except (OSError, ValueError):
             return None
 
@@ -193,15 +211,17 @@ class SshBackend:
             return False
         return out.strip() == "active"
 
-    def rss_kib(self, host: int, role: str) -> int | None:
+    def memory(self, host: int, role: str) -> dict[str, int] | None:
+        fields = "|".join(PROC_FIELDS)
         try:
             out = self.run(
                 self.cluster.hosts[host],
-                f"pid=$(systemctl show -p MainPID --value {unit(role)}); [ \"$pid\" != 0 ] && ps -o rss= -p $pid || true",
+                f"pid=$(systemctl show -p MainPID --value {unit(role)}); "
+                f"[ \"$pid\" != 0 ] && grep -E '^({fields}):' /proc/$pid/status || true",
             )
-            return int(out.strip()) if out.strip() else None
-        except (RuntimeError, ValueError):
+        except RuntimeError:
             return None
+        return parse_proc_status(out) or None
 
     def _watchdog(self, address: str, seconds: int, command: str) -> None:
         self.fault_id += 1

@@ -7,7 +7,12 @@ A plan is JSON:
   load: see `workload.start`,
   faults: {interval_s: [min, max], down_s: [min, max], kinds: [...], netem: "delay 100ms ...",
            recovery_timeout_s, sequence: [{kind, group, host, down}, ...] run first, in order},
-  metrics_interval_s, status_interval_s, rss_min_window_s, rss_warn_percent_per_hour.
+  metrics_interval_s, status_interval_s, artifact_interval_s, rss_min_window_s,
+  rss_warn_percent_per_hour.
+
+Every `artifact_interval_s` (default 600) the events and metrics go to Blob gzipped, and before
+the history check the whole history does too, so a controller that dies or a VM deleted early
+never takes the run's evidence with it.
 
 `restart_as`: "replica" (default) or "configured", see `Runner.start`.
 
@@ -17,6 +22,7 @@ isolate-host, netem. A kind the backend cannot inject is recorded as skipped."""
 from __future__ import annotations
 
 import gzip
+import io
 import json
 import random
 import signal
@@ -251,13 +257,36 @@ class Runner:
         if phase:
             self.status.data["phase"] = phase
         self.status.data["operations"] = dict(self.history.counts)
-        slopes = self.collector.rss_slopes(float(self.plan.get("rss_min_window_s", 1800)))
+        window = float(self.plan.get("rss_min_window_s", 1800))
+        slopes = self.collector.rss_slopes(window)
+        charged = self.collector.charged_slopes(window)
         self.status.data["rss_slope_percent_per_hour"] = slopes
+        self.status.data["charged_slope_percent_per_hour"] = charged
         limit = float(self.plan.get("rss_warn_percent_per_hour", 1.0))
         for name, slope in slopes.items():
             if slope > limit and self.status.data["phase"] in ("load", "final"):
-                self.status.problem(f"{name}: RSS grows {slope:.2f}%/h", severity="warn")
+                data = f", data {charged[name]:.2f}%/h" if name in charged else ""
+                self.status.problem(f"{name}: RSS grows {slope:.2f}%/h{data}", severity="warn")
         self.status.save()
+
+    def upload(self, *names: str) -> None:
+        """Uploads run files to Blob, `.jsonl` gzipped. A copy is taken first, so the writers keep
+        appending while it uploads."""
+        if not self.uploader:
+            return
+        for name in names:
+            path = self.directory / name
+            if not path.exists():
+                continue
+            if name.endswith(".jsonl"):
+                # Compressed in chunks: a long run's history is over a gigabyte uncompressed.
+                buffer = io.BytesIO()
+                with open(path, "rb") as source, gzip.GzipFile(fileobj=buffer, mode="wb", compresslevel=6) as target:
+                    while chunk := source.read(1 << 20):
+                        target.write(chunk)
+                self.uploader.put(name + ".gz", buffer.getvalue(), "application/gzip")
+            else:
+                self.uploader.put(name, path.read_bytes())
 
     def run(self) -> dict:
         plan = self.plan
@@ -315,6 +344,8 @@ class Runner:
         end = time.monotonic() + float(plan.get("duration_s", 60))
         status_every = float(plan.get("status_interval_s", 60))
         next_status = time.monotonic() + status_every
+        artifacts_every = float(plan.get("artifact_interval_s", 600))
+        next_artifacts = time.monotonic() + artifacts_every
         next_fault = time.monotonic() + self.random.uniform(low, high)
         sequence = list(faults.get("sequence", []))
         while time.monotonic() < end:
@@ -329,6 +360,10 @@ class Runner:
                 self.history.flush()
                 self.save_status()
                 next_status = time.monotonic() + status_every
+            if time.monotonic() >= next_artifacts:
+                self.events.flush()
+                self.upload("events.jsonl", "metrics.jsonl")
+                next_artifacts = time.monotonic() + artifacts_every
             time.sleep(0.5)
 
     def final(self) -> None:
@@ -342,20 +377,25 @@ class Runner:
             self.status.problem(f"the cluster was not healthy before the final reads: {reason}")
         unread = workload.final_reads(self.history, self.cluster.seeds(), self.cluster.password)
         self.event("final-reads", unread=unread)
-        result = checker.check_file(self.directory / "history.jsonl")
+        self.events.flush()
+        # The evidence goes out before the check, which is the slowest step and the one most
+        # likely to run out of memory on a long history.
+        self.save_status("uploading")
+        self.upload("history.jsonl", "events.jsonl", "metrics.jsonl")
+        self.save_status("checking")
+        started = time.monotonic()
+        try:
+            result = checker.check_file(self.directory / "history.jsonl")
+        except MemoryError:
+            self.status.problem("the history check ran out of memory; run `run.py check` on the uploaded history")
+            self.save_status("done")
+            return
+        self.event("checked", seconds=round(time.monotonic() - started, 1), operations=result["operations"])
         (self.directory / "check.json").write_text(json.dumps(result, indent=2))
         self.status.data["check"] = {k: result[k] for k in ("verdict", "problems", "operations")}
         self.status.data["check"]["profiles"] = result["profiles"]
         self.status.raise_verdict(result["verdict"])
         for problem in result["problems"]:
             self.status.problem(problem, severity=result["verdict"] if result["verdict"] != "ok" else "warn")
+        self.upload("check.json", "events.jsonl")
         self.save_status("done")
-        if self.uploader:
-            for name in ("check.json", "events.jsonl", "history.jsonl", "metrics.jsonl"):
-                path = self.directory / name
-                if path.exists():
-                    data = path.read_bytes()
-                    if name.endswith(".jsonl"):
-                        self.uploader.put(name + ".gz", gzip.compress(data), "application/gzip")
-                    else:
-                        self.uploader.put(name, data)

@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
 """Unit tests of the soak tool: the history checker on histories with known faults, config
 rendering, the ssh backend's commands, and the blob upload request. No server, no network
-beyond 127.0.0.1; under a second.
+beyond 127.0.0.1; about a second.
 
     python3 tests/soak/test_soak.py"""
 
 from __future__ import annotations
 
+import gzip
 import http.server
 import json
 import signal
 import tempfile
 import threading
+import time
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 
 from ruvio_soak import history
-from ruvio_soak.backends import SshBackend
+from ruvio_soak.backends import SshBackend, parse_proc_status
 from ruvio_soak.cluster import Cluster
 from ruvio_soak.resp import key_slot
+from ruvio_soak.runner import Runner
 from ruvio_soak.status import BlobUploader, Status
 
 
@@ -120,6 +124,20 @@ class HistoryChecks(unittest.TestCase):
         self.assertEqual(stats["stale_read"], 2)
         self.assertEqual(stats["backwards_read"], 1)
 
+    def test_a_long_register_history_is_checked_in_seconds(self):
+        # Every read used to scan all earlier writes of its key; a 3-hour run never finished.
+        r = Recorder()
+        for v in range(1, 30001):
+            r.op_("rw", "write", "r", v, "ok", "default")
+            r.op_("rr", "read", "r", None, "ok", "default", result=v)
+        r.op_("rr2", "read", "r", None, "ok", "default", result=29000)
+        r.final("r", 30000, "default")
+        started = time.monotonic()
+        stats = history.check(r.entries)["profiles"]["default"]
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(stats["stale_read"], 1)
+        self.assertEqual(stats["ok"], 60001)
+
     def test_a_read_concurrent_with_a_write_may_return_either(self):
         r = Recorder()
         r.op_("rw", "write", "r", 1, "ok")
@@ -195,6 +213,14 @@ class SshCommands(unittest.TestCase):
         self.assertFalse(any(cluster.password in command or cluster.secret in command for _, command, _ in calls))
 
 
+class ProcessMemory(unittest.TestCase):
+    def test_proc_status_memory_lines(self):
+        text = "Name:\truvio\nVmHWM:\t  2048 kB\nVmRSS:\t  1024 kB\nRssAnon:\t   900 kB\nRssFile:\t   124 kB\nThreads:\t9\nVmFlags: x\n"
+        self.assertEqual(parse_proc_status(text),
+                         {"rss_peak_kib": 2048, "rss_kib": 1024, "rss_anon_kib": 900, "rss_file_kib": 124, "threads": 9})
+        self.assertEqual(parse_proc_status(""), {})
+
+
 class BlobUpload(unittest.TestCase):
     def test_put_request_and_redaction(self):
         received = []
@@ -224,6 +250,34 @@ class BlobUpload(unittest.TestCase):
             self.assertEqual(received[0][1], "BlockBlob")
             self.assertFalse(uploader.put("fail.json", b"{}"))
             self.assertNotIn("SECRET", uploader.last_error)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_run_files_upload_gzipped(self):
+        received = {}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_PUT(self):
+                received[self.path.split("?")[0]] = self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(201)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            uploader = BlobUploader(f"http://127.0.0.1:{server.server_port}/soak?sig=x", "run-1")
+            with tempfile.TemporaryDirectory() as directory:
+                lines = b"".join(b'{"n":%d}\n' % n for n in range(300000))
+                (Path(directory) / "history.jsonl").write_bytes(lines)
+                (Path(directory) / "check.json").write_bytes(b"{}")
+                Runner.upload(SimpleNamespace(uploader=uploader, directory=Path(directory)),
+                              "history.jsonl", "check.json", "missing.jsonl")
+            self.assertEqual(sorted(received), ["/soak/run-1/check.json", "/soak/run-1/history.jsonl.gz"])
+            self.assertEqual(gzip.decompress(received["/soak/run-1/history.jsonl.gz"]), lines)
         finally:
             server.shutdown()
             server.server_close()
