@@ -881,6 +881,8 @@ fn hand_over(
         session.to,
         Message::Move(MoveMessage::Flip(Arc::clone(session))),
     );
+    // The wait below holds this thread, so the target is woken now, not at the end of the turn.
+    super::forward::ring_deferred_wakes();
 
     let outcome = session
         .outcome
