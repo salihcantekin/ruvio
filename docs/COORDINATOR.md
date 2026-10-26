@@ -70,8 +70,10 @@ new primary. In a test that wrote continuously while the primary was killed, 0â€
 acknowledged writes were missing afterwards, always the last ones. A client that cannot lose a write
 turns on `CLIENT DURABILITY REPLICAS 1` for its connection: every reply then waits until a replica
 holds the writes before it on disk, and becomes `NOREPLICAS` if none does within the timeout (default
-5000 ms; the writes stay applied). After a timeout, the connection's next batch waits only if the shard
-logged a new record in between, so a read sent right after can return a write no replica holds yet. The client libraries
+5000 ms; the writes stay applied). Until a replica holds those writes, every later reply on that
+connection, reads included, waits out its timeout and becomes `NOREPLICAS` too, so the connection never
+shows a write that a failover could take back; once a replica catches up, replies flow again at once. A
+service that must keep reading while its replicas are down reads on a connection without durability. The client libraries
 have a connect option that sends it on every connection. `WAIT 1 timeout_ms` after a write does the same for one write at a time.
 
 A failover keeps such writes as long as the coordinators learned that they were committed (see

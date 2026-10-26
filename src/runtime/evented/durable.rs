@@ -5,7 +5,8 @@
 //! connection that did not pays nothing. The wait covers every record its shards wrote up to
 //! the flush (other clients' too); a flush after which this shard wrote nothing does not wait. On
 //! timeout every reply of the batch becomes `-NOREPLICAS`; the writes are applied and stay,
-//! as with `WAIT`.
+//! as with `WAIT`. The connection counts a record as waited for only once enough replicas
+//! hold it, so after a timeout its next replies wait again (and time out again) until they do.
 
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -35,6 +36,8 @@ pub(super) async fn hold_until_durable(
     let mut targets: Vec<(Arc<DurableAcks>, u64)> = Vec::with_capacity(shards.len());
 
     let mut waits_on = Vec::with_capacity(shards.len());
+    // Advanced only once the wait succeeds: after a timeout the same records are waited for again.
+    let mut own_mark = None;
 
     for shard in shards {
         let mut wal = shard.wal.lock().unwrap_or_else(|error| error.into_inner());
@@ -46,7 +49,7 @@ pub(super) async fn hold_until_durable(
                 continue;
             }
 
-            session.durable_mark = target;
+            own_mark = Some(target);
         }
 
         // A primary ships only records it synced: sync now instead of on the next
@@ -78,6 +81,10 @@ pub(super) async fn hold_until_durable(
     };
 
     if reached >= durability.replicas {
+        if let Some(mark) = own_mark {
+            session.durable_mark = mark;
+        }
+
         for (shard, (_, target)) in waits_on.iter().zip(&targets) {
             shard.replies.commit(*target);
         }
