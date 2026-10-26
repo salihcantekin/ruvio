@@ -1,0 +1,84 @@
+---
+import Page from "../layouts/Page.astro";
+import PageIntro from "../components/PageIntro.astro";
+import { site } from "../config/site";
+import { longRuns } from "../data/long-run-tests";
+---
+
+<Page title="Long-run tests" description="How Ruvio behaves over hours of load and failures: what was tested, where, for how long, and the result.">
+  <PageIntro title="Long-run tests">
+    Short tests run in seconds on one machine. These runs keep a multi-node cluster under load for hours, break it on
+    a schedule and then check every recorded operation against what the cluster holds at the end.
+  </PageIntro>
+
+  <section class="reading">
+    <div class="wrap runs">
+      {longRuns.map((run) => (
+        <article class="panel run">
+          <header class="run-head">
+            <div>
+              <p class="when">{run.date}</p>
+              <h2>{run.title}</h2>
+            </div>
+            <span class="passed">Passed</span>
+          </header>
+          <dl class="facts">
+            <div><dt>Where</dt><dd>{run.environment}</dd></div>
+            <div><dt>How long</dt><dd>{run.duration}</dd></div>
+          </dl>
+          <div class="grid grid-2 lists">
+            <div>
+              <h3>Tested</h3>
+              <ul>{run.tested.map((t) => <li>{t}</li>)}</ul>
+            </div>
+            <div>
+              <h3>Result</h3>
+              <ul>{run.result.map((r) => <li>{r}</li>)}</ul>
+            </div>
+          </div>
+        </article>
+      ))}
+
+      <div class="prose how">
+        <h2>How a run works</h2>
+        <p>
+          Each run builds the server from source on fresh virtual machines, starts a coordinator and two replicated
+          groups on three machines, and drives load from a fourth. Every operation is written to a history file with its
+          outcome: acknowledged, refused, or unknown. Faults are injected and healed on a schedule, and after each one the
+          cluster must agree on its primaries and take writes again. At the end every key is read back and the history
+          is checked for lost, duplicated, invented and out-of-order writes and for stale reads.
+        </p>
+        <p>
+          The tool, its plans and the machine templates are in{" "}
+          <a href={`${site.github}/tree/dev/tests/soak`}>tests/soak</a>; anyone can run them.
+        </p>
+      </div>
+    </div>
+  </section>
+</Page>
+
+<style>
+  .runs { display: grid; gap: 22px; }
+  .run { padding: 26px; display: grid; gap: 18px; }
+  .run-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
+  .run-head h2 { margin: 2px 0 0; font-size: 23px; }
+  .when { margin: 0; font-size: 14px; color: var(--faint); font-weight: 500; }
+  .passed {
+    flex: none; font-size: 14px; font-weight: 600; color: var(--ink);
+    border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px;
+  }
+  .passed::before { content: "✓ "; color: var(--accent); }
+  .facts { margin: 0; display: flex; flex-wrap: wrap; gap: 8px 32px; }
+  .facts div { display: flex; gap: 8px; }
+  .facts dt { color: var(--faint); font-size: 15px; }
+  .facts dd { margin: 0; color: var(--ink-body); font-size: 15px; }
+  .lists h3 { margin: 0 0 8px; font-size: 16px; color: var(--ink); }
+  .lists ul { margin: 0; padding-left: 18px; color: var(--ink-body); font-size: 16px; line-height: var(--leading); }
+  .lists li + li { margin-top: 6px; }
+  .how { margin-top: 12px; }
+  .how h2 { font-size: 21px; }
+  @media (max-width: 720px) {
+    .grid-2.lists { grid-template-columns: 1fr; }
+    .run { padding: 20px; }
+  }
+</style>
