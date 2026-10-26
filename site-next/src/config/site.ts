@@ -32,6 +32,7 @@ export const footerNav: { title: string; items: NavItem[] }[] = [
       { label: "Use cases", href: "/use-cases/" },
       { label: "Interactive examples", href: "/examples/" },
       { label: "Benchmarks", href: "/benchmarks/" },
+      { label: "Long-run tests", href: "/testing/" },
       { label: "Get started", href: "/get-started/" },
       { label: "Changelog", href: "/changelog/" },
     ],
