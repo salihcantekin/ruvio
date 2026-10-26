@@ -1168,8 +1168,11 @@ fn a_durable_connection_waits_for_its_replica_and_is_refused_without_one() {
         line(&resp(&[&[b"SET", b"lost", b"1"]])),
         b"-NOREPLICAS Not enough good replicas to write.\r\n"
     );
-    // Nothing was written since: a read is not held back.
-    assert_eq!(line(&resp(&[&[b"EXISTS", b"lost"]])), b":1\r\n");
+    // No replica holds that write yet: a read on this connection is held back too.
+    assert_eq!(
+        line(&resp(&[&[b"EXISTS", b"lost"]])),
+        b"-NOREPLICAS Not enough good replicas to write.\r\n"
+    );
 
     primary_stop.request();
     join_within(primary, PATIENCE).unwrap();
