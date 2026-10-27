@@ -129,6 +129,31 @@ Charged memory is a deterministic storage-budget model, not process RSS. See
 [MEMORY_ACCOUNTING.md](MEMORY_ACCOUNTING.md) for category definitions and
 limitations.
 
+## .NET client
+
+`Ruvio.Client` reports through `System.Diagnostics`, so it needs no OpenTelemetry package. The activity source
+and the meter are both named `Ruvio.Client`:
+
+```csharp
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracing => tracing.AddSource("Ruvio.Client"))
+    .WithMetrics(metrics => metrics.AddMeter("Ruvio.Client"));
+```
+
+- A client span per command, named after it (for example `GET`), with `db.system` = `ruvio`,
+  `db.operation.name` and `db.namespace` (the database number); on failure its status is `Error` and
+  `error.type` names the exception.
+- Internal spans `socket.queue`, `socket.write` and `socket.reply`, children of the command span.
+- Histogram `ruvio_client_command_duration_milliseconds` (ms), tagged `db.system`, `db.operation.name` and
+  `outcome` (`ok` or `error`).
+- Histogram `ruvio_client_socket_phase_duration_milliseconds` (ms), tagged `backend` and `phase`.
+- Counters `ruvio_client_socket_write_calls` and `ruvio_client_socket_written_bytes`.
+
+Keys, values and arguments are never recorded. A command span covers every command sent through the typed methods,
+`ExecuteAsync` and `ExecuteBinaryAsync`; pipelines (`ExecuteManyAsync`) get only the socket spans. With no listener on
+the source or the meter a command pays one check and allocates nothing more; a measurement on a local server showed
+the same bytes per operation and throughput within noise. The cost with a listener attached was not measured.
+
 ## Coordinators
 
 `ruvio coordinator` has no metrics endpoint; its `INFO` (after `AUTH secret`) is what to watch. On
