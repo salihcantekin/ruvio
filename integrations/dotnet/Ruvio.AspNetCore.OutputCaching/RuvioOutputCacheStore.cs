@@ -20,6 +20,9 @@ public sealed class RuvioOutputCacheStore : IOutputCacheStore
     private static readonly Counter<long> StorageCommands = Meter.CreateCounter<long>("ruvio.output_cache.storage_commands");
     private static readonly Histogram<double> StorageDuration = Meter.CreateHistogram<double>(
         "ruvio.output_cache.storage_duration", "ms");
+    private static readonly Counter<long> Hits = Meter.CreateCounter<long>("ruvio.output_cache.hit");
+    private static readonly Counter<long> Misses = Meter.CreateCounter<long>("ruvio.output_cache.miss");
+    private static readonly Counter<long> TagEvictions = Meter.CreateCounter<long>("ruvio.output_cache.tag_evict");
     private static readonly ReadOnlyMemory<byte> Get = "GET"u8.ToArray();
     private static readonly ReadOnlyMemory<byte> Delete = "DEL"u8.ToArray();
     private static readonly ReadOnlyMemory<byte> Set = "SET"u8.ToArray();
@@ -276,7 +279,11 @@ public sealed class RuvioOutputCacheStore : IOutputCacheStore
         var reply = await Execute("get_entry", [Get, KeyBytes("entry:", key)], cancellationToken).ConfigureAwait(false);
 
         if (reply.Kind == RespKind.Null)
+        {
+            CountMiss("absent");
+
             return null;
+        }
 
         if (reply.Kind != RespKind.Bulk)
             throw Unexpected();
@@ -298,11 +305,25 @@ public sealed class RuvioOutputCacheStore : IOutputCacheStore
             for (int i = 0; i < count; i++)
             {
                 if (!SameAscii(live[i], data.AsSpan(6 + i * 96 + 64, 32)))
+                {
+                    CountMiss("tag_evicted");
+
                     return null;
+                }
             }
         }
 
+        if (Hits.Enabled)
+            Hits.Add(1);
+
         return data.AsSpan(offset).ToArray();
+    }
+
+    // A missing entry and an entry whose tag was evicted are both misses; the reason tells them apart.
+    private static void CountMiss(string reason)
+    {
+        if (Misses.Enabled)
+            Misses.Add(1, new KeyValuePair<string, object?>("reason", reason));
     }
 
     /// <summary>
@@ -345,6 +366,9 @@ public sealed class RuvioOutputCacheStore : IOutputCacheStore
 
         if (reply.Kind != RespKind.Integer || reply.Integer is < 0 or > 1)
             throw Unexpected();
+
+        if (TagEvictions.Enabled)
+            TagEvictions.Add(1);
     }
 
     internal string EntryKey(string key) => KeyText("entry:", key);
