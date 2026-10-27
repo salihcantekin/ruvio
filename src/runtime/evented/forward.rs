@@ -371,7 +371,17 @@ impl Fabric {
         // Only the 0 -> non-zero transition wakes the target; a busy shard is already draining.
         let previous = self.ports[dst].mask.fetch_or(1 << src, Ordering::AcqRel);
 
-        if previous == 0 {
+        if previous == 0 && !defer_wake(dst) {
+            self.ports[dst].notify.notify_one();
+        }
+    }
+
+    /// Wakes every shard in `mask` (see [`run_doorbell`]).
+    fn ring(&self, mut mask: u64) {
+        while mask != 0 {
+            let dst = mask.trailing_zeros() as usize;
+
+            mask &= mask - 1;
             self.ports[dst].notify.notify_one();
         }
     }
@@ -420,6 +430,84 @@ impl Fabric {
                 .unwrap_or_else(|error| error.into_inner());
 
             into.append(&mut mailbox);
+        }
+    }
+}
+
+/// Waking another shard's thread is a syscall, and an inter-processor interrupt when that
+/// thread sleeps: on a VM it cost a sending shard over a third of its time when it forwarded
+/// most of its commands. A shard thread therefore only notes whom a send must wake, and its
+/// [`run_doorbell`] task wakes each of them once, after the tasks already queued this turn ran.
+/// Threads without a doorbell (tests, helper threads) wake at once.
+struct Doorbell {
+    fabric: Arc<Fabric>,
+    pending: Cell<u64>,
+    notify: tokio::sync::Notify,
+}
+
+thread_local! {
+    static DOORBELL: RefCell<Option<Rc<Doorbell>>> = const { RefCell::new(None) };
+}
+
+/// True when this thread's doorbell took the wake of `dst`.
+fn defer_wake(dst: usize) -> bool {
+    DOORBELL.with(|slot| {
+        let slot = slot.borrow();
+        let Some(doorbell) = slot.as_ref() else {
+            return false;
+        };
+        let pending = doorbell.pending.get();
+
+        if pending == 0 {
+            // Same-thread wake: the task goes to the back of this shard's run queue.
+            doorbell.notify.notify_one();
+        }
+        doorbell.pending.set(pending | 1 << dst);
+        true
+    })
+}
+
+/// Rings now every wake this thread deferred. For a shard that blocks its thread right after a
+/// send (and so would not reach its doorbell task until the wait ends).
+pub(super) fn ring_deferred_wakes() {
+    let doorbell = DOORBELL.with(|slot| slot.borrow().clone());
+
+    if let Some(doorbell) = doorbell {
+        doorbell.fabric.ring(doorbell.pending.replace(0));
+    }
+}
+
+/// Rings the wakes this shard's sends deferred, until the shard stops. Spawned on the shard's
+/// own `LocalSet` before it serves.
+pub(super) async fn run_doorbell(fabric: Arc<Fabric>) {
+    let doorbell = Rc::new(Doorbell {
+        fabric,
+        pending: Cell::new(0),
+        notify: tokio::sync::Notify::new(),
+    });
+    let _installed = DoorbellGuard::install(Rc::clone(&doorbell));
+
+    loop {
+        doorbell.notify.notified().await;
+        doorbell.fabric.ring(doorbell.pending.replace(0));
+    }
+}
+
+/// Removes the doorbell when its task ends and rings what it still owed, so no wake is lost
+/// and later sends on this thread wake at once.
+struct DoorbellGuard;
+
+impl DoorbellGuard {
+    fn install(doorbell: Rc<Doorbell>) -> Self {
+        DOORBELL.with(|slot| *slot.borrow_mut() = Some(doorbell));
+        Self
+    }
+}
+
+impl Drop for DoorbellGuard {
+    fn drop(&mut self) {
+        if let Some(doorbell) = DOORBELL.with(|slot| slot.borrow_mut().take()) {
+            doorbell.fabric.ring(doorbell.pending.replace(0));
         }
     }
 }

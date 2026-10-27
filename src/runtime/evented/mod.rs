@@ -1329,6 +1329,7 @@ async fn serve_async(
                 replies: Arc::clone(&state.durable_replies),
             },
         );
+        tokio::task::spawn_local(forward::run_doorbell(Arc::clone(&forwarding.fabric)));
         tokio::task::spawn_local(remote_loop(Rc::clone(&state), shutdown.clone()));
     }
 
