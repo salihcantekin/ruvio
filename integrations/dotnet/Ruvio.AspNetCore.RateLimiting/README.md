@@ -54,6 +54,26 @@ limits. Partition values must be trusted and bounded, not arbitrary client heade
 The partition and policy are hashed; raw identifiers are not stored in keys or
 telemetry. Every application should have its own prefix.
 
+### Named policies
+
+Define each budget once and refer to it by name, as with the built-in ASP.NET Core rate limiter:
+
+```csharp
+builder.Services.AddRuvioRateLimiting(options =>
+{
+    options.PartitionKey = context => context.User.FindFirst("tenant_id")?.Value ?? "anonymous";
+    options.AddPolicy("create-order", permits: 100, window: TimeSpan.FromMinutes(1));
+    options.AddPolicy("search", permits: 30, window: TimeSpan.FromSeconds(10), RuvioRateLimitAlgorithm.SlidingWindow);
+});
+
+app.MapPost("/orders", HandleOrder).WithRuvioRateLimit("create-order");   // or [RuvioRateLimit("create-order")]
+```
+
+An unknown name throws `InvalidOperationException` when the request arrives, before Ruvio is called. A duplicate name or
+a non-positive permit count or window is rejected in `AddPolicy`. The inline forms (`WithRuvioRateLimit("p", 100, window)`
+and `[RuvioRateLimit("p", 100, 60)]`) need no registration and keep working; a named policy and an inline one with the same
+name share one bucket, so keep their settings the same.
+
 Only opted-in endpoints resolve services or call Ruvio. Other endpoints return
 the next delegate's task directly: no async state machine, hashing, timers, network
 requests, or per-request heap allocation in the bypass path. On an opted-in endpoint

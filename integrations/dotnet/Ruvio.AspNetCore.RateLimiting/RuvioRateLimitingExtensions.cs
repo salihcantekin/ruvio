@@ -55,4 +55,15 @@ public static class RuvioRateLimitEndpointExtensions
 
         return builder.WithMetadata(new RuvioRateLimitAttribute(policy, permits, seconds) { Algorithm = algorithm });
     }
+
+    /// <summary>
+    /// Limits the endpoint or group with a policy defined by <see cref="RuvioRateLimitingOptions.AddPolicy"/>, by name only.
+    /// </summary>
+    public static TBuilder WithRuvioRateLimit<TBuilder>(this TBuilder builder, string policy)
+        where TBuilder : IEndpointConventionBuilder
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        return builder.WithMetadata(new RuvioRateLimitAttribute(policy));
+    }
 }

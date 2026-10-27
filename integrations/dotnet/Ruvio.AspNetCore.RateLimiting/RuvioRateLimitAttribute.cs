@@ -18,6 +18,19 @@ public enum RuvioRateLimitAlgorithm
 public sealed class RuvioRateLimitAttribute : Attribute
 {
     /// <summary>
+    /// Refers to a policy defined with <see cref="RuvioRateLimitingOptions.AddPolicy"/>; its permits, window and algorithm
+    /// come from there. An unknown name fails the request with <see cref="InvalidOperationException"/>.
+    /// </summary>
+    /// <param name="policy">The name of a registered policy.</param>
+    public RuvioRateLimitAttribute(string policy)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(policy);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(policy.Length, 128, nameof(policy));
+
+        Policy = policy;
+    }
+
+    /// <summary>
     /// Initializes a new instance of the <see cref="RuvioRateLimitAttribute"/> class with the specified policy, permits, and window duration.
     /// </summary>
     /// <param name="policy">The rate-limiting policy name.</param>
@@ -44,7 +57,7 @@ public sealed class RuvioRateLimitAttribute : Attribute
     public string Policy { get; }
 
     /// <summary>
-    /// Gets the number of permits allowed within the window.
+    /// Gets the number of permits allowed within the window; 0 when only a policy name was given.
     /// </summary>
     public long Permits { get; }
 
@@ -52,6 +65,9 @@ public sealed class RuvioRateLimitAttribute : Attribute
     /// Gets the duration of the fixed window in seconds.
     /// </summary>
     public int WindowSeconds { get; }
+
+    /// <summary>True when only the policy name was given, so the settings come from the registered policy.</summary>
+    internal bool IsNamed => Permits == 0;
 
     /// <summary>
     /// Gets or sets how requests are counted. For <see cref="RuvioRateLimitAlgorithm.TokenBucket"/>, <see cref="Permits"/>
