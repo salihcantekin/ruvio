@@ -212,7 +212,7 @@ $ redis-cli -a change-me
         <div><b>{fmtX(scale.memGeomeanPerShard)}</b><span>memory per shard against one Redis across {scale.memory.length} data shapes; {fmtX(scaleEverysec.geomeanCluster)} throughput with every write logged (everysec, same as Redis AOF)</span></div>
       </div>
       <div class="scale-chart"><ScaleBars scale={scale} names={popular} /></div>
-      <p class="source">Source: <a href={`${site.github}/blob/main/${scale.file}`}>{scale.file}</a>, <a href={`${site.github}/blob/main/${scaleDeep.file}`}>pipeline {scaleDeep.pipeline}</a> and <a href={`${site.github}/blob/main/${scaleEverysec.file}`}>everysec</a> · Azure F16as_v6, AMD EPYC 9V74, 16 cores · {scale.clients} clients per shard, {scale.rounds} alternating rounds · <a href="/benchmarks/#scale">how it is measured</a></p>
+      <p class="source">Source: <a href={`${site.github}/blob/main/${scale.file}`}>{scale.file}</a>, <a href={`${site.github}/blob/main/${scaleDeep.file}`}>pipeline {scaleDeep.pipeline}</a> and <a href={`${site.github}/blob/main/${scaleEverysec.file}`}>everysec</a> · Azure VM F16as_v6 (AMD EPYC 9V74, virtualized), 16 cores · {scale.clients} clients per shard, {scale.rounds} alternating rounds · <a href="/benchmarks/#scale">how it is measured</a></p>
     </div>
   </section>
 

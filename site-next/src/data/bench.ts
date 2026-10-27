@@ -6,6 +6,9 @@ import path from "node:path";
 const repo = path.resolve(process.cwd(), "..");
 const readJson = (rel: string) => JSON.parse(fs.readFileSync(path.join(repo, rel), "utf8"));
 
+// Records name the host as "Azure F16as_v6, AMD ..."; say plainly that the AMD CPU is an Azure VM.
+const azureVm = (m: string) => m.replace(/^Azure (?!VM)/, "Azure VM ");
+
 export type Row = { label: string; ruvio: number; redis: number; ratio: number; ratioLo: number; ratioHi: number; rounds: number };
 export type MemRow = { label: string; ruvioKib: number; redisKib: number; saved: number };
 export type Platform = {
@@ -90,7 +93,7 @@ export type LoadRow = { label: string; shards: number; ruvio: { rps: number; p99
 export const loadRun = {
   file: "benchmark/records/x86-azure-2026-10-11.json",
   date: azure.date as string,
-  machine: `${azure.host.cpu}, ${azure.host.vcpus} vCPU (Azure VM)`,
+  machine: `Azure VM, ${azure.host.cpu}, ${azure.host.vcpus} vCPU`,
   commit: azure.build.ruvio_commit as string,
   rows: azure.concurrency.map((c: any) => ({
     label: c.label, shards: c.ruvio_shards,
@@ -169,7 +172,7 @@ function loadScale(file: string): Scale {
   const redisVersion = (String(d.redis_version).match(/v=([\d.]+)/) || [])[1] ?? "";
   return {
     file, date: d.date, shards: n, pipeline: d.config.pipeline, clients: d.config.clients, rounds: d.config.rounds,
-    durability: d.config.durability, machine: d.host?.description ?? d.host?.cpu ?? "", commit: d.build?.ruvio_commit ?? "", redisVersion,
+    durability: d.config.durability, machine: azureVm(d.host?.description ?? d.host?.cpu ?? ""), commit: d.build?.ruvio_commit ?? "", redisVersion,
     rows, memory,
     geomeanCluster: gm(steady.map((r) => r.vsCluster)), geomeanPerCore: gm(steady.map((r) => r.perCore)),
     atParCluster: rows.filter((r) => r.vsCluster >= 0.97).length, fasterThanCluster: rows.filter((r) => r.vsCluster >= 1).length,
@@ -199,7 +202,7 @@ const shardRow = (shards: number, system: string, client: string): ShardRow => {
 export const shardScaling = {
   file: shardFile,
   date: shardRaw.date as string,
-  machine: shardRaw.host.description as string,
+  machine: azureVm(shardRaw.host.description as string),
   commit: shardRaw.build.ruvio_commit as string,
   rounds: shardRaw.config.rounds as number,
   pipeline: shardRaw.config.pipeline as number,

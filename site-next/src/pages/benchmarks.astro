@@ -163,7 +163,7 @@ const one = at(1);
       <div class="peak-notes">
         <div><h3>What the number is</h3><p>The sum over {scaleDeep.shards} shards, each driven by its own <code>redis-benchmark</code> ({scaleDeep.clients} clients, pipeline {scaleDeep.pipeline}, in-memory). It shows what the hot path can do when the network and the client are not the limit.</p></div>
         <div><h3>What it is not</h3><p>Not every command: heavier ones such as <code>SETEX</code>, <code>HSET</code> or <code>LPUSH</code> run at {mil(Math.min(...peakNames.slice(3).map((n) => scaleDeep.row(n).ruvio)))}M to {mil(Math.max(...peakNames.slice(3).map((n) => scaleDeep.row(n).ruvio)))}M, and large replies are limited by the network. Without pipelining, a request waits for its reply and the load generator becomes the limit.</p></div>
-        <div><h3>Conditions</h3><p>One Azure F16as_v6 VM (AMD EPYC 9V74, 16 cores, no SMT): servers on cpus 8-15, load generators on cpus 0-7, loopback, {scaleDeep.date}. Server and load generator share the VM, so compare the systems with each other, not with other hosts.</p></div>
+        <div><h3>Conditions</h3><p>One Azure VM, F16as_v6 (AMD EPYC 9V74, virtualized, 16 cores, no SMT): servers on cpus 8-15, load generators on cpus 0-7, loopback, {scaleDeep.date}. Server and load generator share the VM, so compare the systems with each other, not with other hosts.</p></div>
       </div>
       <p class="source">Source: <a href={blob(scaleDeep.file)}>{scaleDeep.file}</a> · the same run as the pipeline {scaleDeep.pipeline} grid below.</p>
     </div>
@@ -208,7 +208,7 @@ const one = at(1);
           </tbody>
         </table>
       </div>
-      <p class="source">Sources: {grids.map((g, i) => <span>{i ? " · " : ""}<a href={blob(g.s.file)}>{g.s.file}</a></span>)} · Azure F16as_v6, AMD EPYC 9V74 (virtualized), 16 cores without SMT; servers on cpus 8-15, load generators on cpus 0-7, loopback · {scale.date}, Ruvio {scale.commit} · the record with the one-shard control run and the profiles is <a href="/docs/evidence/2026-10-16-azure-8-shards/">in the docs</a>.</p>
+      <p class="source">Sources: {grids.map((g, i) => <span>{i ? " · " : ""}<a href={blob(g.s.file)}>{g.s.file}</a></span>)} · Azure VM F16as_v6 (AMD EPYC 9V74, virtualized), 16 cores without SMT; servers on cpus 8-15, load generators on cpus 0-7, loopback · {scale.date}, Ruvio {scale.commit} · the record with the one-shard control run and the profiles is <a href="/docs/evidence/2026-10-16-azure-8-shards/">in the docs</a>.</p>
     </div>
   </section>
 
