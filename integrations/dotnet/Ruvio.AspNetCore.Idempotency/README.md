@@ -147,6 +147,24 @@ converted or replayed via Lua. Drain old admissions, handlers and retry retentio
 before switching all application instances. Do not delete old keys or change
 namespace to bypass this safety barrier. See [the native contract](../../../docs/IDEM.md).
 
+## A separate connection
+
+By default the middleware uses the unkeyed `IRuvioClient`. To give it a connection of its
+own (another server, database or set of options), register one with
+`AddKeyedRuvioClient` from `Ruvio.Client.AspNetCore` and name it in `ClientKey`:
+
+```csharp
+builder.Services.AddKeyedRuvioClient("idempotency", builder.Configuration.GetSection("RuvioDurable"));
+builder.Services.AddRuvioIdempotency(o =>
+{
+    o.ClientKey = "idempotency";
+    o.Namespace = "orders";
+    o.ScopeSelector = context => context.User.FindFirst("tenant")?.Value;
+});
+```
+
+The keyed client is looked up per request that the middleware handles, from the request's services.
+
 ## When Ruvio is unreachable
 
 By default a storage error reaches your exception handling (`Outage.Mode = Throw`). Choose what to do instead:

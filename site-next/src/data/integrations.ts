@@ -190,9 +190,16 @@ app.MapPost("/orders/{id}/pay", PayAsync).WithMetadata(new RuvioLockAttribute("o
     summary:
       "Durable Data Protection key ring, so every instance can read the others' cookies and protected payloads. Encryption of the ring is required by default.",
     useCases: ["sessions"],
-    example: cs(`builder.Services.AddDataProtection()
+    example: cs(`// The key ring on its own durable server; the cache can stay on a memory-only one.
+builder.Services.AddKeyedRuvioClient("key-ring", builder.Configuration.GetSection("RuvioDurable"));
+
+builder.Services.AddDataProtection()
     .SetApplicationName("orders-production")
-    .PersistKeysToRuvio(o => o.Key = "orders:production:data-protection:v1")
+    .PersistKeysToRuvio(o =>
+    {
+        o.ClientKey = "key-ring";
+        o.Key = "orders:production:data-protection:v1";
+    })
     .ProtectKeysWithCertificate(certificate);`),
   },
 };

@@ -230,6 +230,91 @@ public static class RuvioServiceCollectionExtensions
             : null;
 
     /// <summary>
+    /// Registers a second, independent connection under <paramref name="serviceKey"/>: keyed singletons
+    /// <see cref="RuvioConnection"/>, <see cref="IRuvioConnection"/>, <see cref="IRuvioClient"/> and
+    /// <see cref="RuvioClient"/>, resolved with <c>GetRequiredKeyedService</c> or <c>[FromKeyedServices]</c>.
+    /// The integrations select it with their <c>ClientKey</c> option. The unkeyed client, if any, is untouched.
+    /// </summary>
+    /// <param name="services">The service collection.</param>
+    /// <param name="serviceKey">The key, for example <c>"key-ring"</c>.</param>
+    /// <param name="configure">Configures this connection's options.</param>
+    /// <returns>The same service collection.</returns>
+    /// <example>
+    /// <code>
+    /// builder.Services.AddKeyedRuvioClient("key-ring", o => { o.Host = "ruvio-durable"; o.Port = 6379; });
+    /// builder.Services.AddDataProtection().PersistKeysToRuvio(o => o.ClientKey = "key-ring");
+    /// </code>
+    /// </example>
+    public static IServiceCollection AddKeyedRuvioClient(
+        this IServiceCollection services,
+        string serviceKey,
+        Action<RuvioClientOptions> configure)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentException.ThrowIfNullOrEmpty(serviceKey);
+        ArgumentNullException.ThrowIfNull(configure);
+        services.AddOptions<RuvioClientOptions>(serviceKey).Configure(configure);
+        RegisterKeyedClient(services, serviceKey);
+
+        return services;
+    }
+
+    /// <summary>Registers a keyed connection for <paramref name="host"/>:<paramref name="port"/>; see the options overload.</summary>
+    /// <param name="services">The service collection.</param>
+    /// <param name="serviceKey">The key.</param>
+    /// <param name="host">The server host.</param>
+    /// <param name="port">The server port.</param>
+    /// <param name="database">The database the client is bound to.</param>
+    /// <returns>The same service collection.</returns>
+    public static IServiceCollection AddKeyedRuvioClient(
+        this IServiceCollection services,
+        string serviceKey,
+        string host,
+        int port,
+        int database = 0)
+    {
+        return services.AddKeyedRuvioClient(serviceKey, options =>
+        {
+            options.Host = host;
+            options.Port = port;
+            options.Database = database;
+        });
+    }
+
+    /// <summary>Binds a keyed connection's options from <paramref name="configuration"/> (same keys as <c>AddRuvioClient</c>).</summary>
+    /// <param name="services">The service collection.</param>
+    /// <param name="serviceKey">The key.</param>
+    /// <param name="configuration">The configuration section.</param>
+    /// <returns>The same service collection.</returns>
+    public static IServiceCollection AddKeyedRuvioClient(
+        this IServiceCollection services,
+        string serviceKey,
+        IConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        return services.AddKeyedRuvioClient(serviceKey, options => BindOptions(configuration, options));
+    }
+
+    private static void RegisterKeyedClient(IServiceCollection services, string serviceKey)
+    {
+        services.AddKeyedSingleton(serviceKey, static (provider, key) =>
+            RuvioConnection.ConnectAsync(
+                provider.GetRequiredService<IOptionsMonitor<RuvioClientOptions>>().Get((string)key!)).GetAwaiter().GetResult());
+        services.AddKeyedSingleton<IRuvioConnection>(serviceKey,
+            static (provider, key) => provider.GetRequiredKeyedService<RuvioConnection>(key));
+        services.AddKeyedSingleton<IRuvioClient>(serviceKey, static (provider, key) =>
+        {
+            RuvioClientOptions options = provider.GetRequiredService<IOptionsMonitor<RuvioClientOptions>>().Get((string)key!);
+
+            return provider.GetRequiredKeyedService<RuvioConnection>(key)
+                .GetDatabaseAsync(options.Database).GetAwaiter().GetResult();
+        });
+        services.AddKeyedSingleton(serviceKey,
+            static (provider, key) => (RuvioClient)provider.GetRequiredKeyedService<IRuvioClient>(key));
+    }
+
+    /// <summary>
     /// The connection owns the socket resources and the database-scoped clients.
     /// </summary>
     private static void RegisterClient(IServiceCollection services)

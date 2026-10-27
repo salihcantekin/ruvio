@@ -175,7 +175,9 @@ public sealed class IdempotencyMiddleware
             string storageKey = StorageKey(identityParts, key);
             string fingerprint = Fingerprint(identityParts, requestParts, bytes.AsSpan(0, length));
             string owner = NewOwner();
-            var client = context.RequestServices.GetRequiredService<IRuvioClient>();
+            var client = options.ClientKey is { } clientKey
+                ? context.RequestServices.GetRequiredKeyedService<IRuvioClient>(clientKey)
+                : context.RequestServices.GetRequiredService<IRuvioClient>();
             var outage = options.Outage;
             (string State, string? Result) acquired = default;
             Exception? unreachable = null;

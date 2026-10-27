@@ -120,6 +120,19 @@ invalidations and bring back stale responses; this is not durable application
 state or an authorization boundary. Never enable caching of user-specific content
 without an appropriate trusted variation policy.
 
+## A separate connection
+
+By default the store uses the unkeyed `IRuvioClient`. To give it a connection of its
+own (another server, database or set of options), register one with
+`AddKeyedRuvioClient` from `Ruvio.Client.AspNetCore` and name it in `ClientKey`:
+
+```csharp
+builder.Services.AddKeyedRuvioClient("pages", "cache-host", 6379);
+builder.Services.AddRuvioOutputCache(o => o.ClientKey = "pages");
+```
+
+The keyed client is resolved on first use, like the unkeyed one.
+
 ## When Ruvio is unreachable
 
 ASP.NET Core's output-cache middleware already treats a store error on a read or a write as a miss and serves the

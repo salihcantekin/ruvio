@@ -14,6 +14,12 @@ public sealed class RuvioOutputCacheOptions
     public string InstanceName { get; set; } = "default";
 
     /// <summary>
+    /// The key of a connection registered with <c>AddKeyedRuvioClient</c>. Null (the default) uses the unkeyed
+    /// <c>IRuvioClient</c>.
+    /// </summary>
+    public string? ClientKey { get; set; }
+
+    /// <summary>
     /// Gets or sets the maximum size, in bytes, of a cache entry's value.
     /// </summary>
     public int MaxValueBytes { get; set; } = 1024 * 1024;

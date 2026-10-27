@@ -84,6 +84,23 @@ Inject `IRuvioClient` into services that send commands. Inject `IRuvioConnection
 app.Services.GetRequiredService<RuvioConnection>();
 ```
 
+## A second connection (keyed)
+
+`AddKeyedRuvioClient(key, ...)` registers another, independent connection under a service key, for example a durable server for the Data Protection key ring next to a memory-only cache server. It takes the same three forms as `AddRuvioClient` (options, host and port, configuration section) and registers keyed singletons `RuvioConnection`, `IRuvioConnection`, `IRuvioClient` and `RuvioClient`. The unkeyed client, if any, is untouched; each key opens its own sockets when it is first resolved.
+
+```csharp
+builder.Services.AddRuvioClient(builder.Configuration.GetSection("Ruvio"));
+builder.Services.AddKeyedRuvioClient("key-ring", builder.Configuration.GetSection("RuvioDurable"));
+
+// Inject it directly ...
+app.MapGet("/ring", ([FromKeyedServices("key-ring")] IRuvioClient ring) => ring.PingAsync());
+
+// ... or point an integration at it with its ClientKey option.
+builder.Services.AddDataProtection().PersistKeysToRuvio(o => o.ClientKey = "key-ring");
+```
+
+Every Ruvio .NET integration (distributed cache, output cache, distributed lock, idempotency, Data Protection) has a `ClientKey` option; null, the default, uses the unkeyed client as before.
+
 ## Optional health check
 
 ```csharp

@@ -56,8 +56,10 @@ See its README for generation/expiry races and buffering limits.
 Data Protection and Session have different storage requirements: the distributed
 cache stores expiring session contents; Data Protection retains the encryption
 key ring without TTL. The latter requires an encryptor by default and must use
-persistent, backed-up, non-evicting storage. Its connection-factory overload can select
-a separate durable Ruvio connection. Sharing the ring and `SetApplicationName`
+persistent, backed-up, non-evicting storage. Register that durable server with
+`AddKeyedRuvioClient("key-ring", ...)` and set `ClientKey = "key-ring"`; every
+integration has the same `ClientKey` option, so the cache, output cache, locks and
+idempotency can each use their own connection too. Sharing the ring and `SetApplicationName`
 allows instances to decrypt each other's session/authentication cookies. The
 Data Protection package includes a Session composition example, exercised across
 two real HTTP hosts. Neither adapter changes Session's last-writer-wins semantics.

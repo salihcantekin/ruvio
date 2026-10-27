@@ -4,6 +4,7 @@ Notable changes to the NuGet package `Ruvio.AspNetCore.DistributedLock`. New ent
 
 ## Unreleased
 
+- `ClientKey` option: names a connection registered with `AddKeyedRuvioClient`, so the lock provider can use its own server or database. Null (the default) keeps the unkeyed `IRuvioClient`.
 - A missing `AddRuvioDistributedLock` registration now fails the request with the usual "no service registered" error instead of a `NullReferenceException`.
 - `options.Outage`: choose what happens when Ruvio is unreachable (`Throw`, the default and unchanged: the `[RuvioLock]` middleware answers 503, `WithDistributedLock` raises; `FailClosed`, 503 on both; `FailOpen`, the request runs with no lock) and optionally stop calling Ruvio after repeated failures with a circuit breaker. See the README.
 

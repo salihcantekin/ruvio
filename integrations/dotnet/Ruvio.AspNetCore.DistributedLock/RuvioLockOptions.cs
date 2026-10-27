@@ -9,6 +9,12 @@ public sealed class RuvioLockOptions
     /// <summary>Prefix for lock keys. Use one per application so resources never collide.</summary>
     public string KeyPrefix { get; set; } = "lock:";
 
+    /// <summary>
+    /// The key of a connection registered with <c>AddKeyedRuvioClient</c>. Null (the default) uses the unkeyed
+    /// <c>IRuvioClient</c>.
+    /// </summary>
+    public string? ClientKey { get; set; }
+
     /// <summary>First pause between acquisition attempts. It doubles up to <see cref="RetryMax"/>, with jitter.</summary>
     public TimeSpan RetryMin { get; set; } = TimeSpan.FromMilliseconds(10);
 

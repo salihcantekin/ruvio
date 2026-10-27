@@ -4,6 +4,7 @@ Notable changes to the NuGet package `Ruvio.AspNetCore.DataProtection`. New entr
 
 ## Unreleased
 
+- `ClientKey` option: names a connection registered with `AddKeyedRuvioClient`, so the key-ring repository can use its own server or database. Null (the default) keeps the unkeyed `IRuvioClient`.
 - README: explains why the key ring has no outage mode (fail open or closed) like the other integrations.
 
 ## 0.1.2 - 2026-10-16

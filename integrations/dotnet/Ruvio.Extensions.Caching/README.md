@@ -159,6 +159,17 @@ envelope and the `SET` command; increasing provider limits does not raise
 server limits. Only a sliding renewal sends `EVAL`, and that script is one fixed
 text cached on the shard.
 
+## A separate connection
+
+By default the cache uses the unkeyed `IRuvioClient`. To give it a connection of its
+own (another server, database or set of options), register one with
+`AddKeyedRuvioClient` from `Ruvio.Client.AspNetCore` and name it in `ClientKey`:
+
+```csharp
+services.AddKeyedRuvioClient("cache", "cache-host", 6379);
+services.AddRuvioDistributedCache(o => { o.ClientKey = "cache"; o.InstanceName = "orders"; });
+```
+
 ## When Ruvio is unreachable
 
 By default a storage error reaches the caller (`Outage.Mode = Throw`). With `FailOpen` the cache steps aside:

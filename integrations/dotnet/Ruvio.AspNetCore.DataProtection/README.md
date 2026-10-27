@@ -47,8 +47,23 @@ is checked after options configuration, so method ordering does not disable the
 requirement. Keep old decryption certificates available when rotating certificates.
 The package does not provision certificates, export secrets or install an exporter.
 
-For a separate durable Ruvio connection, use a connection factory, for example
-after registering a keyed `IRuvioConnection` named `"key-ring"`:
+For a separate durable Ruvio connection, register it with `AddKeyedRuvioClient`
+(from `Ruvio.Client.AspNetCore`) and name it in `ClientKey`:
+
+```csharp
+builder.Services.AddKeyedRuvioClient("key-ring", builder.Configuration.GetSection("RuvioDurable"));
+builder.Services.AddDataProtection()
+    .SetApplicationName("orders-production")
+    .PersistKeysToRuvio(o =>
+    {
+        o.ClientKey = "key-ring";
+        o.Key = "orders:production:data-protection:v1";
+    })
+    .ProtectKeysWithCertificate(certificate);
+```
+
+A connection factory does the same for a connection registered some other way
+(`ClientKey` is ignored by this overload):
 
 ```csharp
 builder.Services.AddDataProtection()
