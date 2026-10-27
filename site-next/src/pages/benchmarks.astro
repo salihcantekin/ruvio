@@ -7,7 +7,7 @@ import RatioSwarm from "../components/charts/RatioSwarm.astro";
 import LoadArrows from "../components/charts/LoadArrows.astro";
 import MemoryDumbbell from "../components/charts/MemoryDumbbell.astro";
 import ScaleBars from "../components/charts/ScaleBars.astro";
-import { platforms, loadRun, scripted, fmtOps, fmtX, fmtMiB, pct, scale, scaleDeep, scaleEverysec } from "../data/bench";
+import { platforms, loadRun, scripted, fmtOps, fmtX, fmtMiB, pct, scale, scaleDeep, scaleEverysec, shardScaling } from "../data/bench";
 import { site } from "../config/site";
 import { clamp } from "../lib/geom";
 
@@ -164,6 +164,55 @@ const one = at(1);
         </table>
       </div>
       <p class="source">Sources: {grids.map((g, i) => <span>{i ? " · " : ""}<a href={blob(g.s.file)}>{g.s.file}</a></span>)} · Azure F16as_v6, AMD EPYC 9V74 (virtualized), 16 cores without SMT; servers on cpus 8-15, load generators on cpus 0-7, loopback · {scale.date}, Ruvio {scale.commit} · the record with the one-shard control run and the profiles is <a href="/docs/evidence/2026-10-16-azure-8-shards/">in the docs</a>.</p>
+    </div>
+  </section>
+
+  <section class="section" id="shard-scaling">
+    <div class="wrap">
+      <div class="head-row">
+        <div>
+          <p class="kicker">More shards</p>
+          <h2 class="title">Adding shards with a cluster-aware client</h2>
+          <p class="lede">One <code>memtier_benchmark</code> (8 threads, pipeline {shardScaling.pipeline}) routes each key to the shard that owns it: <code>--cluster-mode</code> against Ruvio, and against a Redis Cluster with one master per core (one plain Redis for one shard). <code>SET</code> and <code>GET</code> over 100,000 keys, median of {shardScaling.rounds} rounds.</p>
+        </div>
+      </div>
+      <div class="table-wrap scale-table">
+        <table class="res">
+          <thead><tr><th>Shards</th><th class="num">Ruvio SET</th><th class="num">Redis SET</th><th class="num">Ratio</th><th class="num">Ruvio GET</th><th class="num">Redis GET</th><th class="num">Ratio</th></tr></thead>
+          <tbody>
+            {shardScaling.routed.map((r) => {
+              const s = r.ruvio.set / r.redis.set, g = r.ruvio.get / r.redis.get;
+              return (
+                <tr><td>{r.shards}</td><td class="num">{fmtOps(r.ruvio.set)}</td><td class="num dim">{fmtOps(r.redis.set)}</td><td class={`num x ${s >= 1 ? "up" : s >= 0.97 ? "par" : "down"}`}>{fmtX(s)}</td><td class="num">{fmtOps(r.ruvio.get)}</td><td class="num dim">{fmtOps(r.redis.get)}</td><td class={`num x ${g >= 1 ? "up" : g >= 0.97 ? "par" : "down"}`}>{fmtX(g)}</td></tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <h3>One port, a client that does not route</h3>
+      <p class="lede">Every connection on the first port; the server forwards each command to the shard that owns its key. Since the forwarding shard wakes each other shard once per turn instead of once per send:</p>
+      <div class="table-wrap scale-table">
+        <table class="res">
+          <thead><tr><th>Shards</th><th class="num">SET before</th><th class="num">SET now</th><th class="num">GET before</th><th class="num">GET now</th></tr></thead>
+          <tbody>
+            {shardScaling.onePort.map((r) => (
+              <tr><td>{r.shards}</td><td class="num dim">{fmtOps(r.before.set)}</td><td class="num">{fmtOps(r.after.set)}</td><td class="num dim">{fmtOps(r.before.get)}</td><td class="num">{fmtOps(r.after.get)}</td></tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <h3>One shard, same run</h3>
+      <div class="table-wrap scale-table">
+        <table class="res">
+          <thead><tr><th>Command</th><th class="num">Ruvio</th><th class="num">Redis {shardScaling.redisVersion}</th><th class="num">Ratio</th></tr></thead>
+          <tbody>
+            {shardScaling.oneShard.map((r) => (
+              <tr><td>{r.label}</td><td class="num">{fmtOps(r.ruvio)}</td><td class="num dim">{fmtOps(r.redis)}</td><td class={`num x ${r.ratio >= 1 ? "up" : r.ratio >= 0.97 ? "par" : "down"}`}>{fmtX(r.ratio)}</td></tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p class="source">Source: <a href={blob(shardScaling.file)}>{shardScaling.file}</a> · {shardScaling.machine}; servers on cpus 8-15, load on cpus 0-7, loopback · {shardScaling.date}, Ruvio {shardScaling.commit} · 8 shards were measured too but are not shown: eight load threads were the limit for both systems there · <a href="/docs/evidence/2026-10-26-azure-shard-scaling/">record in the docs</a>.</p>
     </div>
   </section>
 

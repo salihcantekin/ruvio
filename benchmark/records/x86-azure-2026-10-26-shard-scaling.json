@@ -1,0 +1,470 @@
+{
+ "date": "2026-10-26",
+ "host": {
+  "description": "Azure F16as_v6, AMD EPYC 9V74 (virtualized), 16 cores without SMT",
+  "cpu": "AMD EPYC 9V74"
+ },
+ "build": {
+  "ruvio_commit": "bfc23fe",
+  "ruvio_before_commit": "a5a0a56",
+  "profile": "release"
+ },
+ "redis_version": "v=8.10.2",
+ "config": {
+  "tool": "memtier_benchmark 2.1.2",
+  "threads": 8,
+  "connections_per_thread_and_node": 7,
+  "pipeline": 16,
+  "value_bytes": 32,
+  "keys": 100000,
+  "seconds_per_row": 5,
+  "rounds": 3,
+  "durability": "memory",
+  "servers": "cpus 8-15",
+  "load": "cpus 0-7",
+  "script": "benchmark/azure/shard-bench.sh",
+  "notes": "cluster-aware: memtier --cluster-mode against Ruvio per-shard and a Redis Cluster (one plain Redis for 1 shard). one-port: every connection on port 7000, the server forwards. ruvio_before = dev before the forwarding wake fix. At 8 shards both systems swing between ~5.3M and ~8.6M from round to round: eight load threads are the limit there."
+ },
+ "rows": [
+  {
+   "shards": 1,
+   "system": "redis",
+   "client": "cluster-aware",
+   "set": 1101151,
+   "get": 1029771
+  },
+  {
+   "shards": 1,
+   "system": "ruvio",
+   "client": "cluster-aware",
+   "set": 1252591,
+   "get": 1532554
+  },
+  {
+   "shards": 1,
+   "system": "ruvio_before",
+   "client": "cluster-aware",
+   "set": 1259456,
+   "get": 1043987
+  },
+  {
+   "shards": 4,
+   "system": "redis",
+   "client": "cluster-aware",
+   "set": 3045537,
+   "get": 3548374
+  },
+  {
+   "shards": 4,
+   "system": "ruvio",
+   "client": "cluster-aware",
+   "set": 6812813,
+   "get": 5441456
+  },
+  {
+   "shards": 4,
+   "system": "ruvio_before",
+   "client": "cluster-aware",
+   "set": 6732312,
+   "get": 6699078
+  },
+  {
+   "shards": 8,
+   "system": "redis",
+   "client": "cluster-aware",
+   "set": 8183797,
+   "get": 6869689
+  },
+  {
+   "shards": 8,
+   "system": "ruvio",
+   "client": "cluster-aware",
+   "set": 5322476,
+   "get": 5738716
+  },
+  {
+   "shards": 8,
+   "system": "ruvio_before",
+   "client": "cluster-aware",
+   "set": 5364380,
+   "get": 5720780
+  },
+  {
+   "shards": 4,
+   "system": "ruvio",
+   "client": "one-port",
+   "set": 875055,
+   "get": 1054682
+  },
+  {
+   "shards": 4,
+   "system": "ruvio_before",
+   "client": "one-port",
+   "set": 648299,
+   "get": 655078
+  },
+  {
+   "shards": 8,
+   "system": "ruvio",
+   "client": "one-port",
+   "set": 1224082,
+   "get": 986074
+  },
+  {
+   "shards": 8,
+   "system": "ruvio_before",
+   "client": "one-port",
+   "set": 669085,
+   "get": 544815
+  }
+ ],
+ "samples": [
+  {
+   "shards": 1,
+   "system": "redis",
+   "client": "cluster-aware",
+   "round": 1,
+   "set": 1101151,
+   "get": 1029771
+  },
+  {
+   "shards": 1,
+   "system": "ruvio_before",
+   "client": "cluster-aware",
+   "round": 1,
+   "set": 1045835,
+   "get": 1024499
+  },
+  {
+   "shards": 1,
+   "system": "ruvio",
+   "client": "cluster-aware",
+   "round": 1,
+   "set": 1568281,
+   "get": 1532554
+  },
+  {
+   "shards": 4,
+   "system": "redis",
+   "client": "cluster-aware",
+   "round": 1,
+   "set": 3045537,
+   "get": 3539939
+  },
+  {
+   "shards": 4,
+   "system": "ruvio_before",
+   "client": "cluster-aware",
+   "round": 1,
+   "set": 6732312,
+   "get": 6717903
+  },
+  {
+   "shards": 4,
+   "system": "ruvio_before",
+   "client": "one-port",
+   "round": 1,
+   "set": 642120,
+   "get": 654103
+  },
+  {
+   "shards": 4,
+   "system": "ruvio",
+   "client": "cluster-aware",
+   "round": 1,
+   "set": 6825907,
+   "get": 6814136
+  },
+  {
+   "shards": 4,
+   "system": "ruvio",
+   "client": "one-port",
+   "round": 1,
+   "set": 875055,
+   "get": 872361
+  },
+  {
+   "shards": 8,
+   "system": "redis",
+   "client": "cluster-aware",
+   "round": 1,
+   "set": 5477620,
+   "get": 8552967
+  },
+  {
+   "shards": 8,
+   "system": "ruvio_before",
+   "client": "cluster-aware",
+   "round": 1,
+   "set": 7978668,
+   "get": 5715052
+  },
+  {
+   "shards": 8,
+   "system": "ruvio_before",
+   "client": "one-port",
+   "round": 1,
+   "set": 441421,
+   "get": 676876
+  },
+  {
+   "shards": 8,
+   "system": "ruvio",
+   "client": "cluster-aware",
+   "round": 1,
+   "set": 7943587,
+   "get": 5738716
+  },
+  {
+   "shards": 8,
+   "system": "ruvio",
+   "client": "one-port",
+   "round": 1,
+   "set": 817065,
+   "get": 1238881
+  },
+  {
+   "shards": 1,
+   "system": "redis",
+   "client": "cluster-aware",
+   "round": 2,
+   "set": 1109564,
+   "get": 1299856
+  },
+  {
+   "shards": 1,
+   "system": "ruvio_before",
+   "client": "cluster-aware",
+   "round": 2,
+   "set": 1259456,
+   "get": 1043987
+  },
+  {
+   "shards": 1,
+   "system": "ruvio",
+   "client": "cluster-aware",
+   "round": 2,
+   "set": 1053894,
+   "get": 1576199
+  },
+  {
+   "shards": 4,
+   "system": "redis",
+   "client": "cluster-aware",
+   "round": 2,
+   "set": 3599079,
+   "get": 3548374
+  },
+  {
+   "shards": 4,
+   "system": "ruvio_before",
+   "client": "cluster-aware",
+   "round": 2,
+   "set": 4478074,
+   "get": 6699078
+  },
+  {
+   "shards": 4,
+   "system": "ruvio_before",
+   "client": "one-port",
+   "round": 2,
+   "set": 775969,
+   "get": 655078
+  },
+  {
+   "shards": 4,
+   "system": "ruvio",
+   "client": "cluster-aware",
+   "round": 2,
+   "set": 4520292,
+   "get": 4551925
+  },
+  {
+   "shards": 4,
+   "system": "ruvio",
+   "client": "one-port",
+   "round": 2,
+   "set": 1314600,
+   "get": 1054682
+  },
+  {
+   "shards": 8,
+   "system": "redis",
+   "client": "cluster-aware",
+   "round": 2,
+   "set": 8198752,
+   "get": 6869689
+  },
+  {
+   "shards": 8,
+   "system": "ruvio_before",
+   "client": "cluster-aware",
+   "round": 2,
+   "set": 5345853,
+   "get": 5720780
+  },
+  {
+   "shards": 8,
+   "system": "ruvio_before",
+   "client": "one-port",
+   "round": 2,
+   "set": 676706,
+   "get": 544815
+  },
+  {
+   "shards": 8,
+   "system": "ruvio",
+   "client": "cluster-aware",
+   "round": 2,
+   "set": 5295634,
+   "get": 5686891
+  },
+  {
+   "shards": 8,
+   "system": "ruvio",
+   "client": "one-port",
+   "round": 2,
+   "set": 1227344,
+   "get": 986074
+  },
+  {
+   "shards": 1,
+   "system": "redis",
+   "client": "cluster-aware",
+   "round": 3,
+   "set": 734380,
+   "get": 859026
+  },
+  {
+   "shards": 1,
+   "system": "ruvio_before",
+   "client": "cluster-aware",
+   "round": 3,
+   "set": 1563420,
+   "get": 1541097
+  },
+  {
+   "shards": 1,
+   "system": "ruvio",
+   "client": "cluster-aware",
+   "round": 3,
+   "set": 1252591,
+   "get": 1034115
+  },
+  {
+   "shards": 4,
+   "system": "redis",
+   "client": "cluster-aware",
+   "round": 3,
+   "set": 3028129,
+   "get": 5334358
+  },
+  {
+   "shards": 4,
+   "system": "ruvio_before",
+   "client": "cluster-aware",
+   "round": 3,
+   "set": 6782515,
+   "get": 5417131
+  },
+  {
+   "shards": 4,
+   "system": "ruvio_before",
+   "client": "one-port",
+   "round": 3,
+   "set": 648299,
+   "get": 977037
+  },
+  {
+   "shards": 4,
+   "system": "ruvio",
+   "client": "cluster-aware",
+   "round": 3,
+   "set": 6812813,
+   "get": 5441456
+  },
+  {
+   "shards": 4,
+   "system": "ruvio",
+   "client": "one-port",
+   "round": 3,
+   "set": 866663,
+   "get": 1312778
+  },
+  {
+   "shards": 8,
+   "system": "redis",
+   "client": "cluster-aware",
+   "round": 3,
+   "set": 8183797,
+   "get": 5759882
+  },
+  {
+   "shards": 8,
+   "system": "ruvio_before",
+   "client": "cluster-aware",
+   "round": 3,
+   "set": 5364380,
+   "get": 8550670
+  },
+  {
+   "shards": 8,
+   "system": "ruvio_before",
+   "client": "one-port",
+   "round": 3,
+   "set": 669085,
+   "get": 444434
+  },
+  {
+   "shards": 8,
+   "system": "ruvio",
+   "client": "cluster-aware",
+   "round": 3,
+   "set": 5322476,
+   "get": 8608885
+  },
+  {
+   "shards": 8,
+   "system": "ruvio",
+   "client": "one-port",
+   "round": 3,
+   "set": 1224082,
+   "get": 826586
+  }
+ ],
+ "one_shard": {
+  "tool": "redis-benchmark 8.10.2, 4 threads, 50 clients, pipeline 16, 3 rounds (identical)",
+  "rows": [
+   {
+    "label": "SET",
+    "redis": 856409,
+    "ruvio": 1090513
+   },
+   {
+    "label": "GET",
+    "redis": 999334,
+    "ruvio": 1090513
+   },
+   {
+    "label": "INCR",
+    "redis": 922509,
+    "ruvio": 1090513
+   },
+   {
+    "label": "LPUSH",
+    "redis": 922509,
+    "ruvio": 922793
+   },
+   {
+    "label": "LPOP",
+    "redis": 856653,
+    "ruvio": 856653
+   },
+   {
+    "label": "GET one key",
+    "redis": 1090116,
+    "ruvio": 1199520
+   }
+  ]
+ }
+}
