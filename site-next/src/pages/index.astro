@@ -25,6 +25,14 @@ const jobs = [
 const popular = ["GET", "SET", "DEL (missing key)", "SETEX", "HSET (existing field)", "HGET", "LPUSH", "ZADD (existing member, same score)", "EXPIRE (key with TTL)", "PUBLISH (no subscribers)"];
 const scriptedPick = ["TRANSFER (enough)", "SET IFGT (random keys, half hit)", "ZPOPBYSCORE COUNT 1", "LIMIT SLIDING (allowed)", "INCR EX 60 (new keys)", "RENEW lease"].map((n) => scripted.rows.find((r) => r.label === n)!);
 const deepGet = scaleDeep.row("GET"), deepSet = scaleDeep.row("SET");
+// The largest gains of one command over the same job as a Lua script, one row per command.
+const topScripted = Object.values(
+  scripted.rows.reduce<Record<string, (typeof scripted.rows)[number]>>((acc, r) => {
+    const name = r.label.replace(/ \(.*\)$/, "").replace(/ COUNT \d+$/, "");
+    if (!/for scale/.test(r.label) && (!acc[name] || acc[name].ratio < r.ratio)) acc[name] = r;
+    return acc;
+  }, {}),
+).sort((a, b) => b.ratio - a.ratio).slice(0, 4);
 
 const steps = [
   { name: "Parse", text: "The connection's shard reads the request." },
@@ -57,6 +65,7 @@ $ redis-cli -a change-me
         </div>
         <ul class="facts">
           <li><a class="fact-link" href="/benchmarks/#peak"><b>{Math.round(deepGet.ruvio / 1e6)}M</b> GET/SET per second on {scale.shards} shards</a></li>
+          <li><a class="fact-link" href="#scripts">Up to <b>{fmtX(topScripted[0].ratio)}</b> a Lua script, as one command</a></li>
           <li>{commands.length} commands</li>
           <li>{clients.length} first-party clients</li>
           <li>Linux, macOS and Windows builds</li>
@@ -85,6 +94,41 @@ $ redis-cli -a change-me
           </a>
         ))}
       </div>
+    </div>
+  </section>
+
+  <section class="section band" id="scripts">
+    <div class="wrap">
+      <div class="head-row">
+        <div>
+          <p class="kicker">One command instead of a script</p>
+          <h2 class="title">The jobs you would script on Redis are single commands</h2>
+          <p class="lede">Each row is a Ruvio command next to the Lua script that does the same job on Redis {scripted.redisVersion}. Same machine, same load, one request at a time per connection for the latency.</p>
+        </div>
+        <a class="btn ghost" href="/benchmarks/#scripted">All commands and memory</a>
+      </div>
+      <div class="kpis script-kpis">
+        {topScripted.map((r) => (
+          <div><b>{fmtX(r.ratio)}</b><span><code>{r.label.replace(/ \(.*\)$/, "")}</code> against the same job as a Lua script</span></div>
+        ))}
+      </div>
+      <div class="scroll-x">
+        <table class="res">
+          <thead><tr><th>Ruvio command</th><th class="num">Ruvio ops/s</th><th class="num">Redis Lua ops/s</th><th class="num">Ratio</th><th class="num">p99 ms</th></tr></thead>
+          <tbody>
+            {scriptedPick.map((r) => (
+              <tr>
+                <td>{r.label.replace(/ \(.*\)$/, "")}</td>
+                <td class="num">{fmtOps(r.ruvio)}</td>
+                <td class="num dim">{fmtOps(r.redis)}</td>
+                <td class="num">{fmtX(r.ratio)}</td>
+                <td class="num dim">{r.ruvioP99.toFixed(2)} / {r.redisP99.toFixed(2)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p class="source">Source: <a href={`${site.github}/blob/main/${scripted.file}`}>{scripted.file}</a> · {scripted.machine}, in-memory, 1 shard · macOS only, not yet measured on x86 · <a href="/benchmarks/#scripted">how it is measured</a></p>
     </div>
   </section>
 
@@ -168,39 +212,10 @@ $ redis-cli -a change-me
         <div><b>{fmtX(scale.memGeomeanPerShard)}</b><span>memory per shard against one Redis across {scale.memory.length} data shapes; {fmtX(scaleEverysec.geomeanCluster)} throughput with every write logged (everysec, same as Redis AOF)</span></div>
       </div>
       <div class="scale-chart"><ScaleBars scale={scale} names={popular} /></div>
-      <p class="source">Source: <a href={`${site.github}/blob/main/${scale.file}`}>{scale.file}</a>, <a href={`${site.github}/blob/main/${scaleDeep.file}`}>pipeline {scaleDeep.pipeline}</a> and <a href={`${site.github}/blob/main/${scaleEverysec.file}`}>everysec</a> · Azure F16as_v6, AMD EPYC 9V74, 16 cores · {scale.clients} clients per shard, {scale.rounds} alternating rounds · <a href="/benchmarks/#scale">how it is measured</a></p>
+      <p class="source">Source: <a href={`${site.github}/blob/main/${scale.file}`}>{scale.file}</a>, <a href={`${site.github}/blob/main/${scaleDeep.file}`}>pipeline {scaleDeep.pipeline}</a> and <a href={`${site.github}/blob/main/${scaleEverysec.file}`}>everysec</a> · Azure VM F16as_v6 (AMD EPYC 9V74, virtualized), 16 cores · {scale.clients} clients per shard, {scale.rounds} alternating rounds · <a href="/benchmarks/#scale">how it is measured</a></p>
     </div>
   </section>
 
-  <section class="section" id="scripts">
-    <div class="wrap">
-      <div class="head-row">
-        <div>
-          <p class="kicker">One command instead of a script</p>
-          <h2 class="title">The jobs you would script on Redis are single commands</h2>
-          <p class="lede">Each row is a Ruvio command next to the Lua script that does the same job on Redis {scripted.redisVersion}. Same machine, same load, one request at a time per connection for the latency.</p>
-        </div>
-        <a class="btn ghost" href="/benchmarks/#scripted">All commands and memory</a>
-      </div>
-      <div class="scroll-x">
-        <table class="res">
-          <thead><tr><th>Ruvio command</th><th class="num">Ruvio ops/s</th><th class="num">Redis Lua ops/s</th><th class="num">Ratio</th><th class="num">p99 ms</th></tr></thead>
-          <tbody>
-            {scriptedPick.map((r) => (
-              <tr>
-                <td>{r.label.replace(/ \(.*\)$/, "")}</td>
-                <td class="num">{fmtOps(r.ruvio)}</td>
-                <td class="num dim">{fmtOps(r.redis)}</td>
-                <td class="num">{fmtX(r.ratio)}</td>
-                <td class="num dim">{r.ruvioP99.toFixed(2)} / {r.redisP99.toFixed(2)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-      <p class="source">Source: <a href={`${site.github}/blob/main/${scripted.file}`}>{scripted.file}</a> · {scripted.machine}, in-memory, 1 shard · macOS only, not yet measured on x86 · <a href="/benchmarks/#scripted">how it is measured</a></p>
-    </div>
-  </section>
 
   <section class="section band" id="architecture">
     <div class="wrap arch">
@@ -296,6 +311,7 @@ $ redis-cli -a change-me
   .hero-lede { font-size: 19.5px; color: var(--mute); max-width: 46ch; margin: 0 0 30px; }
   .hero-lede code { font-size: 0.9em; }
   .ctas { display: flex; flex-wrap: wrap; gap: 12px; }
+  .script-kpis { margin-bottom: 24px; }
   .facts { display: flex; flex-wrap: wrap; gap: 8px 24px; margin: 30px 0 0; padding: 0; list-style: none; font-size: 15px; color: var(--mute); }
   .fact-link b { color: var(--ink); font-weight: 600; }
   .fact-link:hover { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }

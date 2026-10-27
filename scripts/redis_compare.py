@@ -10,7 +10,7 @@ the table reports the median of the rounds.
     python3 scripts/redis_compare.py --out target/redis-compare
 
 Writes results.json, table.md, and table.html into --out. About two minutes on
-an Apple M4 Pro with the defaults.
+an Apple silicon Mac with the defaults.
 """
 
 from __future__ import annotations

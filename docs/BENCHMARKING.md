@@ -26,7 +26,7 @@ python3 scripts/redis_compare.py --out target/redis-compare
 
 **Outputs:** `results.json`, `table.md`, and `table.html` (the same rows as an HTML table).
 
-**Run time:** about 75 s on an Apple M4 Pro.
+**Run time:** about 75 s on an Apple silicon Mac.
 
 **Options:**
 
