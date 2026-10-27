@@ -14,6 +14,22 @@ export type LongRun = {
 export const longRuns: LongRun[] = [
   {
     date: "2026-10-26",
+    title: "Throughput as shards are added",
+    environment: "Azure F16as_v6 (16 cores): servers on 8 cores, load on the other 8",
+    duration: "24 minutes, 3 rounds of every row",
+    tested: [
+      "SET and GET at 1, 4 and 8 shards with a cluster-aware client",
+      "A client that does not route: every connection on one port, the server forwards each command",
+      "One shard: SET, GET, INCR, LPUSH and LPOP",
+    ],
+    result: [
+      "4 shards: 6.8M SET and 5.4M GET per second, against 1.25M and 1.5M on one shard",
+      "One port: 4 shards 0.88M SET / 1.05M GET, 8 shards 1.22M SET per second, up from 0.65M after the forwarding fix",
+      "One shard: SET, GET and INCR at 1.09M, LPUSH 0.92M, LPOP 0.86M per second at pipeline 16; the full tables are on the benchmarks page",
+    ],
+  },
+  {
+    date: "2026-10-26",
     title: "Memory under a steady load",
     environment: "Azure, 3 nodes (4 vCPU, 16 GB each) and a load machine",
     duration: "2 hours",

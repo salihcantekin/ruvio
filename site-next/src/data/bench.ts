@@ -176,6 +176,30 @@ export const scale = loadScale("benchmark/records/x86-azure-2026-10-16-8-shards-
 export const scaleDeep = loadScale("benchmark/records/x86-azure-2026-10-16-8-shards-p64-after.json");
 export const scaleEverysec = loadScale("benchmark/records/x86-azure-2026-10-16-8-shards-everysec-after.json");
 
+// Shard scaling with a cluster-aware client on both sides, and the one-port path before and after the
+// forwarding wake fix (benchmark/azure/shard-bench.sh). Medians over the rounds.
+type ShardRow = { shards: number; system: string; client: string; set: number; get: number };
+const shardFile = "benchmark/records/x86-azure-2026-10-26-shard-scaling.json";
+const shardRaw = readJson(shardFile);
+const shardRow = (shards: number, system: string, client: string): ShardRow => {
+  const found = (shardRaw.rows as ShardRow[]).find((r) => r.shards === shards && r.system === system && r.client === client);
+  if (!found) throw new Error(`${shardFile} has no row ${shards} ${system} ${client}`);
+  return found;
+};
+export const shardScaling = {
+  file: shardFile,
+  date: shardRaw.date as string,
+  machine: shardRaw.host.description as string,
+  commit: shardRaw.build.ruvio_commit as string,
+  rounds: shardRaw.config.rounds as number,
+  pipeline: shardRaw.config.pipeline as number,
+  redisVersion: ((String(shardRaw.redis_version).match(/v=([\d.]+)/) || [])[1] ?? "") as string,
+  // 8 shards are left out: eight load threads were the limit for both systems there.
+  routed: [1, 4].map((n) => ({ shards: n, ruvio: shardRow(n, "ruvio", "cluster-aware"), redis: shardRow(n, "redis", "cluster-aware") })),
+  onePort: [4, 8].map((n) => ({ shards: n, before: shardRow(n, "ruvio_before", "one-port"), after: shardRow(n, "ruvio", "one-port") })),
+  oneShard: (shardRaw.one_shard.rows as { label: string; redis: number; ruvio: number }[]).map((r) => ({ ...r, ratio: r.ruvio / r.redis })),
+};
+
 // One Ruvio command against the Lua script that does the same on Redis (scripts/bench_scripted_equivalents.py).
 export type ScriptedRow = { label: string; ruvio: number; redis: number; ratio: number; ruvioP50: number; redisP50: number; ruvioP99: number; redisP99: number };
 export type ScriptedMem = { label: string; ruvioBytes: number; redisBytes: number; ratio: number };

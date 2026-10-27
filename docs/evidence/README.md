@@ -8,6 +8,7 @@ Current numbers are on the [performance](https://ruviodb.com/benchmarks/) and [m
 
 | Date | Record | What it measured |
 | --- | --- | --- |
+| 2026-10-26 | [Shard scaling](2026-10-26-azure-shard-scaling.md) | `SET`/`GET` at 1, 4 and 8 shards with a cluster-aware client against Redis and a Redis Cluster, the one-port forwarding path before and after its fix, and one-shard rows, on one Azure EPYC 9V74 VM |
 | 2026-10-16 | [Eight shards against Redis](2026-10-16-azure-8-shards.md) | 60 commands and 12 data structures, Ruvio with eight shards against one Redis core and an eight-node Redis Cluster on one Azure EPYC 9V74 VM; one-shard control run |
 | 2026-10-16 | [Client cluster routing cost](2026-10-16-client-cluster-routing.md) | CPU and allocation per request on the cluster path against the plain path, before and after, for all six clients on a 4-shard local server |
 | 2026-10-11 | [Azure command comparison](2026-10-11-azure-command-comparison.md) | 60 commands and 12 data structures against Redis 8.10.2, throughput and memory, one Azure EPYC VM |
