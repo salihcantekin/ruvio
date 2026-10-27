@@ -4,7 +4,7 @@
 
 <h1 align="center">Ruvio.AspNetCore.RateLimiting <sub>NuGet</sub></h1>
 
-<p align="center">Endpoint-opt-in distributed fixed-window rate limiting.</p>
+<p align="center">Endpoint-opt-in distributed rate limiting: fixed or sliding window, token bucket, concurrency.</p>
 
 <p align="center">
   <a href="https://www.nuget.org/packages/Ruvio.AspNetCore.RateLimiting"><img alt="NuGet" src="https://img.shields.io/nuget/v/Ruvio.AspNetCore.RateLimiting?label=nuget"></a>
@@ -20,9 +20,10 @@
 
 ---
 
-Opt-in distributed, first-request-anchored fixed-window HTTP budgets using
-Ruvio's atomic `LIMIT`. This is middleware, not an implementation of the
-in-process ASP.NET Core `RateLimiter`. There is no waiting queue or background task.
+Opt-in distributed HTTP budgets using Ruvio's atomic `LIMIT` (fixed window by default,
+first-request-anchored). This is middleware, not an implementation of the
+in-process ASP.NET Core `RateLimiter`. A rejected request is answered at once with 429;
+there is no waiting queue or background task.
 
 ```csharp
 using Ruvio.AspNetCore.RateLimiting;
@@ -73,6 +74,70 @@ An unknown name throws `InvalidOperationException` when the request arrives, bef
 a non-positive permit count or window is rejected in `AddPolicy`. The inline forms (`WithRuvioRateLimit("p", 100, window)`
 and `[RuvioRateLimit("p", 100, 60)]`) need no registration and keep working; a named policy and an inline one with the same
 name share one bucket, so keep their settings the same.
+
+### One policy per partition
+
+`options.PartitionKey` is the default owner of a budget. A policy can name its own, so one endpoint is limited per IP and
+another per tenant:
+
+```csharp
+options.PartitionKey = context => context.User.FindFirst("tenant_id")?.Value ?? "";   // default: per tenant
+options.AddPolicy("create-order", permits: 100, window: TimeSpan.FromMinutes(1));      // uses the default
+options.AddPolicy("login", permits: 5, window: TimeSpan.FromMinutes(1),
+    partitionKey: context => context.Connection.RemoteIpAddress?.ToString() ?? "");    // per client IP
+```
+
+`options.PartitionKey` is only required when some limit has no key of its own. A blank key (null, empty or whitespace) is a
+configuration error by default. Set `options.EmptyPartition = RuvioEmptyPartitionMode.SharedBucket` to let all such requests
+share one budget per policy instead; they are limited together, never unlimited. Over 1024 characters is always an error.
+
+### Several limits in one policy
+
+A request must pass every limit of a policy. Each limit has its own permits, window, algorithm and partition:
+
+```csharp
+options.AddPolicy("search", policy => policy
+    .Limit(20, TimeSpan.FromSeconds(10), partitionKey: context => ClientIp(context))        // per IP
+    .Limit(1000, TimeSpan.FromMinutes(1), algorithm: RuvioRateLimitAlgorithm.SlidingWindow) // per tenant
+    .Concurrency(maxConcurrent: 8, maxRequestDuration: TimeSpan.FromSeconds(30)));         // 8 at once per tenant
+```
+
+Limits run in the order added, one Ruvio command each, so cost grows with their number. They are not one atomic unit: a
+request refused by a later limit has already used a permit of the earlier ones. List the strictest limit first. The first
+limit of a policy keeps the key of a one-limit policy of the same name. `Retry-After` comes from the limit that refused.
+
+`Concurrency` caps requests in flight. It takes a `SEMAPHORE` slot before the endpoint runs and releases it afterwards (two
+commands per request), also when the endpoint throws. The slot expires after `maxRequestDuration` (30 seconds by default),
+so a crashed instance cannot hold it forever; a request that runs longer than that can be over-admitted, so set it above
+your slowest normal request. A policy can have one concurrency limit. A refused request gets 429 with `Retry-After: 1`.
+
+### A default policy for every endpoint
+
+```csharp
+options.AddPolicy("api", permits: 600, window: TimeSpan.FromMinutes(1));
+options.DefaultPolicy = "api";                 // every routed endpoint without its own limit
+
+app.MapGet("/health", () => "ok").DisableRuvioRateLimit();   // or [DisableRuvioRateLimit]
+```
+
+With no `DefaultPolicy` and no policy on an endpoint, nothing is limited (the default). A request that matches no endpoint
+(a 404) is never limited. When an endpoint has both a limit and an exemption, the one closest to the endpoint wins, so an
+endpoint can opt back in inside an exempt group. Without a `DefaultPolicy` the middleware does no extra work for endpoints
+without a limit.
+
+### Shaping the rejection
+
+The default answer is 429 with `Retry-After`. `OnRejected` runs after both are set and may change the status or write a body:
+
+```csharp
+options.OnRejected = async (context, rejection) =>
+{
+    // rejection.Policy, .Reason (RateLimit or Concurrency), .LimitIndex, .RetryAfter
+    await context.Response.WriteAsJsonAsync(new { error = "rate_limited", retryAfter = rejection.RetryAfter.TotalSeconds });
+};
+```
+
+It is not called for the 503 of `Outage.Mode = FailClosed`.
 
 Only opted-in endpoints resolve services or call Ruvio. Other endpoints return
 the next delegate's task directly: no async state machine, hashing, timers, network

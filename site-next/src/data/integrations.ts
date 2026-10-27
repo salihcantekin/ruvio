@@ -95,25 +95,59 @@ await store.EvictByTagAsync("catalog", cancellationToken);`),
   },
   "Ruvio.AspNetCore.RateLimiting": {
     summary:
-      "Distributed fixed-window budgets per endpoint with one atomic LIMIT call. Define named policies once and refer to them by name. Rejected requests get 429 with Retry-After; endpoints without the attribute pay nothing. Choose what happens when Ruvio is unreachable: throw, answer 503, or let requests through, with an optional circuit breaker.",
+      "Distributed budgets per endpoint with one atomic LIMIT call. Define named policies once and refer to them by name; give a policy its own partition (IP for one endpoint, tenant for another), chain several limits, cap concurrent requests, set a default policy for every endpoint, and shape the rejection answer. Rejected requests get 429 with Retry-After; endpoints without the attribute pay nothing. Choose what happens when Ruvio is unreachable: throw, answer 503, or let requests through, with an optional circuit breaker.",
     useCases: ["rate-limits"],
     example: cs(`builder.Services.AddRuvioClient(builder.Configuration.GetSection("Ruvio"));
 builder.Services.AddRuvioRateLimiting(options =>
 {
     options.KeyPrefix = "orders:rate:v1:";
-    options.PartitionKey = context =>
-        context.User.FindFirst("tenant_id")?.Value
-        ?? throw new InvalidOperationException("An authenticated tenant is required.");
+
+    // Default budget owner for every policy that does not name its own: here the tenant.
+    options.PartitionKey = context => context.User.FindFirst("tenant_id")?.Value ?? "";
+
+    // A request without a tenant shares one budget instead of failing. It is never unlimited.
+    // The default (Throw) treats a blank key as a configuration error.
+    options.EmptyPartition = RuvioEmptyPartitionMode.SharedBucket;
+
+    // 100 requests a minute per tenant (uses options.PartitionKey).
     options.AddPolicy("create-order", permits: 100, window: TimeSpan.FromMinutes(1));
+
+    // A policy can count something else: this one is per client IP, whatever the tenant is.
+    options.AddPolicy("login", permits: 5, window: TimeSpan.FromMinutes(1),
+        partitionKey: context => context.Connection.RemoteIpAddress?.ToString() ?? "");
+
+    // Chained limits: a request must pass all of them, in this order. Put the strictest first,
+    // because a request refused by a later limit has already used a permit of the earlier ones.
+    options.AddPolicy("search", policy => policy
+        .Limit(20, TimeSpan.FromSeconds(10),
+            partitionKey: context => context.Connection.RemoteIpAddress?.ToString() ?? "")  // per IP
+        .Limit(1000, TimeSpan.FromMinutes(1), algorithm: RuvioRateLimitAlgorithm.SlidingWindow)  // per tenant
+        .Concurrency(maxConcurrent: 8, maxRequestDuration: TimeSpan.FromSeconds(30)));  // 8 at once per tenant
+
+    // Applies to every routed endpoint that has no limit of its own. Opt out with DisableRuvioRateLimit().
+    options.DefaultPolicy = "create-order";
+
+    // Runs after the default 429 and Retry-After are set; change the status or write a body here.
+    options.OnRejected = async (context, rejection) =>
+    {
+        await context.Response.WriteAsJsonAsync(new
+        {
+            error = "rate_limited",
+            policy = rejection.Policy,
+            retryAfterSeconds = (int)rejection.RetryAfter.TotalSeconds,
+        });
+    };
 });
 
 app.UseRouting();
 app.UseAuthentication();
 app.UseAuthorization();
 app.UseRuvioRateLimiting();
-app.MapPost("/orders", HandleOrder)
-    .RequireAuthorization()
-    .WithRuvioRateLimit("create-order");`),
+
+app.MapPost("/login", HandleLogin).WithRuvioRateLimit("login");
+app.MapGet("/search", HandleSearch).WithRuvioRateLimit("search");
+app.MapPost("/orders", HandleOrder).RequireAuthorization();   // limited by DefaultPolicy
+app.MapGet("/health", () => "ok").DisableRuvioRateLimit();     // never limited`),
   },
   "Ruvio.AspNetCore.Idempotency": {
     summary:

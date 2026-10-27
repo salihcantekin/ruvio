@@ -14,11 +14,26 @@ namespace Ruvio.AspNetCore.RateLimiting;
 /// <summary>
 /// Middleware for enforcing Ruvio rate limiting on incoming HTTP requests.
 /// </summary>
-/// <param name="next">The next middleware in the pipeline.</param>
-/// <param name="options">The validated rate-limiting options, read once.</param>
-public sealed class RuvioRateLimitingMiddleware(RequestDelegate next, IOptions<RuvioRateLimitingOptions> options)
+public sealed class RuvioRateLimitingMiddleware
 {
-    private readonly RuvioRateLimitingOptions options = options.Value;
+    private readonly RequestDelegate next;
+    private readonly RuvioRateLimitingOptions options;
+
+    // Applies to routed endpoints without rate-limit metadata; null when no default policy is configured.
+    private readonly RuvioRateLimitAttribute? defaultPolicy;
+
+    /// <summary>Creates the middleware; the options are read once.</summary>
+    /// <param name="next">The next middleware in the pipeline.</param>
+    /// <param name="options">The validated rate-limiting options.</param>
+    public RuvioRateLimitingMiddleware(RequestDelegate next, IOptions<RuvioRateLimitingOptions> options)
+    {
+        this.next = next;
+        this.options = options.Value;
+        defaultPolicy = this.options.DefaultPolicy is { } name ? new RuvioRateLimitAttribute(name) : null;
+    }
+
+    // All blank partitions of a policy share this bucket in SharedBucket mode; the NUL keeps real values from colliding with it.
+    private const string BlankPartition = "\0blank";
 
     /// <summary>
     /// Invokes the middleware for the given HTTP context, enforcing rate limiting if applicable.
@@ -27,35 +42,92 @@ public sealed class RuvioRateLimitingMiddleware(RequestDelegate next, IOptions<R
     /// <returns>A task representing the asynchronous operation.</returns>
     public Task InvokeAsync(HttpContext context)
     {
-        var policy = context.GetEndpoint()?.Metadata.GetMetadata<RuvioRateLimitAttribute>();
+        var metadata = context.GetEndpoint()?.Metadata;
 
-        return policy is null ? next(context) : InvokeLimitedAsync(context, policy);
+        if (metadata is null)
+            return next(context);
+
+        var policy = metadata.GetMetadata<RuvioRateLimitAttribute>();
+
+        if (policy is null)
+        {
+            if (defaultPolicy is null || metadata.GetMetadata<DisableRuvioRateLimitAttribute>() is not null)
+                return next(context);
+
+            policy = defaultPolicy;
+        }
+        else if (metadata.GetMetadata<DisableRuvioRateLimitAttribute>() is not null && DisableIsClosest(metadata))
+        {
+            return next(context);
+        }
+
+        return InvokeLimitedAsync(context, policy);
+    }
+
+    // The metadata closest to the endpoint (added last) decides when both a limit and an exemption are present.
+    private static bool DisableIsClosest(EndpointMetadataCollection metadata)
+    {
+        for (int index = metadata.Count - 1; index >= 0; index--)
+        {
+            if (metadata[index] is DisableRuvioRateLimitAttribute)
+                return true;
+
+            if (metadata[index] is RuvioRateLimitAttribute)
+                return false;
+        }
+
+        return false;
+    }
+
+    private string Partition(HttpContext context, RuvioLimit limit, string policy)
+    {
+        var select = limit.Partition ?? options.PartitionKey
+            ?? throw new InvalidOperationException(
+                $"The rate-limit policy '{policy}' has no partition key; set options.PartitionKey or give the limit its own.");
+        string partition = select(context);
+
+        if (string.IsNullOrWhiteSpace(partition))
+        {
+            // Throw by default: a blank key would otherwise merge unrelated callers into one budget by accident.
+            if (options.EmptyPartition == RuvioEmptyPartitionMode.SharedBucket)
+                return BlankPartition;
+
+            throw new InvalidOperationException("The rate-limit partition must have 1-1024 characters.");
+        }
+
+        if (partition.Length > 1024)
+            throw new InvalidOperationException("The rate-limit partition must have 1-1024 characters.");
+
+        return partition;
     }
 
     private async Task InvokeLimitedAsync(HttpContext context, RuvioRateLimitAttribute policy)
     {
-        string partition = options.PartitionKey!(context);
-
-        // An empty partition is a configuration error, not a shared anonymous bucket: it would merge
-        // unrelated callers into one budget.
-        if (string.IsNullOrWhiteSpace(partition) || partition.Length > 1024)
-            throw new InvalidOperationException("The rate-limit partition must have 1-1024 characters.");
-
-        long permits = policy.Permits;
-        int windowSeconds = policy.WindowSeconds;
-        var algorithm = policy.Algorithm;
+        RuvioLimit[] limits;
 
         if (policy.IsNamed)
         {
-            if (!options.TryGetPolicy(policy.Policy, out var named))
+            if (!options.TryGetPolicy(policy.Policy, out limits!))
                 throw new InvalidOperationException($"No rate-limit policy named '{policy.Policy}' was added with AddPolicy.");
-
-            permits = named.Permits;
-            windowSeconds = named.WindowSeconds;
-            algorithm = named.Algorithm;
+        }
+        else
+        {
+            limits = policy.InlineLimits;
         }
 
-        string key = StorageKey(options.KeyPrefix, policy.Policy, partition);
+        // Resolve every partition before the first storage call, so a configuration error never leaves a permit used.
+        string firstPartition = Partition(context, limits[0], policy.Policy);
+        string[]? partitions = null;
+
+        if (limits.Length > 1)
+        {
+            partitions = new string[limits.Length];
+            partitions[0] = firstPartition;
+
+            for (int index = 1; index < limits.Length; index++)
+                partitions[index] = Partition(context, limits[index], policy.Policy);
+        }
+
         var client = context.RequestServices.GetRequiredService<IRuvioClient>();
         var outage = options.Outage;
 
@@ -67,84 +139,157 @@ public sealed class RuvioRateLimitingMiddleware(RequestDelegate next, IOptions<R
         }
 
         using var activity = Telemetry.Source.StartActivity("ruvio.rate_limit");
-        long? remaining;
-        long retryAfterMs = 0;
-        long started = Stopwatch.GetTimestamp();
-        string outcome = "error";
-        Exception? unreachable = null;
+        string? slotKey = null;
+        long slotToken = 0;
 
         try
         {
-            // LIMIT checks and counts in one server command, so parallel requests cannot all read the
-            // same count and pass.
-            long windowMs = (long)windowSeconds * 1000;
+            Exception? unreachable = null;
+            int rejectedBy = -1;
+            long retrySeconds = 0;
 
-            if (algorithm == RuvioRateLimitAlgorithm.FixedWindow)
+            for (int index = 0; index < limits.Length; index++)
             {
-                remaining = await client.LimitAsync(key, permits, windowMs, context.RequestAborted);
+                var limit = limits[index];
+                string key = StorageKey(options.KeyPrefix, limit.KeyName, partitions is null ? firstPartition : partitions[index]);
+                long windowMs = (long)limit.WindowSeconds * 1000;
+                long started = Stopwatch.GetTimestamp();
+                string outcome = "error";
+
+                try
+                {
+                    if (limit.IsConcurrency)
+                    {
+                        long? token = await client.AcquireSemaphoreAsync(key, limit.Permits, windowMs, context.RequestAborted);
+
+                        outage.Succeeded();
+                        outcome = token is null ? "rejected" : "accepted";
+
+                        if (token is { } slot)
+                        {
+                            slotKey = key;
+                            slotToken = slot;
+                        }
+                        else
+                        {
+                            rejectedBy = index;
+                            retrySeconds = 1;
+                        }
+                    }
+                    else
+                    {
+                        long? remaining;
+                        long retryAfterMs = 0;
+
+                        // LIMIT checks and counts in one server command, so parallel requests cannot all read the
+                        // same count and pass.
+                        if (limit.Algorithm == RuvioRateLimitAlgorithm.FixedWindow)
+                        {
+                            remaining = await client.LimitAsync(key, limit.Permits, windowMs, context.RequestAborted);
+                        }
+                        else
+                        {
+                            // WITHRETRY says when the same call would pass, so Retry-After is exact.
+                            var result = limit.Algorithm == RuvioRateLimitAlgorithm.SlidingWindow
+                                ? await client.LimitSlidingWithRetryAsync(key, limit.Permits, windowMs, context.RequestAborted)
+                                : await client.LimitTokensWithRetryAsync(key, limit.Permits, windowMs, 1, context.RequestAborted);
+
+                            remaining = result.Allowed ? result.Remaining : null;
+                            retryAfterMs = result.RetryAfterMs;
+                        }
+
+                        outage.Succeeded();
+                        outcome = remaining is null ? "rejected" : "accepted";
+
+                        if (remaining is < 0 || remaining >= limit.Permits)
+                            throw new RuvioException("LIMIT returned an invalid remaining allowance.");
+
+                        if (remaining is null)
+                        {
+                            rejectedBy = index;
+
+                            // Fixed window: LIMIT does not return the deadline, so a full window is a conservative delay.
+                            retrySeconds = retryAfterMs > 0 ? Math.Max(1, (retryAfterMs + 999) / 1000) : limit.WindowSeconds;
+                        }
+                    }
+                }
+                catch (Exception error)
+                {
+                    bool isOutage = outage.Failed(error, context.RequestAborted);
+
+                    activity?.SetStatus(ActivityStatusCode.Error, error.GetType().Name);
+                    Telemetry.Errors.Add(1);
+
+                    if (!isOutage || outage.Mode == RuvioOutageMode.Throw)
+                        throw;
+
+                    unreachable = error;
+                }
+                finally
+                {
+                    Telemetry.StorageCalls.Add(1, new TagList { { "outcome", outcome } });
+                    Telemetry.StorageCommands.Add(1, new TagList { { "outcome", outcome } });
+                    Telemetry.StorageDuration.Record(
+                        Stopwatch.GetElapsedTime(started).TotalMilliseconds,
+                        new TagList { { "outcome", outcome } });
+                }
+
+                if (unreachable is not null || rejectedBy >= 0)
+                    break;
             }
-            else
+
+            if (unreachable is not null)
             {
-                // WITHRETRY says when the same call would pass, so Retry-After is exact.
-                var result = algorithm == RuvioRateLimitAlgorithm.SlidingWindow
-                    ? await client.LimitSlidingWithRetryAsync(key, permits, windowMs, context.RequestAborted)
-                    : await client.LimitTokensWithRetryAsync(key, permits, windowMs, 1, context.RequestAborted);
+                await ReleaseSlot(client, slotKey, slotToken);
+                slotKey = null;
+                await Outage(context, outage, unreachable);
 
-                remaining = result.Allowed ? result.Remaining : null;
-                retryAfterMs = result.RetryAfterMs;
+                return;
             }
 
-            outage.Succeeded();
-            outcome = remaining is null ? "rejected" : "accepted";
-        }
-        catch (Exception error)
-        {
-            bool isOutage = outage.Failed(error, context.RequestAborted);
+            if (rejectedBy >= 0)
+            {
+                await ReleaseSlot(client, slotKey, slotToken);
+                slotKey = null;
+                Telemetry.Rejected.Add(1);
 
-            activity?.SetStatus(ActivityStatusCode.Error, error.GetType().Name);
-            Telemetry.Errors.Add(1);
+                context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+                context.Response.Headers.RetryAfter = retrySeconds.ToString(CultureInfo.InvariantCulture);
 
-            if (!isOutage || outage.Mode == RuvioOutageMode.Throw)
-                throw;
+                if (options.OnRejected is { } onRejected)
+                {
+                    var reason = limits[rejectedBy].IsConcurrency ? RuvioRejectionReason.Concurrency : RuvioRejectionReason.RateLimit;
 
-            unreachable = error;
-            remaining = 0;
+                    await onRejected(context, new RuvioRateLimitRejection(
+                        policy.Policy, reason, rejectedBy, TimeSpan.FromSeconds(retrySeconds)));
+                }
+
+                return;
+            }
+
+            Telemetry.Accepted.Add(1);
+            await next(context);
         }
         finally
         {
-            Telemetry.StorageCalls.Add(1, new TagList { { "outcome", outcome } });
-            Telemetry.StorageCommands.Add(1, new TagList { { "outcome", outcome } });
-            Telemetry.StorageDuration.Record(
-                Stopwatch.GetElapsedTime(started).TotalMilliseconds,
-                new TagList { { "outcome", outcome } });
+            await ReleaseSlot(client, slotKey, slotToken);
         }
+    }
 
-        if (unreachable is not null)
-        {
-            await Outage(context, outage, unreachable);
-
+    // A failed release is not worth failing the request for: the slot expires on its own after its time to live.
+    private static async ValueTask ReleaseSlot(IRuvioClient client, string? key, long token)
+    {
+        if (key is null)
             return;
-        }
 
-        if (remaining is < 0 || remaining >= permits)
-            throw new RuvioException("LIMIT returned an invalid remaining allowance.");
-
-        if (remaining is null)
+        try
         {
-            Telemetry.Rejected.Add(1);
-
-            context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
-            
-            // Fixed window: LIMIT does not return the deadline, so a full window is a conservative delay.
-            long retrySeconds = retryAfterMs > 0 ? Math.Max(1, (retryAfterMs + 999) / 1000) : windowSeconds;
-
-            context.Response.Headers.RetryAfter = retrySeconds.ToString(CultureInfo.InvariantCulture);
-
-            return;
+            await client.ReleaseAsync(key, token);
         }
-
-        Telemetry.Accepted.Add(1);
-        await next(context);
+        catch (Exception)
+        {
+            // Left to expire.
+        }
     }
 
     // Ruvio could not be reached (or the circuit is open): let the request through or answer 503.
