@@ -6,6 +6,8 @@ namespace Ruvio.AspNetCore.DistributedLock.Tests;
 /// <summary>Run against a real server: set RUVIO_TEST_ADDR to host:port, otherwise each test returns at once.</summary>
 public class LiveTests
 {
+    internal static Task<(RuvioConnection Connection, IRuvioClient Client)?> TryConnectAsync() => ConnectAsync();
+
     private static async Task<(RuvioConnection Connection, IRuvioClient Client)?> ConnectAsync()
     {
         string? address = Environment.GetEnvironmentVariable("RUVIO_TEST_ADDR");

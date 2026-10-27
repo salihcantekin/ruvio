@@ -44,21 +44,34 @@ public sealed class RuvioLockProvider
         string leaseText = LeaseMilliseconds(lease).ToString(CultureInfo.InvariantCulture);
         string key = options.KeyPrefix + resource;
         // Random per acquisition: IFEQ and DELEX match on it, so a holder whose lease expired cannot
-        // renew or release a lock that another owner now holds.
-        string token = Guid.NewGuid().ToString("N");
-        IReadOnlyList<string> command = ["SET", key, token, "NX", "PX", leaseText];
+        // renew or release a lock that another owner now holds. A fenced lock gets its token from LEASE.
+        bool fenced = options.Fenced;
+        string? token = fenced ? null : Guid.NewGuid().ToString("N");
+        IReadOnlyList<string> command = fenced ? ["LEASE", key, leaseText] : ["SET", key, token!, "NX", "PX", leaseText];
         long start = options.TimeProvider.GetTimestamp();
         TimeSpan pause = options.RetryMin;
 
         while (true)
         {
-            RespValue reply = await client.ExecuteAsync(command, cancellationToken).ConfigureAwait(false);
+            RespValue? reply = null;
 
-            Check(reply);
-
-            if (reply.Kind != RespKind.Null)
+            try
             {
-                return new RuvioLock(client, options, resource, key, token, lease);
+                reply = await client.ExecuteAsync(command, cancellationToken).ConfigureAwait(false);
+                Check(reply);
+            }
+            catch (RuvioException exception) when (fenced && exception.IsServerReply && IsWrongType(exception.Message))
+            {
+                // A plain lock (a string) taken by an instance without fencing answers WRONGTYPE to LEASE: it is
+                // held, like a null reply.
+                reply = null;
+            }
+
+            if (reply is not null && reply.Kind != RespKind.Null)
+            {
+                return fenced
+                    ? new RuvioLock(client, options, resource, key, reply.Integer.ToString(CultureInfo.InvariantCulture), lease, reply.Integer)
+                    : new RuvioLock(client, options, resource, key, token!, lease);
             }
 
             TimeSpan remaining = wait - options.TimeProvider.GetElapsedTime(start);
@@ -87,6 +100,47 @@ public sealed class RuvioLockProvider
             ?? throw new TimeoutException($"The lock '{resource}' stayed taken for {wait}.");
     }
 
+    /// <summary>
+    /// Runs <paramref name="work"/> at most once per <paramref name="period"/> across every instance, with the server's
+    /// <c>ONCE</c>: the first caller in a period sets a marker and runs the work; the others get false and skip it.
+    /// The period starts at that first call (it is not aligned to the clock), and the marker is set before the work
+    /// runs, so work that fails is not run again in the same period.
+    /// </summary>
+    /// <param name="name">The job name; the marker key is the key prefix, <c>once:</c> and the name.</param>
+    /// <param name="period">At least one millisecond.</param>
+    /// <param name="work">The work; it receives <paramref name="cancellationToken"/>.</param>
+    /// <param name="cancellationToken">Cancels the request and the work.</param>
+    /// <returns>True when this call ran the work.</returns>
+    public async ValueTask<bool> RunOncePerPeriodAsync(
+        string name,
+        TimeSpan period,
+        Func<CancellationToken, Task> work,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(name);
+        ArgumentNullException.ThrowIfNull(work);
+        long milliseconds = (long)period.TotalMilliseconds;
+
+        if (milliseconds < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(period), "The period must be at least one millisecond.");
+        }
+
+        IReadOnlyList<string> command = ["ONCE", options.KeyPrefix + "once:" + name, milliseconds.ToString(CultureInfo.InvariantCulture)];
+        RespValue reply = await client.ExecuteAsync(command, cancellationToken).ConfigureAwait(false);
+
+        Check(reply);
+
+        if (reply.Kind != RespKind.Integer || reply.Integer != 1)
+        {
+            return false;
+        }
+
+        await work(cancellationToken).ConfigureAwait(false);
+
+        return true;
+    }
+
     internal static long LeaseMilliseconds(TimeSpan lease)
     {
         long milliseconds = (long)lease.TotalMilliseconds;
@@ -98,6 +152,8 @@ public sealed class RuvioLockProvider
 
         return milliseconds;
     }
+
+    private static bool IsWrongType(string message) => message.StartsWith("WRONGTYPE", StringComparison.Ordinal);
 
     internal static void Check(RespValue reply)
     {

@@ -119,6 +119,8 @@ public sealed class RuvioLockMiddleware(RequestDelegate next)
 
         RuvioLockTelemetry.Acquired.Add(1, tags);
         activity?.SetTag("ruvio.lock.outcome", "acquired");
+        // GetRuvioLock() hands the handler its lock, and with it the fencing token.
+        RuvioLockHttp.Set(context, held);
         CancellationToken original = context.RequestAborted;
 
         // One token that fires when the client disconnects OR the lock is lost. Downstream code that
