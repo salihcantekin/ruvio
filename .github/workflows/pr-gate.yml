@@ -50,7 +50,11 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: iai
-      - run: sudo apt-get update && sudo apt-get install -y valgrind
+      # A stalled mirror download is cut after 30 s and retried, instead of waiting for minutes.
+      - run: |
+          apt_opts="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+          sudo apt-get $apt_opts update && sudo apt-get $apt_opts install -y valgrind
+        timeout-minutes: 6
       - run: cargo install iai-callgrind-runner --version 0.16.1 --locked
       - name: Hot-path instruction counts (+2% limit)
         run: |
