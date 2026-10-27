@@ -18,7 +18,7 @@ public enum RuvioRateLimitAlgorithm
 public sealed class RuvioRateLimitAttribute : Attribute
 {
     /// <summary>
-    /// Refers to a policy defined with <see cref="RuvioRateLimitingOptions.AddPolicy"/>; its permits, window and algorithm
+    /// Refers to a policy defined with <see cref="RuvioRateLimitingOptions.AddPolicy(string, long, TimeSpan, RuvioRateLimitAlgorithm)"/>; its permits, window and algorithm
     /// come from there. An unknown name fails the request with <see cref="InvalidOperationException"/>.
     /// </summary>
     /// <param name="policy">The name of a registered policy.</param>
@@ -75,4 +75,17 @@ public sealed class RuvioRateLimitAttribute : Attribute
     /// it was first used with; changing it needs a new policy name.
     /// </summary>
     public RuvioRateLimitAlgorithm Algorithm { get; init; }
+
+    private RuvioLimit[]? inline;
+
+    // The single limit of an inline attribute, built on first use and reused afterwards.
+    internal RuvioLimit[] InlineLimits
+        => inline ??= [new RuvioLimit(Policy, Permits, WindowSeconds, Algorithm, null, false)];
 }
+
+/// <summary>
+/// Exempts an endpoint or controller from rate limiting, including <see cref="RuvioRateLimitingOptions.DefaultPolicy"/>.
+/// If it sits next to a <see cref="RuvioRateLimitAttribute"/>, the one closer to the endpoint wins.
+/// </summary>
+[AttributeUsage(AttributeTargets.Method | AttributeTargets.Class)]
+public sealed class DisableRuvioRateLimitAttribute : Attribute;

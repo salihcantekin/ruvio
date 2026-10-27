@@ -23,7 +23,10 @@ public class NamedPolicyTests
         Assert.Throws<ArgumentOutOfRangeException>(() => options.AddPolicy("p", 1, TimeSpan.FromSeconds(1), (RuvioRateLimitAlgorithm)9));
 
         Assert.Same(options, options.AddPolicy("p", 7, TimeSpan.FromMilliseconds(1500), RuvioRateLimitAlgorithm.TokenBucket));
-        Assert.True(options.TryGetPolicy("p", out var policy));
+        Assert.True(options.TryGetPolicy("p", out var limits));
+
+        var policy = Assert.Single(limits);
+
         Assert.Equal((7L, 2, RuvioRateLimitAlgorithm.TokenBucket), (policy.Permits, policy.WindowSeconds, policy.Algorithm));
         Assert.Throws<ArgumentException>(() => options.AddPolicy("p", 1, TimeSpan.FromSeconds(1)));
         Assert.False(options.TryGetPolicy("P", out _));
