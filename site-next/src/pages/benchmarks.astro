@@ -11,7 +11,7 @@ import { platforms, loadRun, scripted, fmtOps, fmtX, fmtMiB, pct, scale, scaleDe
 import { site } from "../config/site";
 import { clamp } from "../lib/geom";
 
-const [mac, linux] = platforms;
+const [mac, azure] = platforms;
 const blob = (f: string) => `${site.github}/blob/main/${f}`;
 const popular = ["GET", "SET", "DEL (missing key)", "SETEX", "HSET (existing field)", "HGET", "LPUSH", "ZADD (existing member, same score)", "EXPIRE (key with TTL)", "PUBLISH (no subscribers)"];
 const peakNames = ["GET", "SET", "DEL (missing key)", "SETEX", "HGET", "HSET (existing field)", "LPUSH"];
@@ -34,7 +34,7 @@ const one = at(1);
   <PageIntro title="Measured against Redis, on the same machine, from the records in the repository" kicker="Benchmarks">
     Each run starts both servers on one host, drives them with the same load generator in alternating rounds, and
     stores the raw numbers in a JSON file next to the site. The charts below are drawn from those files when the
-    site is built.
+    site is built. Runs of hours under load and failures are on the <a href="/testing/">long-run tests</a> page.
     <div class="kpis two" slot="after">
       {platforms.map((p) => (
         <div>
@@ -46,26 +46,71 @@ const one = at(1);
     </div>
   </PageIntro>
 
+  <section class="section" id="scripted">
+    <div class="wrap">
+      <div class="head-row">
+        <div>
+          <p class="kicker">One command instead of a script</p>
+          <h2 class="title">{fmtX(Math.min(...scripted.rows.map((r) => r.ratio)))} to {fmtX(Math.max(...scripted.rows.map((r) => r.ratio)))} the throughput of the same job written as a Lua script</h2>
+          <p class="lede">Moving a balance, popping due jobs, a sliding-window limiter or a counter that gets a deadline when it is created are one command in Ruvio. On Redis the usual answer is a Lua script. Each row runs the Ruvio command against that script (<code>EVALSHA</code>) on the same machine. The table compares the two ways of doing the job, not the servers in general.</p>
+        </div>
+      </div>
+      <div class="scroll-x">
+        <table class="res">
+          <thead><tr><th>Ruvio command</th><th class="num">Ruvio ops/s</th><th class="num">Redis Lua ops/s</th><th class="num">Ratio</th><th class="num">p50 ms</th><th class="num">p99 ms</th></tr></thead>
+          <tbody>
+            {scripted.rows.map((r) => (
+              <tr>
+                <td>{r.label}</td>
+                <td class="num">{fmtOps(r.ruvio)}</td>
+                <td class="num dim">{fmtOps(r.redis)}</td>
+                <td class="num">{fmtX(r.ratio)}</td>
+                <td class="num dim">{r.ruvioP50.toFixed(2)} / {r.redisP50.toFixed(2)}</td>
+                <td class="num dim">{r.ruvioP99.toFixed(2)} / {r.redisP99.toFixed(2)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div class="scroll-x scale-table">
+        <table class="res">
+          <thead><tr><th>Memory per key</th><th class="num">Ruvio</th><th class="num">Redis</th><th class="num">Ratio</th></tr></thead>
+          <tbody>
+            {scripted.memory.map((m) => (
+              <tr>
+                <td>{m.label}</td>
+                <td class="num">{Math.round(m.ruvioBytes)} B</td>
+                <td class="num dim">{Math.round(m.redisBytes)} B</td>
+                <td class="num">{fmtX(m.ratio)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p class="source">Source: <a href={blob(scripted.file)}>{scripted.file}</a> · {scripted.machine}, {scripted.date}, commit {scripted.commit} · Redis {scripted.redisVersion} · {scripted.clients} clients, pipeline {scripted.pipeline}, {scripted.rounds} alternating rounds, median · p50 and p99 are Ruvio / Redis with one request in flight per connection · in-memory, 1 shard · macOS only, not yet measured on Linux or x86 · semaphore memory is compared with a one-member sorted set, Redis's most compact structure for the job.</p>
+    </div>
+  </section>
+
   <section class="section band" id="machines">
     <div class="wrap">
       <div class="head-row">
         <div>
           <p class="kicker">Two machines</p>
           <h2 class="title">Where each command lands on both machines</h2>
-          <p class="lede">Each dot is one command: its ratio to Redis on {mac.name} across, on {linux.name} up. The shaded corner holds the commands that are faster than Redis on both. Dots near the faint diagonal behave the same on ARM and x86.</p>
+          <p class="lede">Each dot is one command: its ratio to Redis on {mac.name} across, on {azure.name} up. The shaded corner holds the commands that are faster than Redis on both. Dots near the faint diagonal behave the same on ARM and x86.</p>
         </div>
       </div>
       <div class="quad-grid">
-        <div class="chart" data-chart><QuadrantScatter x={mac} y={linux} /></div>
+        <div class="chart" data-chart><QuadrantScatter x={mac} y={azure} /></div>
         <div class="notes">
           <h3>Reading it</h3>
-          <p>The two machines are very different: a 12-core laptop chip with no pinning, and a 2 vCPU cloud guest with the server and the load generator pinned to separate CPUs. A command that stays top-right on both is fast because of how Ruvio runs it, not because of the hardware.</p>
+          <p>The two machines are very different: a 12-core ARM laptop with no pinning, and an x86 cloud VM with the server and the load generator pinned to separate cores. A command that stays top-right on both is fast because of how Ruvio runs it, not because of the hardware.</p>
           <div class="legend">
             <span><i style="background:var(--c1)"></i>faster on both</span>
             <span><i style="background:var(--c2)"></i>faster on one</span>
             <span><i style="background:var(--redis)"></i>behind on both</span>
           </div>
-          <p class="source">Sources: <a href={blob(mac.file)}>{mac.file}</a>, <a href={blob(linux.file)}>{linux.file}</a></p>
+          <p class="source">Sources: <a href={blob(mac.file)}>{mac.file}</a>, <a href={blob(azure.file)}>{azure.file}</a></p>
         </div>
       </div>
     </div>
@@ -173,7 +218,7 @@ const one = at(1);
         <div>
           <p class="kicker">More shards</p>
           <h2 class="title">Adding shards with a cluster-aware client</h2>
-          <p class="lede">One <code>memtier_benchmark</code> (8 threads, pipeline {shardScaling.pipeline}) routes each key to the shard that owns it: <code>--cluster-mode</code> against Ruvio, and against a Redis Cluster with one master per core (one plain Redis for one shard). <code>SET</code> and <code>GET</code> over 100,000 keys, median of {shardScaling.rounds} rounds.</p>
+          <p class="lede">Also on the <a href="/testing/">long-run tests</a> page. One <code>memtier_benchmark</code> (8 threads, pipeline {shardScaling.pipeline}) routes each key to the shard that owns it: <code>--cluster-mode</code> against Ruvio, and against a Redis Cluster with one master per core (one plain Redis for one shard). <code>SET</code> and <code>GET</code> over 100,000 keys, median of {shardScaling.rounds} rounds.</p>
         </div>
       </div>
       <div class="table-wrap scale-table">
@@ -281,50 +326,6 @@ const one = at(1);
     </section>
   </div>
 
-  <section class="section" id="scripted">
-    <div class="wrap">
-      <div class="head-row">
-        <div>
-          <p class="kicker">One command instead of a script</p>
-          <h2 class="title">{fmtX(Math.min(...scripted.rows.map((r) => r.ratio)))} to {fmtX(Math.max(...scripted.rows.map((r) => r.ratio)))} the throughput of the same job written as a Lua script</h2>
-          <p class="lede">Moving a balance, popping due jobs, a sliding-window limiter or a counter that gets a deadline when it is created are one command in Ruvio. On Redis the usual answer is a Lua script. Each row runs the Ruvio command against that script (<code>EVALSHA</code>) on the same machine. The table compares the two ways of doing the job, not the servers in general.</p>
-        </div>
-      </div>
-      <div class="scroll-x">
-        <table class="res">
-          <thead><tr><th>Ruvio command</th><th class="num">Ruvio ops/s</th><th class="num">Redis Lua ops/s</th><th class="num">Ratio</th><th class="num">p50 ms</th><th class="num">p99 ms</th></tr></thead>
-          <tbody>
-            {scripted.rows.map((r) => (
-              <tr>
-                <td>{r.label}</td>
-                <td class="num">{fmtOps(r.ruvio)}</td>
-                <td class="num dim">{fmtOps(r.redis)}</td>
-                <td class="num">{fmtX(r.ratio)}</td>
-                <td class="num dim">{r.ruvioP50.toFixed(2)} / {r.redisP50.toFixed(2)}</td>
-                <td class="num dim">{r.ruvioP99.toFixed(2)} / {r.redisP99.toFixed(2)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-      <div class="scroll-x scale-table">
-        <table class="res">
-          <thead><tr><th>Memory per key</th><th class="num">Ruvio</th><th class="num">Redis</th><th class="num">Ratio</th></tr></thead>
-          <tbody>
-            {scripted.memory.map((m) => (
-              <tr>
-                <td>{m.label}</td>
-                <td class="num">{Math.round(m.ruvioBytes)} B</td>
-                <td class="num dim">{Math.round(m.redisBytes)} B</td>
-                <td class="num">{fmtX(m.ratio)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-      <p class="source">Source: <a href={blob(scripted.file)}>{scripted.file}</a> · {scripted.machine}, {scripted.date}, commit {scripted.commit} · Redis {scripted.redisVersion} · {scripted.clients} clients, pipeline {scripted.pipeline}, {scripted.rounds} alternating rounds, median · p50 and p99 are Ruvio / Redis with one request in flight per connection · in-memory, 1 shard · macOS only, not yet measured on Linux or x86 · semaphore memory is compared with a one-member sorted set, Redis's most compact structure for the job.</p>
-    </div>
-  </section>
 
   <section class="section band" id="method">
     <div class="wrap">
@@ -348,7 +349,7 @@ const one = at(1);
         <div class="how">
           <p>The whole-machine grids come from <code>scripts/shard_compare.py</code>: {scale.shards} shards in one Ruvio process (<code>port_mode = "per-shard"</code>), a Redis Cluster of {scale.shards} masters created with <code>redis-cli --cluster create</code>, and one Redis process, each driven by one <code>redis-benchmark</code> per shard with hash-tagged keys. The {scale.shards}-shard systems hold {scale.shards} copies of each data shape, so a shard holds what the single process holds.</p>
           <p>The single-machine rows come from <code>scripts/redis_compare_features.py</code>, which runs <code>redis-benchmark</code> against each server in turn. Absolute numbers describe one host; the ratio between the two servers is the result. Shared cloud machines vary from run to run, so a row within a few percent of 1× is a tie.</p>
-          <p><a class="btn ghost small" href="/docs/benchmarking/">Benchmarking guide</a> <a class="btn ghost small" href={`${site.github}/tree/main/benchmark/records`}>All records</a></p>
+          <p><a class="btn ghost small" href="/docs/benchmarking/">Benchmarking guide</a> <a class="btn ghost small" href={`${site.github}/tree/main/benchmark/records`}>All records</a> <a class="btn ghost small" href="/testing/">Long-run tests</a></p>
         </div>
       </div>
     </div>

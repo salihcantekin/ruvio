@@ -2,7 +2,8 @@
 
 This page says who chooses what when an application talks to Ruvio: the
 server, the client library, or the application. It covers servers, shards,
-logical databases, and the Rust and C# clients.
+logical databases, and the clients (Rust and C# as examples). Replicas, failover and
+clusters of several machines are on [Cluster and failover](CLUSTER.md).
 
 ## The three layers
 
@@ -15,9 +16,13 @@ logical databases, and the Rust and C# clients.
 ## Servers
 
 A Ruvio process is one server. The application is configured with the address
-of the server it should use, for example from a connection string. A client
-never finds a different Ruvio process by itself. Two independent servers mean
-two clients, each opened with its own address.
+of the server it should use, for example from a connection string. Two
+independent servers mean two clients, each opened with its own address.
+
+A client moves to another process only within one deployment: to the new
+primary of a replication group after a failover (when it was given several seed
+addresses or the coordinators), and to the group that owns a key in a
+multi-node cluster (`MOVED`, `ASK`). See [Cluster and failover](CLUSTER.md).
 
 ## Shards
 
@@ -30,7 +35,7 @@ answered on the same connection; a multi-key command that spans slots gets
 The application does not pick a shard. It gives the client one address. On
 connect, the client sends `CLUSTER SLOTS`, learns every shard, opens a socket
 to each as needed, and sends every key to the shard that owns
-`hash_slot(key)`. Both first-party clients do this. A single-shard server
+`hash_slot(key)`. All six first-party clients do this. A single-shard server
 answers as a standalone server and the client skips routing.
 
 The application's only part is key design. Commands that touch several keys

@@ -103,8 +103,8 @@ This is not a certified production cluster. Before making stronger availability 
 
 - measured overload isolation and tail-latency budgets under saturation,
 - production-like fault, disk and recovery drills,
-- defined membership, migration, election and split-brain behavior,
-- hardware and long-duration durability evidence.
+- membership changes beyond what `ruvio coordinator` does today (election, failover, slot moves and split-brain behavior are defined in [COORDINATOR](COORDINATOR.md) and summarized in [CLUSTER](CLUSTER.md)),
+- hardware durability evidence and longer runs than the hours-long cluster runs on the [long-run tests](https://ruviodb.com/testing/) page.
 
 Report at least p50, p95, p99, and p99.9 latency together with throughput, CPU utilization, allocation rate, key/value distribution, connection count, compiler version, kernel version, and CPU model. Compare against a scalar or conventional threaded baseline.
 

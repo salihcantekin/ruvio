@@ -162,7 +162,7 @@ These commands run on the shard that owns the key. [`examples/09_building_blocks
 | --- | --- | --- |
 | **Against Redis 8.10.2** | 59 of 60 commands at or above 0.97×, geometric mean 1.22× | 4-core Azure x86 VM, one shard, `memory` durability, 50 clients, pipeline 16, 64-byte values, five alternating rounds (2026-10-11) |
 | **Whole machine, 8 shards** | against an 8-node Redis Cluster on the same 8 cores: geometric mean 1.13× over 59 commands at pipeline 16 (55 at or above 0.97×, none below 0.90×), 1.23× at pipeline 64 (`GET` 1.75×, `SET` 2.21×, 29M and 30M req/s), 1.14× with every write logged (`everysec` against AOF `everysec`); memory per shard 0.96× of one Redis | 16-core Azure EPYC 9V74 VM, one process with 8 shards (`port_mode = "per-shard"`), one `redis-benchmark` per shard, three alternating rounds ([record](docs/evidence/2026-10-16-azure-8-shards.md), 2026-10-16) |
-| **Raw throughput** | about 2.61M `SET`/s, 2.74M `GET`/s, 2.88M `INCR`/s | Apple M4 Pro, evented, `memory` durability, one shard, 50 clients, pipeline 16, 64-byte values, fixed key, median of 3 rounds (2026-10-07) |
+| **Raw throughput** | about 2.61M `SET`/s, 2.74M `GET`/s, 2.88M `INCR`/s | Apple silicon Mac, evented, `memory` durability, one shard, 50 clients, pipeline 16, 64-byte values, fixed key, median of 3 rounds (2026-10-07) |
 
 Samples, flags and the rows below 1× are on the [performance page](https://ruviodb.com/benchmarks/); memory results are on the [memory page](https://ruviodb.com/benchmarks/#memory). There is no Garnet measurement.
 

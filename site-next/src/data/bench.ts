@@ -9,7 +9,7 @@ const readJson = (rel: string) => JSON.parse(fs.readFileSync(path.join(repo, rel
 export type Row = { label: string; ruvio: number; redis: number; ratio: number; ratioLo: number; ratioHi: number; rounds: number };
 export type MemRow = { label: string; ruvioKib: number; redisKib: number; saved: number };
 export type Platform = {
-  id: "mac" | "linux";
+  id: "mac" | "azure";
   name: string;
   short: string;
   file: string;
@@ -34,8 +34,17 @@ export type Platform = {
 
 const cleanLabel = (s: string) => s.replace(/\s*\(baseline, for scale\)/, "");
 
-function load(id: Platform["id"], file: string, name: string, short: string): Platform {
+function load(id: Platform["id"], file: string, name: string, short: string, part?: string): Platform {
   const d = readJson(file);
+  // The Azure record keeps the command grid under `features`, next to its own host and method fields.
+  if (part) {
+    const runs = d[part].rows[0]?.samples?.ruvio?.length ?? 1;
+    Object.assign(d, d[part], {
+      redis_version: `v=${String(d.build?.redis ?? "").match(/\d+\.\d+\.\d+/)?.[0] ?? ""}`,
+      config: { rounds: runs, clients: 50, pipeline: 16 },
+      environment: { machine: d.host?.description ?? "", durability: "memory", shards: 1, commit: d.build?.ruvio_commit ?? "", pinning: "server on cpu 0, load generator on cpus 2 and 4" },
+    });
+  }
   // ratioLo/ratioHi: the slowest Ruvio round against the fastest Redis round, and the reverse.
   const rows: Row[] = d.rows.map((r: any) => {
     const sr: number[] = r.samples?.ruvio ?? [r.ruvio], sx: number[] = r.samples?.redis ?? [r.redis];
@@ -56,7 +65,8 @@ function load(id: Platform["id"], file: string, name: string, short: string): Pl
   const redisVersion = (String(d.redis_version).match(/v=([\d.]+)/) || [])[1] ?? "";
   return {
     id, name, short, file, date: d.date,
-    machine: d.environment?.machine ?? "",
+    // The site names the Mac by its architecture, not its model.
+    machine: String(d.environment?.machine ?? "").replace(/Apple M\d+( Pro| Max)?/, "Apple silicon"),
     durability: d.environment?.durability ?? "", shards: d.environment?.shards ?? 1, rounds: d.config.rounds,
     pinning: d.environment?.pinning ?? "", commit: d.build?.commit ?? d.environment?.commit ?? "",
     clients: d.config.clients, pipeline: d.config.pipeline, redisVersion,
@@ -69,8 +79,8 @@ function load(id: Platform["id"], file: string, name: string, short: string): Pl
 }
 
 export const platforms: Platform[] = [
-  load("mac", "benchmark/records/mac-2026-10-14.json", "Apple M4 Pro", "Apple M4 Pro"),
-  load("linux", "benchmark/records/linux-hostinger-2026-10-14.json", "AMD EPYC, 2 vCPU", "AMD EPYC (x86)"),
+  load("mac", "benchmark/records/mac-2026-10-14.json", "Mac (ARM)", "Mac"),
+  load("azure", "benchmark/records/x86-azure-2026-10-11.json", "Azure VM (x86)", "Azure", "features"),
 ];
 export const primary = platforms[0];
 
@@ -208,7 +218,7 @@ const scriptedRaw = readJson(scriptedFile);
 export const scripted = {
   file: scriptedFile,
   date: scriptedRaw.date as string,
-  machine: `${scriptedRaw.host.cpu}, ${scriptedRaw.host.cores} cores`,
+  machine: `${String(scriptedRaw.host.cpu).replace(/Apple M\d+( Pro| Max)?/, "Apple silicon")}, ${scriptedRaw.host.cores} cores`,
   commit: scriptedRaw.build.commit as string,
   clients: scriptedRaw.config.clients as number,
   pipeline: scriptedRaw.config.pipeline as number,

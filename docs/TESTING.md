@@ -3,7 +3,9 @@
 This page summarizes what has been exercised, how the checks are run, and
 which production claims still need evidence. A test surface being present in
 CI is not the same as a recent successful run. Each result below is labeled by
-where and how it was obtained.
+where and how it was obtained. Runs of hours on a multi-node cluster under load and
+injected faults, made with [tests/soak](../tests/soak), are summarized on the
+[long-run tests](https://ruviodb.com/testing/) page.
 
 ## Local gate
 
@@ -293,7 +295,7 @@ Engine 29.8.0 (`linux/aarch64`), using image
 
 ## Native in-flight process-crash run
 
-On 2026-10-03, the current Apple M4 Pro ran three randomized kills during
+On 2026-10-03, the current Apple silicon Mac ran three randomized kills during
 concurrent pipelined writes for each WAL-backed durability profile. All six
 trials recovered a continuous key prefix. `always` preserved every observed
 acknowledged write; in-flight records beyond the client-observed replies were

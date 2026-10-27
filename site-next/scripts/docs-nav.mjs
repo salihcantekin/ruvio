@@ -82,6 +82,7 @@ export const GROUPS = [
     items: [
       { src: "docs/ARCHITECTURE.md", label: "Architecture" },
       { src: "docs/CONNECTION_MODEL.md", label: "Connection model" },
+      { src: "docs/CLUSTER.md", label: "Cluster and failover" },
       { src: "docs/DATA_TYPES.md", label: "Data types" },
       { src: "docs/LOGICAL_DATABASES.md", label: "Logical databases" },
       { src: "docs/STORAGE_LAYOUT.md", label: "Storage layout" },

@@ -245,7 +245,7 @@ An optional third argument selects concurrency 1/16/128; for example,
 `--socket-phases 16479 5 16`. `wallMicrosecondsPerOperation` is elapsed wall
 time divided by completed operations, not concurrent request latency.
 
-On local Apple M4 Pro/.NET 8.0.18 loopback, initial means were about 30 us total,
+On local Apple silicon Mac/.NET 8.0.18 loopback, initial means were about 30 us total,
 0.04–0.05 us encode, 0.26–0.34 us queue, 2.7–2.8 us write and 28.5–28.7 us reply.
 The dominant interval includes reply waiting, parsing and async scheduling;
 these data do not isolate wire latency.
@@ -281,7 +281,7 @@ The second mode explicitly submits prebuilt groups of 16 commands through
 count and average bytes per write. It is an explicit pipeline experiment, not
 automatic batching of independent calls.
 
-Local instrumented .NET 8.0.18/M4 Pro comparison (256-byte values, one shared
+Local instrumented .NET 8.0.18/Apple silicon comparison (256-byte values, one shared
 loopback connection, identical SET values, one warmup and five measured seconds):
 
 | Operation | Concurrent calls ops/s | Pipeline ops/s | Writes/op, calls → pipeline | Client CPU us/op, calls → pipeline |
@@ -353,7 +353,7 @@ arrays are still created at the call site when applicable: this removes the
 client's second, flattened array, not all allocations in the operation.
 
 `KeyedCommandBenchmarks` measures construction plus encoding with preallocated
-input pairs. On Apple M4 Pro / .NET 8.0.18 (three warmups, five measured
+input pairs. On Apple silicon Mac / .NET 8.0.18 (three warmups, five measured
 iterations), one-pair HSET changed from 89.49 to 67.19 ns and 56 to 0 allocated
 bytes; two pairs from 126.59 to 97.32 ns and 72 to 0 bytes. Three pairs use the
 array fallback (162.83 vs 164.50 ns, 88 bytes in both). These measurements exclude
@@ -373,7 +373,7 @@ To measure the inline encoder without network or server costs:
 dotnet run -c Release --project clients/csharp/Ruvio.Client.Benchmarks -- --filter '*InlineCommandBenchmarks*' --job short
 ```
 
-On Apple M4 Pro / .NET 8.0.18, a local five-iteration comparison reduced encoding
+On Apple silicon Mac / .NET 8.0.18, a local five-iteration comparison reduced encoding
 time from 34.28 to 25.55 ns for GET, 45.99 to 37.26 ns for SET, 34.59 to 25.64 ns
 for INCR, and 21.79 to 14.92 ns for PING, with no measured managed allocation in
 either version. An unlisted inline CUSTOM command increased from 33.95 to
@@ -584,7 +584,7 @@ after admission so caller-owned memory can be reused after cancellation.
 blocking I/O and a reader thread of its own: the caller that owns the writer writes its
 frames synchronously, and the thread reads the replies and completes the callers, who
 resume on the thread pool. This skips the runtime's async socket engine and one thread-pool
-hand-off per round trip. On a 4-shard local server (Apple M4 Pro) it cut user CPU per
+hand-off per round trip. On a 4-shard local server (Apple silicon Mac) it cut user CPU per
 request by about 45% for 16-command pipelines on one socket and by 25-35% for pipelines
 split over the shards; Linux was not measured. The cost is one thread per socket (one per
 shard in a cluster), and a write that fills the socket buffer blocks its caller until the
