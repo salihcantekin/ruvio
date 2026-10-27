@@ -4,6 +4,7 @@ Notable changes to the NuGet package `Ruvio.AspNetCore.RateLimiting`. New entrie
 
 ## Unreleased
 
+- Named policies: define them once with `options.AddPolicy(name, permits, window, algorithm)` in `AddRuvioRateLimiting`, then refer to them by name only: `[RuvioRateLimit("api")]` or `.WithRuvioRateLimit("api")`. Settings are read from the options at request time (one dictionary lookup); an unknown name throws `InvalidOperationException`. Endpoints that spell out permits and window work as before and share the same bucket as a named policy of the same name.
 - `RuvioRateLimitingMiddleware` now takes `IOptions<RuvioRateLimitingOptions>` in its constructor and reads the options once, not on every limited request (the pipeline builds it through dependency injection, so `UseRuvioRateLimiting` is unchanged; code that calls `new RuvioRateLimitingMiddleware(next)` must pass the options). The client is still resolved per request.
 - `options.Outage`: choose what happens when Ruvio is unreachable (`Throw`, the default and unchanged; `FailClosed`, 503; `FailOpen`, the request runs unlimited) and optionally stop calling Ruvio after repeated failures with a circuit breaker. See the README.
 

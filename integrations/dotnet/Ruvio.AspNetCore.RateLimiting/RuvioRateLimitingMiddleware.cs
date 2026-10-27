@@ -41,6 +41,20 @@ public sealed class RuvioRateLimitingMiddleware(RequestDelegate next, IOptions<R
         if (string.IsNullOrWhiteSpace(partition) || partition.Length > 1024)
             throw new InvalidOperationException("The rate-limit partition must have 1-1024 characters.");
 
+        long permits = policy.Permits;
+        int windowSeconds = policy.WindowSeconds;
+        var algorithm = policy.Algorithm;
+
+        if (policy.IsNamed)
+        {
+            if (!options.TryGetPolicy(policy.Policy, out var named))
+                throw new InvalidOperationException($"No rate-limit policy named '{policy.Policy}' was added with AddPolicy.");
+
+            permits = named.Permits;
+            windowSeconds = named.WindowSeconds;
+            algorithm = named.Algorithm;
+        }
+
         string key = StorageKey(options.KeyPrefix, policy.Policy, partition);
         var client = context.RequestServices.GetRequiredService<IRuvioClient>();
         var outage = options.Outage;
@@ -63,18 +77,18 @@ public sealed class RuvioRateLimitingMiddleware(RequestDelegate next, IOptions<R
         {
             // LIMIT checks and counts in one server command, so parallel requests cannot all read the
             // same count and pass.
-            long windowMs = (long)policy.WindowSeconds * 1000;
+            long windowMs = (long)windowSeconds * 1000;
 
-            if (policy.Algorithm == RuvioRateLimitAlgorithm.FixedWindow)
+            if (algorithm == RuvioRateLimitAlgorithm.FixedWindow)
             {
-                remaining = await client.LimitAsync(key, policy.Permits, windowMs, context.RequestAborted);
+                remaining = await client.LimitAsync(key, permits, windowMs, context.RequestAborted);
             }
             else
             {
                 // WITHRETRY says when the same call would pass, so Retry-After is exact.
-                var result = policy.Algorithm == RuvioRateLimitAlgorithm.SlidingWindow
-                    ? await client.LimitSlidingWithRetryAsync(key, policy.Permits, windowMs, context.RequestAborted)
-                    : await client.LimitTokensWithRetryAsync(key, policy.Permits, windowMs, 1, context.RequestAborted);
+                var result = algorithm == RuvioRateLimitAlgorithm.SlidingWindow
+                    ? await client.LimitSlidingWithRetryAsync(key, permits, windowMs, context.RequestAborted)
+                    : await client.LimitTokensWithRetryAsync(key, permits, windowMs, 1, context.RequestAborted);
 
                 remaining = result.Allowed ? result.Remaining : null;
                 retryAfterMs = result.RetryAfterMs;
@@ -112,7 +126,7 @@ public sealed class RuvioRateLimitingMiddleware(RequestDelegate next, IOptions<R
             return;
         }
 
-        if (remaining is < 0 || remaining >= policy.Permits)
+        if (remaining is < 0 || remaining >= permits)
             throw new RuvioException("LIMIT returned an invalid remaining allowance.");
 
         if (remaining is null)
@@ -122,7 +136,7 @@ public sealed class RuvioRateLimitingMiddleware(RequestDelegate next, IOptions<R
             context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
             
             // Fixed window: LIMIT does not return the deadline, so a full window is a conservative delay.
-            long retrySeconds = retryAfterMs > 0 ? Math.Max(1, (retryAfterMs + 999) / 1000) : policy.WindowSeconds;
+            long retrySeconds = retryAfterMs > 0 ? Math.Max(1, (retryAfterMs + 999) / 1000) : windowSeconds;
 
             context.Response.Headers.RetryAfter = retrySeconds.ToString(CultureInfo.InvariantCulture);
 

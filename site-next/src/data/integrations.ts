@@ -95,7 +95,7 @@ await store.EvictByTagAsync("catalog", cancellationToken);`),
   },
   "Ruvio.AspNetCore.RateLimiting": {
     summary:
-      "Distributed fixed-window budgets per endpoint with one atomic LIMIT call. Rejected requests get 429 with Retry-After; endpoints without the attribute pay nothing. Choose what happens when Ruvio is unreachable: throw, answer 503, or let requests through, with an optional circuit breaker.",
+      "Distributed fixed-window budgets per endpoint with one atomic LIMIT call. Define named policies once and refer to them by name. Rejected requests get 429 with Retry-After; endpoints without the attribute pay nothing. Choose what happens when Ruvio is unreachable: throw, answer 503, or let requests through, with an optional circuit breaker.",
     useCases: ["rate-limits"],
     example: cs(`builder.Services.AddRuvioClient(builder.Configuration.GetSection("Ruvio"));
 builder.Services.AddRuvioRateLimiting(options =>
@@ -104,6 +104,7 @@ builder.Services.AddRuvioRateLimiting(options =>
     options.PartitionKey = context =>
         context.User.FindFirst("tenant_id")?.Value
         ?? throw new InvalidOperationException("An authenticated tenant is required.");
+    options.AddPolicy("create-order", permits: 100, window: TimeSpan.FromMinutes(1));
 });
 
 app.UseRouting();
@@ -112,7 +113,7 @@ app.UseAuthorization();
 app.UseRuvioRateLimiting();
 app.MapPost("/orders", HandleOrder)
     .RequireAuthorization()
-    .WithRuvioRateLimit("create-order", permits: 100, window: TimeSpan.FromMinutes(1));`),
+    .WithRuvioRateLimit("create-order");`),
   },
   "Ruvio.AspNetCore.Idempotency": {
     summary:
