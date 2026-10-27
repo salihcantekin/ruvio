@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization.Metadata;
 using System.Globalization;
+using System.Security.Cryptography;
 using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Options;
 using Ruvio.Client;
@@ -38,10 +39,13 @@ public sealed class RuvioDistributedCache : IDistributedCache
     private static readonly ReadOnlyMemory<byte> FillGetCommand = "FILLGET"u8.ToArray();
     private static readonly ReadOnlyMemory<byte> FillSetCommand = "FILLSET"u8.ToArray();
     private static readonly ReadOnlyMemory<byte> PersistCommand = "PERSIST"u8.ToArray();
+    private static readonly ReadOnlyMemory<byte> Swr = "SWR"u8.ToArray();
     // Lenient like Microsoft's SetString/GetString helpers: a value that is not valid UTF-8 decodes with replacement characters.
     private static readonly UTF8Encoding Text = new(false);
     private readonly IRuvioClient _client;
     private readonly byte[] _prefix;
+    private readonly string _tagPrefix;
+    private readonly int _maxTags;
     private readonly int _maxValueBytes;
     private readonly int _maxKeyBytes;
     private readonly long _fillMilliseconds;
@@ -49,6 +53,7 @@ public sealed class RuvioDistributedCache : IDistributedCache
     private readonly RuvioOutageOptions _outage;
     private static readonly System.Diagnostics.Metrics.Meter Meter = new("Ruvio.Extensions.Caching");
     private static readonly System.Diagnostics.Metrics.Counter<long> Outages = Meter.CreateCounter<long>("ruvio.cache.outage");
+    private static readonly System.Diagnostics.Metrics.Counter<long> FailSafe = Meter.CreateCounter<long>("ruvio.cache.fail_safe");
 
     /// <summary>Constructs a provider with validated, snapshotted options and a borrowed client.</summary>
     public RuvioDistributedCache(IRuvioClient client, IOptions<RuvioCacheOptions> options)
@@ -60,6 +65,8 @@ public sealed class RuvioDistributedCache : IDistributedCache
         settings.Validate();
         _client = client;
         _prefix = RuvioCacheOptions.Utf8.GetBytes(settings.InstanceName + RuvioCacheOptions.VersionPrefix);
+        _tagPrefix = settings.InstanceName + RuvioCacheOptions.TagPrefix;
+        _maxTags = settings.MaxTagsPerEntry;
         _maxValueBytes = settings.MaxValueBytes;
         _maxKeyBytes = settings.MaxKeyBytes;
         _fillMilliseconds = (long)settings.FillTimeout.TotalMilliseconds;
@@ -166,27 +173,49 @@ public sealed class RuvioDistributedCache : IDistributedCache
         return offset < 0 ? default : convert(stored, offset, state);
     }
 
-    /// <summary>Applies the envelope's absolute and sliding expiry to bytes just read, and returns the payload offset (-1 when expired).</summary>
+    /// <summary>Applies the envelope's expiry to bytes just read, and returns the payload offset (-1 when expired, stale or evicted by a tag).</summary>
     private async Task<int> Decode(ReadOnlyMemory<byte> encoded, byte[] stored, CancellationToken token)
     {
-        (long absolute, long sliding, int payload) = Parse(stored);
+        (Freshness state, int offset) = await Inspect(encoded, stored, token).ConfigureAwait(false);
+
+        return state == Freshness.Fresh ? offset : -1;
+    }
+
+    private enum Freshness
+    {
+        Fresh,
+        // Past its fresh period, still within StaleFor: kept for GetOrCreate, a miss for Get.
+        Stale,
+        Gone,
+    }
+
+    /// <summary>
+    /// Applies the envelope's absolute and sliding expiry and checks its tags. An entry past its deadline is deleted; a
+    /// stale one or one whose tag was removed is left alone (it expires on its own).
+    /// </summary>
+    private async Task<(Freshness State, int Offset)> Inspect(ReadOnlyMemory<byte> encoded, byte[] stored, CancellationToken token)
+    {
+        Header header = Parse(stored);
         long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-        if (absolute > 0 && absolute <= now)
+        if (header.Absolute > 0 && header.Absolute <= now)
         {
             await Touch(encoded, stored, 0, token).ConfigureAwait(false);
 
-            return -1;
+            return (Freshness.Gone, -1);
         }
 
-        if (sliding > 0)
+        if (header.TagCount > 0 && !await TagsLive(stored, header, token).ConfigureAwait(false))
+            return (Freshness.Gone, -1);
+
+        if (header.Sliding > 0)
         {
-            long deadline = absolute > 0 ? Math.Min(absolute, now + sliding) : now + sliding;
+            long deadline = header.Absolute > 0 ? Math.Min(header.Absolute, now + header.Sliding) : now + header.Sliding;
 
             await Touch(encoded, stored, deadline <= now ? 0 : deadline, token).ConfigureAwait(false);
         }
 
-        return payload;
+        return (header.Fresh > 0 && header.Fresh <= now ? Freshness.Stale : Freshness.Fresh, header.Payload);
     }
 
     /// <inheritdoc />
@@ -200,7 +229,7 @@ public sealed class RuvioDistributedCache : IDistributedCache
         ArgumentNullException.ThrowIfNull(value);
         CheckSize(value.Length);
 
-        await WriteAsync(key, options, value, static (absolute, sliding, bytes) => Envelope(absolute, sliding, bytes), token)
+        await WriteAsync(key, options, value, static (header, bytes) => Envelope(header, bytes), token)
             .ConfigureAwait(false);
     }
 
@@ -214,7 +243,7 @@ public sealed class RuvioDistributedCache : IDistributedCache
         ArgumentNullException.ThrowIfNull(value);
         CheckSize(Text.GetByteCount(value));
 
-        await WriteAsync(key, options, value, static (absolute, sliding, text) => EnvelopeString(absolute, sliding, text), token)
+        await WriteAsync(key, options, value, static (header, text) => EnvelopeString(header, text), token)
             .ConfigureAwait(false);
     }
 
@@ -224,7 +253,7 @@ public sealed class RuvioDistributedCache : IDistributedCache
     public async Task SetJsonAsync<T>(string key, T value, DistributedCacheEntryOptions options,
         JsonSerializerOptions? serializerOptions = null, CancellationToken token = default)
         => await WriteAsync(key, options, (cache: this, value, serializerOptions),
-            static (absolute, sliding, state) => state.cache.EnvelopeJson(absolute, sliding, (state.value, state.serializerOptions),
+            static (header, state) => state.cache.EnvelopeJson(header, (state.value, state.serializerOptions),
                 static (w, input) => JsonSerializer.Serialize(w, input.value, input.serializerOptions), state.serializerOptions),
             token).ConfigureAwait(false);
 
@@ -235,17 +264,17 @@ public sealed class RuvioDistributedCache : IDistributedCache
         ArgumentNullException.ThrowIfNull(typeInfo);
 
         await WriteAsync(key, options, (cache: this, value, typeInfo),
-            static (absolute, sliding, state) => state.cache.EnvelopeJson(absolute, sliding, (state.value, state.typeInfo),
+            static (header, state) => state.cache.EnvelopeJson(header, (state.value, state.typeInfo),
                 static (w, input) => JsonSerializer.Serialize(w, input.value, input.typeInfo), state.typeInfo.Options),
             token).ConfigureAwait(false);
     }
 
     private Task WriteAsync<TState>(string key, DistributedCacheEntryOptions options, TState state,
-        Func<long, long, TState, ReadOnlyMemory<byte>> envelope, CancellationToken token)
+        Func<Header, TState, ReadOnlyMemory<byte>> envelope, CancellationToken token)
         => Guarded ? WriteGuardedAsync(key, options, state, envelope, token) : WriteCoreAsync(key, options, state, envelope, token);
 
     private async Task WriteGuardedAsync<TState>(string key, DistributedCacheEntryOptions options, TState state,
-        Func<long, long, TState, ReadOnlyMemory<byte>> envelope, CancellationToken token)
+        Func<Header, TState, ReadOnlyMemory<byte>> envelope, CancellationToken token)
     {
         if (!_outage.TryEnter())
         {
@@ -269,16 +298,17 @@ public sealed class RuvioDistributedCache : IDistributedCache
     }
 
     private async Task WriteCoreAsync<TState>(string key, DistributedCacheEntryOptions options, TState state,
-        Func<long, long, TState, ReadOnlyMemory<byte>> envelope, CancellationToken token)
+        Func<Header, TState, ReadOnlyMemory<byte>> envelope, CancellationToken token)
     {
         ReadOnlyMemory<byte> encoded = Key(key);
-        var prepared = Prepare(options, state, envelope);
+        Plan plan = PlanFor(options);
 
         token.ThrowIfCancellationRequested();
-        ReadOnlyMemory<byte>[] command = prepared.Expiry switch
+        ReadOnlyMemory<byte> record = envelope(await HeaderFor(plan, token).ConfigureAwait(false), state);
+        ReadOnlyMemory<byte>[] command = plan.Expiry switch
         {
-            (string kind, long when) => [SetCommand, encoded, prepared.Record, kind == "PX" ? Px : Pxat, Number(when)],
-            null => [SetCommand, encoded, prepared.Record],
+            (string kind, long when) => [SetCommand, encoded, record, kind == "PX" ? Px : Pxat, Number(when)],
+            null => [SetCommand, encoded, record],
         };
 
         RespValue reply = await _client.ExecuteBinaryAsync(command, token).ConfigureAwait(false);
@@ -303,11 +333,11 @@ public sealed class RuvioDistributedCache : IDistributedCache
 
         return await GetOrCreateCore(key, factory, options,
             static (stored, offset) => stored.AsSpan(offset).ToArray(),
-            (value, absolute, sliding) =>
+            (value, header) =>
             {
                 CheckSize(value.Length);
 
-                return Envelope(absolute, sliding, value);
+                return Envelope(header, value);
             }, token).ConfigureAwait(false);
     }
 
@@ -319,12 +349,12 @@ public sealed class RuvioDistributedCache : IDistributedCache
 
         return await GetOrCreateCore(key, factory, options,
             static (stored, offset) => Text.GetString(stored, offset, stored.Length - offset),
-            (value, absolute, sliding) =>
+            (value, header) =>
             {
                 ArgumentNullException.ThrowIfNull(value);
                 CheckSize(Text.GetByteCount(value));
 
-                return EnvelopeString(absolute, sliding, value);
+                return EnvelopeString(header, value);
             }, token).ConfigureAwait(false);
     }
 
@@ -339,7 +369,7 @@ public sealed class RuvioDistributedCache : IDistributedCache
 
         return await GetOrCreateCore(key, factory, options,
             (stored, offset) => JsonSerializer.Deserialize<T>(stored.AsSpan(offset), serializerOptions)!,
-            (value, absolute, sliding) => EnvelopeJson(absolute, sliding, (value, serializerOptions),
+            (value, header) => EnvelopeJson(header, (value, serializerOptions),
                 static (w, input) => JsonSerializer.Serialize(w, input.value, input.serializerOptions), serializerOptions), token).ConfigureAwait(false);
     }
 
@@ -352,20 +382,20 @@ public sealed class RuvioDistributedCache : IDistributedCache
 
         return await GetOrCreateCore(key, factory, options,
             (stored, offset) => JsonSerializer.Deserialize(stored.AsSpan(offset), typeInfo)!,
-            (value, absolute, sliding) => EnvelopeJson(absolute, sliding, (value, typeInfo),
+            (value, header) => EnvelopeJson(header, (value, typeInfo),
                 static (w, input) => JsonSerializer.Serialize(w, input.value, input.typeInfo), typeInfo.Options), token).ConfigureAwait(false);
     }
 
     private Task<T> GetOrCreateCore<T>(string key, Func<CancellationToken, Task<T>> factory,
         DistributedCacheEntryOptions options, Func<byte[], int, T> read,
-        Func<T, long, long, ReadOnlyMemory<byte>> envelope, CancellationToken token)
+        Func<T, Header, ReadOnlyMemory<byte>> envelope, CancellationToken token)
         => Guarded
             ? GetOrCreateGuardedAsync(key, factory, options, read, envelope, token)
             : GetOrCreateStoredAsync(key, factory, options, read, envelope, token);
 
     private async Task<T> GetOrCreateGuardedAsync<T>(string key, Func<CancellationToken, Task<T>> factory,
         DistributedCacheEntryOptions options, Func<byte[], int, T> read,
-        Func<T, long, long, ReadOnlyMemory<byte>> envelope, CancellationToken token)
+        Func<T, Header, ReadOnlyMemory<byte>> envelope, CancellationToken token)
     {
         ArgumentNullException.ThrowIfNull(options);
 
@@ -421,7 +451,7 @@ public sealed class RuvioDistributedCache : IDistributedCache
 
     private async Task<T> GetOrCreateStoredAsync<T>(string key, Func<CancellationToken, Task<T>> factory,
         DistributedCacheEntryOptions options, Func<byte[], int, T> read,
-        Func<T, long, long, ReadOnlyMemory<byte>> envelope, CancellationToken token)
+        Func<T, Header, ReadOnlyMemory<byte>> envelope, CancellationToken token)
     {
         ReadOnlyMemory<byte> encoded = Key(key);
 
@@ -449,31 +479,73 @@ public sealed class RuvioDistributedCache : IDistributedCache
             delay = Math.Min(delay * 2, 25);
         }
 
+        // The server decides staleness when it remembers the entry's soft expiry (STALE, with a token for the one
+        // caller that refreshes). When it does not (a restart, or an entry written by Set), the envelope's fresh
+        // deadline decides, and every caller that sees it stale refreshes.
+        byte[]? stale = null;
+        int staleOffset = -1;
+
         if (fill.State is FillState.Hit or FillState.Stale)
         {
-            int offset = await Decode(encoded, fill.Value!, token).ConfigureAwait(false);
+            (Freshness state, int offset) = await Inspect(encoded, fill.Value!, token).ConfigureAwait(false);
 
-            if (offset >= 0)
+            if (state == Freshness.Fresh && fill.State == FillState.Hit)
                 return read(fill.Value!, offset);
+
+            if (state != Freshness.Gone)
+            {
+                if (fill.State == FillState.Stale && fill.Token is null)
+                    return read(fill.Value!, offset);   // another caller is refreshing it
+
+                stale = fill.Value;
+                staleOffset = offset;
+            }
         }
 
-        T value = await factory(token).ConfigureAwait(false);
+        T value;
 
-        if (fill.State == FillState.Fill)
+        try
         {
-            var prepared = Prepare(options, (envelope, value),
-                static (absolute, sliding, state) => state.envelope(state.value, absolute, sliding));
-            // FILLSET needs a positive TTL; an entry without expiry is stored with one and then persisted.
-            long ttl = prepared.Expiry switch
-            {
-                ("PX", long when) => when,
-                (_, long when) => Math.Max(1, when - prepared.Now),
-                null => 3_600_000,
-            };
-            bool persistent = prepared.Expiry is null;
+            value = await factory(token).ConfigureAwait(false);
+        }
+        catch (Exception) when (stale is not null && !token.IsCancellationRequested)
+        {
+            // Fail-safe: the stale value is better than the error. The refresh token lapses after FillTimeout,
+            // so a later caller tries again.
+            if (FailSafe.Enabled)
+                FailSafe.Add(1);
 
-            RespValue stored = await Execute(
-                [FillSetCommand, encoded, prepared.Record, Number(ttl), Number(fill.Token!.Value)], token).ConfigureAwait(false);
+            return read(stale, staleOffset);
+        }
+
+        long? fillToken = fill.State switch
+        {
+            FillState.Fill => fill.Token,
+            FillState.Stale => fill.Token,
+            _ => null,
+        };
+
+        if (fillToken is { } owned)
+        {
+            Plan plan = PlanFor(options);
+            Header header = await HeaderFor(plan, token).ConfigureAwait(false);
+            ReadOnlyMemory<byte> record = envelope(value, header);
+            // FILLSET needs a positive TTL; an entry without expiry is stored with one and then persisted. A stale
+            // period is FILLSET's SWR window, so the server keeps the end of the fresh period too.
+            long ttl = plan.Fresh > 0
+                ? Math.Max(1, plan.Fresh - plan.Now)
+                : plan.Expiry switch
+                {
+                    ("PX", long when) => when,
+                    (_, long when) => Math.Max(1, when - plan.Now),
+                    null => 3_600_000,
+                };
+            bool persistent = plan.Expiry is null;
+            ReadOnlyMemory<byte>[] fillSet = plan.StaleFor > 0
+                ? [FillSetCommand, encoded, record, Number(ttl), Number(owned), Swr, Number(plan.StaleFor)]
+                : [FillSetCommand, encoded, record, Number(ttl), Number(owned)];
+
+            RespValue stored = await Execute(fillSet, token).ConfigureAwait(false);
 
             if (stored.Kind != RespKind.Integer)
                 throw UnexpectedReply();
@@ -486,14 +558,17 @@ public sealed class RuvioDistributedCache : IDistributedCache
         }
 
         await WriteAsync(key, options, (envelope, value),
-            static (absolute, sliding, state) => state.envelope(state.value, absolute, sliding), token).ConfigureAwait(false);
+            static (header, state) => state.envelope(state.value, header), token).ConfigureAwait(false);
 
         return value;
     }
 
-    /// <summary>Validates the expiry options, then builds the stored record with <paramref name="envelope"/>. Returns the current time used.</summary>
-    private static (ReadOnlyMemory<byte> Record, (string Kind, long When)? Expiry, long Now) Prepare<TState>(
-        DistributedCacheEntryOptions options, TState state, Func<long, long, TState, ReadOnlyMemory<byte>> envelope)
+    /// <summary>The expiry of one write: deadlines in Unix milliseconds (0 for none), and the server-side expiry.</summary>
+    private readonly record struct Plan(long Now, long Absolute, long Sliding, long Fresh, long StaleFor,
+        (string Kind, long When)? Expiry, IReadOnlyList<string>? Tags);
+
+    /// <summary>Validates the expiry options and works out the deadlines; with a stale period the stored deadline is its end.</summary>
+    private Plan PlanFor(DistributedCacheEntryOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
 
@@ -512,7 +587,60 @@ public sealed class RuvioDistributedCache : IDistributedCache
         if (relative > 0)
             absolute = absolute == 0 ? now + relative : Math.Min(absolute, now + relative);
 
-        return (envelope(absolute, sliding, state), Expiry(now, absolute, sliding), now);
+        long fresh = 0;
+        long staleFor = 0;
+        IReadOnlyList<string>? tags = null;
+
+        if (options is RuvioCacheEntryOptions extra)
+        {
+            staleFor = Milliseconds(extra.StaleFor);
+
+            if (staleFor > 0)
+            {
+                if (sliding > 0)
+                    throw new ArgumentException("StaleFor cannot be combined with SlidingExpiration.", nameof(options));
+
+                if (absolute == 0)
+                    throw new ArgumentException("StaleFor needs an absolute or relative expiration: the end of the fresh period.", nameof(options));
+
+                if (staleFor > DateTimeOffset.MaxValue.ToUnixTimeMilliseconds() - absolute)
+                    throw new ArgumentOutOfRangeException(nameof(options), "StaleFor exceeds the supported date range.");
+
+                fresh = absolute;
+                absolute += staleFor;
+            }
+
+            if (extra.Tags is { Count: > 0 } given)
+            {
+                if (given.Count > _maxTags)
+                    throw new ArgumentException("Too many cache tags; see MaxTagsPerEntry.", nameof(options));
+
+                foreach (string tag in given)
+                    ArgumentException.ThrowIfNullOrEmpty(tag, nameof(options));
+
+                tags = given;
+            }
+        }
+
+        return new Plan(now, absolute, sliding, fresh, staleFor, Expiry(now, absolute, sliding), tags);
+    }
+
+    /// <summary>The envelope header of a write; for tags, reads (and creates) their generations first.</summary>
+    private async ValueTask<Header> HeaderFor(Plan plan, CancellationToken token)
+    {
+        if (plan.Tags is null)
+            return new Header(plan.Absolute, plan.Sliding, plan.Fresh, null, 0, 0);
+
+        // A tag key must outlive every entry that carries it; zero is an entry without expiry.
+        long lifetime = plan.Expiry switch
+        {
+            ("PX", long when) => when,
+            (_, long when) => Math.Max(1, when - plan.Now),
+            null => 0,
+        };
+
+        return new Header(plan.Absolute, plan.Sliding, plan.Fresh,
+            await TagBlock(plan.Tags, lifetime, token).ConfigureAwait(false), plan.Tags.Count, 0);
     }
 
     /// <inheritdoc />
@@ -589,54 +717,93 @@ public sealed class RuvioDistributedCache : IDistributedCache
             throw UnexpectedReply();
     }
 
-    private static (long Absolute, long Sliding, int Payload) Parse(byte[] stored)
+    /// <summary>
+    /// The stored header. <c>RDC1\n{absolute}\n{sliding}\n</c> for an entry without a stale period or tags (the
+    /// format older versions read); <c>RDC2\n{absolute}\n{sliding}\n{fresh}\n{tags}\n</c> followed by 96 ASCII bytes
+    /// per tag (the hex SHA-256 of the tag, then the hex generation it had) otherwise. Times are Unix milliseconds.
+    /// </summary>
+    private readonly record struct Header(long Absolute, long Sliding, long Fresh, byte[]? Tags, int TagCount, int Payload)
     {
-        ReadOnlySpan<byte> body = stored;
-        ReadOnlySpan<byte> magic = "RDC1\n"u8;
-
-        if (!body.StartsWith(magic))
-            throw UnexpectedReply();
-
-        body = body[magic.Length..];
-        int first = body.IndexOf((byte)'\n');
-
-        if (first <= 0 || !long.TryParse(body[..first], NumberStyles.None, CultureInfo.InvariantCulture, out long absolute))
-            throw UnexpectedReply();
-
-        body = body[(first + 1)..];
-        int second = body.IndexOf((byte)'\n');
-
-        if (second <= 0 || !long.TryParse(body[..second], NumberStyles.None, CultureInfo.InvariantCulture, out long sliding))
-            throw UnexpectedReply();
-
-        return (absolute, sliding, magic.Length + first + 1 + second + 1);
+        public bool Extended => Fresh > 0 || Tags is not null;
+        public int MaxLength => 5 + 20 + 1 + 20 + 1 + (Extended ? 20 + 1 + 2 + 1 + (Tags?.Length ?? 0) : 0);
     }
 
-    private const int MaxHeaderBytes = 5 + 20 + 1 + 20 + 1;
+    private const int TagBytes = 96;
 
-    /// <summary>Writes <c>RDC1\n{absolute}\n{sliding}\n</c> and returns its length.</summary>
-    private static int WriteHeader(Span<byte> header, long absolute, long sliding)
+    private static Header Parse(byte[] stored)
     {
-        ReadOnlySpan<byte> magic = "RDC1\n"u8;
+        ReadOnlySpan<byte> body = stored;
+        bool extended = body.StartsWith("RDC2\n"u8);
 
-        magic.CopyTo(header);
-        int written = magic.Length;
+        if (!extended && !body.StartsWith("RDC1\n"u8))
+            throw UnexpectedReply();
 
-        Utf8Formatter.TryFormat(absolute, header[written..], out int digits);
-        written += digits;
-        header[written++] = (byte)'\n';
-        Utf8Formatter.TryFormat(sliding, header[written..], out digits);
-        written += digits;
-        header[written++] = (byte)'\n';
+        int position = 5;
+        long absolute = Field(stored, ref position);
+        long sliding = Field(stored, ref position);
+
+        if (!extended)
+            return new Header(absolute, sliding, 0, null, 0, position);
+
+        long fresh = Field(stored, ref position);
+        long tags = Field(stored, ref position);
+
+        if (tags > 64 || stored.Length - position < tags * TagBytes)
+            throw UnexpectedReply();
+
+        return new Header(absolute, sliding, fresh, null, (int)tags, position + (int)tags * TagBytes);
+    }
+
+    /// <summary>Reads one decimal field ending in <c>\n</c> at <paramref name="position"/> and moves past it.</summary>
+    private static long Field(byte[] stored, ref int position)
+    {
+        ReadOnlySpan<byte> rest = stored.AsSpan(position);
+        int end = rest.IndexOf((byte)'\n');
+
+        if (end <= 0 || !long.TryParse(rest[..end], NumberStyles.None, CultureInfo.InvariantCulture, out long value))
+            throw UnexpectedReply();
+
+        position += end + 1;
+
+        return value;
+    }
+
+    /// <summary>Writes the header and returns its length.</summary>
+    private static int WriteHeader(Span<byte> header, Header fields)
+    {
+        (fields.Extended ? "RDC2\n"u8 : "RDC1\n"u8).CopyTo(header);
+        int written = 5;
+
+        WriteField(header, ref written, fields.Absolute);
+        WriteField(header, ref written, fields.Sliding);
+
+        if (fields.Extended)
+        {
+            WriteField(header, ref written, fields.Fresh);
+            WriteField(header, ref written, fields.TagCount);
+
+            if (fields.Tags is not null)
+            {
+                fields.Tags.CopyTo(header[written..]);
+                written += fields.Tags.Length;
+            }
+        }
 
         return written;
     }
 
-    /// <summary>The header followed by the payload, in one allocation.</summary>
-    private static byte[] Envelope(long absolute, long sliding, byte[] value)
+    private static void WriteField(Span<byte> header, ref int written, long value)
     {
-        Span<byte> header = stackalloc byte[MaxHeaderBytes];
-        int written = WriteHeader(header, absolute, sliding);
+        Utf8Formatter.TryFormat(value, header[written..], out int digits);
+        written += digits;
+        header[written++] = (byte)'\n';
+    }
+
+    /// <summary>The header followed by the payload, in one allocation.</summary>
+    private static byte[] Envelope(Header fields, byte[] value)
+    {
+        Span<byte> header = fields.MaxLength <= 256 ? stackalloc byte[256] : new byte[fields.MaxLength];
+        int written = WriteHeader(header, fields);
         byte[] record = new byte[written + value.Length];
 
         header[..written].CopyTo(record);
@@ -646,10 +813,10 @@ public sealed class RuvioDistributedCache : IDistributedCache
     }
 
     /// <summary>The header followed by the string encoded as UTF-8 directly into the record, in one allocation.</summary>
-    private static byte[] EnvelopeString(long absolute, long sliding, string value)
+    private static byte[] EnvelopeString(Header fields, string value)
     {
-        Span<byte> header = stackalloc byte[MaxHeaderBytes];
-        int written = WriteHeader(header, absolute, sliding);
+        Span<byte> header = fields.MaxLength <= 256 ? stackalloc byte[256] : new byte[fields.MaxLength];
+        int written = WriteHeader(header, fields);
         byte[] record = new byte[written + Text.GetByteCount(value)];
 
         header[..written].CopyTo(record);
@@ -659,13 +826,13 @@ public sealed class RuvioDistributedCache : IDistributedCache
     }
 
     /// <summary>The header followed by JSON written straight into one growing buffer; no separate payload array.</summary>
-    private ReadOnlyMemory<byte> EnvelopeJson<TState>(long absolute, long sliding, TState state,
+    private ReadOnlyMemory<byte> EnvelopeJson<TState>(Header fields, TState state,
         Action<Utf8JsonWriter, TState> write, JsonSerializerOptions? serializerOptions)
     {
         var buffer = new ArrayBufferWriter<byte>(256);
-        Span<byte> header = buffer.GetSpan(MaxHeaderBytes);
+        Span<byte> header = buffer.GetSpan(fields.MaxLength);
 
-        buffer.Advance(WriteHeader(header, absolute, sliding));
+        buffer.Advance(WriteHeader(header, fields));
         int headerBytes = buffer.WrittenCount;
 
         using (var writer = new Utf8JsonWriter(buffer, new JsonWriterOptions
@@ -698,6 +865,166 @@ public sealed class RuvioDistributedCache : IDistributedCache
             return ("PXAT", absolute);
 
         return null;
+    }
+
+    /// <summary>
+    /// Removes every entry written with <paramref name="tag"/> (<see cref="RuvioCacheEntryOptions.Tags"/>): one <c>DEL</c>
+    /// of the tag's generation key, no scan. The entries stay stored until they expire, but no read returns them again.
+    /// </summary>
+    public Task RemoveByTagAsync(string tag, CancellationToken token = default)
+        => Guarded ? RemoveTagGuardedAsync(tag, token) : RemoveTagCoreAsync(tag, token);
+
+    private async Task RemoveTagGuardedAsync(string tag, CancellationToken token)
+    {
+        if (!_outage.TryEnter())
+        {
+            CountOutage("remove_tag", null);
+
+            if (_outage.Mode == RuvioOutageMode.FailOpen)
+                return;
+
+            throw new RuvioCircuitOpenException(_outage.RetryAfter);
+        }
+
+        try
+        {
+            await RemoveTagCoreAsync(tag, token).ConfigureAwait(false);
+            _outage.Succeeded();
+        }
+        catch (Exception error) when (_outage.Failed(error, token) && _outage.Mode == RuvioOutageMode.FailOpen)
+        {
+            // The removal is lost: entries with this tag can be read again once Ruvio is back.
+            CountOutage("remove_tag", error);
+        }
+    }
+
+    private async Task RemoveTagCoreAsync(string tag, CancellationToken token)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(tag);
+        token.ThrowIfCancellationRequested();
+        RespValue reply = await Execute([Delete, RuvioCacheOptions.Utf8.GetBytes(TagKey(Digest(tag)))], token).ConfigureAwait(false);
+
+        if (reply.Kind != RespKind.Integer || reply.Integer is < 0 or > 1)
+            throw UnexpectedReply();
+    }
+
+    /// <summary>
+    /// The 96-byte-per-tag block of a write: each tag's digest and current generation. A tag without a generation key
+    /// gets a new random one, so an entry written under an earlier generation never matches it again. The keys are not
+    /// confined to one hash slot, so this is not atomic with the entry: a racing removal can at worst cost a miss.
+    /// </summary>
+    private async ValueTask<byte[]> TagBlock(IReadOnlyList<string> tags, long lifetime, CancellationToken token)
+    {
+        var keys = new string[tags.Count];
+        var digests = new string[tags.Count];
+        var lookup = new IReadOnlyList<string>[tags.Count * 2];
+
+        for (int i = 0; i < tags.Count; i++)
+        {
+            digests[i] = Digest(tags[i]);
+            keys[i] = TagKey(digests[i]);
+            lookup[i * 2] = ["GET", keys[i]];
+            lookup[i * 2 + 1] = ["PTTL", keys[i]];
+        }
+
+        IReadOnlyList<RespValue> found = await _client.ExecuteManyAsync(lookup, token).ConfigureAwait(false);
+
+        if (found.Count != lookup.Length)
+            throw UnexpectedReply();
+
+        string created = Guid.NewGuid().ToString("N");
+        string? life = lifetime > 0 ? lifetime.ToString(CultureInfo.InvariantCulture) : null;
+        var writes = new List<IReadOnlyList<string>>();
+        byte[] block = new byte[tags.Count * TagBytes];
+
+        for (int i = 0; i < tags.Count; i++)
+        {
+            RespValue current = found[i * 2];
+            RespValue ttl = found[i * 2 + 1];
+            string generation;
+
+            CheckReply(current);
+            CheckReply(ttl);
+
+            if (current.Kind == RespKind.Null)
+            {
+                generation = created;
+                writes.Add(life is null ? ["SET", keys[i], created] : ["SET", keys[i], created, "PX", life]);
+            }
+            else
+            {
+                generation = current.AsString() ?? "";
+
+                if (current.Kind != RespKind.Bulk || generation.Length != 32 || ttl.Kind != RespKind.Integer)
+                    throw UnexpectedReply();
+
+                // -1 is a key without expiry, which outlives anything.
+                if (life is null && ttl.Integer >= 0)
+                    writes.Add(["PERSIST", keys[i]]);
+                else if (life is not null && ttl.Integer >= 0 && ttl.Integer < lifetime)
+                    writes.Add(["PEXPIRE", keys[i], life]);
+            }
+
+            Encoding.ASCII.GetBytes(digests[i], block.AsSpan(i * TagBytes, 64));
+            Encoding.ASCII.GetBytes(generation, block.AsSpan(i * TagBytes + 64, 32));
+        }
+
+        if (writes.Count > 0)
+        {
+            foreach (RespValue reply in await _client.ExecuteManyAsync(writes, token).ConfigureAwait(false))
+                CheckReply(reply);
+        }
+
+        return block;
+    }
+
+    /// <summary>True when every tag of a stored entry still has the generation the entry was written under.</summary>
+    private async ValueTask<bool> TagsLive(byte[] stored, Header header, CancellationToken token)
+    {
+        int start = header.Payload - header.TagCount * TagBytes;
+        var keys = new string[header.TagCount];
+
+        for (int i = 0; i < keys.Length; i++)
+            keys[i] = TagKey(Encoding.ASCII.GetString(stored, start + i * TagBytes, 64));
+
+        string[] command = new string[keys.Length + 1];
+
+        command[0] = "MGET";
+        keys.CopyTo(command, 1);
+        // A pipeline splits an MGET over several slots and merges the replies in order.
+        IReadOnlyList<RespValue> replies = await _client.ExecuteManyAsync([command], token).ConfigureAwait(false);
+
+        if (replies.Count != 1)
+            throw UnexpectedReply();
+
+        CheckReply(replies[0]);
+
+        if (replies[0].Items is not { } live || live.Count != keys.Length)
+            throw UnexpectedReply();
+
+        for (int i = 0; i < keys.Length; i++)
+        {
+            if (live[i].AsString() is not { Length: 32 } generation
+                || Encoding.ASCII.GetByteCount(generation) != 32
+                || !stored.AsSpan(start + i * TagBytes + 64, 32).SequenceEqual(Encoding.ASCII.GetBytes(generation)))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private string TagKey(string digest) => _tagPrefix + digest;
+
+    // Hashing keeps tag keys a fixed length whatever the tag.
+    private static string Digest(string tag)
+    {
+        Span<byte> digest = stackalloc byte[SHA256.HashSizeInBytes];
+
+        SHA256.HashData(RuvioCacheOptions.Utf8.GetBytes(tag), digest);
+
+        return Convert.ToHexString(digest).ToLowerInvariant();
     }
 
     private static void CheckReply(RespValue reply)

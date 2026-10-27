@@ -44,7 +44,7 @@ const ecosystemDetails: Record<string, EcosystemDetails> = {
 const details: Record<string, Details> = {
   "Ruvio.Extensions.Caching": {
     summary:
-      "Binary-safe IDistributedCache for web, worker and console apps. Store strings and models as JSON without touching byte[]. GetOrCreate builds a missing entry once across every instance with FILLGET and FILLSET.",
+      "Binary-safe IDistributedCache for web, worker and console apps. Store strings and models as JSON without touching byte[]. GetOrCreate builds a missing entry once across every instance with FILLGET and FILLSET. Optional stale period (stale-while-revalidate and fail-safe) and tags removed in one call.",
     useCases: ["cache", "sessions"],
     example: cs(`builder.Services.AddRuvioClient(builder.Configuration.GetSection("Ruvio"));
 builder.Services.AddRuvioDistributedCache(options => options.InstanceName = "orders");
@@ -60,7 +60,18 @@ Invoice invoice = await cache.GetOrCreateJsonAsync(
     "invoice-model:42", token => LoadInvoiceAsync(token), AppJson.Default.Invoice, entry);
 
 // Already have a JSON string? Store it as a string.
-await cache.SetStringAsync("invoice-json:42", json, entry);`),
+await cache.SetStringAsync("invoice-json:42", json, entry);
+
+// Serve the last good value for an hour while one caller refreshes it, and tag it.
+var resilient = new RuvioCacheEntryOptions
+{
+    AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5),
+    StaleFor = TimeSpan.FromHours(1),
+    Tags = ["customer:7"],
+};
+Invoice cached = await cache.GetOrCreateJsonAsync(
+    "invoice-model:42", token => LoadInvoiceAsync(token), AppJson.Default.Invoice, resilient);
+await cache.RemoveByTagAsync("customer:7");   // every entry tagged customer:7 is gone`),
     caseExamples: {
       sessions: cs(`builder.Services.AddRuvioDistributedCache(o => o.InstanceName = "orders-session-v1");
 builder.Services.AddSession(o => o.IdleTimeout = TimeSpan.FromMinutes(20));

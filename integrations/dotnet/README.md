@@ -25,7 +25,7 @@ keep their current paths.
 
 | NuGet package | Responsibility |
 | --- | --- |
-| `Ruvio.Extensions.Caching` | `IDistributedCache` for web, worker and console applications |
+| `Ruvio.Extensions.Caching` | `IDistributedCache` for web, worker and console applications, with optional stale-while-revalidate, fail-safe and tags |
 | `Ruvio.AspNetCore.RateLimiting` | Endpoint-opt-in distributed budgets (fixed, sliding window, token bucket, concurrency), inline or as named policies with their own partition, chained limits and a default policy |
 | `Ruvio.AspNetCore.Idempotency` | Endpoint-opt-in bounded HTTP request deduplication and response replay |
 | `Ruvio.AspNetCore.OutputCaching` | Native ASP.NET Core output-cache store with distributed tag invalidation |

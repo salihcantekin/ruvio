@@ -4,6 +4,7 @@ Notable changes to the NuGet package `Ruvio.Extensions.Caching`. New entries go 
 
 ## Unreleased
 
+- `RuvioCacheEntryOptions.StaleFor`: stale-while-revalidate and fail-safe for `GetOrCreate*` (one caller refreshes while the rest get the stale value; a throwing factory falls back to it, counted by `ruvio.cache.fail_safe`). `RuvioCacheEntryOptions.Tags` and `RemoveByTagAsync(tag)`: remove every entry with a tag in one `DEL`. Entries that use either are written in a new format older package versions cannot read; upgrade every instance first. Entries without them are unchanged. See the README.
 - Fewer allocations per call: `GetJsonAsync`, `SetAsync`, `SetStringAsync` and `SetJsonAsync` no longer allocate a closure and delegate for each call. Behaviour is unchanged.
 - `options.Outage`: `FailOpen` makes reads misses and drops writes and removals when Ruvio is unreachable (`GetOrCreate*` runs its factory without caching), and an optional circuit breaker stops calls to a Ruvio that is down. Default (`Throw`) unchanged. See the README.
 

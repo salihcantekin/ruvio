@@ -7,7 +7,7 @@ using Xunit;
 
 namespace Ruvio.Extensions.Caching.Tests;
 
-public class LiveTests
+public partial class LiveTests
 {
     [LiveFact]
     public async Task Binary_empty_namespace_isolation_and_sync_contract()
@@ -291,6 +291,17 @@ public class LiveTests
         }
 
         public async Task<long> Ttl(string key) => (await Client.ExecuteAsync("PTTL", Key(key))).Integer;
+
+        public string TagKey(string tag)
+        {
+            string physical = Namespace + RuvioCacheOptions.TagPrefix
+                + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(tag))).ToLowerInvariant();
+
+            _keys.Add(physical);
+
+            return physical;
+        }
+
         public static async Task<Scope> Open()
         {
             RuvioConnection connection = await Connect();
