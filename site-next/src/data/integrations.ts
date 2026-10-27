@@ -169,6 +169,23 @@ app.MapPost("/orders", HandleOrder)
     .RequireAuthorization()
     .WithRuvioIdempotency();`),
   },
+  "Ruvio.Extensions.Idempotency": {
+    summary:
+      "Run work once per key outside HTTP: message consumers, background jobs, gRPC handlers. A redelivered message gets the stored result instead of running the work again; a running or failed attempt and other content under the same key are reported.",
+    useCases: ["idempotency"],
+    example: cs(`builder.Services.AddRuvioIdempotentExecutor(o => o.KeyPrefix = "payments:");
+
+IdempotentResult<Receipt> result = await executor.ExecuteOnceAsync(
+    key: message.Id,
+    fingerprint: message.ContentHash,
+    work: ct => ChargeAsync(message, ct),
+    typeInfo: AppJson.Default.Receipt,
+    retention: TimeSpan.FromDays(1),
+    cancellationToken);
+
+if (result.Outcome == IdempotentOutcome.Pending)
+    await message.AbandonAsync();   // another consumer runs it; try again later`),
+  },
   "Ruvio.AspNetCore.DistributedLock": {
     summary:
       "Locks with owner-checked release and automatic renewal, plus a [RuvioLock] endpoint attribute: 409 when taken, request cancelled if the lock is lost. Choose what happens when Ruvio is unreachable: 503, throw, or run without the lock, with an optional circuit breaker.",

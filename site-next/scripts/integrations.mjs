@@ -14,6 +14,7 @@ export const INTEGRATION_ECOSYSTEMS = [
       { package: "Ruvio.AspNetCore.OutputCaching", slug: "output-caching", title: "Output caching", label: "Output caching" },
       { package: "Ruvio.AspNetCore.RateLimiting", slug: "rate-limiting", title: "Rate limiting", label: "Rate limiting" },
       { package: "Ruvio.AspNetCore.Idempotency", slug: "idempotency", title: "HTTP idempotency", label: "Idempotency" },
+      { package: "Ruvio.Extensions.Idempotency", slug: "idempotent-executor", title: "Run once per key (outside HTTP)", label: "Run once" },
       { package: "Ruvio.AspNetCore.DistributedLock", slug: "distributed-lock", title: "Distributed locks", label: "Distributed locks" },
       { package: "Ruvio.AspNetCore.DataProtection", slug: "data-protection", title: "Data Protection key ring", label: "Data Protection" },
     ],

@@ -95,6 +95,7 @@ for _name in (
     "Ruvio.AspNetCore.OutputCaching",
     "Ruvio.AspNetCore.DataProtection",
     "Ruvio.AspNetCore.DistributedLock",
+    "Ruvio.Extensions.Idempotency",
 ):
     PACKAGES[_name] = {
         "cargo": [],
