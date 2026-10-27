@@ -21,13 +21,15 @@ namespace Ruvio.AspNetCore.Idempotency;
 public sealed class IdempotencyMiddleware
 {
     private const int MaxMetadataChars = 8192;
-    internal static readonly string[] ReplayHeaders = ["Content-Type", "Content-Language", "ETag", "Last-Modified"];
+    // Retry-After on a 409 for a request that is still running: the shortest whole-second hint.
+    private const string PendingRetryAfterSeconds = "1";
     // Stored JSON is never embedded in HTML. Avoid escaping '+' in arbitrary base64 payloads.
     private static readonly IdempotencyJsonContext JsonContext = new(
         new JsonSerializerOptions { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping });
 
     private readonly RequestDelegate next;
     private readonly IdempotencyOptions options;
+    private readonly string[] replayHeaders;
 
     /// <summary>Creates middleware that applies the configured idempotency policy.</summary>
     /// <param name="next">The next middleware in the request pipeline.</param>
@@ -44,6 +46,8 @@ public sealed class IdempotencyMiddleware
             throw new OptionsValidationException(nameof(IdempotencyOptions),
                                                  typeof(IdempotencyOptions),
                                                  ["Invalid idempotency configuration."]);
+
+        replayHeaders = [.. this.options.ReplayHeaders];
     }
 
     /// <summary>
@@ -55,13 +59,13 @@ public sealed class IdempotencyMiddleware
     public Task InvokeAsync(HttpContext context)
     {
         // Keep the unselected path allocation-free; in particular don't resolve IRuvioClient.
-        if (context.GetEndpoint()?.Metadata.GetMetadata<RuvioIdempotencyAttribute>() is null)
+        if (context.GetEndpoint()?.Metadata.GetMetadata<RuvioIdempotencyAttribute>() is not { } endpoint)
             return next(context);
 
-        return InvokeSelectedAsync(context);
+        return InvokeSelectedAsync(context, endpoint);
     }
 
-    private async Task InvokeSelectedAsync(HttpContext context)
+    private async Task InvokeSelectedAsync(HttpContext context, RuvioIdempotencyAttribute endpoint)
     {
         using var activity = options.EnableInstrumentation ? Instrumentation.Source.StartActivity("idempotency") : null;
         var request = context.Request;
@@ -72,6 +76,17 @@ public sealed class IdempotencyMiddleware
         if (request.Method is not ("POST" or "PUT" or "PATCH" or "DELETE"))
         {
             context.Response.StatusCode = StatusCodes.Status405MethodNotAllowed;
+
+            return;
+        }
+
+        var (keyHeader, retention, pendingWait) = EndpointSettings(endpoint);
+        var suppliedKey = request.Headers[keyHeader];
+
+        // An endpoint that makes the key optional runs a request without one unchecked, before any body is read.
+        if (suppliedKey.Count == 0 && !endpoint.KeyRequired)
+        {
+            await next(context);
 
             return;
         }
@@ -112,8 +127,6 @@ public sealed class IdempotencyMiddleware
 
         if (string.IsNullOrWhiteSpace(scope))
             throw new InvalidOperationException("An idempotency scope is required for this request.");
-
-        var suppliedKey = request.Headers["Idempotency-Key"];
 
         if (suppliedKey.Count != 1 || suppliedKey[0] is not { Length: > 0 and <= 128 } key ||
             key.AsSpan().ContainsAnyExceptInRange('!', '~'))
@@ -185,7 +198,7 @@ public sealed class IdempotencyMiddleware
             {
                 try
                 {
-                    acquired = await IdempotencyStore.AcquireAsync(client, storageKey, fingerprint, owner, options.Retention, cancellation);
+                    acquired = await AcquireAsync(client, storageKey, fingerprint, owner, retention, pendingWait, cancellation);
                     outage.Succeeded();
                 }
                 catch (Exception error) when (outage.Failed(error, cancellation) && outage.Mode != RuvioOutageMode.Throw)
@@ -221,9 +234,17 @@ public sealed class IdempotencyMiddleware
 
             activity?.SetTag("idempotency.state", State);
 
-            if (State is "pending" or "conflict")
+            if (State == "pending")
             {
                 context.Response.StatusCode = StatusCodes.Status409Conflict;
+                context.Response.Headers.RetryAfter = PendingRetryAfterSeconds;
+
+                return;
+            }
+
+            if (State == "conflict")
+            {
+                context.Response.StatusCode = options.MismatchStatusCode;
 
                 return;
             }
@@ -235,6 +256,8 @@ public sealed class IdempotencyMiddleware
 
                 foreach (var header in replay.Headers)
                     context.Response.Headers[header.Key] = header.Value;
+
+                context.Response.Headers["Idempotent-Replayed"] = "true";
 
                 context.Response.ContentLength = body.Length;
                 await originalBodyFeature.Stream.WriteAsync(body, cancellation);
@@ -331,6 +354,68 @@ public sealed class IdempotencyMiddleware
         }
     }
 
+    // The attribute's own values win; checked per request because endpoint metadata is not seen at startup.
+    private (string KeyHeader, TimeSpan Retention, TimeSpan PendingWait) EndpointSettings(RuvioIdempotencyAttribute endpoint)
+    {
+        string keyHeader = endpoint.KeyHeader ?? options.KeyHeader;
+
+        if (!IdempotencyOptions.IsHeaderName(keyHeader))
+            throw new InvalidOperationException("RuvioIdempotency KeyHeader must be a header name of at most 64 characters.");
+
+        TimeSpan retention = endpoint.RetentionSeconds switch
+        {
+            0 => options.Retention,
+            > 0 and <= 604_800 => TimeSpan.FromSeconds(endpoint.RetentionSeconds),
+            _ => throw new InvalidOperationException("RuvioIdempotency RetentionSeconds must be 1 to 604800, or 0 for the global retention."),
+        };
+
+        TimeSpan pendingWait = endpoint.PendingWaitMilliseconds switch
+        {
+            -1 => options.PendingWait,
+            >= 0 and <= 30_000 => TimeSpan.FromMilliseconds(endpoint.PendingWaitMilliseconds),
+            _ => throw new InvalidOperationException("RuvioIdempotency PendingWaitMilliseconds must be 0 to 30000, or -1 for the global wait."),
+        };
+
+        return (keyHeader, retention, pendingWait);
+    }
+
+    // BEGIN again while an earlier request with the key runs, until it completes, its record goes away (this request
+    // then owns a new one) or the wait is over. Only the final state is counted.
+    private static async Task<(string State, string? Result)> AcquireAsync(IRuvioClient client, string key,
+        string fingerprint, string owner, TimeSpan retention, TimeSpan wait, CancellationToken cancellation)
+    {
+        var acquired = await IdempotencyStore.AcquireAsync(client, key, fingerprint, owner, retention, cancellation, count: wait <= TimeSpan.Zero);
+
+        if (acquired.State != "pending" || wait <= TimeSpan.Zero)
+            return acquired;
+
+        long started = Stopwatch.GetTimestamp();
+        int delay = 2;
+
+        while (true)
+        {
+            TimeSpan left = wait - Stopwatch.GetElapsedTime(started);
+
+            if (left <= TimeSpan.Zero)
+            {
+                IdempotencyStore.RecordState(acquired.State);
+
+                return acquired;
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(Math.Min(delay, left.TotalMilliseconds)), cancellation);
+            delay = Math.Min(delay * 2, 25);
+            acquired = await IdempotencyStore.AcquireAsync(client, key, fingerprint, owner, retention, cancellation, count: false);
+
+            if (acquired.State != "pending")
+            {
+                IdempotencyStore.RecordState(acquired.State);
+
+                return acquired;
+            }
+        }
+    }
+
     // The handler's own output is discarded: the finally block restores the original response features.
     private static void Unavailable(HttpContext context, RuvioOutageOptions outage)
     {
@@ -354,7 +439,7 @@ public sealed class IdempotencyMiddleware
             ?? throw new IOException("Missing stored idempotency result.");
 
         if (result.Status is < 200 or > 599 || result.Body is null || result.Headers is null ||
-            result.Headers.Count > ReplayHeaders.Length ||
+            result.Headers.Count > replayHeaders.Length ||
             result.Body.Length > (options.MaxResponseBodyBytes + 2) / 3 * 4)
             throw new IOException("Invalid stored idempotency result.");
 
@@ -362,6 +447,7 @@ public sealed class IdempotencyMiddleware
 
         foreach (var header in result.Headers)
         {
+            // Fail closed: a header outside the configured list is a corrupt (or tampered) record, never replayed.
             if (!IsReplayHeader(header.Key) || header.Value is null ||
                 header.Value.Contains('\r') || header.Value.Contains('\n') ||
                 (headerLength += header.Value.Length) > MaxMetadataChars)
@@ -377,12 +463,12 @@ public sealed class IdempotencyMiddleware
         return (result, body);
     }
 
-    private static Dictionary<string, string> CaptureHeaders(IHeaderDictionary headers)
+    private Dictionary<string, string> CaptureHeaders(IHeaderDictionary headers)
     {
         var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         int length = 0;
 
-        foreach (string name in ReplayHeaders)
+        foreach (string name in replayHeaders)
         {
             if (!headers.TryGetValue(name, out var values))
                 continue;
@@ -416,9 +502,9 @@ public sealed class IdempotencyMiddleware
         return false;
     }
 
-    private static bool IsReplayHeader(string name)
+    private bool IsReplayHeader(string name)
     {
-        foreach (string header in ReplayHeaders)
+        foreach (string header in replayHeaders)
         {
             if (header.Equals(name, StringComparison.OrdinalIgnoreCase))
                 return true;
