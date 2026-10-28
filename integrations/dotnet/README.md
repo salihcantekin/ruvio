@@ -28,6 +28,7 @@ keep their current paths.
 | `Ruvio.Extensions.Caching` | `IDistributedCache` for web, worker and console applications |
 | `Ruvio.AspNetCore.RateLimiting` | Endpoint-opt-in distributed budgets (fixed, sliding window, token bucket, concurrency), inline or as named policies with their own partition, chained limits and a default policy |
 | `Ruvio.AspNetCore.Idempotency` | Endpoint-opt-in bounded HTTP request deduplication and response replay |
+| `Ruvio.Extensions.Idempotency` | Run work once per key outside HTTP (message consumers, jobs, gRPC) and replay its stored result |
 | `Ruvio.AspNetCore.OutputCaching` | Native ASP.NET Core output-cache store with distributed tag invalidation |
 | `Ruvio.AspNetCore.DataProtection` | Encrypted key-ring persistence for shared cookies and protected payloads |
 | `Ruvio.AspNetCore.DistributedLock` | Distributed locks with owner-checked release and automatic renewal, plus a `[RuvioLock]` endpoint attribute (409 when taken, request cancelled on lock loss, metrics) |
