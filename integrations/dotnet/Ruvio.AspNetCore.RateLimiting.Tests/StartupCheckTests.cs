@@ -12,7 +12,7 @@ namespace Ruvio.AspNetCore.RateLimiting.Tests;
 /// <summary>What the package checks before the server takes a request.</summary>
 public sealed class StartupCheckTests
 {
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task MissingClientFailsStartAndNamesTheFix()
     {
         await using WebApplication app = App(services => { });
@@ -22,7 +22,7 @@ public sealed class StartupCheckTests
         Assert.Contains("services.AddRuvioClient", error.Message);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task MissingKeyedClientFailsStartAndNamesTheKey()
     {
         await using WebApplication app = App(Client, clientKey: "limits");
@@ -32,7 +32,7 @@ public sealed class StartupCheckTests
         Assert.Contains("AddKeyedRuvioClient(\"limits\"", error.Message);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task RegisteredClientIsNotResolvedAtStart()
     {
         await using WebApplication app = App(services =>
@@ -42,7 +42,7 @@ public sealed class StartupCheckTests
         await app.StopAsync();
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task UnknownNamedPolicyOnAnEndpointFailsStart()
     {
         await using WebApplication app = App(Client, app =>
@@ -58,7 +58,7 @@ public sealed class StartupCheckTests
         Assert.DoesNotContain("/ok", error.Message);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task ExemptedEndpointIsNotChecked()
     {
         await using WebApplication app = App(Client, app =>
@@ -68,7 +68,7 @@ public sealed class StartupCheckTests
         await app.StopAsync();
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task InlineLimitWithoutPartitionKeyFailsStart()
     {
         await using WebApplication app = App(Client, app =>
@@ -80,7 +80,7 @@ public sealed class StartupCheckTests
         Assert.Contains("PartitionKey", error.Message);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task UseWithoutAddFailsStart()
     {
         var builder = WebApplication.CreateBuilder();
