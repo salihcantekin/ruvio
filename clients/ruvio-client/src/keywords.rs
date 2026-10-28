@@ -149,6 +149,46 @@ impl<'a> StreamTrim<'a> {
     }
 }
 
+/// The condition of `EXPIRE`, `PEXPIRE`, `EXPIREAT` and `PEXPIREAT`: the deadline changes only
+/// when it holds. A key without a deadline counts as an infinite one, so `Gt` never applies to
+/// it and `Lt` always does.
+///
+/// # Examples
+///
+/// ```
+/// use ruvio_client::ExpireCondition;
+///
+/// assert_eq!(ExpireCondition::Gt.as_str(), "GT");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpireCondition {
+    /// `NX`: only when the key has no deadline.
+    Nx,
+    /// `XX`: only when the key already has a deadline.
+    Xx,
+    /// `GT`: only when the new deadline is later than the current one.
+    Gt,
+    /// `LT`: only when the new deadline is earlier than the current one.
+    Lt,
+}
+
+impl ExpireCondition {
+    /// The wire keyword: `NX`, `XX`, `GT` or `LT`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Nx => "NX",
+            Self::Xx => "XX",
+            Self::Gt => "GT",
+            Self::Lt => "LT",
+        }
+    }
+
+    /// The wire keyword as constant bytes.
+    pub const fn as_bytes(self) -> &'static [u8] {
+        self.as_str().as_bytes()
+    }
+}
+
 /// A section for [`Client::info_section`](crate::Client::info_section). An unknown name makes
 /// the server answer with an empty text, which is why this is an enum.
 ///

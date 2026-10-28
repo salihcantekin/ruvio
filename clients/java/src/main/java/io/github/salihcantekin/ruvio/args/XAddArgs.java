@@ -3,6 +3,8 @@ package io.github.salihcantekin.ruvio.args;
 
 import io.github.salihcantekin.ruvio.internal.Args;
 
+import java.time.Duration;
+
 /**
  * Options of {@code XADD}: entry id, {@code NOMKSTREAM}, {@code MAXLEN}/{@code MINID} trimming and the Ruvio-only {@code DELAY} hold.
  *
@@ -13,6 +15,7 @@ public final class XAddArgs {
     public XAddArgs() {
     }
 
+    private Duration ttl;
     private String id = "*";
     private boolean noMkStream;
     private long maxLen = -1;
@@ -109,11 +112,25 @@ public final class XAddArgs {
     }
 
     /**
+     * Sets {@code EX} or {@code PX}: gives the stream a time to live, but only when this call creates it; an existing key keeps its own deadline.
+     * Whole seconds are sent as {@code EX}, anything finer as {@code PX}.
+     *
+     * @param ttl the time to live (above zero)
+     * @return this builder
+     * @throws IllegalArgumentException when {@code ttl} is zero, negative or too large (checked when the command is built)
+     */
+    public XAddArgs ttl(Duration ttl) {
+        this.ttl = ttl;
+        return this;
+    }
+
+    /**
      * Appends these options to a command being encoded. Used by the client; you do not call it.
      *
      * @param a the argument writer
      */
     public void write(Args a) {
+        if (ttl != null) a.ttl(ttl);
         if (noMkStream) a.s("NOMKSTREAM");
         if (delayMillis >= 0) a.s("DELAY").l(delayMillis);
         if (trim != null) {

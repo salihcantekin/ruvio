@@ -22,6 +22,36 @@ public partial interface IRuvioClient
     ValueTask<bool> SetIfEqualAsync(string key, string value, string expected, TimeSpan? expiry = null, CancellationToken cancellationToken = default)
         => RespRead.NotNull(ExecuteAsync(CoverageCommands.SetIfEqual(key, value, expected, expiry).AsList(), cancellationToken));
 
+    /// <summary>Sends <c>SET key value IFGT [PX ms]</c>: writes when the key is missing or the value is greater than the stored integer (watermark, version, highest bid). A Ruvio extension.</summary>
+    /// <param name="key">The key.</param>
+    /// <param name="value">The new number.</param>
+    /// <param name="expiry">New time to live, rounded to milliseconds. Null removes any TTL.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
+    /// <returns><see langword="true"/> when written; <see langword="false"/> when the stored number is greater or equal.</returns>
+    /// <exception cref="RuvioException">The key holds a value that is not a string (<c>WRONGTYPE</c>), or the stored string is not an integer.</exception>
+    /// <example>
+    /// <code>
+    /// bool advanced = await db.SetIfGreaterAsync("watermark", 1_700_000_000L);
+    /// </code>
+    /// </example>
+    ValueTask<bool> SetIfGreaterAsync(string key, long value, TimeSpan? expiry = null, CancellationToken cancellationToken = default)
+        => RespRead.NotNull(ExecuteAsync(CoverageCommands.SetIfGreater(key, value, expiry).AsList(), cancellationToken));
+
+    /// <summary>Sends <c>SET key value IFLT [PX ms]</c>: writes when the key is missing or the value is smaller than the stored integer (lowest price, earliest deadline). A Ruvio extension.</summary>
+    /// <param name="key">The key.</param>
+    /// <param name="value">The new number.</param>
+    /// <param name="expiry">New time to live, rounded to milliseconds. Null removes any TTL.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
+    /// <returns><see langword="true"/> when written; <see langword="false"/> when the stored number is smaller or equal.</returns>
+    /// <exception cref="RuvioException">The key holds a value that is not a string (<c>WRONGTYPE</c>), or the stored string is not an integer.</exception>
+    /// <example>
+    /// <code>
+    /// bool lowered = await db.SetIfLessAsync("best:price", 499L);
+    /// </code>
+    /// </example>
+    ValueTask<bool> SetIfLessAsync(string key, long value, TimeSpan? expiry = null, CancellationToken cancellationToken = default)
+        => RespRead.NotNull(ExecuteAsync(CoverageCommands.SetIfLess(key, value, expiry).AsList(), cancellationToken));
+
     /// <summary>Sends <c>SET key value IFEQ expected KEEPTTL</c>: compare-and-set that keeps the current expiry.</summary>
     /// <param name="key">The key.</param>
     /// <param name="value">The new value.</param>
@@ -115,7 +145,7 @@ public partial interface IRuvioClient
     /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
     /// <returns>The new value. A missing key starts at 0.</returns>
     /// <exception cref="RuvioException">The value is not a number, or the result is not finite; <c>WRONGTYPE</c> for another type.</exception>
-    /// <remarks>Computed in double precision and printed with 15 significant digits (Redis uses long double). A TTL is kept.</remarks>
+    /// <remarks>Computed in double precision and printed with 16 significant digits (Redis uses long double). A TTL is kept.</remarks>
     /// <example>
     /// <code>
     /// double total = await db.IncrementByFloatAsync("balance", 2.5);
@@ -1092,6 +1122,31 @@ public partial interface IRuvioClient
     ValueTask<string> GetRuvioOwnerAsync(CancellationToken cancellationToken = default)
         => RespRead.RequiredText(ExecuteAsync(new RespCommand("RUVIO", "OWNER").AsList(), cancellationToken), "RUVIO");
 
+    /// <summary>Sends <c>RUVIO MOVESLOTS first-last shard</c>: moves the hash slots <paramref name="first"/> to <paramref name="last"/> to <paramref name="shard"/> (counted from 0) of the same server, which keeps serving them meanwhile. Completes once the move has started; <see cref="GetMoveSlotsStatusAsync"/> follows it. One move runs at a time, and every slot of the range must be on one shard.</summary>
+    /// <param name="first">First hash slot of the range (0-16383).</param>
+    /// <param name="last">Last hash slot of the range, inclusive.</param>
+    /// <param name="shard">Shard of the same server to move the range to.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
+    /// <exception cref="RuvioException">The range is already on that shard, spans shards, another move runs, the server has one shard, or replication is on.</exception>
+    /// <example>
+    /// <code>
+    /// await db.MoveSlotsAsync(0, 1000, 2);
+    /// </code>
+    /// </example>
+    ValueTask MoveSlotsAsync(int first, int last, int shard, CancellationToken cancellationToken = default)
+        => RespRead.Ok(ExecuteAsync(new RespCommand("RUVIO", "MOVESLOTS", RespRead.Number(first) + "-" + RespRead.Number(last), RespRead.Number(shard)).AsList(), cancellationToken));
+
+    /// <summary>Sends <c>RUVIO MOVESLOTS STATUS</c>: the running or last slot move. <c>state</c> is <c>none</c>, <c>copying</c>, <c>cleaning</c>, <c>cancelling</c>, <c>done</c> or <c>cancelled</c>; the other names are <c>first</c>, <c>last</c>, <c>from</c>, <c>to</c>, <c>keys</c>, <c>rounds</c>, <c>elapsed_ms</c>, <c>freeze_ms</c> and <c>error</c>.</summary>
+    /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
+    /// <returns>Name to value, as text.</returns>
+    /// <example>
+    /// <code>
+    /// var status = await db.GetMoveSlotsStatusAsync();
+    /// </code>
+    /// </example>
+    ValueTask<IReadOnlyDictionary<string, string>> GetMoveSlotsStatusAsync(CancellationToken cancellationToken = default)
+        => RespRead.Map(ExecuteAsync(new RespCommand("RUVIO", "MOVESLOTS", "STATUS").AsList(), cancellationToken), "RUVIO");
+
     /// <summary>Sends <c>COMMAND</c>: lists the command table.</summary>
     /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
     /// <returns>The raw reply, one entry per command (name, arity, flags and positions of the first and last key).</returns>
@@ -1193,7 +1248,7 @@ public partial interface IRuvioClient
         => RespRead.Ok(ExecuteAsync(new RespCommand("AUTH", username, password).AsList(), cancellationToken));
 
     /// <summary>Sends <c>CLIENT KILL ADDR address</c>: closes the client connections with that remote address.</summary>
-    /// <param name="address">The client address as <c>ip:port</c>, as shown by <see cref="GetClientListAsync"/>.</param>
+    /// <param name="address">The client address as <c>ip:port</c>, as shown by <see cref="GetClientListAsync(CancellationToken)"/>.</param>
     /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
     /// <returns>The number of connections closed.</returns>
     /// <remarks>Each shard knows only its own connections. With several shards the command reaches the shard that got it.</remarks>
@@ -1223,4 +1278,23 @@ public partial interface IRuvioClient
     /// </example>
     ValueTask<IdempotencyBegin> TryBeginIdempotencyAsync(string key, string fingerprint, string owner, TimeSpan ttl, CancellationToken cancellationToken = default)
         => RespRead.Idempotency(ExecuteAsync(new RespCommand("IDEM", key, "BEGIN", fingerprint, owner, RespRead.Milliseconds(ttl)).AsList(), cancellationToken));
+
+    /// <summary>
+    /// Sends <c>IDEM key ABORT fingerprint owner</c>: gives up a pending record this owner acquired, so the next
+    /// <see cref="TryBeginIdempotencyAsync"/> acquires it at once instead of waiting for the retention to end.
+    /// </summary>
+    /// <param name="key">The key.</param>
+    /// <param name="fingerprint">The fingerprint used in the begin call.</param>
+    /// <param name="owner">The owner token used in the begin call.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
+    /// <returns><see langword="true"/> when the pending record was removed; <see langword="false"/> when it is missing or expired, the owner or fingerprint differs, or it is already completed (a stored result is never removed).</returns>
+    /// <exception cref="RuvioException">A token is out of range, or the key holds a non-IDEM value.</exception>
+    /// <remarks>Abort only when the work did not take effect, or is safe to run again: a retry after an abort runs it again.</remarks>
+    /// <example>
+    /// <code>
+    /// await db.AbortIdempotencyAsync("pay:42", "sha256:ab", "worker-1");
+    /// </code>
+    /// </example>
+    ValueTask<bool> AbortIdempotencyAsync(string key, string fingerprint, string owner, CancellationToken cancellationToken = default)
+        => RespRead.Flag(ExecuteAsync(new RespCommand("IDEM", key, "ABORT", fingerprint, owner).AsList(), cancellationToken), "IDEM");
 }

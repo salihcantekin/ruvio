@@ -1,6 +1,7 @@
 ---
 // Starlight footer override: Starlight's edit link and pagination, then a slim site footer.
 import Default from "@astrojs/starlight/components/Footer.astro";
+import Lightbox from "../Lightbox.astro";
 import { footerNav } from "../../config/site";
 
 const seen = new Set<string>();
@@ -10,6 +11,7 @@ const links = footerNav
 ---
 
 <Default />
+<Lightbox />
 <div class="site-foot print:hidden">
   <nav aria-label="Site">
     {links.map((item) => <a href={item.href}>{item.href === "/" ? "Home" : item.label}</a>)}

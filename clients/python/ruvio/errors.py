@@ -23,6 +23,8 @@ __all__ = [
     "CrossSlotError",
     "LockError",
     "WatchError",
+    "is_transient",
+    "may_have_run",
 ]
 
 
@@ -101,8 +103,8 @@ class ExecAbortError(ResponseError):
 
 
 class MovedError(ResponseError):
-    """``MOVED`` / ``ASK`` cluster redirection that was not resolved (the cluster client follows ``MOVED`` up
-    to 3 times; ``ASK`` is never followed).
+    """``MOVED`` / ``ASK`` cluster redirection that was not resolved (the cluster client follows ``MOVED``
+    and ``ASK`` up to 3 times per command in all). ``TRYAGAIN`` is a plain :class:`ResponseError`.
     """
 
 
@@ -157,3 +159,58 @@ class WatchError(RuvioError):
     """``EXEC`` returned nil: a watched key changed, so the transaction did not run. :meth:`ruvio.Ruvio.transaction`
     retries on it automatically.
     """
+
+
+_TRANSIENT_CODES = frozenset(("LOADING", "MASTERDOWN", "CLUSTERDOWN", "TRYAGAIN", "READONLY", "NOREPLICAS"))
+
+
+def is_transient(error: BaseException) -> bool:
+    """Tells whether the same call can succeed later without any change on the caller's side.
+
+    True for a failed or timed-out connection (:class:`ConnectionError`, :class:`TimeoutError`) and for the
+    server replies ``LOADING``, ``MASTERDOWN``, ``CLUSTERDOWN``, ``TRYAGAIN``, ``READONLY`` and ``NOREPLICAS``.
+    False for every other server reply (``WRONGTYPE``, ``OOM``, a syntax error), for :class:`ProtocolError`,
+    for a cancelled task and for any other exception.
+
+    The client already follows ``MOVED``/``ASK`` and waits out ``TRYAGAIN`` during a slot move; this judges what
+    still reaches the caller, for a retry policy of your own (tenacity, a loop). Retry only when it is true and
+    the command is safe to repeat (a read, a ``set`` of the same value, a command with an idempotency key) or
+    :func:`may_have_run` is false.
+
+    Example:
+        >>> from tenacity import retry, retry_if_exception, stop_after_attempt
+        >>> @retry(  # incr is not safe to repeat: retry it only when it surely did not run
+        ...     retry=retry_if_exception(lambda e: is_transient(e) and not may_have_run(e)),
+        ...     stop=stop_after_attempt(3),
+        ... )
+        ... def visit(r):
+        ...     return r.incr("visits")
+
+    Args:
+        error: The exception the call raised.
+
+    Returns:
+        Whether retrying later can succeed.
+    """
+    if isinstance(error, ResponseError):
+        return error.code in _TRANSIENT_CODES
+    return isinstance(error, ConnectionError)
+
+
+def may_have_run(error: BaseException) -> bool:
+    """Tells whether the failed call may have changed data, so repeating a write that is not safe to repeat
+    could apply it twice.
+
+    False only for a server error reply (:class:`ResponseError`), which the server sends instead of running the
+    command. ``NOREPLICAS`` is the exception: the write was applied on the primary and only the replica
+    confirmation timed out. A failed connection, a timeout or a cancellation after sending may have run.
+
+    Args:
+        error: The exception the call raised.
+
+    Returns:
+        Whether the command may have been applied.
+    """
+    if isinstance(error, ResponseError):
+        return error.code == "NOREPLICAS"
+    return True

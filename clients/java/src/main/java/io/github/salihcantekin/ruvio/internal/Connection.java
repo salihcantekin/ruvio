@@ -4,16 +4,26 @@ package io.github.salihcantekin.ruvio.internal;
 import io.github.salihcantekin.ruvio.RuvioConnectionException;
 import io.github.salihcantekin.ruvio.RuvioException;
 import io.github.salihcantekin.ruvio.RuvioServerException;
+import io.github.salihcantekin.ruvio.RuvioTimeoutException;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.net.StandardSocketOptions;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
+
+import javax.net.ssl.SNIHostName;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLSocket;
 
 /**
  * One multiplexed socket shared by every caller.
@@ -36,7 +46,22 @@ public class Connection implements AutoCloseable {
     public final String host;
     /** The server port. */
     public final int port;
+    /** Set on the shared connection of a link that follows a failover: the link, and the writes kept until their reply. */
+    private Link followLink;
+    private static final int KEEP_BYTES = 128 * 1024;
+    /** The ring of kept bytes, per ring slot where the command sits in it ({@code -1}: in {@link #spill}) and its length (0: none kept). */
+    private byte[] kept;
+    private int[] keptOff;
+    private int[] keptLen;
+    private byte[][] spill;
+    /** Bytes ever put in the ring (padding included; lock held) and bytes released by the reader, in absolute positions. */
+    private long keptWritten;
+    private volatile long keptReleased;
     private final SocketChannel channel;
+    /** With TLS, the streams of the TLS socket the reader and writer use instead of {@link #channel}; all null otherwise. */
+    private final InputStream tlsIn;
+    private final OutputStream tlsOut;
+    private final SSLSocket tlsSocket;
     private final ReentrantLock lock = new ReentrantLock();
     private final Thread writer;
     private final Thread reader;
@@ -54,6 +79,9 @@ public class Connection implements AutoCloseable {
     private volatile long tail;
     private volatile long head;
 
+    private volatile long timeoutMillis;
+    private volatile Thread watchdog;
+
     private volatile Throwable closed;
     private volatile Consumer<Object> pushHandler;
     private ByteBuffer writeView;
@@ -69,22 +97,55 @@ public class Connection implements AutoCloseable {
      * @param name the name used for the threads
      * @throws IOException when the socket cannot be opened
      */
+    @SuppressWarnings("this-escape") // the writer and reader threads start here on purpose
     public Connection(String host, int port, int connectTimeoutMs, int maxInFlight, String name) throws IOException {
+        this(host, port, connectTimeoutMs, maxInFlight, name, null, null);
+    }
+
+    /**
+     * Opens the socket, wrapped in TLS when {@code tls} is given, and starts the reader and writer threads. The TLS
+     * handshake is part of the connect, and the server certificate must carry {@code serverName} (the host when null).
+     *
+     * @param host the server host
+     * @param port the server port
+     * @param connectTimeoutMs the connect timeout in milliseconds (the handshake gets the same)
+     * @param maxInFlight the most replies outstanding at once (rounded up to a power of two)
+     * @param name the name used for the threads
+     * @param tls the TLS context, or null for plain TCP
+     * @param serverName the name the certificate must carry, or null for {@code host}
+     * @throws IOException when the socket cannot be opened or the handshake fails
+     */
+    @SuppressWarnings("this-escape") // the writer and reader threads start here on purpose
+    public Connection(String host, int port, int connectTimeoutMs, int maxInFlight, String name, SSLContext tls,
+            String serverName) throws IOException {
         this.host = host;
         this.port = port;
         int cap = Integer.highestOneBit(Math.max(16, maxInFlight - 1)) << 1;
         this.ring = new Request<?>[cap];
         this.mask = cap - 1;
         SocketChannel ch = SocketChannel.open();
+        SSLSocket secure = null;
         try {
             ch.setOption(StandardSocketOptions.TCP_NODELAY, true);
             ch.setOption(StandardSocketOptions.SO_KEEPALIVE, true);
             ch.socket().connect(new InetSocketAddress(host, port), connectTimeoutMs);
-        } catch (IOException e) {
+            if (tls != null) {
+                secure = handshake(ch.socket(), tls, serverName == null ? host : serverName, port, connectTimeoutMs);
+            }
+        } catch (IOException | RuntimeException e) {
             ch.close();
             throw e;
         }
         this.channel = ch;
+        if (secure != null) {
+            this.tlsIn = secure.getInputStream();
+            this.tlsOut = secure.getOutputStream();
+            this.tlsSocket = secure;
+        } else {
+            this.tlsIn = null;
+            this.tlsOut = null;
+            this.tlsSocket = null;
+        }
         out.owner = this;
         spare.owner = this;
         writer = new Thread(this::writeLoop, name + "-writer");
@@ -95,6 +156,25 @@ public class Connection implements AutoCloseable {
         reader.start();
     }
 
+    /** Wraps the connected socket in TLS and finishes the handshake, with the host name checked against {@code name}. */
+    private static SSLSocket handshake(Socket plain, SSLContext tls, String name, int port, int timeoutMs) throws IOException {
+        SSLSocket socket = (SSLSocket) tls.getSocketFactory().createSocket(plain, name, port, true);
+        SSLParameters parameters = socket.getSSLParameters();
+        parameters.setEndpointIdentificationAlgorithm("HTTPS");
+        if (!isIpAddress(name)) {
+            parameters.setServerNames(List.of(new SNIHostName(name)));
+        }
+        socket.setSSLParameters(parameters);
+        socket.setSoTimeout(timeoutMs);
+        socket.startHandshake();
+        socket.setSoTimeout(0);
+        return socket;
+    }
+
+    private static boolean isIpAddress(String name) {
+        return name.indexOf(':') >= 0 || (!name.isEmpty() && name.chars().allMatch(c -> c == '.' || (c >= '0' && c <= '9')));
+    }
+
     /**
      * Sets the receiver of RESP3 push frames; it runs on the reader thread.
      *
@@ -102,6 +182,41 @@ public class Connection implements AutoCloseable {
      */
     public void setPushHandler(Consumer<Object> handler) {
         this.pushHandler = handler;
+    }
+
+    /**
+     * Turns on the command timeout for futures handed to callers: each request gets a deadline when it is
+     * queued (the timeout plus a blocking command's own wait, none for one that waits forever), and one
+     * daemon thread per connection fails overdue requests with {@link RuvioException}. The late reply is
+     * still read and dropped, so the connection stays in use. Call once, before the first command.
+     *
+     * @param millis the command timeout in milliseconds; 0 or less leaves it off
+     */
+    public void setCommandTimeout(long millis) {
+        if (millis <= 0 || watchdog != null || closed != null) {
+            return;
+        }
+        timeoutMillis = millis;
+        long period = Math.max(10, Math.min(1000, millis / 4)) * 1_000_000L;
+        Thread t = new Thread(() -> watchLoop(millis, period), writer.getName().replace("-writer", "-watchdog"));
+        t.setDaemon(true);
+        watchdog = t;
+        t.start();
+    }
+
+    private void watchLoop(long millis, long period) {
+        while (closed == null) {
+            LockSupport.parkNanos(this, period);
+            long now = System.nanoTime();
+            long t = tail; // the ring slots below t are published by this volatile read
+            for (long i = head; i < t; i++) {
+                Request<?> q = ring[(int) (i & mask)];
+                if (q != null && q.deadline != 0 && now - q.deadline >= 0) {
+                    q.deadline = 0;
+                    q.fail(new RuvioTimeoutException("no reply within " + millis + " ms (command timeout)"));
+                }
+            }
+        }
     }
 
     /**
@@ -149,6 +264,81 @@ public class Connection implements AutoCloseable {
         }
     }
 
+    /**
+     * Makes this connection keep each write sent with {@link #endKeeping} until its reply arrives, so that a
+     * {@code READONLY} refusal can be sent again by {@code link}. The bytes are copied into a fixed ring of bytes that
+     * is freed in reply order, so the healthy path allocates nothing; a write that does not fit (very many writes in
+     * flight) gets its own copy. Call before the first command.
+     *
+     * @param link the link to tell about a refusal
+     */
+    void keepWrites(Link link) {
+        kept = new byte[KEEP_BYTES];
+        keptOff = new int[ring.length];
+        keptLen = new int[ring.length];
+        followLink = link;
+    }
+
+    /**
+     * Like {@link #end}, and keeps the encoded command (unless it is a read, which a replica never refuses) for a
+     * {@code READONLY} reply.
+     *
+     * @param request the request that will receive the reply
+     */
+    public void endKeeping(Request<?> request) {
+        end(request, true);
+    }
+
+    /** Keeps the command encoded at {@code out.buf[mark, out.pos)} for ring slot {@code slot}. Lock held. */
+    private void keep(int slot) {
+        byte[] b = out.buf;
+        if (Link.isRead(b, mark)) {
+            keptLen[slot] = 0;
+            return;
+        }
+        int n = out.pos - mark;
+        byte[] arena = kept;
+        int size = arena.length;
+        long w = keptWritten;
+        int o = (int) (w % size);
+        if (o + n > size) {
+            w += size - o; // the command does not fit before the end: start again at the front
+            o = 0;
+        }
+        if (n <= size && w + n - keptReleased <= size) {
+            System.arraycopy(b, mark, arena, o, n);
+            keptWritten = w + n;
+            keptOff[slot] = o;
+        } else {
+            if (spill == null) {
+                spill = new byte[ring.length][];
+            }
+            spill[slot] = java.util.Arrays.copyOfRange(b, mark, mark + n);
+            keptOff[slot] = -1;
+        }
+        keptLen[slot] = n;
+    }
+
+    /** Reader thread: the request in ring slot {@code slot} was answered; its kept bytes may be overwritten. */
+    private void release(int slot) {
+        int n = keptLen[slot];
+        if (n == 0) {
+            return;
+        }
+        keptLen[slot] = 0;
+        int o = keptOff[slot];
+        if (o < 0) {
+            spill[slot] = null;
+            return;
+        }
+        long r = keptReleased;
+        long start = r - r % kept.length + o;
+        if (start < r) {
+            start += kept.length;
+        }
+        keptReleased = start + n;
+    }
+
     /** Drops the partly encoded frame and releases the lock. */
     public void abort() {
         out.pos = mark;
@@ -161,8 +351,23 @@ public class Connection implements AutoCloseable {
      * @param request the request that will receive the reply
      */
     public void end(Request<?> request) {
+        end(request, false);
+    }
+
+    private void end(Request<?> request, boolean keep) {
         long t = tail;
+        if (kept != null) {
+            if (keep) {
+                keep((int) (t & mask));
+            } else {
+                keptLen[(int) (t & mask)] = 0;
+            }
+        }
         boolean serial = t == head;
+        long tm = timeoutMillis;
+        if (tm > 0) {
+            request.arm(tm);
+        }
         ring[(int) (t & mask)] = request;
         tail = t + 1;
         submitLocked(serial);
@@ -183,8 +388,15 @@ public class Connection implements AutoCloseable {
         }
         long t = tail;
         boolean serial = t == head;
+        long tm = timeoutMillis;
         for (int i = 0; i < count; i++) {
+            if (tm > 0) {
+                requests[i].arm(tm);
+            }
             ring[(int) ((t + i) & mask)] = requests[i];
+            if (kept != null) {
+                keptLen[(int) ((t + i) & mask)] = 0;
+            }
         }
         tail = t + count;
         submitLocked(serial);
@@ -280,6 +492,11 @@ public class Connection implements AutoCloseable {
     /** Writes the whole buffer. Returns false (and fails the connection) on an I/O error. */
     private boolean writeBuffer(RespOut b) {
         try {
+            if (tlsOut != null) {
+                tlsOut.write(b.buf, 0, b.pos);
+                tlsOut.flush();
+                return true;
+            }
             ByteBuffer bb = view(b.buf);
             bb.limit(b.pos).position(0);
             while (bb.hasRemaining()) {
@@ -311,8 +528,13 @@ public class Connection implements AutoCloseable {
         int lim = 0;
         try {
             for (;;) {
-                bb.limit(buf.length).position(lim);
-                int n = channel.read(bb);
+                int n;
+                if (tlsIn != null) {
+                    n = tlsIn.read(buf, lim, buf.length - lim);
+                } else {
+                    bb.limit(buf.length).position(lim);
+                    n = channel.read(bb);
+                }
                 if (n < 0) {
                     throw new RuvioConnectionException("connection closed by server");
                 }
@@ -363,7 +585,11 @@ public class Connection implements AutoCloseable {
     /** Removes the request at the head of the FIFO. Reader thread only. */
     public final void popRequest() {
         long h = head;
-        ring[(int) (h & mask)] = null;
+        int slot = (int) (h & mask);
+        ring[slot] = null;
+        if (kept != null) {
+            release(slot);
+        }
         head = h + 1;
     }
 
@@ -390,8 +616,26 @@ public class Connection implements AutoCloseable {
         if (q == null) {
             throw new RuvioException("protocol error: reply without a pending request");
         }
+        if (q.isDone()) {
+            // Failed by the command timeout (or cancelled): read the late reply and drop it.
+            r.skip();
+            popRequest();
+            return;
+        }
         if (t == '-') {
             RuvioServerException err = r.readError();
+            Link l = followLink;
+            if (l != null && Link.isReadonly(err)) {
+                int slot = (int) (head & mask);
+                int n = keptLen[slot];
+                if (n > 0) {
+                    int o = keptOff[slot];
+                    byte[] command = o < 0 ? spill[slot] : java.util.Arrays.copyOfRange(kept, o, o + n);
+                    popRequest();
+                    l.followReadonly(q, command, this, err);
+                    return;
+                }
+            }
             popRequest();
             q.fail(err);
             return;
@@ -439,11 +683,19 @@ public class Connection implements AutoCloseable {
             lock.unlock();
         }
         try {
+            // The plain socket first: closing a TLS socket sends a close_notify, which can wait behind a blocked write.
             channel.close();
+            if (tlsSocket != null) {
+                tlsSocket.close();
+            }
         } catch (IOException ignored) {
             // closing anyway
         }
         LockSupport.unpark(writer);
+        Thread w = watchdog;
+        if (w != null) {
+            LockSupport.unpark(w);
+        }
         // Producers can no longer push (they check "closed" under the lock), so drain the ring.
         // Wait for the reader to stop touching head before draining from another thread.
         if (Thread.currentThread() != reader) {

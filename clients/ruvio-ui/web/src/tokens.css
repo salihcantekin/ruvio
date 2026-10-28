@@ -13,6 +13,7 @@
   --line: #242b3e;
   --hover-wash: rgba(160, 175, 215, 0.07);
   --shadow: rgba(2, 3, 8, 0.6);
+  --side-wash: rgba(17, 22, 46, 0.45);
 
   /* Text */
   --ink: #e9ecf3;
@@ -54,6 +55,7 @@
   --danger-line: rgba(255, 157, 157, 0.35);
   --danger-wash: rgba(255, 157, 157, 0.05);
   --warn: #f0b45a;
+  --warn-wash: rgba(240, 180, 90, 0.06);
 
   /* JSON viewer */
   --syn-key: #8da2c0;
@@ -67,4 +69,58 @@
   --f-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Consolas, monospace;
 
   color-scheme: dark;
+}
+
+/*
+ * Light theme, the same slate-blue paper as the project site (never plain white).
+ * Applied by theme.js through <html data-theme="light">.
+ */
+:root[data-theme="light"] {
+  --bg: #e9ecf2;
+  --panel: rgba(244, 246, 250, 0.86);
+  --panel-solid: #f3f5f9;
+  --soft: #e3e7ef;
+  --soft-hover: #d9dfea;
+  --inset: rgba(20, 28, 48, 0.05);
+  --line: #c8cfdd;
+  --hover-wash: rgba(20, 28, 48, 0.06);
+  --shadow: rgba(20, 28, 48, 0.22);
+  --side-wash: rgba(59, 87, 128, 0.07);
+
+  --ink: #141b2d;
+  --muted: #4a566c;
+  --faint: #566277;
+
+  --accent: #a4441e;
+  --accent-hover: #913b19;
+  --accent-ink: #ffffff;
+  --accent-text: #963d19;
+  --accent-dim: rgba(164, 68, 30, 0.08);
+  --accent-line: rgba(164, 68, 30, 0.45);
+
+  --dusk: 190, 96, 52;
+  --ground-glow-a: rgba(59, 87, 128, 0.10);
+  --ground-glow-b: rgba(var(--dusk), 0.07);
+  --ground-dot: rgba(20, 28, 48, 0.07);
+  --sky-0: #e3e8f1;
+  --sky-1: #d8dfec;
+  --sky-2: #e5dedd;
+  --sky:
+    radial-gradient(60% 120% at 30% 160%, rgba(var(--dusk), 0.22), rgba(var(--dusk), 0) 70%),
+    linear-gradient(180deg, var(--sky-0) 0%, var(--sky-1) 70%, var(--sky-2) 100%);
+  --sky-edge: linear-gradient(90deg, transparent, rgba(var(--dusk), 0.55), transparent);
+
+  --danger: #a92a22;
+  --danger-line: rgba(169, 42, 34, 0.4);
+  --danger-wash: rgba(169, 42, 34, 0.06);
+  --warn: #8a5a00;
+  --warn-wash: rgba(138, 90, 0, 0.08);
+
+  --syn-key: #3b5780;
+  --syn-string: #2f6b2f;
+  --syn-number: #8a5a00;
+  --syn-boolean: #7b3fa6;
+  --placeholder: #5f6a80;
+
+  color-scheme: light;
 }

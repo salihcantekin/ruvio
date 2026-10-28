@@ -23,7 +23,7 @@ func (c *Client) execManyLocal(ctx context.Context, r *request, n int) ([]Value,
 func (c *Client) rtMany(ctx context.Context, r *request, n int) (bool, error) {
 	r.expect = n
 	r.vals = make([]Value, 0, n)
-	return c.rt(ctx, r, false)
+	return c.rt(ctx, r, false, false)
 }
 
 func (cl *cluster) execMany(ctx context.Context, r *request, n int) ([]Value, error) {
@@ -42,6 +42,9 @@ func (cl *cluster) execMany(ctx context.Context, r *request, n int) ([]Value, er
 	defer pipePool.Put(s)
 	s.offs, s.target = s.offs[:0], s.target[:0]
 	seedIndex := len(t.nodes) // keyless commands, and slots without an owner, go to the seed
+	// A pipeline goes to replicas only when every command in it is a read, so it never reads
+	// its own writes from a replica that has not received them.
+	replicaReads := cl.policy != ReadPrimary
 	cur := -1
 	off := 0
 	for i := 0; i < n; i++ {
@@ -57,6 +60,9 @@ func (cl *cluster) execMany(ctx context.Context, r *request, n int) ([]Value, er
 			return nil, ErrProtocol
 		}
 		off += end
+		if replicaReads && !spec.reads() {
+			replicaReads = false
+		}
 		if upperEq(cmdName(r.buf[off-end:]), "MULTI") {
 			sawMulti = true
 		}
@@ -91,6 +97,9 @@ func (cl *cluster) execMany(ctx context.Context, r *request, n int) ([]Value, er
 		s.target = append(s.target, cur)
 	}
 	s.offs = append(s.offs, off)
+	if replicaReads && n > 0 {
+		return cl.pipeReads(ctx, t, r, n, s, split)
+	}
 	if sawMulti && differ {
 		putReq(r)
 		return nil, fmt.Errorf("%w (MULTI)", ErrCrossSlot)
@@ -109,6 +118,53 @@ func (cl *cluster) execMany(ctx context.Context, r *request, n int) ([]Value, er
 		return cl.pipeMany(ctx, t, r, n, split)
 	}
 	return cl.pipeSpread(ctx, t, r, n, s)
+}
+
+// pipeReads sends a pipeline of reads: each command goes to the replica of its slot's node
+// (or to the primary where there is none), keyless commands to the seed. s holds the frame
+// offsets of the pipeline. A split command in it is read on its own, so the pipeline runs one
+// command at a time. It recycles r.
+func (cl *cluster) pipeReads(ctx context.Context, t *topology, r *request, n int, s *pipeScratch, split bool) ([]Value, error) {
+	if split {
+		return cl.pipeReadsEach(ctx, r, n, s)
+	}
+	s.target = s.target[:0]
+	for i := 0; i < n; i++ {
+		_, slot, _, _ := routeFrame(r.buf[s.offs[i]:])
+		ni := len(t.nodes) // the seed
+		if slot >= 0 {
+			rt, err := cl.replicaFor(ctx, t, slot)
+			if err != nil {
+				putReq(r)
+				return nil, err
+			}
+			if o := int(t.owner[slot]); rt != nil {
+				ni = o + len(t.nodes) + 1 // the replica of node o
+			} else if o != noOwner {
+				ni = o
+			}
+		}
+		s.target = append(s.target, ni)
+	}
+	return cl.pipeSpread(ctx, t, r, n, s)
+}
+
+// pipeReadsEach runs the commands of a pipeline of reads one after the other, each through
+// the routing of a plain command.
+func (cl *cluster) pipeReadsEach(ctx context.Context, r *request, n int, s *pipeScratch) ([]Value, error) {
+	out := make([]Value, n)
+	for i := 0; i < n; i++ {
+		sub := getReq()
+		sub.buf = append(sub.buf, r.buf[s.offs[i]:s.offs[i+1]]...)
+		v, err := cl.exec(ctx, sub)
+		if err != nil && v.Kind != KindError {
+			putReq(r)
+			return nil, err
+		}
+		out[i] = v
+	}
+	putReq(r)
+	return out, nil
 }
 
 // pipeScratch is the per-pipeline routing state of execMany, pooled so a pipeline spread over
@@ -143,6 +199,9 @@ func (cl *cluster) pipeSpread(ctx context.Context, t *topology, r *request, n in
 		}
 	}
 	nodes := len(t.nodes) + 1
+	if len(t.read) > 0 {
+		nodes += len(t.nodes) // the replicas follow the seed
+	}
 	for len(s.subs) < nodes {
 		s.subs = append(s.subs, nil)
 		s.vals = append(s.vals, nil)
@@ -177,6 +236,8 @@ func (cl *cluster) pipeSpread(ctx context.Context, t *topology, r *request, n in
 		node := cl.seed
 		if ni < len(t.nodes) {
 			node = t.nodes[ni]
+		} else if ni > len(t.nodes) {
+			node = t.read[ni-len(t.nodes)-1].node
 		}
 		// A non-nil reply slice marks a pipeline for the reader, even for one command.
 		if sub.vals = s.vals[ni][:0]; sub.vals == nil {
@@ -187,6 +248,7 @@ func (cl *cluster) pipeSpread(ctx context.Context, t *topology, r *request, n in
 			// Every node is written before any is read. A node with nobody reading lets this
 			// goroutine read its replies below, without a hand-off to the node's reader.
 			s.conns[ni] = cn
+			cn.setDeadline(ctx, sub)
 			s.leads[ni], err = cn.send(sub, canLead)
 		}
 		if err != nil {
@@ -223,7 +285,8 @@ func (cl *cluster) pipeSpread(ctx context.Context, t *topology, r *request, n in
 		var ok bool
 		var err error
 		if s.leads[ni] {
-			ok, err = s.conns[ni].lead(ctx, sub)
+			s.conns[ni].lead(sub)
+			ok = true
 		} else {
 			ok, err = sub.wait(ctx)
 		}
@@ -261,7 +324,7 @@ func (cl *cluster) pipeSpread(ctx context.Context, t *topology, r *request, n in
 	}
 	for i := range out {
 		if out[i].Kind == KindError {
-			if _, _, isMoved := parseMoved(out[i].Bytes); isMoved {
+			if isRedirectErr(out[i].Bytes) {
 				cl.redo(ctx, r.buf[s.offs[i]:s.offs[i+1]], &out[i])
 			}
 		}
@@ -290,7 +353,7 @@ func frameAt(buf []byte, i int) []byte {
 	return buf[off : off+end]
 }
 
-// pipeOne sends the whole pipeline to one node and repairs -MOVED replies.
+// pipeOne sends the whole pipeline to one node and repairs -MOVED, -ASK and -TRYAGAIN replies.
 func (cl *cluster) pipeOne(ctx context.Context, node *Client, r *request, n int) ([]Value, error) {
 	ok, err := node.rtMany(ctx, r, n)
 	if !ok {
@@ -304,7 +367,7 @@ func (cl *cluster) pipeOne(ctx context.Context, node *Client, r *request, n int)
 	vals := r.vals
 	for i := range vals {
 		if vals[i].Kind == KindError {
-			if _, _, isMoved := parseMoved(vals[i].Bytes); isMoved {
+			if isRedirectErr(vals[i].Bytes) {
 				cl.redo(ctx, frameAt(r.buf, i), &vals[i])
 			}
 		}
@@ -313,7 +376,7 @@ func (cl *cluster) pipeOne(ctx context.Context, node *Client, r *request, n int)
 	return vals, nil
 }
 
-// redo sends one command again after -MOVED (the table is updated first) and stores the
+// redo sends one command again after -MOVED, -ASK or -TRYAGAIN (the table is updated first) and stores the
 // outcome in dst.
 func (cl *cluster) redo(ctx context.Context, frame []byte, dst *Value) {
 	req := getReq()
@@ -431,7 +494,7 @@ func (cl *cluster) pipeMany(ctx context.Context, t *topology, r *request, n int,
 				continue
 			}
 			if v.Kind == KindError {
-				if _, _, isMoved := parseMoved(v.Bytes); isMoved { // repair this part alone
+				if isRedirectErr(v.Bytes) { // repair this part alone
 					again := getReq()
 					plans[it.i].appendPart(again, it.part)
 					var err error
@@ -466,7 +529,7 @@ func (cl *cluster) pipeMany(ctx context.Context, t *topology, r *request, n int,
 			continue
 		}
 		if out[i].Kind == KindError {
-			if _, _, isMoved := parseMoved(out[i].Bytes); isMoved {
+			if isRedirectErr(out[i].Bytes) {
 				cl.redo(ctx, r.buf[offs[i]:offs[i+1]], &out[i])
 			}
 		}

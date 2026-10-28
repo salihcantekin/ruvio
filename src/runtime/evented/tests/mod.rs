@@ -190,23 +190,22 @@ fn serve_on_ephemeral() -> (SocketAddr, ShutdownToken, thread::JoinHandle<()>) {
     serve_with(|_| {})
 }
 
+/// Two listeners on consecutive ports from a reserved block (see `crate::test_ports`): a port
+/// next to one the OS picked for `127.0.0.1:0` is in the ephemeral range, where parallel tests'
+/// outbound sockets can take it.
 fn bind_consecutive_pair() -> (std::net::TcpListener, std::net::TcpListener, u16) {
-    for _ in 0..32 {
-        let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = first.local_addr().unwrap();
-        let Some(next) = address.port().checked_add(1) else {
-            continue;
-        };
+    let ports = crate::test_ports::reserve();
+    // Bound under the spawn lock, so no child forked meanwhile keeps a copy of them.
+    let spawning = crate::test_ports::spawn_lock();
+    let first = std::net::TcpListener::bind(ports.address_at(0)).unwrap();
+    let second = std::net::TcpListener::bind(ports.address_at(1)).unwrap();
 
-        if let Ok(second) = std::net::TcpListener::bind((address.ip(), next)) {
-            first.set_nonblocking(true).unwrap();
-            second.set_nonblocking(true).unwrap();
+    drop(spawning);
 
-            return (first, second, address.port());
-        }
-    }
+    first.set_nonblocking(true).unwrap();
+    second.set_nonblocking(true).unwrap();
 
-    panic!("could not bind consecutive ports");
+    (first, second, ports.port())
 }
 
 fn serve_two_shards() -> (
@@ -262,6 +261,8 @@ fn serve_two_shards_with(
         shard_count: 2,
         advertised_host: advertised.clone(),
         advertised_port,
+        slots: crate::routing::SlotTable::from_formula(2),
+        topology: None,
     };
 
     let route1 = ClusterRoute {
@@ -269,6 +270,8 @@ fn serve_two_shards_with(
         shard_count: 2,
         advertised_host: advertised,
         advertised_port,
+        slots: crate::routing::SlotTable::from_formula(2),
+        topology: None,
     };
 
     let left = first.local_addr().unwrap();
@@ -486,12 +489,17 @@ fn tag_on_shard(shard: usize) -> String {
     panic!("no hash tag landed on shard {shard}");
 }
 
+mod change_failover;
 mod cluster;
+mod config_set;
 mod connection;
 mod expire;
 mod hangups;
 mod maintenance;
 mod misc;
 mod replica;
+mod replica_reads;
+mod role_change;
 mod single_port;
+mod slot_moves;
 mod wal;

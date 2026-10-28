@@ -23,7 +23,7 @@ impl WalSink {
 
         if !config.profile.uses_wal() {
             let published = Arc::new(AtomicU64::new(0));
-            let durable = Arc::new(AtomicU64::new(0));
+            let durable = Arc::new(DurableSequence::new(0));
             let backlog_floor = Arc::new(AtomicU64::new(u64::MAX));
             let replica_count = Arc::new(AtomicU64::new(0));
 
@@ -49,7 +49,6 @@ impl WalSink {
                     failed: None,
                     sync_failed: false,
                     hot_through: 0,
-                    hot_refused: false,
                     last_recovery: None,
                     published,
                     durable,
@@ -63,7 +62,7 @@ impl WalSink {
                     group_bytes: 0,
                     tick_hold: false,
                     sync_running: Arc::new(AtomicBool::new(false)),
-                    sync_error: Arc::new(Mutex::new(None)),
+                    sync_error: Arc::default(),
                     sync_in_flight: 0,
                     sync_worker: None,
                     sync_worker_file: None,
@@ -119,10 +118,10 @@ impl WalSink {
         };
 
         let published = Arc::new(AtomicU64::new(report.last_sequence));
-        let durable = Arc::new(AtomicU64::new(report.last_sequence));
+        let durable = Arc::new(DurableSequence::new(report.last_sequence));
         let backlog_floor = Arc::new(AtomicU64::new(u64::MAX));
         let replica_count = Arc::new(AtomicU64::new(0));
-        let sync_error = Arc::new(Mutex::new(None));
+        let sync_error = Arc::new(SyncError::default());
         let prefill_enabled =
             cfg!(target_os = "linux") && config.wal_prefill.enabled_for(config.profile);
         let sync_worker = if config.sync_worker_active {
@@ -156,7 +155,6 @@ impl WalSink {
                 failed: None,
                 sync_failed: false,
                 hot_through: 0,
-                hot_refused: false,
                 last_recovery: None,
                 published,
                 durable,
@@ -192,7 +190,7 @@ impl WalSink {
     }
 
     /// Last sequence synced to disk. Replication ships through this cursor.
-    pub fn durable(&self) -> Arc<AtomicU64> {
+    pub fn durable(&self) -> Arc<DurableSequence> {
         Arc::clone(&self.durable)
     }
 
@@ -310,9 +308,8 @@ impl WalSink {
         self.sync_failed
     }
 
-    /// Before a hot-key write is applied to the shared hot store: a failed log tries to
-    /// resume, as its next record would, and refuses the write while it cannot, so the
-    /// write is refused before any other shard can read it.
+    /// Before a hot-key write: a failed log tries to resume, as its next record would, and
+    /// refuses the write while it cannot, even one that would record nothing.
     pub fn ready_for_record(&mut self) -> Result<(), PersistenceError> {
         if self.failed.is_none() {
             return Ok(());
@@ -321,22 +318,16 @@ impl WalSink {
         self.recover_if_failed()
     }
 
-    /// The records just made hold a hot-key write already in the shared hot store.
+    /// The records just made hold a hot-key write now in the shared hot store.
     pub fn note_hot_record(&mut self) {
         self.hot_through = self.last_sequence();
-    }
-
-    /// A hot-key write already in the shared hot store was refused (its record failed).
-    pub fn note_hot_refused(&mut self) {
-        self.hot_refused = true;
     }
 
     /// For a cluster round's hot partition, taken from the shared hot store: under
     /// `always`, syncs this log's hot-key records, so every hot write the partition holds
     /// is acknowledged or will be. Fails while that is not so; the flag says whether a
-    /// later attempt may succeed: not after this log refused a hot write that the store
-    /// may still hold (a failed record, or a failed sync past which `hot_through` lies),
-    /// which lasts until restart. A log that failed for other records alone does not keep
+    /// later attempt may succeed: not after a failed sync past which `hot_through` lies
+    /// (the store may hold a hot write the log cannot vouch for), which lasts until restart. A log that failed for other records alone does not keep
     /// the partition out.
     pub fn sync_hot_records(&mut self) -> Result<(), (PersistenceError, bool)> {
         if self.profile != DurabilityProfile::Always {
@@ -350,10 +341,6 @@ impl WalSink {
                  hot store may still hold ({message})"
             ))
         };
-
-        if self.hot_refused {
-            return Err((refused("record failed"), false));
-        }
 
         // A base installed since (a replica's resync) may have moved the sequence back.
         let hot_through = self.hot_through.min(self.last_sequence());

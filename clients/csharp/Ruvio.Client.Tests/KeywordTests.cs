@@ -43,6 +43,17 @@ public class KeywordTests
         Assert.Equal(Encode(new RespCommand("BLMOVE", "a", "b", word, "LEFT", 1)), Encode(new RespCommand("BLMOVE", "a", "b", Keywords.Arg(side), "LEFT", 1)));
     }
 
+    [Theory]
+    [InlineData(ExpireCondition.Nx, "NX")]
+    [InlineData(ExpireCondition.Xx, "XX")]
+    [InlineData(ExpireCondition.Gt, "GT")]
+    [InlineData(ExpireCondition.Lt, "LT")]
+    public void ExpireConditionTableMatchesTheServerWords(ExpireCondition condition, string word)
+    {
+        Assert.Equal(word, Keywords.Word(condition));
+        Assert.Equal(Encode(new RespCommand("EXPIRE", "k", 5, word)), Encode(new RespCommand("EXPIRE", "k", 5, Keywords.Arg(condition))));
+    }
+
     [Fact]
     public void TokenArgumentsSurviveTheListPath()
     {

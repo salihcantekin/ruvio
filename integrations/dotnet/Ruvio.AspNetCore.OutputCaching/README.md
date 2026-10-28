@@ -120,6 +120,77 @@ invalidations and bring back stale responses; this is not durable application
 state or an authorization boundary. Never enable caching of user-specific content
 without an appropriate trusted variation policy.
 
+## A separate connection
+
+By default the store uses the unkeyed `IRuvioClient`. To give it a connection of its
+own (another server, database or set of options), register one with
+`AddKeyedRuvioClient` from `Ruvio.Client.AspNetCore` and name it in `ClientKey`:
+
+```csharp
+builder.Services.AddKeyedRuvioClient("pages", "cache-host", 6379);
+builder.Services.AddRuvioOutputCache(o => o.ClientKey = "pages");
+```
+
+The keyed client is resolved on first use, like the unkeyed one.
+
+## Metrics
+
+Meter `Ruvio.AspNetCore.OutputCaching`: `ruvio.output_cache.hit`, `ruvio.output_cache.miss` (tagged `reason`: `absent`
+when no entry is stored, `tag_evicted` when a tag of the entry was evicted since) and `ruvio.output_cache.tag_evict`
+(one per `EvictByTagAsync`), next to the existing `ruvio.output_cache.storage_calls`, `storage_commands` and
+`storage_duration` (tagged `operation` and `outcome`). No keys or tags are recorded. With no listener attached a lookup
+pays one field read.
+
+## Startup checks
+
+A configuration mistake stops the host while it starts, before the server takes a request, with the fix named in the error. This package checks:
+
+- the client is registered: `AddRuvioClient(...)`, or `AddKeyedRuvioClient(key, ...)` when `ClientKey` is set. Only the registration is checked, no connection is opened, so a Ruvio that is down at start still follows the `Outage` settings.
+
+See [Startup checks](../README.md#startup-checks) for how the checks run.
+
+## When Ruvio is unreachable
+
+ASP.NET Core's output-cache middleware already treats a store error on a read or a write as a miss and serves the
+endpoint's own response. What `Outage` adds:
+
+- `FailOpen` also drops `EvictByTagAsync` calls instead of throwing. An eviction that was dropped is not repeated, so the
+  entries it should have removed can be served again once Ruvio is back; use it only when stale pages are acceptable.
+  `Throw` (the default) and `FailClosed` raise from `EvictByTagAsync`.
+- A circuit breaker (`options.Outage.CircuitBreaker`) stops every request from waiting out a timeout on a Ruvio that is
+  down: an open circuit answers reads as misses at once and skips writes.
+
+```csharp
+builder.Services.AddRuvioOutputCache(options =>
+{
+    options.Outage.Mode = RuvioOutageMode.FailOpen;
+    options.Outage.CircuitBreaker = new RuvioCircuitBreakerOptions();
+});
+```
+
+See [When Ruvio is unreachable](../README.md#when-ruvio-is-unreachable) for the modes and the circuit breaker.
+
+### Watching the circuit
+
+Each change of the circuit is logged through `ILogger` under the category `Ruvio.AspNetCore.OutputCaching`: a Warning when it opens (with the break
+duration), Information for the trial call and when it closes. The client counts the changes in
+`ruvio_client_circuit_transitions`. To react in your own code, for a health check or an alert, subscribe to the breaker
+after setting it:
+
+```csharp
+builder.Services.AddRuvioOutputCache(options =>
+{
+    options.Outage.Mode = RuvioOutageMode.FailOpen;
+    options.Outage.CircuitBreaker = new RuvioCircuitBreakerOptions();
+    // Subscribe after setting CircuitBreaker: setting it again replaces the breaker.
+    options.Outage.Breaker!.StateChanged += (_, change) =>
+        RuvioHealth.Down = change.Current == RuvioCircuitState.Open;   // your own flag, read by a health check
+});
+```
+
+The handler runs after the state changed, outside the breaker's lock; an exception it throws is caught and does not reach
+the call.
+
 ## Development
 
 ```bash

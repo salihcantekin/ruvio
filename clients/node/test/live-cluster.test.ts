@@ -412,3 +412,15 @@ test('cluster client against a plain server falls back to standalone', { skip: S
 });
 
 void CLUSTER_ADDR;
+
+test('cluster: RUVIO MOVESLOTS STATUS answers and a range already in place is refused', { skip: CSKIP }, async () => {
+  const c = await cluster();
+  try {
+    const status = await c.moveSlotsStatus();
+    assert.ok('state' in status, JSON.stringify(status));
+    // Slot 0 is on shard 0: nothing to move, and the server says why.
+    await assert.rejects(c.moveSlots(0, 10, 0), /already on that shard/);
+  } finally {
+    await c.quit();
+  }
+});

@@ -100,7 +100,7 @@ public static class RuvioServiceCollectionExtensions
     /// Binds <see cref="RuvioClientOptions"/> from configuration and registers a singleton <see cref="RuvioClient"/>.
     /// </summary>
     /// <param name="services">The service collection.</param>
-    /// <param name="configuration">A configuration section whose keys are option names: <c>Host</c>, <c>Port</c>, <c>Username</c>, <c>Password</c>, <c>Database</c>, <c>ConnectTimeout</c>, <c>MaxInFlightRequests</c>, <c>DedicatedReaderThread</c>, <c>DiscoverCluster</c>, <c>Reconnect</c>, <c>MaxReconnectAttempts</c>, <c>ReconnectBaseDelay</c> and <c>ReconnectMaxDelay</c>. Missing keys keep the defaults. Time spans use the <c>hh:mm:ss</c> form.</param>
+    /// <param name="configuration">A configuration section whose keys are option names: <c>Host</c>, <c>Port</c>, <c>Seeds</c> (an array of <c>host:port</c> strings), <c>Username</c>, <c>Password</c>, <c>Database</c>, <c>ConnectTimeout</c>, <c>MaxInFlightRequests</c>, <c>DedicatedReaderThread</c>, <c>DiscoverCluster</c>, <c>Reconnect</c>, <c>MaxReconnectAttempts</c>, <c>ReconnectBaseDelay</c> and <c>ReconnectMaxDelay</c>, plus the TLS keys <c>Tls</c> (true turns TLS on), <c>TlsServerName</c>, <c>TlsCaFile</c>, <c>TlsClientCertFile</c>, <c>TlsClientKeyFile</c> (PEM files) and <c>TlsInsecureSkipVerify</c>. Missing keys keep the defaults. Time spans use the <c>hh:mm:ss</c> form.</param>
     /// <returns>The same collection, for chaining.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="services"/> or <paramref name="configuration"/> is null.</exception>
     /// <exception cref="FormatException">A numeric, boolean or time value in the section cannot be parsed (raised when the options are first read).</exception>
@@ -129,6 +129,17 @@ public static class RuvioServiceCollectionExtensions
 
         if (Number(configuration, "Port") is { } port)
             options.Port = port;
+
+        List<string>? seeds = null;
+
+        foreach (IConfigurationSection seed in configuration.GetSection("Seeds").GetChildren())
+        {
+            if (seed.Value is { Length: > 0 } entry)
+                (seeds ??= []).Add(entry);
+        }
+
+        if (seeds is not null)
+            options.Seeds = seeds;
 
         if (configuration["Username"] is { } username)
             options.Username = username;
@@ -162,6 +173,47 @@ public static class RuvioServiceCollectionExtensions
 
         if (Span(configuration, "ReconnectMaxDelay") is { } maxDelay)
             options.ReconnectMaxDelay = maxDelay;
+
+        BindTls(configuration, options);
+    }
+
+    // TLS is off unless "Tls" is true; the files are PEM.
+    private static void BindTls(IConfiguration configuration, RuvioClientOptions options)
+    {
+        if (Flag(configuration, "Tls") is not true)
+            return;
+
+        var tls = new RuvioTlsOptions();
+
+        if (configuration["TlsServerName"] is { Length: > 0 } serverName)
+            tls.ServerName = serverName;
+
+        if (configuration["TlsCaFile"] is { Length: > 0 } caFile)
+        {
+            var roots = new System.Security.Cryptography.X509Certificates.X509Certificate2Collection();
+
+            roots.ImportFromPemFile(caFile);
+            tls.TrustedCertificates = roots;
+        }
+
+        if (configuration["TlsClientCertFile"] is { Length: > 0 } certFile)
+        {
+            using var pem = System.Security.Cryptography.X509Certificates.X509Certificate2.CreateFromPemFile(
+                certFile,
+                configuration["TlsClientKeyFile"]);
+
+            // The Windows TLS stack needs the key in a persisted form; the round trip gives it.
+            tls.ClientCertificates =
+            [
+                new System.Security.Cryptography.X509Certificates.X509Certificate2(
+                    pem.Export(System.Security.Cryptography.X509Certificates.X509ContentType.Pfx)),
+            ];
+        }
+
+        if (Flag(configuration, "TlsInsecureSkipVerify") is { } skip)
+            tls.InsecureSkipVerify = skip;
+
+        options.Tls = tls;
     }
 
     private static int? Number(IConfiguration configuration, string key)
@@ -176,6 +228,91 @@ public static class RuvioServiceCollectionExtensions
         => configuration[key] is { } text
             ? TimeSpan.Parse(text, System.Globalization.CultureInfo.InvariantCulture)
             : null;
+
+    /// <summary>
+    /// Registers a second, independent connection under <paramref name="serviceKey"/>: keyed singletons
+    /// <see cref="RuvioConnection"/>, <see cref="IRuvioConnection"/>, <see cref="IRuvioClient"/> and
+    /// <see cref="RuvioClient"/>, resolved with <c>GetRequiredKeyedService</c> or <c>[FromKeyedServices]</c>.
+    /// The integrations select it with their <c>ClientKey</c> option. The unkeyed client, if any, is untouched.
+    /// </summary>
+    /// <param name="services">The service collection.</param>
+    /// <param name="serviceKey">The key, for example <c>"key-ring"</c>.</param>
+    /// <param name="configure">Configures this connection's options.</param>
+    /// <returns>The same service collection.</returns>
+    /// <example>
+    /// <code>
+    /// builder.Services.AddKeyedRuvioClient("key-ring", o => { o.Host = "ruvio-durable"; o.Port = 6379; });
+    /// builder.Services.AddDataProtection().PersistKeysToRuvio(o => o.ClientKey = "key-ring");
+    /// </code>
+    /// </example>
+    public static IServiceCollection AddKeyedRuvioClient(
+        this IServiceCollection services,
+        string serviceKey,
+        Action<RuvioClientOptions> configure)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentException.ThrowIfNullOrEmpty(serviceKey);
+        ArgumentNullException.ThrowIfNull(configure);
+        services.AddOptions<RuvioClientOptions>(serviceKey).Configure(configure);
+        RegisterKeyedClient(services, serviceKey);
+
+        return services;
+    }
+
+    /// <summary>Registers a keyed connection for <paramref name="host"/>:<paramref name="port"/>; see the options overload.</summary>
+    /// <param name="services">The service collection.</param>
+    /// <param name="serviceKey">The key.</param>
+    /// <param name="host">The server host.</param>
+    /// <param name="port">The server port.</param>
+    /// <param name="database">The database the client is bound to.</param>
+    /// <returns>The same service collection.</returns>
+    public static IServiceCollection AddKeyedRuvioClient(
+        this IServiceCollection services,
+        string serviceKey,
+        string host,
+        int port,
+        int database = 0)
+    {
+        return services.AddKeyedRuvioClient(serviceKey, options =>
+        {
+            options.Host = host;
+            options.Port = port;
+            options.Database = database;
+        });
+    }
+
+    /// <summary>Binds a keyed connection's options from <paramref name="configuration"/> (same keys as <c>AddRuvioClient</c>).</summary>
+    /// <param name="services">The service collection.</param>
+    /// <param name="serviceKey">The key.</param>
+    /// <param name="configuration">The configuration section.</param>
+    /// <returns>The same service collection.</returns>
+    public static IServiceCollection AddKeyedRuvioClient(
+        this IServiceCollection services,
+        string serviceKey,
+        IConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        return services.AddKeyedRuvioClient(serviceKey, options => BindOptions(configuration, options));
+    }
+
+    private static void RegisterKeyedClient(IServiceCollection services, string serviceKey)
+    {
+        services.AddKeyedSingleton(serviceKey, static (provider, key) =>
+            RuvioConnection.ConnectAsync(
+                provider.GetRequiredService<IOptionsMonitor<RuvioClientOptions>>().Get((string)key!)).GetAwaiter().GetResult());
+        services.AddKeyedSingleton<IRuvioConnection>(serviceKey,
+            static (provider, key) => provider.GetRequiredKeyedService<RuvioConnection>(key));
+        services.AddKeyedSingleton<IRuvioClient>(serviceKey, static (provider, key) =>
+        {
+            RuvioClientOptions options = provider.GetRequiredService<IOptionsMonitor<RuvioClientOptions>>().Get((string)key!);
+
+            return provider.GetRequiredKeyedService<RuvioConnection>(key)
+                .GetDatabaseAsync(options.Database).GetAwaiter().GetResult();
+        });
+        services.AddKeyedSingleton(serviceKey,
+            static (provider, key) => (RuvioClient)provider.GetRequiredKeyedService<IRuvioClient>(key));
+    }
 
     /// <summary>
     /// The connection owns the socket resources and the database-scoped clients.

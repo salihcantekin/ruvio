@@ -19,12 +19,14 @@
 /.cursor/
 /.cursorignore
 /.agents/
-/.claude/
 /.codex/
 /.superpowers/
 /AGENTS.md
-/CLAUDE.md
 __pycache__/
+# Claude Code: CLAUDE.md, .claude/settings.json and .claude/skills/ are tracked; local state is not
+/.claude/settings.local.json
+/.claude/launch.json
+/.claude/worktrees/
 
 # Internal design records and plans: kept locally, never committed
 /docs/adr/

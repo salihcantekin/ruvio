@@ -18,6 +18,8 @@ public class Request<T> extends CompletableFuture<T> {
     public final RuvioCodec<?> keys;
     /** The value codec used to decode values in the reply. */
     public final RuvioCodec<?> values;
+    /** When the connection's deadline check fails this request ({@code System.nanoTime} based); 0 means never. */
+    long deadline;
 
     /**
      * Creates a request.
@@ -30,6 +32,20 @@ public class Request<T> extends CompletableFuture<T> {
         this.reply = reply;
         this.keys = keys;
         this.values = values;
+    }
+
+    /**
+     * Stamps the deadline: the command timeout plus this command's own wait, none for one that waits forever.
+     *
+     * @param timeoutMillis the command timeout, greater than 0
+     */
+    final void arm(long timeoutMillis) {
+        long ms = Blocking.timeoutFor(timeoutMillis, this);
+        if (ms <= 0) {
+            return;
+        }
+        long d = System.nanoTime() + Math.min(ms, 1_000_000_000_000L) * 1_000_000L;
+        deadline = d == 0 ? 1 : d;
     }
 
     /**

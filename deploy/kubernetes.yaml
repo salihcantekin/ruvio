@@ -1,15 +1,10 @@
 # One replica. The process listens only after recovery, so a TCP probe is readiness.
-# Set requirepass. The published image defaults to RUVIO_PROTECTED_MODE=false
-# and RUVIO_DURABILITY unset (memory). This manifest turns durability on.
-apiVersion: v1
-kind: Secret
-metadata:
-  name: ruvio
-type: Opaque
-stringData:
-  RUVIO_REQUIREPASS: change-me
-  RUVIO_METRICS_TOKEN: change-me-too
----
+# Create the secret first; no password is committed to this file:
+#   kubectl create secret generic ruvio \
+#     --from-literal=RUVIO_REQUIREPASS="$(openssl rand -hex 24)" \
+# The published image defaults to RUVIO_PROTECTED_MODE=false and RUVIO_DURABILITY unset
+# (memory). This manifest turns durability on. The image tag is checked against Cargo.toml
+# by scripts/check_package_metadata.py; set it with scripts/release_version.py.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -26,14 +21,24 @@ spec:
       labels:
         app: ruvio
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: ruvio
-          image: salihcantekin/ruvio:0.2.3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          image: salihcantekin/ruvio:0.3.4
           ports:
             - name: resp
               containerPort: 6379
-            - name: metrics
-              containerPort: 9121
           env:
             - name: RUVIO_ADDR
               value: 0.0.0.0:6379
@@ -41,18 +46,11 @@ spec:
               value: everysec
             - name: RUVIO_DATA_DIR
               value: /data
-            - name: RUVIO_METRICS_ADDR
-              value: 0.0.0.0:9121
             - name: RUVIO_REQUIREPASS
               valueFrom:
                 secretKeyRef:
                   name: ruvio
                   key: RUVIO_REQUIREPASS
-            - name: RUVIO_METRICS_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: ruvio
-                  key: RUVIO_METRICS_TOKEN
           readinessProbe:
             tcpSocket:
               port: resp
@@ -70,6 +68,8 @@ spec:
             requests:
               cpu: "1"
               memory: 512Mi
+            limits:
+              memory: 1Gi
           volumeMounts:
             - name: data
               mountPath: /data
@@ -100,6 +100,3 @@ spec:
     - name: resp
       port: 6379
       targetPort: resp
-    - name: metrics
-      port: 9121
-      targetPort: metrics

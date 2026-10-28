@@ -404,3 +404,110 @@ test('a failed topology load rejects every waiting call and is retried by the ne
     await s.close();
   }
 });
+
+// ---- ASK and TRYAGAIN -----------------------------------------------------------------------
+
+const isErr = (code: string) => (e: unknown) => e instanceof RuvioError && e.code === code;
+
+test('ASK sends ASKING and the command to the named node and leaves the slot map alone', async () => {
+  let asks = 1;
+  const b = await fakeServer((args) => (args[0] === 'GET' ? bulk('B:' + args[1]) : ok));
+  // A's first GET answers ASK, later ones the value.
+  const a2 = await fakeServer((args) => {
+    if (args[0] === 'CLUSTER') return slotsReply([[0, 8191, a2.port], [8192, 16383, b.port]]);
+    if (args[0] === 'GET') return asks-- > 0 ? err(`ASK ${hashSlot(args[1]!)} 127.0.0.1:${b.port}`) : bulk('A:' + args[1]);
+    return ok;
+  });
+  const c = new ClusterClient({ host: '127.0.0.1', port: a2.port, commandTimeoutMs: 5000 });
+  try {
+    const k = keyIn(0, 8191);
+    assert.equal(await c.get(k), 'B:' + k);
+    assert.deepEqual(b.seen.map((x) => x[0]), ['ASKING', 'GET'], 'ASKING comes first, then the command');
+    assert.deepEqual(b.seen[1], ['GET', k]);
+    assert.equal(c.redirectCount, 1);
+    assert.equal(c.refreshCount, 0);
+    assert.equal(await c.get(k), 'A:' + k, 'the slot is still owned by A');
+    assert.equal(a2.count('GET'), 2);
+    assert.equal(b.count('GET'), 1);
+  } finally {
+    c.disconnect();
+    await a2.close();
+    await b.close();
+  }
+});
+
+test('ASK to a node the table does not list is followed', async () => {
+  const x = await fakeServer((args) => (args[0] === 'GET' ? bulk('X') : ok));
+  const a = await fakeServer((args) => {
+    if (args[0] === 'CLUSTER') return slotsReply([[0, 16383, a.port]]);
+    if (args[0] === 'GET') return err(`ASK ${hashSlot(args[1]!)} 127.0.0.1:${x.port}`);
+    return ok;
+  });
+  const c = new ClusterClient({ host: '127.0.0.1', port: a.port, commandTimeoutMs: 5000 });
+  try {
+    assert.equal(await c.get('foo'), 'X');
+    assert.deepEqual(x.seen.map((s) => s[0]), ['ASKING', 'GET']);
+    assert.equal(c.refreshCount, 0);
+  } finally {
+    c.disconnect();
+    await a.close();
+    await x.close();
+  }
+});
+
+test('TRYAGAIN is retried after a short wait and the later success is returned', async () => {
+  let n = 0;
+  const a = await fakeServer((args) => {
+    if (args[0] === 'CLUSTER') return slotsReply([[0, 16383, a.port]]);
+    if (args[0] === 'GET') return n++ < 1 ? err('TRYAGAIN slot is being handed over') : bulk('v');
+    return ok;
+  });
+  const c = new ClusterClient({ host: '127.0.0.1', port: a.port, commandTimeoutMs: 5000 });
+  try {
+    await c.connect();
+    const t0 = process.hrtime.bigint();
+    assert.equal(await c.get('k'), 'v');
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+    assert.ok(ms >= 4, `waited ${ms} ms before the retry`);
+    assert.equal(a.count('GET'), 2);
+  } finally {
+    c.disconnect();
+    await a.close();
+  }
+});
+
+test('TRYAGAIN is retried seven times; the eighth answer is returned to the caller', async () => {
+  const a = await fakeServer((args) => {
+    if (args[0] === 'CLUSTER') return slotsReply([[0, 16383, a.port]]);
+    if (args[0] === 'GET') return err('TRYAGAIN slot is being handed over');
+    return ok;
+  });
+  const c = new ClusterClient({ host: '127.0.0.1', port: a.port, commandTimeoutMs: 5000 });
+  try {
+    await c.connect();
+    const t0 = process.hrtime.bigint();
+    await assert.rejects(c.get('k'), isErr('TRYAGAIN'));
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+    assert.equal(a.count('GET'), 8, 'the first send and seven retries');
+    assert.ok(ms >= 630, `waited ${ms} ms in total (5 + 10 + 20 + 40 + 80 + 160 + 320)`);
+  } finally {
+    c.disconnect();
+    await a.close();
+  }
+});
+
+test('ASK and MOVED share one budget of three redirects; the fourth comes back as the error', async () => {
+  const seq = (ports: number[]) => [`ASK # 127.0.0.1:${ports[1]}`, `MOVED # 127.0.0.1:${ports[2]}`, `ASK # 127.0.0.1:${ports[1]}`, `ASK # 127.0.0.1:${ports[2]}`];
+  let n = 0;
+  const { nodes, close } = await threeNodes((_i, k, ports) => err(seq(ports)[n++]!.replace('#', String(hashSlot(k)))));
+  const c = new ClusterClient({ host: '127.0.0.1', port: nodes[0]!.port, commandTimeoutMs: 5000 });
+  try {
+    await c.connect();
+    await assert.rejects(c.get(keyIn(0, 16381)), isErr('ASK'));
+    assert.equal(n, 4, 'one send and three followed redirects');
+    assert.equal(c.redirectCount, 3);
+  } finally {
+    c.disconnect();
+    await close();
+  }
+});

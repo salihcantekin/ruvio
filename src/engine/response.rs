@@ -89,6 +89,8 @@ pub enum Response<'a> {
     /// What a sorted-set pop took, each member followed by its score, after the key when
     /// one is given (`BZPOPMIN`). Written as `Scored(_, true)` is.
     Popped(Option<crate::protocol::Bytes<'a>>, PoppedEntries),
+    /// What `ZPOPBYSCORE` took: members, each followed by its score when the flag is set.
+    PoppedByScore(PoppedEntries, bool),
     /// A hash written straight from the store: pairs as a map, or only fields or values.
     HashEntries(crate::store::HashStream<'a>, crate::store::HashStreamKind),
     Double(f64),
@@ -189,6 +191,9 @@ impl Response<'_> {
             }
             Self::Popped(key, entries) => {
                 Response::Popped(key.map(|key| Cow::Owned(key.into_owned())), entries)
+            }
+            Self::PoppedByScore(entries, with_scores) => {
+                Response::PoppedByScore(entries, with_scores)
             }
             Self::HashEntries(stream, kind) => {
                 use crate::store::HashStreamKind;
@@ -350,6 +355,18 @@ pub fn write_response_in(
             }
         }
 
+        Response::PoppedByScore(entries, with_scores) => {
+            write_header(writer, b'*', entries.len() * (1 + usize::from(with_scores)))?;
+
+            for (member, score) in entries.iter() {
+                write_bulk(writer, member)?;
+
+                if with_scores {
+                    write_score_bulk(writer, score)?;
+                }
+            }
+        }
+
         Response::HashEntries(stream, kind) => {
             use crate::store::HashStreamKind;
 
@@ -501,19 +518,18 @@ pub fn hello_response(
     ])
 }
 
-/// Values up to this size are framed in a stack buffer and written with one call.
+/// Values up to this size are framed with a small stack header, no staging copy of the value.
 pub(super) const SMALL_BULK: usize = 128;
 
 pub(super) fn write_bulk(writer: &mut impl Write, value: &[u8]) -> io::Result<()> {
     if value.len() <= SMALL_BULK {
-        let mut frame = [0u8; SMALL_BULK + 8];
-        let mut digits = [0u8; 3];
-        let mut position = digits.len();
+        let mut header = [0u8; 6];
+        let mut position = 4;
         let mut len = value.len();
 
         loop {
             position -= 1;
-            digits[position] = b'0' + (len % 10) as u8;
+            header[position] = b'0' + (len % 10) as u8;
             len /= 10;
 
             if len == 0 {
@@ -521,20 +537,15 @@ pub(super) fn write_bulk(writer: &mut impl Write, value: &[u8]) -> io::Result<()
             }
         }
 
-        let digits = &digits[position..];
-        let mut at = 0;
-        frame[at] = b'$';
-        at += 1;
-        frame[at..at + digits.len()].copy_from_slice(digits);
-        at += digits.len();
-        frame[at..at + 2].copy_from_slice(b"\r\n");
-        at += 2;
-        frame[at..at + value.len()].copy_from_slice(value);
-        at += value.len();
-        frame[at..at + 2].copy_from_slice(b"\r\n");
-        at += 2;
+        // `$` goes right before the digits; the CRLF follows them.
+        position -= 1;
+        header[position] = b'$';
+        header[4] = b'\r';
+        header[5] = b'\n';
+        writer.write_all(&header[position..])?;
+        writer.write_all(value)?;
 
-        return writer.write_all(&frame[..at]);
+        return writer.write_all(b"\r\n");
     }
 
     writer.write_all(b"$")?;
@@ -564,19 +575,10 @@ pub(super) fn write_usize(writer: &mut impl Write, value: usize) -> io::Result<(
     write_u64(writer, value as u64)
 }
 
-pub(super) fn write_u64(writer: &mut impl Write, mut value: u64) -> io::Result<()> {
+pub(super) fn write_u64(writer: &mut impl Write, value: u64) -> io::Result<()> {
     let mut buffer = [0u8; 20];
-    let mut position = buffer.len();
 
-    loop {
-        position -= 1;
-        buffer[position] = b'0' + (value % 10) as u8;
-        value /= 10;
-
-        if value == 0 {
-            return writer.write_all(&buffer[position..]);
-        }
-    }
+    writer.write_all(crate::output::decimal(value, &mut buffer))
 }
 
 pub(super) fn write_i64(writer: &mut impl Write, value: i64) -> io::Result<()> {
@@ -631,23 +633,26 @@ pub(super) fn sorted_set_range_response(
     Response::Scored(entries, with_scores)
 }
 
-/// Writes a score as a bulk string without allocating. A formatted `f64` is at most
-/// 330 bytes, so the stack buffer always fits.
+/// Writes a score as a bulk string without allocating. Integer scores skip `core::fmt`;
+/// other scores are printed into a small stack buffer, and only text longer than that
+/// (huge or tiny magnitudes) takes the cold path with the full-size buffer.
 fn write_score_bulk(writer: &mut impl Write, score: f64) -> io::Result<()> {
+    let mut stack = ScoreText::default();
+
+    match stack.format(score) {
+        Some(text) => write_bulk(writer, text),
+        None => write_long_score_bulk(writer, score),
+    }
+}
+
+/// A formatted `f64` is at most 330 bytes, so this buffer always fits.
+#[cold]
+#[inline(never)]
+fn write_long_score_bulk(writer: &mut impl Write, score: f64) -> io::Result<()> {
     let mut buffer = [0u8; 352];
     let mut cursor = io::Cursor::new(&mut buffer[..]);
 
-    let written = if score == f64::INFINITY {
-        cursor.write_all(b"inf")
-    } else if score == f64::NEG_INFINITY {
-        cursor.write_all(b"-inf")
-    } else if score.fract() == 0.0 && score.abs() <= i64::MAX as f64 {
-        write!(cursor, "{}", score as i64)
-    } else {
-        write!(cursor, "{score}")
-    };
-
-    match written {
+    match write!(cursor, "{score}") {
         Ok(()) => {
             let length = cursor.position() as usize;
 
@@ -687,6 +692,30 @@ impl Default for ScoreText {
 }
 
 impl ScoreText {
+    /// The decimal digits of `value`, without `core::fmt`; the buffer is empty here.
+    fn push_integer(&mut self, value: i64) {
+        let mut digits = [0u8; 20];
+        let mut position = digits.len();
+        let mut rest = value.unsigned_abs();
+
+        loop {
+            position -= 1;
+            digits[position] = b'0' + (rest % 10) as u8;
+            rest /= 10;
+
+            if rest == 0 {
+                break;
+            }
+        }
+
+        let sign = usize::from(value < 0);
+        let len = sign + digits.len() - position;
+
+        self.bytes[0] = b'-';
+        self.bytes[sign..len].copy_from_slice(&digits[position..]);
+        self.len = len;
+    }
+
     /// `None` when the text does not fit (huge magnitudes): use `format_score` then.
     fn format(&mut self, score: f64) -> Option<&[u8]> {
         use std::fmt::Write;
@@ -696,7 +725,8 @@ impl ScoreText {
         } else if score == f64::NEG_INFINITY {
             self.write_str("-inf")
         } else if score.fract() == 0.0 && score.abs() <= i64::MAX as f64 {
-            write!(self, "{}", score as i64)
+            self.push_integer(score as i64);
+            Ok(())
         } else {
             write!(self, "{score}")
         };
@@ -754,6 +784,37 @@ pub(super) fn bloom_error(error: BloomError) -> Response<'static> {
 }
 
 #[cfg(test)]
+mod bulk_tests {
+    use super::*;
+
+    #[test]
+    fn write_bulk_frames_every_length_like_the_wire_format() {
+        for length in [0, 1, 9, 10, 99, 100, 127, 128, 129, 999, 1000, 100_000] {
+            let value = vec![b'x'; length];
+            let mut out = Vec::new();
+
+            write_bulk(&mut out, &value).unwrap();
+
+            let mut expected = format!("${length}\r\n").into_bytes();
+
+            expected.extend_from_slice(&value);
+            expected.extend_from_slice(b"\r\n");
+            assert_eq!(out, expected, "{length}");
+        }
+    }
+
+    #[test]
+    fn write_u64_matches_to_string() {
+        for value in [0, 7, 10, 99, 100, 12_345, u64::MAX] {
+            let mut out = Vec::new();
+
+            write_u64(&mut out, value).unwrap();
+            assert_eq!(out, value.to_string().as_bytes());
+        }
+    }
+}
+
+#[cfg(test)]
 mod score_text_tests {
     use super::*;
 
@@ -787,5 +848,116 @@ mod score_text_tests {
                 None => assert!(expected.len() > 48, "{score}"),
             }
         }
+    }
+
+    /// Values at the edges of the integer fast path and of the stack buffer.
+    #[allow(clippy::approx_constant)]
+    const EDGE_SCORES: [f64; 34] = [
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        9.0,
+        10.0,
+        -10.0,
+        0.5,
+        -0.5,
+        1e-7,
+        -1e-7,
+        3.14159,
+        9_007_199_254_740_992.0,
+        9_007_199_254_740_994.0,
+        -9_007_199_254_740_992.0,
+        9.2e18,
+        9_223_372_036_854_775_807.0,
+        -9_223_372_036_854_775_808.0,
+        1.5e19,
+        -1.5e19,
+        1e21,
+        1e22,
+        1e300,
+        -1e300,
+        1e-300,
+        f64::MAX,
+        f64::MIN,
+        f64::MIN_POSITIVE,
+        f64::EPSILON,
+        5e-324,
+        -5e-324,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+    ];
+
+    fn framed(text: &[u8]) -> Vec<u8> {
+        let mut expected = format!("${}\r\n", text.len()).into_bytes();
+        expected.extend_from_slice(text);
+        expected.extend_from_slice(b"\r\n");
+        expected
+    }
+
+    #[test]
+    fn score_bulk_matches_format_score() {
+        for score in EDGE_SCORES {
+            let mut written = Vec::new();
+            write_score_bulk(&mut written, score).unwrap();
+
+            assert_eq!(written, framed(&format_score(score)), "{score:e}");
+        }
+    }
+
+    #[test]
+    fn score_text_edge_values() {
+        assert_eq!(format_score(-0.0), b"0");
+        assert_eq!(format_score(9_007_199_254_740_993.0), b"9007199254740992");
+        assert_eq!(
+            format_score(-9_223_372_036_854_775_808.0),
+            b"-9223372036854775808"
+        );
+        // 2^63 is outside i64 and the cast saturates; the text stays what it always was.
+        assert_eq!(
+            format_score(9_223_372_036_854_775_808.0),
+            b"9223372036854775807"
+        );
+        assert_eq!(format_score(1.5e19), b"15000000000000000000");
+        assert_eq!(format_score(f64::INFINITY), b"inf");
+        assert_eq!(format_score(f64::NEG_INFINITY), b"-inf");
+        assert_eq!(format_score(f64::NAN), b"NaN");
+        assert_eq!(format_score(1e-300).len(), 302);
+        assert_eq!(format_score(f64::MAX).len(), 309);
+    }
+
+    #[test]
+    fn double_reply_matches_format_score() {
+        for score in EDGE_SCORES {
+            let text = format_score(score);
+
+            let mut resp2 = Vec::new();
+            write_response_in(&mut resp2, Response::Double(score), RespVersion::V2).unwrap();
+            assert_eq!(resp2, framed(&text), "{score:e}");
+
+            let mut resp3 = Vec::new();
+            write_response_in(&mut resp3, Response::Double(score), RespVersion::V3).unwrap();
+            let mut expected = b",".to_vec();
+            expected.extend_from_slice(&text);
+            expected.extend_from_slice(b"\r\n");
+            assert_eq!(resp3, expected, "{score:e}");
+        }
+    }
+
+    #[test]
+    fn scored_reply_writes_every_score() {
+        let entries = vec![
+            (&b"a"[..], 1.0),
+            (&b"b"[..], -2.5),
+            (&b"c"[..], f64::INFINITY),
+        ];
+        let mut written = Vec::new();
+        write_response(&mut written, Response::Scored(entries, true)).unwrap();
+
+        assert_eq!(
+            written,
+            b"*6\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$4\r\n-2.5\r\n$1\r\nc\r\n$3\r\ninf\r\n"
+        );
     }
 }

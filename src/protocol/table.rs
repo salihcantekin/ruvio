@@ -87,6 +87,15 @@ impl<'a, 's> Args<'a, 's> {
     pub(crate) fn rest(&self, from: usize) -> Vec<Bytes<'a>> {
         (from..self.len()).map(|index| self.arg(index)).collect()
     }
+
+    /// Arguments `from..` like [`Self::rest`], with a single argument kept inline.
+    pub(crate) fn rest_one_or_many(&self, from: usize) -> OneOrMany<Bytes<'a>> {
+        if self.len() == from + 1 {
+            OneOrMany::One(self.arg(from))
+        } else {
+            OneOrMany::Many(self.rest(from))
+        }
+    }
 }
 
 pub(crate) type ParseFn = for<'a, 's> fn(&Args<'a, 's>) -> Result<Command<'a>, ProtocolError>;
@@ -168,7 +177,7 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
     ),
     CommandSpec::migrated(
         "incr",
-        2,
+        -2,
         WRITE | DENYOOM | FAST,
         (1, 1, 1),
         &["write", "string", "fast"],
@@ -176,7 +185,7 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
     ),
     CommandSpec::migrated(
         "decr",
-        2,
+        -2,
         WRITE | DENYOOM | FAST,
         (1, 1, 1),
         &["write", "string", "fast"],
@@ -192,7 +201,7 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
     ),
     CommandSpec::migrated(
         "decrby",
-        3,
+        -3,
         WRITE | DENYOOM | FAST,
         (1, 1, 1),
         &["write", "string", "fast"],
@@ -264,7 +273,7 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
     ),
     CommandSpec::migrated(
         "incrbyfloat",
-        3,
+        -3,
         WRITE | DENYOOM | FAST,
         (1, 1, 1),
         &["write", "string", "fast"],
@@ -496,7 +505,7 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
     ),
     CommandSpec::migrated(
         "setbit",
-        4,
+        -4,
         WRITE | DENYOOM,
         (1, 1, 1),
         &["write", "bitmap", "slow"],
@@ -775,6 +784,22 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
         commands::cmd_config,
     ),
     CommandSpec::migrated(
+        "replicaof",
+        -3,
+        0,
+        (0, 0, 0),
+        &["admin", "slow", "dangerous"],
+        commands::cmd_replicaof,
+    ),
+    CommandSpec::migrated(
+        "role",
+        1,
+        FAST,
+        (0, 0, 0),
+        &["admin", "fast", "dangerous"],
+        commands::cmd_role,
+    ),
+    CommandSpec::migrated(
         "info",
         -1,
         0,
@@ -832,7 +857,7 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
     ),
     CommandSpec::migrated(
         "json.set",
-        4,
+        -4,
         WRITE | DENYOOM,
         (1, 1, 1),
         &["write", "slow"],
@@ -1040,6 +1065,22 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
         commands::cmd_take,
     ),
     CommandSpec::migrated(
+        "transfer",
+        -4,
+        WRITE | DENYOOM | FAST,
+        (1, 2, 1),
+        &["string", "write", "fast"],
+        commands::cmd_transfer,
+    ),
+    CommandSpec::migrated(
+        "htransfer",
+        -5,
+        WRITE | DENYOOM | FAST,
+        (1, 1, 1),
+        &["hash", "write", "fast"],
+        commands::cmd_htransfer,
+    ),
+    CommandSpec::migrated(
         "getex",
         -2,
         WRITE | DENYOOM | FAST,
@@ -1054,6 +1095,14 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
         (1, 1, 1),
         &["keyspace", "write", "fast"],
         commands::cmd_release,
+    ),
+    CommandSpec::migrated(
+        "renew",
+        4,
+        WRITE | FAST,
+        (1, 1, 1),
+        &["keyspace", "write", "fast"],
+        commands::cmd_renew,
     ),
     CommandSpec::migrated(
         "setv",
@@ -1537,7 +1586,7 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
     ),
     CommandSpec::migrated(
         "hincrby",
-        4,
+        -4,
         WRITE | DENYOOM | FAST,
         (1, 1, 1),
         &["write", "hash", "fast"],
@@ -1590,6 +1639,14 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
         (1, 1, 1),
         &["write", "hash", "fast"],
         parse_hset,
+    ),
+    CommandSpec::migrated(
+        "hmset",
+        -4,
+        WRITE | DENYOOM | FAST,
+        (1, 1, 1),
+        &["write", "hash", "fast"],
+        parse_hmset,
     ),
     CommandSpec::migrated(
         "hdel",
@@ -1785,7 +1842,7 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
     ),
     CommandSpec::migrated(
         "zincrby",
-        4,
+        -4,
         WRITE | DENYOOM | FAST,
         (1, 1, 1),
         &["write", "sortedset", "fast"],
@@ -1838,6 +1895,22 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
         (1, 1, 1),
         &["write", "sortedset", "fast"],
         parse_zpopmax,
+    ),
+    CommandSpec::migrated(
+        "zpopbyscore",
+        -3,
+        WRITE | FAST,
+        (1, 1, 1),
+        &["write", "sortedset", "fast"],
+        parse_zpopbyscore,
+    ),
+    CommandSpec::migrated(
+        "zmovedue",
+        -4,
+        WRITE | DENYOOM,
+        (1, 2, 1),
+        &["write", "sortedset", "list", "slow"],
+        parse_zmovedue,
     ),
     CommandSpec::migrated(
         "bzpopmin",
@@ -2220,19 +2293,79 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
 // A const-built open-addressed table instead of phf: no new dependency, so the deny.toml
 // and SBOM surface stay the same. Duplicate names and long probe chains fail the build.
 const SLOTS: usize = 1024;
-const EMPTY: u16 = 0;
+const SLOT_BITS: u32 = SLOTS.trailing_zeros();
 
-const fn hash(name: &[u8]) -> usize {
-    let mut state: u32 = 0x811c_9dc5;
+/// The first `WORD_BYTES` bytes of a name are hashed and compared as two words.
+const WORD_BYTES: usize = 16;
+const ONES: u64 = 0x0101_0101_0101_0101;
+const HIGH_BITS: u64 = ONES * 0x80;
+
+/// One table slot: the lowercased name head as two little-endian words (zero padded),
+/// the name length, and the `COMMANDS` index plus one (zero is empty). Holding the words
+/// in the slot settles a lookup with one read and two word compares.
+#[derive(Clone, Copy)]
+struct Slot {
+    words: [u64; 2],
+    command: u16,
+    length: u8,
+}
+
+const EMPTY: Slot = Slot {
+    words: [0; 2],
+    command: 0,
+    length: 0,
+};
+
+/// Lowercases every ASCII letter of `word`; every byte must be below 0x80, so no add
+/// carries into the next byte.
+const fn lower_ascii(word: u64) -> u64 {
+    let from_a = word.wrapping_add(ONES * (0x80 - b'A' as u64));
+    let past_z = word.wrapping_add(ONES * (0x80 - b'Z' as u64 - 1));
+    let upper = from_a & !past_z & HIGH_BITS;
+
+    word | upper >> 2
+}
+
+/// Up to eight bytes as a little-endian word, zero padded, without reading past `bytes`.
+#[inline(always)]
+fn load_word(bytes: &[u8]) -> u64 {
+    let length = bytes.len();
+
+    if length == 8 {
+        u64::from_le_bytes(bytes.try_into().unwrap())
+    } else if length >= 4 {
+        // Two overlapping four-byte loads; the shared bytes are the same on both sides.
+        let low = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as u64;
+        let high = u32::from_le_bytes(bytes[length - 4..].try_into().unwrap()) as u64;
+
+        low | high << ((length - 4) * 8)
+    } else if length > 0 {
+        bytes[0] as u64
+            | (bytes[length / 2] as u64) << (length / 2 * 8)
+            | (bytes[length - 1] as u64) << ((length - 1) * 8)
+    } else {
+        0
+    }
+}
+
+const fn hash(words: [u64; 2], length: usize) -> usize {
+    let mixed =
+        (words[0] ^ words[1].rotate_left(29) ^ length as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+
+    (mixed >> (u64::BITS - SLOT_BITS)) as usize
+}
+
+/// The lowercase table name's head words, built byte by byte at compile time.
+const fn table_words(name: &[u8]) -> [u64; 2] {
+    let mut words = [0; 2];
     let mut index = 0;
 
-    while index < name.len() {
-        state ^= name[index] as u32;
-        state = state.wrapping_mul(0x0100_0193);
+    while index < name.len() && index < WORD_BYTES {
+        words[index / 8] |= (name[index] as u64) << (index % 8 * 8);
         index += 1;
     }
 
-    (state as usize) & (SLOTS - 1)
+    words
 }
 
 const fn same_name(left: &[u8], right: &[u8]) -> bool {
@@ -2253,14 +2386,14 @@ const fn same_name(left: &[u8], right: &[u8]) -> bool {
     true
 }
 
-/// Open-addressed table of `COMMANDS` indexes plus one (zero is empty), built at compile
-/// time. Panics the build on a duplicate name, an over-long or non-lowercase name, an
-/// overfull table, or a probe sequence longer than `MAX_PROBES`.
+/// Open-addressed table of `COMMANDS` rows, built at compile time. Panics the build on a
+/// duplicate name, an over-long or non-lowercase name, an overfull table, or a probe
+/// sequence longer than `MAX_PROBES`.
 const MAX_PROBES: usize = 8;
 
-static TABLE: [u16; SLOTS] = build_table();
+static TABLE: [Slot; SLOTS] = build_table();
 
-const fn build_table() -> [u16; SLOTS] {
+const fn build_table() -> [Slot; SLOTS] {
     let mut table = [EMPTY; SLOTS];
     let mut command = 0;
 
@@ -2278,17 +2411,18 @@ const fn build_table() -> [u16; SLOTS] {
 
         while check < name.len() {
             assert!(
-                !name[check].is_ascii_uppercase(),
-                "command names are lowercase"
+                name[check].is_ascii() && !name[check].is_ascii_uppercase(),
+                "command names are lowercase ASCII"
             );
             check += 1;
         }
 
-        let mut slot = hash(name);
+        let words = table_words(name);
+        let mut slot = hash(words, name.len());
         let mut probes = 0;
 
-        while table[slot] != EMPTY {
-            let other = COMMANDS[(table[slot] - 1) as usize].name.as_bytes();
+        while table[slot].command != 0 {
+            let other = COMMANDS[(table[slot].command - 1) as usize].name.as_bytes();
 
             assert!(!same_name(name, other), "duplicate command name");
             slot = (slot + 1) & (SLOTS - 1);
@@ -2296,55 +2430,64 @@ const fn build_table() -> [u16; SLOTS] {
             assert!(probes < MAX_PROBES, "command table probe chain is too long");
         }
 
-        table[slot] = command as u16 + 1;
+        table[slot] = Slot {
+            words,
+            command: command as u16 + 1,
+            length: name.len() as u8,
+        };
         command += 1;
     }
 
     table
 }
 
-/// The row for `name`, matched ASCII case-insensitively, or `None` for an unknown or
-/// not-yet-tabled command.
 /// Position of `spec` in the command table.
 pub(crate) fn command_index(spec: &CommandSpec) -> usize {
     (spec as *const CommandSpec as usize - COMMANDS.as_ptr() as usize)
         / std::mem::size_of::<CommandSpec>()
 }
 
+/// The row for `name`, matched ASCII case-insensitively, or `None` for an unknown or
+/// not-yet-tabled command.
 pub(crate) fn lookup(name: &[u8]) -> Option<&'static CommandSpec> {
-    if name.len() > MAX_NAME {
+    let length = name.len();
+
+    if length > MAX_NAME {
         return None;
     }
 
-    // The same FNV-1a as `hash`, over the lowercased name, without a lowercase copy.
-    let mut state: u32 = 0x811c_9dc5;
+    let head = &name[..length.min(WORD_BYTES)];
+    let split = head.len().min(8);
+    let words = [load_word(&head[..split]), load_word(&head[split..])];
 
-    for &byte in name {
-        state ^= byte.to_ascii_lowercase() as u32;
-        state = state.wrapping_mul(0x0100_0193);
+    // Command names are ASCII: a high byte is unknown, and checking it first keeps
+    // `lower_ascii` exact.
+    if (words[0] | words[1]) & HIGH_BITS != 0 {
+        return None;
     }
 
-    let mut slot = (state as usize) & (SLOTS - 1);
+    let words = [lower_ascii(words[0]), lower_ascii(words[1])];
+    let mut slot = hash(words, length);
 
     for _ in 0..MAX_PROBES {
-        let entry = TABLE[slot];
+        let entry = &TABLE[slot];
 
-        if entry == EMPTY {
+        if entry.command == 0 {
             return None;
         }
 
-        let spec = &COMMANDS[(entry - 1) as usize];
+        if entry.words == words && entry.length as usize == length {
+            let spec = &COMMANDS[(entry.command - 1) as usize];
 
-        // Table names are lowercase ASCII.
-        let wanted = spec.name.as_bytes();
-
-        if wanted.len() == name.len()
-            && wanted
-                .iter()
-                .zip(name)
-                .all(|(&wanted, &byte)| byte.to_ascii_lowercase() == wanted)
-        {
-            return Some(spec);
+            // Only names past `WORD_BYTES` have a tail left to compare.
+            if length <= WORD_BYTES
+                || spec.name.as_bytes()[WORD_BYTES..]
+                    .iter()
+                    .zip(&name[WORD_BYTES..])
+                    .all(|(&wanted, &byte)| byte.to_ascii_lowercase() == wanted)
+            {
+                return Some(spec);
+            }
         }
 
         slot = (slot + 1) & (SLOTS - 1);
@@ -2419,6 +2562,69 @@ mod tests {
 
         assert!(lookup(b"definitely-not-a-command").is_none());
         assert!(lookup(&[b'x'; MAX_NAME + 1]).is_none());
+    }
+
+    /// `lookup` against a plain scan of `COMMANDS` on near-miss names: every case mix,
+    /// truncations, extensions, bit 0x20 flipped on a non-letter (which a naive
+    /// `| 0x20` lowercase would accept), high bytes, and every length up to past the
+    /// limit.
+    #[test]
+    fn lookup_matches_a_scan_of_the_table() {
+        fn scan(name: &[u8]) -> Option<&'static CommandSpec> {
+            COMMANDS
+                .iter()
+                .find(|spec| spec.name.as_bytes().eq_ignore_ascii_case(name))
+        }
+
+        let mut names: Vec<Vec<u8>> = Vec::new();
+
+        for spec in COMMANDS {
+            let name = spec.name.as_bytes();
+
+            for mask in 0..name.len() {
+                let mixed: Vec<u8> = name
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &byte)| {
+                        if (index + mask) % 3 == 0 {
+                            byte.to_ascii_uppercase()
+                        } else {
+                            byte
+                        }
+                    })
+                    .collect();
+                names.push(mixed);
+
+                let mut flipped = name.to_vec();
+                flipped[mask] ^= 0x20;
+                names.push(flipped);
+
+                let mut high = name.to_vec();
+                high[mask] |= 0x80;
+                names.push(high);
+
+                names.push(name[..mask].to_vec());
+            }
+
+            names.push([name, b"x"].concat());
+            names.push([name, b"\0"].concat());
+        }
+
+        for length in 0..=MAX_NAME + 1 {
+            names.push(vec![b'a'; length]);
+            names.push(vec![b'Z'; length]);
+            names.push(vec![0; length]);
+            names.push(b"georadiusbymember_ro_x_y_z_padding"[..length.min(34)].to_vec());
+        }
+
+        for name in &names {
+            assert_eq!(
+                lookup(name).map(command_index),
+                scan(name).map(command_index),
+                "{:?}",
+                String::from_utf8_lossy(name)
+            );
+        }
     }
 
     #[test]

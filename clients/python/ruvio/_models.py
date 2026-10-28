@@ -11,6 +11,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 __all__ = [
     "FillResult",
+    "LimitOutcome",
     "IdemResult",
     "StreamEntry",
     "GeoResult",
@@ -23,6 +24,21 @@ __all__ = [
 
 Value = Union[str, bytes]
 """A reply string: ``str`` on a decoding client, ``bytes`` on ``client.raw`` / ``decode_responses=False``."""
+
+
+class LimitOutcome(NamedTuple):
+    """Outcome of the ``*_with_retry`` limit calls (see :meth:`ruvio._commands.Commands.limit_sliding_with_retry`).
+
+    Attributes:
+        allowed: ``True`` when this call was let through.
+        remaining: Allowance left after this call (``0`` when refused).
+        retry_after_ms: Milliseconds until the same call would pass (``0`` when it was let through);
+            fit for a ``Retry-After`` header.
+    """
+
+    allowed: bool
+    remaining: int
+    retry_after_ms: int
 
 
 class FillResult(NamedTuple):
@@ -63,10 +79,10 @@ class StreamEntry(NamedTuple):
 
     Attributes:
         id: The entry id as text, ``"<ms>-<seq>"``.
-        fields: ``{field: value}`` of the entry.
+        fields: ``(field, value)`` pairs in stored order; a field name may repeat.
     """
     id: str
-    fields: Dict[Any, Any]
+    fields: List[Tuple[Any, Any]]
 
 
 class GeoResult(NamedTuple):

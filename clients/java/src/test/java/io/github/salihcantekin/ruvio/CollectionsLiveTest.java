@@ -54,6 +54,11 @@ class CollectionsLiveTest {
         assertEquals(7.5, c.hincrbyfloat("h", "n", 0.5));
         assertFalse(c.hsetnx("h", "f1", "x"));
         assertTrue(c.hsetnx("h", "f3", "x"));
+        Map<String, String> legacy = new LinkedHashMap<>();
+        legacy.put("a", "1");
+        legacy.put("b", "2");
+        c.hmset("hm", legacy);
+        assertEquals(Arrays.asList("1", "2"), c.hmget("hm", "a", "b"));
         assertEquals(2L, c.hstrlen("h", "f1"));
         assertEquals(1L, c.hdel("h", "f3", "zz"));
         assertNotNull(c.hrandfield("h"));
@@ -159,6 +164,25 @@ class CollectionsLiveTest {
     }
 
     @Test
+    void asyncCommandTimeoutOnARealServer() throws Exception {
+        RuvioOptions o = Live.options(Live.DB).toBuilder().commandTimeoutMillis(300).build();
+        try (RuvioClient<String, String> t = RuvioClient.connect(o)) {
+            // A blocking command gets its own wait on top: BLPOP 1 returns nil after about 1 s, no timeout error.
+            long start = System.nanoTime();
+            assertNull(t.async().blpop(1, "bl:async:none").get(5, java.util.concurrent.TimeUnit.SECONDS));
+            long took = (System.nanoTime() - start) / 1_000_000;
+            assertTrue(took >= 900 && took < 2500, "took " + took + " ms");
+            // Plain commands still answer, and BLPOP 0 (forever) is not failed by the deadline check.
+            java.util.concurrent.CompletableFuture<?> forever = t.async().blpop(0, "bl:async:forever");
+            Thread.sleep(800);
+            assertFalse(forever.isDone());
+            c.rpush("bl:async:forever", "x");
+            assertNotNull(forever.get(5, java.util.concurrent.TimeUnit.SECONDS));
+            assertEquals("PONG", t.async().ping().get(5, java.util.concurrent.TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
     void sets() {
         assertEquals(3L, c.sadd("s1", "a", "b", "c"));
         assertEquals(1L, c.srem("s1", "c"));
@@ -194,5 +218,21 @@ class CollectionsLiveTest {
         assertEquals(11, c.sscanStream("sbig", ScanArgs.match("m1*")).count());
         assertEquals(50, c.sscan("sbig", "0", ScanArgs.count(100)).items().size());
         assertEquals("0", c.sscan("none", "0").cursor());
+    }
+
+    @Test
+    void ttlOnCreateHincrby() {
+        assertEquals(2L, c.hincrby("ttl:h", "f", 2, LONG_TTL));
+        assertEquals(4L, c.hincrby("ttl:h", "f", 2, LONGER_TTL));
+        assertDeadlineKept("ttl:h");
+    }
+
+    private static final java.time.Duration LONG_TTL = java.time.Duration.ofSeconds(100);
+    private static final java.time.Duration LONGER_TTL = java.time.Duration.ofSeconds(1000);
+
+    /** The key got the first call's deadline (at most 100 s), not the second call's 1000 s. */
+    private void assertDeadlineKept(String key) {
+        long ms = c.pttl(key);
+        assertTrue(ms > 0 && ms <= 100_000, "pttl " + ms);
     }
 }

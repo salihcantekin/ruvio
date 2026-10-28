@@ -79,6 +79,7 @@
 //!   `Client::json_get_value` that accept and return any serde type.
 
 mod args;
+mod blocking;
 mod client;
 mod cluster;
 mod codec;
@@ -92,30 +93,34 @@ mod json_value;
 mod keywords;
 mod models;
 mod scan;
+mod sha1;
 #[cfg(test)]
 mod test_support;
+mod tls;
+mod ttl;
 mod value;
 
-pub use client::{Client, ClientOptions, ConnectionNotice, SetMode};
+pub use client::{Client, ClientOptions, ConnectionNotice, Durability, ReadPolicy, SetMode};
 
 pub use cluster::{hash_slot, hash_slot_bytes};
 
 pub use error::Error;
 pub use helpers::{CacheOptions, IdemOutcome, LeaseGuard, LockGuard, SemaphorePermit, new_token};
 pub use keywords::{
-    ChangeType, ChangeTypes, ClientType, InfoSection, StreamTrim, TrimMode, TrimStrategy, bound,
-    stream_id,
+    ChangeType, ChangeTypes, ClientType, ExpireCondition, InfoSection, StreamTrim, TrimMode,
+    TrimStrategy, bound, stream_id,
 };
 pub use models::{
     Aggregate, BitFieldOffset, BitFieldOp, BitFieldOverflow, BitFieldType, BitOperation, BitUnit,
     BloomInfo, BloomInsertOptions, BloomReserveOptions, FieldExpireCondition, FillOutcome, GeoFrom,
     GeoMatch, GeoOrder, GeoSearch, GeoShape, GeoUnit, HashScanPage, IdemState, InsertPosition,
-    JsonIndexType, JsonSetCondition, KeyType, ListPositionOptions, ListSide, PubSubMessage,
-    RangeBy, RangeOptions, RateLimit, RestoreOptions, ScanPage, SetScanPage, SortedSetAddOptions,
-    SortedSetCombine, SortedSetEntry, SortedSetScanPage, StreamClaimOptions, StreamEntry,
-    StreamPendingEntry, StreamPendingFilter, StreamReadOptions, StreamReadResult,
+    JsonIndexType, JsonSetCondition, KeyType, LimitOutcome, ListPositionOptions, ListSide,
+    PubSubMessage, RangeBy, RangeOptions, RateLimit, RestoreOptions, ScanPage, SetScanPage,
+    SortedSetAddOptions, SortedSetCombine, SortedSetEntry, SortedSetScanPage, StreamClaimOptions,
+    StreamEntry, StreamPendingEntry, StreamPendingFilter, StreamReadOptions, StreamReadResult,
 };
 pub use scan::ScanIter;
+pub use tls::TlsOptions;
 
 pub use value::RespValue;
 

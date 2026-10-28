@@ -667,12 +667,13 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
 
         let active = *active;
 
+        // The deadline write sets the key's TTL hint first, as it must, in the same lookup.
         let address = if db == active {
-            entries.key_address(key)
+            entries.mark_ttl_address(key)
         } else {
             databases
-                .get(db as usize)
-                .and_then(|slot| slot.as_ref()?.key_address(key))
+                .get_mut(db as usize)
+                .and_then(|slot| slot.as_mut()?.mark_ttl_address(key))
         };
 
         let previous = deadlines[db as usize].set(key, address, expires_at, |stored| {
@@ -684,7 +685,6 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         }
 
         self.note_deadline_bound(empty, expires_at);
-        self.mark_ttl_hint(db, key, true);
         self.update_deadline_index_bytes(db as usize, before);
         self.refresh_global_memory_usage();
     }
@@ -1052,10 +1052,6 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
     }
 
     pub fn pttl(&self, key: &[u8]) -> i64 {
-        if let Some(ttl) = self.lease_ttl_ms(key) {
-            return ttl;
-        }
-
         if self.entries.lookup(key).is_none() || self.key_is_expired(key) {
             return -2;
         }
@@ -1076,7 +1072,7 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
     pub fn ttl_seconds(&self, key: &[u8]) -> i64 {
         match self.pttl(key) {
             remaining if remaining < 0 => remaining,
-            millis => (millis + 500) / 1_000,
+            millis => millis.saturating_add(500) / 1_000,
         }
     }
 
@@ -1088,7 +1084,13 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
                 .is_none_or(|soonest| soonest <= self.now_unix_millis())
     }
 
+    #[inline]
     pub fn expire_due(&mut self) -> usize {
+        // Checked here as well, so a store with no TTLs skips the call.
+        if self.expiration.keys_with_ttl == 0 {
+            return 0;
+        }
+
         self.expire_cycle(self.active_expire_keys)
     }
 

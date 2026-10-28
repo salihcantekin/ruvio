@@ -1,6 +1,8 @@
 import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
 import { starlightSidebar } from "./scripts/docs-nav.mjs";
+import { site } from "./src/config/site.ts";
+import { sidebarCss } from "./scripts/docs-icons.mjs";
 
 const fonts =
   "https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap";
@@ -16,6 +18,8 @@ export default defineConfig({
       title: "Ruvio Docs",
       logo: { src: "./public/images/ruvio-mark-128.png", alt: "Ruvio" },
       favicon: "/favicon.png",
+      // One dark code theme in both modes: pale syntax colours on a light panel were hard to read.
+      expressiveCode: { themes: ["night-owl"], useStarlightUiThemeColors: false },
       customCss: ["./src/styles/starlight.css"],
       social: [{ icon: "github", label: "GitHub", href: "https://github.com/salihcantekin/ruvio" }],
       // Each generated page sets its own editUrl to its real source file on GitHub.
@@ -24,6 +28,15 @@ export default defineConfig({
         { tag: "link", attrs: { rel: "preconnect", href: "https://fonts.googleapis.com" } },
         { tag: "link", attrs: { rel: "preconnect", href: "https://fonts.gstatic.com", crossorigin: "" } },
         { tag: "link", attrs: { rel: "stylesheet", href: fonts } },
+        // Link-preview card for docs pages (marketing pages set theirs in layouts/Page.astro).
+        { tag: "meta", attrs: { property: "og:image", content: `${site.url}${site.image}` } },
+        { tag: "meta", attrs: { property: "og:image:width", content: "1200" } },
+        { tag: "meta", attrs: { property: "og:image:height", content: "630" } },
+        { tag: "meta", attrs: { property: "og:image:alt", content: site.imageAlt } },
+        { tag: "meta", attrs: { name: "twitter:card", content: "summary_large_image" } },
+        { tag: "meta", attrs: { name: "twitter:image", content: `${site.url}${site.image}` } },
+        // Sidebar icons, generated from scripts/docs-icons.mjs.
+        { tag: "style", content: sidebarCss() },
         // Apply a hidden "On this page" column before first paint (see DocsPageSidebar.astro).
         {
           tag: "script",
@@ -34,6 +47,7 @@ export default defineConfig({
         Header: "./src/components/docs/DocsHeader.astro",
         Footer: "./src/components/docs/DocsFooter.astro",
         MobileMenuFooter: "./src/components/docs/DocsMobileMenuFooter.astro",
+        PageTitle: "./src/components/docs/DocsPageTitle.astro",
         PageSidebar: "./src/components/docs/DocsPageSidebar.astro",
         Head: "./src/components/docs/DocsHead.astro",
       },

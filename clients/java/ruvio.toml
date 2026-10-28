@@ -1,10 +1,10 @@
 # Effective settings. Ruvio reads this file once, at process start.
 # Editing it while the process is running does not change the live server.
 # Restart to pick up edits.
-# RUVIO_* environment variables and CLI flags override this file and are
-# written back here on startup.
+# RUVIO_* environment variables and CLI flags override this file; they are
+# written back here only when the server starts with --write-config.
 
-address = "127.0.0.1:6591"
+address = "127.0.0.1:6379"
 advertised_host = "127.0.0.1"
 hot_keys = []
 notify_keyspace_events = ""
@@ -32,11 +32,11 @@ reserved_headroom_bytes = 16777216
 set_max_intset_entries = 512
 
 [persistence]
-data_dir = "/tmp/tmp.aJeFuHiPrw"
+data_dir = "./data"
 profile = "memory"
 snapshot_interval_ms = 60000
 snapshot_journal_bytes = 67108864
-snapshot_max_bytes = 1073741824
+snapshot_max_bytes = 17179869184
 snapshot_min_mutations = 0
 sync_interval_ms = 1000
 wal_segment_bytes = 268435456
@@ -51,10 +51,13 @@ max_pipeline_commands = 1024
 max_value_bytes = 16777216
 
 [replication]
+announced = true
+min_replicas_max_lag = 10
+min_replicas_to_write = 0
 role = "off"
 
 [requests]
-max_output_buffer_bytes = 16777216
+max_output_buffer_bytes = 67108864
 max_queued_requests = 1024
 
 [scripts]
@@ -64,7 +67,7 @@ max_calls = 1024
 max_instructions = 1000000
 
 [security]
-allow_unauthenticated_public = true
+allow_unauthenticated_public = false
 metrics_token = ""
 protected_mode = true
 replication_password = ""

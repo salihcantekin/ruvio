@@ -1,11 +1,12 @@
 use super::*;
+use crate::protocol::OneOrMany;
 
 pub(super) fn sorted_set_add<'a, C: Clock, I: StorageIndex, S: MutationSink, W: ListWaiterSink>(
     shard: &'a mut KvShard<C, I>,
     sink: &mut S,
     waiters: &mut W,
     key: crate::protocol::Bytes<'a>,
-    pairs: Vec<(f64, crate::protocol::Bytes<'a>)>,
+    pairs: OneOrMany<(f64, crate::protocol::Bytes<'a>)>,
     options: crate::protocol::SortedSetAddOptions,
 ) -> Result<Response<'a>, S::Error> {
     if pairs.iter().any(|(score, _)| score.is_nan()) {
@@ -30,37 +31,56 @@ pub(super) fn sorted_set_add<'a, C: Clock, I: StorageIndex, S: MutationSink, W: 
 
     let mut added = 0i64;
     let mut changed = 0i64;
-    // Scores this command already set, by member: one lookup per pair, so a ZADD of
-    // many members stays linear.
-    let mut overlay: ahash::AHashMap<&[u8], f64> = ahash::AHashMap::new();
-    let mut kept = vec![false; pairs.len()];
 
-    for (index, (score, member)) in pairs.iter().enumerate() {
-        let current = overlay.get(member.as_ref()).copied().or_else(|| {
-            shard
-                .sorted_set_score(&key, member)
-                .expect("sorted-set type was validated")
-        });
+    let selected = match pairs {
+        // One pair: no other pair can have set its member, and it is either kept or not.
+        OneOrMany::One((score, member)) => {
+            let current = shard
+                .sorted_set_score(&key, &member)
+                .expect("sorted-set type was validated");
 
-        if current == Some(*score) || !score_update_applies(current, *score, options) {
-            continue;
+            if current == Some(score) || !score_update_applies(current, score, options) {
+                return Ok(Response::Integer(0));
+            }
+
+            added = i64::from(current.is_none());
+            changed = 1;
+            OneOrMany::One((score, member))
         }
+        OneOrMany::Many(mut pairs) => {
+            // Scores this command already set, by member: one lookup per pair, so a ZADD of
+            // many members stays linear.
+            let mut overlay: ahash::AHashMap<&[u8], f64> = ahash::AHashMap::new();
+            let mut kept = vec![false; pairs.len()];
 
-        if current.is_none() {
-            added += 1;
+            for (index, (score, member)) in pairs.iter().enumerate() {
+                let current = overlay.get(member.as_ref()).copied().or_else(|| {
+                    shard
+                        .sorted_set_score(&key, member)
+                        .expect("sorted-set type was validated")
+                });
+
+                if current == Some(*score) || !score_update_applies(current, *score, options) {
+                    continue;
+                }
+
+                if current.is_none() {
+                    added += 1;
+                }
+
+                changed += 1;
+                overlay.insert(member.as_ref(), *score);
+                kept[index] = true;
+            }
+            drop(overlay);
+
+            // `retain` visits every pair once, in order.
+            let mut kept = kept.into_iter();
+
+            pairs.retain(|_| kept.next().unwrap_or(false));
+            OneOrMany::Many(pairs)
         }
-
-        changed += 1;
-        overlay.insert(member.as_ref(), *score);
-        kept[index] = true;
-    }
-    drop(overlay);
-
-    let selected: Vec<_> = pairs
-        .into_iter()
-        .zip(kept)
-        .filter_map(|(pair, kept)| kept.then_some(pair))
-        .collect();
+    };
 
     if selected.is_empty() {
         return Ok(Response::Integer(0));
@@ -341,6 +361,143 @@ pub(super) fn pop_sorted<'a, C: Clock, I: StorageIndex, S: MutationSink>(
     remove_popped(shard, sink, &key, &popped)?;
 
     Ok(Response::Popped(None, popped))
+}
+
+/// What `ZPOPBYSCORE`/`ZMOVEDUE` would take: up to `count` entries in `min..=max`, lowest
+/// score first, read in one walk of the score order. `None` when `key` holds another type.
+fn peek_due<C: Clock, I: StorageIndex>(
+    shard: &KvShard<C, I>,
+    key: &[u8],
+    min: crate::protocol::ScoreBound,
+    max: crate::protocol::ScoreBound,
+    count: usize,
+) -> Option<PoppedEntries> {
+    let mut due = PoppedEntries::default();
+
+    shard
+        .sorted_set_visit_scores(key, min, max, |member, score| {
+            due.push(member, score);
+            due.len() < count
+        })
+        .ok()?;
+
+    Some(due)
+}
+
+pub(super) fn pop_sorted_by_score<'a, C: Clock, I: StorageIndex, S: MutationSink>(
+    shard: &'a mut KvShard<C, I>,
+    sink: &mut S,
+    key: crate::protocol::Bytes<'a>,
+    min: crate::protocol::ScoreBound,
+    max: crate::protocol::ScoreBound,
+    count: usize,
+    with_scores: bool,
+) -> Result<Response<'a>, S::Error> {
+    let Some(due) = peek_due(shard, &key, min, max, count) else {
+        return Ok(wrong_type());
+    };
+
+    remove_popped(shard, sink, &key, &due)?;
+
+    Ok(Response::PoppedByScore(due, with_scores))
+}
+
+/// `ZMOVEDUE`: the due members leave `source` and join the tail of list `destination` as one
+/// recorded transaction. Clients blocked on `destination` take their elements first.
+pub(super) fn move_due_sorted<'a, C: Clock, I: StorageIndex, S: MutationSink, W: ListWaiterSink>(
+    shard: &'a mut KvShard<C, I>,
+    sink: &mut S,
+    waiters: &mut W,
+    source: crate::protocol::Bytes<'a>,
+    destination: crate::protocol::Bytes<'a>,
+    max: crate::protocol::ScoreBound,
+    count: usize,
+) -> Result<Response<'a>, S::Error> {
+    if !accepts_type(shard, &destination, ValueKind::List) {
+        return Ok(wrong_type());
+    }
+
+    let Some(due) = peek_due(
+        shard,
+        &source,
+        crate::protocol::ScoreBound::NegInf,
+        max,
+        count,
+    ) else {
+        return Ok(wrong_type());
+    };
+
+    if due.is_empty() {
+        return Ok(Response::Integer(0));
+    }
+
+    let extra = due.iter().map(|(member, _)| member.len()).sum::<usize>()
+        + destination.len()
+        + ADMISSION_OVERHEAD_BYTES;
+
+    if let Some(rejected) =
+        before_mutation(shard, sink, [source.as_ref(), destination.as_ref()], extra)?
+    {
+        return Ok(rejected);
+    }
+
+    let moved = due.len();
+    let database = shard.active_database();
+    let holding = waiters.has_waiters();
+
+    if holding {
+        waiters.hold_deliveries();
+    }
+
+    let mut removed = Vec::with_capacity(moved);
+    let mut remaining = Vec::new();
+
+    for (member, _) in due.iter() {
+        removed.push(member.to_vec());
+
+        if !(holding && waiters.deliver(database, &destination, member)) {
+            remaining.push(member.to_vec());
+        }
+    }
+
+    let mut operations = vec![OwnedMutation::SortedSetRemove {
+        key: source.to_vec(),
+        members: removed,
+    }];
+
+    if !remaining.is_empty() {
+        operations.push(OwnedMutation::ListPushBack {
+            key: destination.to_vec(),
+            values: remaining,
+        });
+    }
+
+    let recorded = sink.record(Mutation::Transaction {
+        mutations: &operations,
+    });
+
+    // Blocked clients get their elements only once the move is recorded.
+    if holding {
+        waiters.served_by(sink.written_sequence());
+        waiters.release_deliveries(recorded.is_ok());
+    }
+    recorded?;
+
+    for operation in &operations {
+        match operation {
+            OwnedMutation::SortedSetRemove { members, .. } => {
+                shard
+                    .sorted_set_remove_popped(&source, members)
+                    .expect("sorted-set type was validated before recording");
+            }
+            OwnedMutation::ListPushBack { values, .. } => {
+                let _ = shard.list_push_back(&destination, values);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(Response::Integer(moved as i64))
 }
 
 pub(super) fn remove_sorted_range<'a, C: Clock, I: StorageIndex, S: MutationSink>(

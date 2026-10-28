@@ -16,7 +16,8 @@ Where the code lives, how to check a change quickly, and every place a new comma
 | `Directory.Build.props`, `Directory.Packages.props` | Settings and package metadata shared by every .NET project, and the one version of each NuGet dependency (a `PackageReference` has no `Version`) |
 | `docs/` | Reference docs and `compatibility-matrix.json`, the list of supported commands |
 | `scripts/` | Local gates, release helpers, fault and benchmark harnesses ([scripts/README.md](../scripts/README.md)) |
-| `site-next/` | The website ([ruviodb.com](https://ruviodb.com)): Astro, docs generated from `docs/`, `clients/` and `integrations/` by `scripts/sync-docs.mjs`; published by the manual `site-azure` workflow. Measurement records it charts are in `benchmark/records/` |
+| `site-next/` | The website ([ruviodb.com](https://ruviodb.com)): Astro, docs generated from `docs/`, `clients/` and `integrations/` by `scripts/sync-docs.mjs`; the `/changelog/` page shows the newest sections of the server's `CHANGELOG.md` and is built from the first-parent history of `main` and `dev` and the release tags by `scripts/changelog.mjs`, 100 entries per page, with a search that fetches `/changelog/entries.json` on first use (a shallow clone gets a page that links to GitHub instead); published by the manual `site-azure` workflow. Measurement records it charts are in `benchmark/records/` |
+| `CLAUDE.md`, `.claude/` | The working agreement and skills for Claude Code sessions (see [Working with Claude Code](#working-with-claude-code)) |
 | `.github/workflows/` | `pr-gate` runs on pull requests and pushes to `main`; every other workflow is started by hand |
 
 ## Server module map
@@ -31,6 +32,7 @@ Each shard is owned by one thread: it parses, records to the WAL, applies and re
 | Storage | `store/` (values, collections, eviction, expiry), `index.rs`, `arena.rs`, `chunked.rs`, `hot_store/`, `stream.rs` (packed blocks in `stream/blocks.rs`), `id_map.rs`, `json.rs` (field indexes in `json/index.rs`), `geo.rs`, `hashbrown/` | `hashbrown/` is a trimmed copy of hashbrown 0.17.1 (`HashTable` only); its README lists every change |
 | Durability | `mutation.rs` (the change vocabulary), `persistence/` (`wal.rs`, `codec.rs`, `snapshot.rs`, `sync_worker.rs`), `dump.rs`, `changes.rs` (CDC) | Format changes need a format-minor bump and a fixture |
 | Replication | `replication.rs`, `runtime/evented/replica.rs` | The preflight matches list every `OwnedMutation`; a new variant does not compile until classified |
+| Coordinator | `coordinator/` (`config.rs`, `raft.rs`, `monitor.rs`, `resp.rs`), behind the default `coordinator` feature | A separate process (`ruvio coordinator`); it reaches data nodes only through RESP commands, never through server internals |
 | Operations | `config.rs`, `acl.rs`, `security.rs`, `metrics.rs`, `latency.rs`, `slowlog.rs`, `keystats.rs`, `memory.rs`, `import.rs`, `shutdown.rs` | |
 
 ## Fast loop
@@ -84,11 +86,12 @@ A change to persistence, the WAL, unsafe code or memory layout gets a second, in
 | Environment variable | `apply_environment` in `src/config.rs` (`RUVIO_<NAME>`) |
 | Command-line flag (optional) | `Cli` in `src/bin/ruvio.rs`, `apply_overrides` in `src/config.rs` |
 | `CONFIG GET` | `introspect` in `src/config.rs` |
+| Live or restart-only | `LIVE_SETTINGS` or `RESTART_ONLY_SETTINGS` in `src/config/live.rs`. A live setting also needs a `set_live` arm and a line in `copy_live_settings` there, and the shard must read it from `ShardState::live` (a `Cell` if it is read per command, `live.with` otherwise), never from `published_config`; `live::apply` in `src/runtime/evented/live.rs` pushes it into the store, limiter or slowlog if they keep their own copy. Restart-only is the default for anything that moves data, opens a listener or changes persistence |
 | `--write-config` | `overlay_config` in `src/config.rs` |
 | Template | `ruvio.example.toml` (its values are tested against the code defaults) |
-| Docs | `docs/CONFIGURATION.md` (the key and a row in the environment table); the site's configuration page is generated from it |
+| Docs | `docs/CONFIGURATION.md` (the key and a row in the environment table, with its `CONFIG SET` name or `no` in the `CONFIG SET` column, and a row in the table under *Changing settings at runtime* for a live one; `the_configuration_tables_show_every_live_setting` checks both); the site's configuration page is generated from it |
 
-`every_template_setting_answers_config_get`, `every_file_setting_is_documented`, `every_environment_variable_is_documented` and `every_command_line_flag_is_documented` (all in `scripts/check.sh`) catch a template value, file key, variable or flag that is missing; the site page is checked by hand.
+`every_config_get_name_is_live_or_restart_only` fails until a new `CONFIG GET` name is in one of the two lists, and `every_live_setting_accepts_its_config_get_value` until a live one has a `set_live` arm. `every_template_setting_answers_config_get`, `every_file_setting_is_documented`, `every_environment_variable_is_documented` and `every_command_line_flag_is_documented` (all in `scripts/check.sh`) catch a template value, file key, variable or flag that is missing; the site page is checked by hand.
 
 ## Adding a client method
 
@@ -104,6 +107,18 @@ Every client has a coverage test that loads `docs/compatibility-matrix.json` and
 | Python | `ruvio/_commands.py` | `tests/test_coverage.py` | `tests/test_live.py` |
 
 `python3 scripts/client_stubs.py <COMMAND> --reply integer|bulk|ok|array` prints a starting skeleton for each client. Cluster key routing needs no hand edit: every client reads the key table `scripts/gen_client_keys.py` writes from `clients/testdata/commands.json`, and tests it against `clients/testdata/key_vectors.json`. The Java blocking facade and command words are generated; the PR gate runs `generate.py --check`. Cluster routing, redirects and retries are compared across clients in [CLIENT_BEHAVIOR.md](CLIENT_BEHAVIOR.md); every client's slot function is tested against `clients/testdata/slots.json`.
+
+## Working with Claude Code
+
+The repository carries the project files for [Claude Code](https://docs.claude.com/en/docs/claude-code/overview), so every contributor's session starts with the same rules.
+
+| File | What it is |
+| --- | --- |
+| `CLAUDE.md` | The working agreement every session reads first: the time budget, how to verify, the test, performance and safety rules, git flow, and which doc to read for what |
+| `.claude/settings.json` | Shared permissions: build, test and read-only commands are allowed; destructive and publishing commands (force-push, tags, `cargo publish`, release workflows, `--release` test builds) are denied, and a deny wins over an allow |
+| `.claude/skills/<name>/SKILL.md` | Procedures for recurring tasks (adding a command, measuring, a risky-change review, test reliability, hygiene, release preparation), loaded when a task matches their description |
+
+Personal overrides go in `.claude/settings.local.json`, which git ignores; do not widen the shared file for one machine. To add a skill, create `.claude/skills/ruvio-<name>/SKILL.md` with YAML front matter (`name:` equal to the folder name, and a one-sentence `description:` that says when to use it), keep the body in English, point to existing docs and scripts rather than copying them, check that every path it names exists, list it in the skills table in `CLAUDE.md`, and run `scripts/check_hygiene.sh`.
 
 ## Releases
 

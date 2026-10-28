@@ -13,6 +13,16 @@ internal static class CoverageCommands
             ? new RespCommand(["SET", key, value, "IFEQ", expected, "PX", RespRead.Number(PositiveMilliseconds(ttl, nameof(expiry)))])
             : new RespCommand("SET", key, value, "IFEQ", expected);
 
+    internal static RespCommand SetIfGreater(string key, long value, TimeSpan? expiry) =>
+        expiry is { } ttl
+            ? new RespCommand(["SET", key, RespRead.Number(value), "IFGT", "PX", RespRead.Number(PositiveMilliseconds(ttl, nameof(expiry)))])
+            : new RespCommand("SET", key, value, "IFGT");
+
+    internal static RespCommand SetIfLess(string key, long value, TimeSpan? expiry) =>
+        expiry is { } ttl
+            ? new RespCommand(["SET", key, RespRead.Number(value), "IFLT", "PX", RespRead.Number(PositiveMilliseconds(ttl, nameof(expiry)))])
+            : new RespCommand("SET", key, value, "IFLT");
+
     internal static RespCommand SetIfEqualKeepingTimeToLive(string key, string value, string expected) =>
         new("SET", key, value, "IFEQ", expected, "KEEPTTL");
 
@@ -311,10 +321,18 @@ internal static class CoverageCommands
     internal static RespCommand InsertBloom(string key, IReadOnlyList<string> items, BloomInsertOptions? options)
     {
         ArgumentNullException.ThrowIfNull(items);
-        var parts = new List<string>(12 + items.Count) { "BF.INSERT", key };
+        var parts = new List<string>(14 + items.Count) { "BF.INSERT", key };
 
         if (options is not null)
         {
+            if (options.Ttl is { } lifetime)
+            {
+                (string word, long value) = RespRead.CreateTtl(lifetime, nameof(options.Ttl));
+
+                parts.Add(word);
+                parts.Add(RespRead.Number(value));
+            }
+
             if (options.Capacity is { } capacity)
             {
                 parts.Add("CAPACITY");

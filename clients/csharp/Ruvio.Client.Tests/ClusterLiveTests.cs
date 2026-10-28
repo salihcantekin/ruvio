@@ -8,6 +8,28 @@ namespace Ruvio.Client.Tests;
 public class ClusterLiveTests
 {
     [Fact(Timeout = 15000)]
+    public async Task ReportsSlotMovesAndRefusesARangeAlreadyInPlace()
+    {
+        string? address = Environment.GetEnvironmentVariable("RUVIO_CLUSTER_ADDR");
+
+        if (string.IsNullOrWhiteSpace(address))
+        {
+            return;
+        }
+
+        string[] parts = address.Split(':');
+
+        await using RuvioConnection connection = await RuvioConnection.ConnectAsync(parts[0], int.Parse(parts[1]));
+        RuvioClient client = await connection.GetDefaultDatabaseAsync();
+        IReadOnlyDictionary<string, string> status = await client.GetMoveSlotsStatusAsync();
+
+        Assert.True(status.ContainsKey("state"));
+        // Slot 0 is on shard 0: nothing to move, and the server says why.
+        RuvioException refused = await Assert.ThrowsAnyAsync<RuvioException>(async () => await client.MoveSlotsAsync(0, 10, 0));
+        Assert.Contains("already on that shard", refused.Message);
+    }
+
+    [Fact(Timeout = 15000)]
     public async Task RoutesKeysAndSplitsMgetAgainstALiveCluster()
     {
         string? address = Environment.GetEnvironmentVariable("RUVIO_CLUSTER_ADDR");

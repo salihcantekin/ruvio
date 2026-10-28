@@ -10,6 +10,8 @@ public final class Cmd {
     private Cmd() {
     }
 
+    /** The word {@code ABORT}, pre-encoded as a RESP bulk string. */
+    public static final byte[] ABORT = RespOut.fragment("ABORT");
     /** The word {@code ACL}, pre-encoded as a RESP bulk string. */
     public static final byte[] ACL = RespOut.fragment("ACL");
     /** The word {@code APPEND}, pre-encoded as a RESP bulk string. */
@@ -72,6 +74,8 @@ public final class Cmd {
     public static final byte[] CONFIG = RespOut.fragment("CONFIG");
     /** The word {@code COPY}, pre-encoded as a RESP bulk string. */
     public static final byte[] COPY = RespOut.fragment("COPY");
+    /** The word {@code COST}, pre-encoded as a RESP bulk string. */
+    public static final byte[] COST = RespOut.fragment("COST");
     /** The word {@code COUNT}, pre-encoded as a RESP bulk string. */
     public static final byte[] COUNT = RespOut.fragment("COUNT");
     /** The word {@code DBSIZE}, pre-encoded as a RESP bulk string. */
@@ -92,6 +96,8 @@ public final class Cmd {
     public static final byte[] EVAL = RespOut.fragment("EVAL");
     /** The word {@code EVALSHA}, pre-encoded as a RESP bulk string. */
     public static final byte[] EVALSHA = RespOut.fragment("EVALSHA");
+    /** The word {@code EX}, pre-encoded as a RESP bulk string. */
+    public static final byte[] EX = RespOut.fragment("EX");
     /** The word {@code EXISTS}, pre-encoded as a RESP bulk string. */
     public static final byte[] EXISTS = RespOut.fragment("EXISTS");
     /** The word {@code EXPIRE}, pre-encoded as a RESP bulk string. */
@@ -168,6 +174,8 @@ public final class Cmd {
     public static final byte[] HLEN = RespOut.fragment("HLEN");
     /** The word {@code HMGET}, pre-encoded as a RESP bulk string. */
     public static final byte[] HMGET = RespOut.fragment("HMGET");
+    /** The word {@code HMSET}, pre-encoded as a RESP bulk string. */
+    public static final byte[] HMSET = RespOut.fragment("HMSET");
     /** The word {@code HPERSIST}, pre-encoded as a RESP bulk string. */
     public static final byte[] HPERSIST = RespOut.fragment("HPERSIST");
     /** The word {@code HPEXPIRE}, pre-encoded as a RESP bulk string. */
@@ -188,6 +196,8 @@ public final class Cmd {
     public static final byte[] HSETNX = RespOut.fragment("HSETNX");
     /** The word {@code HSTRLEN}, pre-encoded as a RESP bulk string. */
     public static final byte[] HSTRLEN = RespOut.fragment("HSTRLEN");
+    /** The word {@code HTRANSFER}, pre-encoded as a RESP bulk string. */
+    public static final byte[] HTRANSFER = RespOut.fragment("HTRANSFER");
     /** The word {@code HTTL}, pre-encoded as a RESP bulk string. */
     public static final byte[] HTTL = RespOut.fragment("HTTL");
     /** The word {@code HVALS}, pre-encoded as a RESP bulk string. */
@@ -196,6 +206,10 @@ public final class Cmd {
     public static final byte[] IDEM = RespOut.fragment("IDEM");
     /** The word {@code IFEQ}, pre-encoded as a RESP bulk string. */
     public static final byte[] IFEQ = RespOut.fragment("IFEQ");
+    /** The word {@code IFGT}, pre-encoded as a RESP bulk string. */
+    public static final byte[] IFGT = RespOut.fragment("IFGT");
+    /** The word {@code IFLT}, pre-encoded as a RESP bulk string. */
+    public static final byte[] IFLT = RespOut.fragment("IFLT");
     /** The word {@code INCR}, pre-encoded as a RESP bulk string. */
     public static final byte[] INCR = RespOut.fragment("INCR");
     /** The word {@code INCRBY}, pre-encoded as a RESP bulk string. */
@@ -330,6 +344,8 @@ public final class Cmd {
     public static final byte[] PTTL = RespOut.fragment("PTTL");
     /** The word {@code PUBLISH}, pre-encoded as a RESP bulk string. */
     public static final byte[] PUBLISH = RespOut.fragment("PUBLISH");
+    /** The word {@code PX}, pre-encoded as a RESP bulk string. */
+    public static final byte[] PX = RespOut.fragment("PX");
     /** The word {@code RANDOMKEY}, pre-encoded as a RESP bulk string. */
     public static final byte[] RANDOMKEY = RespOut.fragment("RANDOMKEY");
     /** The word {@code READONLY}, pre-encoded as a RESP bulk string. */
@@ -342,8 +358,14 @@ public final class Cmd {
     public static final byte[] RENAME = RespOut.fragment("RENAME");
     /** The word {@code RENAMENX}, pre-encoded as a RESP bulk string. */
     public static final byte[] RENAMENX = RespOut.fragment("RENAMENX");
+    /** The word {@code RENEW}, pre-encoded as a RESP bulk string. */
+    public static final byte[] RENEW = RespOut.fragment("RENEW");
+    /** The word {@code REPLICAOF}, pre-encoded as a RESP bulk string. */
+    public static final byte[] REPLICAOF = RespOut.fragment("REPLICAOF");
     /** The word {@code RESTORE}, pre-encoded as a RESP bulk string. */
     public static final byte[] RESTORE = RespOut.fragment("RESTORE");
+    /** The word {@code ROLE}, pre-encoded as a RESP bulk string. */
+    public static final byte[] ROLE = RespOut.fragment("ROLE");
     /** The word {@code RPOP}, pre-encoded as a RESP bulk string. */
     public static final byte[] RPOP = RespOut.fragment("RPOP");
     /** The word {@code RPOPLPUSH}, pre-encoded as a RESP bulk string. */
@@ -394,6 +416,8 @@ public final class Cmd {
     public static final byte[] SINTERSTORE = RespOut.fragment("SINTERSTORE");
     /** The word {@code SISMEMBER}, pre-encoded as a RESP bulk string. */
     public static final byte[] SISMEMBER = RespOut.fragment("SISMEMBER");
+    /** The word {@code SLIDING}, pre-encoded as a RESP bulk string. */
+    public static final byte[] SLIDING = RespOut.fragment("SLIDING");
     /** The word {@code SLOWLOG}, pre-encoded as a RESP bulk string. */
     public static final byte[] SLOWLOG = RespOut.fragment("SLOWLOG");
     /** The word {@code SMEMBERS}, pre-encoded as a RESP bulk string. */
@@ -430,8 +454,12 @@ public final class Cmd {
     public static final byte[] SWR = RespOut.fragment("SWR");
     /** The word {@code TAKE}, pre-encoded as a RESP bulk string. */
     public static final byte[] TAKE = RespOut.fragment("TAKE");
+    /** The word {@code TOKENS}, pre-encoded as a RESP bulk string. */
+    public static final byte[] TOKENS = RespOut.fragment("TOKENS");
     /** The word {@code TOUCH}, pre-encoded as a RESP bulk string. */
     public static final byte[] TOUCH = RespOut.fragment("TOUCH");
+    /** The word {@code TRANSFER}, pre-encoded as a RESP bulk string. */
+    public static final byte[] TRANSFER = RespOut.fragment("TRANSFER");
     /** The word {@code TTL}, pre-encoded as a RESP bulk string. */
     public static final byte[] TTL = RespOut.fragment("TTL");
     /** The word {@code TYPE}, pre-encoded as a RESP bulk string. */
@@ -442,6 +470,8 @@ public final class Cmd {
     public static final byte[] WAIT = RespOut.fragment("WAIT");
     /** The word {@code WATCH}, pre-encoded as a RESP bulk string. */
     public static final byte[] WATCH = RespOut.fragment("WATCH");
+    /** The word {@code WITHRETRY}, pre-encoded as a RESP bulk string. */
+    public static final byte[] WITHRETRY = RespOut.fragment("WITHRETRY");
     /** The word {@code WITHSCORES}, pre-encoded as a RESP bulk string. */
     public static final byte[] WITHSCORES = RespOut.fragment("WITHSCORES");
     /** The word {@code XACK}, pre-encoded as a RESP bulk string. */
@@ -494,8 +524,12 @@ public final class Cmd {
     public static final byte[] ZINTERSTORE = RespOut.fragment("ZINTERSTORE");
     /** The word {@code ZLEXCOUNT}, pre-encoded as a RESP bulk string. */
     public static final byte[] ZLEXCOUNT = RespOut.fragment("ZLEXCOUNT");
+    /** The word {@code ZMOVEDUE}, pre-encoded as a RESP bulk string. */
+    public static final byte[] ZMOVEDUE = RespOut.fragment("ZMOVEDUE");
     /** The word {@code ZMSCORE}, pre-encoded as a RESP bulk string. */
     public static final byte[] ZMSCORE = RespOut.fragment("ZMSCORE");
+    /** The word {@code ZPOPBYSCORE}, pre-encoded as a RESP bulk string. */
+    public static final byte[] ZPOPBYSCORE = RespOut.fragment("ZPOPBYSCORE");
     /** The word {@code ZPOPMAX}, pre-encoded as a RESP bulk string. */
     public static final byte[] ZPOPMAX = RespOut.fragment("ZPOPMAX");
     /** The word {@code ZPOPMIN}, pre-encoded as a RESP bulk string. */

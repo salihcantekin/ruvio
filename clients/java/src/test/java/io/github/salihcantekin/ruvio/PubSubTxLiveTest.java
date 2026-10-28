@@ -194,7 +194,7 @@ class PubSubTxLiveTest {
         for (int i = 0; i < 5000; i++) {
             fs.add(a.incr("pl:async"));
         }
-        CompletableFuture.allOf(fs.toArray(new CompletableFuture[0])).join();
+        CompletableFuture.allOf(fs.toArray(CompletableFuture<?>[]::new)).join();
         assertEquals(5000L, fs.get(4999).join());
     }
 }

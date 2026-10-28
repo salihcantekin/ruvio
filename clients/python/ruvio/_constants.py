@@ -19,6 +19,7 @@ __all__ = [
     "GeoOrder",
     "InsertPosition",
     "ListSide",
+    "ExpireCondition",
     "BitOperation",
     "BitUnit",
     "Aggregate",
@@ -111,6 +112,22 @@ class ListSide(Keyword):
 
     LEFT = "LEFT"
     RIGHT = "RIGHT"
+
+
+class ExpireCondition(Keyword):
+    """Condition of ``EXPIRE``, ``PEXPIRE``, ``EXPIREAT`` and ``PEXPIREAT`` (``condition=``).
+
+    ``NX`` sets the deadline only when the key has none, ``XX`` only when it has one, ``GT`` only when the
+    new deadline is later and ``LT`` only when it is earlier. A key without a deadline counts as infinite.
+    A failed condition replies ``False``.
+
+    Example: ``r.expire("k", 60, condition=ExpireCondition.NX)``.
+    """
+
+    NX = "NX"
+    XX = "XX"
+    GT = "GT"
+    LT = "LT"
 
 
 class BitOperation(Keyword):

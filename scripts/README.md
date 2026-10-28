@@ -28,6 +28,7 @@ Most scripts take the path to a built `ruvio` binary and start their own server.
 | `run_client_suites.py` | Rust and C# client suites plus the .NET integrations against one server |
 | `check_compatibility_matrix.py` | Matrix against the parser, the table, the docs, coverage files, client manifests, and command counts stated in the site and READMEs |
 | `check_instruction_baseline.py` | iai-callgrind counts against `benchmark/baselines/instructions.json` (PR gate, +2%) |
+| `check_hygiene.sh` | Scans the lines a branch adds (`check_hygiene.sh . origin/dev`, after `git add -N .`) or the whole tree for planning ids, Turkish text and misnamed tests |
 | `check_package_metadata.py` | Package descriptions, links and licenses (Python 3.11+) |
 | `resp_conformance.py` | RESP2 conformance smoke |
 | `redis_differential.py`, `geo_differential.py`, `slab_fuzz.py` | Replies compared with a Redis instance |
@@ -50,6 +51,7 @@ Most scripts take the path to a built `ruvio` binary and start their own server.
 | --- | --- |
 | `model_check.py` (+ `model_check_shim.c`, `model_check_mutants/`, `model_check_repros/`) | Model-based randomized checker with crashes and fault injection |
 | `durability_scenarios.py`, `kill9_harness.py`, `kill9_shards.py` | Crash and restart checks per durability profile |
+| `coordinator_faults.py` | `ruvio coordinator` failover under partitions (TCP proxy), a killed coordinator leader, no majority, restart and load; under a minute |
 | `disk_faults.py`, `enospc_check.py` | WAL write errors, slow and full disks (Linux, root) |
 | `native_resilience.py`, `docker_resilience.py` | Crash, recovery and filesystem faults on native processes or containers |
 | `cdc_resume.py`, `worker_repl_check.py`, `json_replica_backlog_smoke.py`, `json_replica_cap_smoke.py` | CDC resume, replication with the sync worker, replica backlogs |
@@ -64,7 +66,7 @@ Most scripts take the path to a built `ruvio` binary and start their own server.
 | `gen_client_keys.py` | Writes each client's command key table from `clients/testdata/commands.json`; `--check` runs in `check.sh` |
 | `client_stubs.py` | Prints a method skeleton per client, and the `command_methods.json` row, for a command already in `clients/testdata/commands.json` |
 | `bench_matrix.py`, `perf_matrix.py`, `benchmark.sh`, `benchmark_regression.py`, `pinned_run.py` | Throughput matrices and repeatable samples |
-| `bench_added_commands.py`, `bench_checkpoint_latency.py`, `bench_concurrency_durability.py`, `json_compare.py` | Feature, checkpoint, durability and JSON costs |
+| `bench_added_commands.py`, `bench_scripted_equivalents.py`, `bench_checkpoint_latency.py`, `bench_concurrency_durability.py`, `json_compare.py` | Feature, checkpoint, durability and JSON costs |
 | `benchmark_shards.py`, `benchmark_shard_skew.py`, `fairness_multishard.py`, `fairness_probe.py` | Shard scaling and tail fairness |
 | `memory_churn.py`, `churn_benchmark.py`, `compare_lru_reads.py`, `rss_docker.py`, `mixed_docker.py` | Memory, eviction and mixed workloads |
 | `ceiling.sh`, `ceiling_compare.py`, `ceiling_logic.sh` | Single-core ceiling |

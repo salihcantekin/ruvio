@@ -30,7 +30,16 @@ pub fn execute_transaction<C: Clock, I: StorageIndex, S: MutationSink, W: ListWa
     commands: Vec<Command<'static>>,
     database: u8,
 ) -> Result<Response<'static>, S::Error> {
-    execute_transaction_in(shard, sink, waiters, conn, commands, database, true)
+    execute_transaction_in(shard, sink, waiters, conn, commands, database, true, None)
+}
+
+/// What a queued `EVAL`, `EVALSHA` or `FCALL` runs with: the connection's script cache, the
+/// running limits, and the ACL rules each script's calls are checked against (none when the
+/// user may run every command on every key).
+pub struct TransactionScripts<'a> {
+    pub cache: &'a mut crate::script::ScriptCache,
+    pub limits: crate::config::ScriptLimits,
+    pub rules: Option<std::sync::Arc<crate::acl::AclRules>>,
 }
 
 /// Runs a queued transaction. `enforce_slots` is off when this shard owns every slot, so
@@ -44,6 +53,7 @@ pub fn execute_transaction_in<C: Clock, I: StorageIndex, S: MutationSink, W: Lis
     commands: Vec<Command<'static>>,
     database: u8,
     enforce_slots: bool,
+    mut scripts: Option<TransactionScripts<'_>>,
 ) -> Result<Response<'static>, S::Error> {
     if shard.watches_dirty(conn) {
         shard.unwatch(conn);
@@ -86,6 +96,33 @@ pub fn execute_transaction_in<C: Clock, I: StorageIndex, S: MutationSink, W: Lis
         if rolls_back {
             capture_undo(shard, &command, &mut undo, database);
         }
+
+        // A script runs in its place, its writes joining the batch's one record; a script
+        // touches only the keys it declares, which the undo log copied above.
+        if let Command::Eval { .. } | Command::EvalSha { .. } | Command::FCall { .. } = command {
+            let response = match scripts.as_mut() {
+                Some(scripts) => {
+                    scripts.cache.restrict_next_script(scripts.rules.clone());
+                    match crate::script::execute_script_command(
+                        shard,
+                        &mut collected,
+                        waiters,
+                        scripts.cache,
+                        scripts.limits,
+                        command,
+                        database,
+                    ) {
+                        Ok(response) => response,
+                        Err(error) => match error {},
+                    }
+                }
+                None => Response::Error(b"ERR script command requires a connection"),
+            };
+
+            responses.push(response);
+            continue;
+        }
+
         match execute_in_database(shard, command, &mut collected, waiters, database) {
             Ok(response) => responses.push(response.into_owned()),
             Err(error) => match error {},
@@ -360,4 +397,83 @@ pub(crate) fn written_keys<'a>(command: &'a Command<'_>) -> Vec<&'a [u8]> {
 thread_local! {
     /// Keys copied into an undo log on this thread, for tests that check what is copied.
     pub(crate) static UNDO_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs a write that sets a deadline only when it creates the key (`EX`/`PX` on `INCRBY`,
+/// `ZADD`, ...). A key that exists keeps its deadline. For a new key the write and the
+/// deadline are logged as one record, and undone together if the log refuses it.
+pub(super) fn create_with_ttl<'a, C: Clock, I: StorageIndex, S: MutationSink, W: ListWaiterSink>(
+    shard: &'a mut KvShard<C, I>,
+    sink: &mut S,
+    waiters: &mut W,
+    ttl_ms: u64,
+    inner: Command<'a>,
+    database: u8,
+) -> Result<Response<'a>, S::Error> {
+    let Some(key) = crate::routing::command_keys(&inner)
+        .first()
+        .map(|key| key.to_vec())
+    else {
+        return execute_in_database(shard, inner, sink, waiters, database);
+    };
+
+    shard.expire_due();
+    shard.enter(database);
+
+    if shard.contains_key(&key) {
+        return execute_in_database(shard, inner, sink, waiters, database);
+    }
+
+    let mut undo = Vec::new();
+    let mut collected = BufferingSink::default();
+    let rolls_back = sink.persists();
+
+    if rolls_back {
+        capture_undo(shard, &inner, &mut undo, database);
+    }
+
+    let before = sink.written_sequence();
+
+    waiters.hold_deliveries();
+
+    let response = match execute_in_database(&mut *shard, inner, &mut collected, waiters, database)
+    {
+        Ok(response) => response.into_owned(),
+        Err(error) => match error {},
+    };
+
+    if shard.contains_key(&key) {
+        let now = shard.now_unix_millis();
+
+        if let Some(deadline) = now.checked_add(ttl_ms) {
+            shard.expire_at(&key, deadline);
+            collected.mutations.push(
+                Mutation::ExpireAt {
+                    key: &key,
+                    unix_millis: deadline.get(),
+                }
+                .to_owned(),
+            );
+        }
+    }
+
+    if !collected.mutations.is_empty() {
+        sink.select_database(database);
+
+        if let Err(error) = sink.record_now(Mutation::Transaction {
+            mutations: &collected.mutations,
+        }) {
+            for step in undo.into_iter().rev() {
+                step.revert(shard);
+            }
+            waiters.release_deliveries(false);
+
+            return Err(error);
+        }
+    }
+
+    waiters.served_by(written_since(before, sink.written_sequence()));
+    waiters.release_deliveries(true);
+
+    Ok(response)
 }

@@ -84,11 +84,25 @@ pub(super) fn cmd_select<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
 /// `EXPIRE` (seconds from now), `PEXPIRE` (milliseconds), `EXPIREAT` (unix seconds) or
 /// `PEXPIREAT` (unix milliseconds).
 fn expire<'a>(args: &Args<'a, '_>, seconds: bool, absolute: bool) -> Parsed<'a> {
-    if args.len() != 2 {
-        return Err(ProtocolError::Invalid(
-            "expiration commands expect a key and an integer",
-        ));
-    }
+    let condition = match args.len() {
+        2 => ExpireCondition::Always,
+        3 => match args.bytes(2) {
+            option if option.eq_ignore_ascii_case(b"NX") => ExpireCondition::Nx,
+            option if option.eq_ignore_ascii_case(b"XX") => ExpireCondition::Xx,
+            option if option.eq_ignore_ascii_case(b"GT") => ExpireCondition::Gt,
+            option if option.eq_ignore_ascii_case(b"LT") => ExpireCondition::Lt,
+            _ => {
+                return Err(ProtocolError::Invalid(
+                    "expiration option must be NX, XX, GT or LT",
+                ));
+            }
+        },
+        _ => {
+            return Err(ProtocolError::Invalid(
+                "expiration commands expect a key, an integer and an optional NX, XX, GT or LT",
+            ));
+        }
+    };
 
     let ttl = parse_i64(args.bytes(1))?;
     let key = args.arg(0);
@@ -103,9 +117,14 @@ fn expire<'a>(args: &Args<'a, '_>, seconds: bool, absolute: bool) -> Parsed<'a> 
         Command::PExpireAt {
             key,
             unix_millis: milliseconds,
+            condition,
         }
     } else {
-        Command::Expire { key, milliseconds }
+        Command::Expire {
+            key,
+            milliseconds,
+            condition,
+        }
     })
 }
 
@@ -268,20 +287,25 @@ pub(super) fn cmd_hmget<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
 }
 
 pub(super) fn cmd_hincrby<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
-    match args.len() {
-        3 => {
-            let delta = parse_i64(args.bytes(2))?;
-
-            Ok(Command::HashIncrement {
-                key: args.arg(0),
-                field: args.arg(1),
-                delta,
-            })
+    let ttl = match args.len() {
+        3 => None,
+        5 => Some(create_ttl_option(args, 3)?.ok_or(ProtocolError::Invalid("syntax error"))?),
+        _ => {
+            return Err(ProtocolError::Invalid(
+                "HINCRBY expects a key, field, increment and an optional EX or PX",
+            ));
         }
-        _ => Err(ProtocolError::Invalid(
-            "HINCRBY expects a key, field, and increment",
-        )),
-    }
+    };
+    let delta = parse_i64(args.bytes(2))?;
+
+    Ok(with_create_ttl(
+        ttl,
+        Command::HashIncrement {
+            key: args.arg(0),
+            field: args.arg(1),
+            delta,
+        },
+    ))
 }
 
 pub(super) fn cmd_hsetnx<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
@@ -342,20 +366,25 @@ pub(super) fn cmd_zrem<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
 }
 
 pub(super) fn cmd_zincrby<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
-    match args.len() {
-        3 => {
-            let delta = parse_f64(args.bytes(1))?;
-
-            Ok(Command::SortedSetIncr {
-                key: args.arg(0),
-                delta,
-                member: args.arg(2),
-            })
+    let ttl = match args.len() {
+        3 => None,
+        5 => Some(create_ttl_option(args, 3)?.ok_or(ProtocolError::Invalid("syntax error"))?),
+        _ => {
+            return Err(ProtocolError::Invalid(
+                "ZINCRBY expects a key, increment, member and an optional EX or PX",
+            ));
         }
-        _ => Err(ProtocolError::Invalid(
-            "ZINCRBY expects a key, increment, and member",
-        )),
-    }
+    };
+    let delta = parse_f64(args.bytes(1))?;
+
+    Ok(with_create_ttl(
+        ttl,
+        Command::SortedSetIncr {
+            key: args.arg(0),
+            delta,
+            member: args.arg(2),
+        },
+    ))
 }
 
 pub(super) fn cmd_mset<'a>(args: &Args<'a, '_>) -> Parsed<'a> {

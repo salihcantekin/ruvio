@@ -2,7 +2,7 @@
 
 Published rows are the evented runtime. That is the only runtime.
 
-## Hash field TTL and sorted-set pops, Apple M4 Pro, 2026-10-01
+## Hash field TTL and sorted-set pops, Apple silicon Mac, 2026-10-01
 
 Same host as the section above. No Docker, no Redis comparison, not bare-metal Linux. Base is `e985d7c` (main). New is that build plus `HEXPIRE`, `HPEXPIRE`, `HEXPIREAT`, `HPEXPIREAT`, `HTTL`, `HPTTL`, `HEXPIRETIME`, `HPEXPIRETIME`, `HPERSIST`, `ZPOPMIN`, `ZPOPMAX`, `BZPOPMIN`, `BZPOPMAX`, `ZREMRANGEBYRANK`, `ZREMRANGEBYSCORE`, and `ZREMRANGEBYLEX`. Release binaries, default features (evented, mimalloc), durability `memory`, 1 shard, loopback.
 
@@ -34,7 +34,7 @@ Memory is `ps` RSS after the load minus the empty process, fresh process per sam
 
 A hash without a field TTL keeps the main layout. A timed hash costs about 180 bytes for its first timed field and about 30 bytes for each further one, on this probe.
 
-## SEMAPHORE and INCRBY MAX, Apple M4 Pro, 2026-10-01
+## SEMAPHORE and INCRBY MAX, Apple silicon Mac, 2026-10-01
 
 Same host as the sections above. No Docker, no Redis comparison, not bare-metal Linux. Base is `99d5c91`; new adds `SEMAPHORE` and `INCRBY key n MAX limit`. Release binaries, evented, mimalloc, durability `memory`, 1 shard, loopback.
 
@@ -72,9 +72,9 @@ Memory: `ps` RSS after 100,000 keys minus the empty process. The `SET`, `LEASE`,
 
 A semaphore with one holder keeps that holder in the object, so that case does not allocate a second slice. A second holder allocates an exact slice, 16 bytes each, with no spare capacity. The two semaphore rows are one later sample of that layout. The other rows are the three-sample run above them. Most of a semaphore's cost is still the deadline record every self-expiring key carries, the same as `ONCE` and `LIMIT`.
 
-## Native Redis comparison, Apple M4 Pro, 2026-10-07
+## Native Redis comparison, Apple silicon Mac, 2026-10-07
 
-**Host/build:** Apple M4 Pro, 12 cores, 24 GiB, macOS 26.6.2, arm64. Native Ruvio 0.2.10 release binary rebuilt from `203f4fc` **with uncommitted TTL deadline-index accounting changes**; Redis 8.10.2. The working tree is not a reproducible commit. Both servers ran as separate processes on loopback, one Ruvio shard with `memory` durability, Redis with RDB and AOF disabled. This is not a WAL, Docker, multi-shard, or networked deployment comparison.
+**Host/build:** Apple silicon Mac, 12 cores, 24 GiB, macOS 26.6.2, arm64. Native Ruvio 0.2.10 release binary rebuilt from `203f4fc` **with uncommitted TTL deadline-index accounting changes**; Redis 8.10.2. The working tree is not a reproducible commit. Both servers ran as separate processes on loopback, one Ruvio shard with `memory` durability, Redis with RDB and AOF disabled. This is not a WAL, Docker, multi-shard, or networked deployment comparison.
 
 **Throughput:** `python3 scripts/redis_compare.py --out target/redis-compare`, three rounds, 50 clients, pipeline 16, 64-byte values, alternating Ruvio/Redis measurement order within each round. Medians of `redis-benchmark` requests/s; most scenarios ran 1,000,000 requests per round, `LRANGE 100/300/500/600` ran 200k/100k/60k/50k, and `MSET` ran 500k. Both processes remain up throughout the three rounds. The `LRANGE` lists were checked nonempty on both servers (`LLEN` 200k/300k/360k/410k in round one). Total comparison including the memory probe: 75.8 s.
 
@@ -120,7 +120,7 @@ The distinct-string load favors Ruvio by RSS delta, but **mixed connection/slow-
 
 ## Capped Docker Desktop comparison, 2026-10-01
 
-Docker Desktop on the same Apple M4 Pro. This is a Linux VM, not the native table above and not bare metal. Both containers had the same cap: `--cpus=4 --memory=2g --memory-swap=2g`. Probe names were `ruvio-cmp-20261001` (port 6391) and `redis-cmp-20261001` (port 6392). They were removed after the run. Do not treat these names as the local `ruvio` or `redis` containers.
+Docker Desktop on the same Apple silicon Mac. This is a Linux VM, not the native table above and not bare metal. Both containers had the same cap: `--cpus=4 --memory=2g --memory-swap=2g`. Probe names were `ruvio-cmp-20261001` (port 6391) and `redis-cmp-20261001` (port 6392). They were removed after the run. Do not treat these names as the local `ruvio` or `redis` containers.
 
 Ruvio image `ruvio-cmp:20261001`, built from `3188283` with default features (evented, mimalloc). Process env: durability `memory`, 1 shard, `RUVIO_CONFIG=/tmp/ruvio.toml`, `RUVIO_DATA_DIR=/tmp`. Redis image `redis:8-alpine` 8.10.2, `--save "" --appendonly no --protected-mode no --bind 0.0.0.0`.
 
@@ -157,7 +157,7 @@ Memory inside the container is `VmRSS` from `/proc/1/status` (KiB), not macOS `p
 
 ## Native JSON vs RedisJSON, 2026-10-07
 
-Apple M4 Pro, macOS 26.6.2 (arm64), native release binaries on loopback, no Docker. Ruvio build `7aebdaf` (evented, `memory` durability, one shard) versus Redis 8.10.2 with the installed `rejson.so` RedisJSON module (`--save "" --appendonly no`). `redis-benchmark` 8.10.2 measured three rounds per operation, alternating which server ran first. Rates below are median requests per second, not production guarantees. The clients used equivalent simple paths but different path syntax for scalar reads (`$.meta.value` / `$.score` on Ruvio, `.meta.value` / `.score` on RedisJSON). The commands and response formats are not identical in every case.
+Apple silicon Mac, macOS 26.6.2 (arm64), native release binaries on loopback, no Docker. Ruvio build `7aebdaf` (evented, `memory` durability, one shard) versus Redis 8.10.2 with the installed `rejson.so` RedisJSON module (`--save "" --appendonly no`). `redis-benchmark` 8.10.2 measured three rounds per operation, alternating which server ran first. Rates below are median requests per second, not production guarantees. The clients used equivalent simple paths but different path syntax for scalar reads (`$.meta.value` / `$.score` on Ruvio, `.meta.value` / `.score` on RedisJSON). The commands and response formats are not identical in every case.
 
 First workload: 20,000 distinct keys, each with the same 87-byte JSON object (`name`, `active`, `score`, and nested `meta`); 100,000 requests per operation per round, 50 clients, pipeline 16. Root SET overwrote keys, rather than creating a fresh 100,000-key live set. Field operations read or overwrite `score`.
 

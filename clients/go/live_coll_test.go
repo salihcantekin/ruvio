@@ -158,6 +158,8 @@ func TestLiveHashes(t *testing.T) {
 	eq(t, bb, []byte{0, 1})
 	eq(t, mb(c.HSetNX(ctx, "h", "a", "x")), false)
 	eq(t, mb(c.HSetNX(ctx, "h", "c", "3")), true)
+	noErr(t, c.HMSet(ctx, "hm", "a", "1", "b", "2"))
+	eq(t, must[[]NullString](t)(c.HMGet(ctx, "hm", "a", "b")), []NullString{{"1", true}, {"2", true}})
 	v, ok, _ := c.HGet(ctx, "h", "a")
 	eq(t, []any{v, ok}, []any{"1", true})
 	eq(t, mi(c.HDel(ctx, "h", "bin")), int64(1))

@@ -140,6 +140,15 @@ export class Lease {
     readonly token: number,
   ) {}
   /**
+   * Extends the lease to now + `ttlMs` (`RENEW key token ttlMs`). The fencing token stays the same.
+   *
+   * @returns `true` when extended; `false` when the lease had already expired or was released.
+   */
+  async renew(ttlMs: number): Promise<boolean> {
+    if (this.released) return false;
+    return this.client.renew(this.key, this.token, ttlMs);
+  }
+  /**
    * Gives the lease back (`RELEASE key token`). Calling it again does nothing.
    *
    * @returns `true` when released; `false` when the lease had already expired or was released.
@@ -173,6 +182,15 @@ export class Permit {
     readonly key: Key,
     readonly token: string,
   ) {}
+  /**
+   * Extends this slot to now + `ttlMs` (`RENEW key token ttlMs`).
+   *
+   * @returns `true` when extended; `false` when the permit had already expired or was released.
+   */
+  async renew(ttlMs: number): Promise<boolean> {
+    if (this.released) return false;
+    return this.client.renew(this.key, this.token, ttlMs);
+  }
   /**
    * Frees this slot (`RELEASE key token`). Calling it again does nothing.
    *
@@ -438,7 +456,10 @@ export abstract class Helpers extends Commands {
    * @param fingerprint Hash of the request body. Reusing the key with a different fingerprint is a conflict (1 to 128 bytes).
    * @param ttlMs How long the key and result are kept, in milliseconds (1 ms to 7 days).
    * @param fn The work. Its return value is stored (at most 4 MiB) and returned to repeats.
-   * @param opts `owner` id of this attempt (default random), `waitMs` how long to poll while another owner runs it (default 0: fail at once), `retryMs` poll delay (default 20).
+   * @param opts `owner` id of this attempt (default random), `waitMs` how long to poll while another owner runs it (default 0: fail at once), `retryMs` poll delay (default 20), `abortOnError` (default false).
+   * With `abortOnError`, a `fn` that throws first sends `IDEM ABORT`, so a retry runs it again at once instead of
+   * finding the key pending until `ttlMs`; the original error is rethrown, and a failed abort is ignored. Use it only
+   * when a failed `fn` did not take effect or is safe to run again.
    * @returns `{ result, replayed }`.
    * @throws {@link IdempotencyConflictError} when the key belongs to a different fingerprint; {@link IdempotencyPendingError} when another owner is still running after `waitMs`.
    *
@@ -452,7 +473,7 @@ export abstract class Helpers extends Commands {
     fingerprint: Value,
     ttlMs: number,
     fn: () => Promise<Value> | Value,
-    opts: { owner?: string; waitMs?: number; retryMs?: number } = {},
+    opts: { owner?: string; waitMs?: number; retryMs?: number; abortOnError?: boolean } = {},
   ): Promise<{ result: string; replayed: boolean }> {
     const owner = opts.owner ?? newToken();
     const deadline = Date.now() + (opts.waitMs ?? 0);
@@ -460,7 +481,13 @@ export abstract class Helpers extends Commands {
       const r = await this.idemBegin(key, fingerprint, owner, ttlMs);
       switch (r.state) {
         case 'acquired': {
-          const v = await fn();
+          let v: Value;
+          try {
+            v = await fn();
+          } catch (e) {
+            if (opts.abortOnError) await this.idemAbort(key, fingerprint, owner).catch(() => undefined);
+            throw e;
+          }
           await this.idemComplete(key, fingerprint, owner, v);
           return { result: str(v), replayed: false };
         }
@@ -827,7 +854,9 @@ export class RuvioClient extends Helpers {
    * ```
    */
   subscriber(opts: Omit<SubscriberOptions, keyof ConnectionOptions> = {}): Subscriber {
-    return new Subscriber({ ...this.options, ...opts });
+    // A subscriber starts at the seed the command connection is on.
+    const seeds = this.conn.seedsFromCurrent();
+    return new Subscriber(seeds === undefined ? { ...this.options, ...opts } : { ...this.options, seeds, ...opts });
   }
 }
 

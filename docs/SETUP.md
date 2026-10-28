@@ -1,5 +1,22 @@
 # Setup
 
+## Arch Linux: AUR package
+
+On Arch Linux, install the prebuilt package using an AUR helper such as `yay` or `paru`:
+
+```bash
+yay -S ruvio-bin
+# or
+paru -S ruvio-bin
+```
+
+This installs `ruvio`, `ruvio-ctl`, sample configuration in `/etc/ruvio/ruvio.toml`, and configures systemd users and directories:
+
+```bash
+# Start and enable Ruvio as a system service
+sudo systemctl enable --now ruvio
+```
+
 ## Linux: prebuilt binaries
 
 Each [GitHub Release](https://github.com/salihcantekin/ruvio/releases/latest) carries ready-to-run archives for
@@ -14,7 +31,7 @@ the README and the license; `SHA256SUMS` lists the checksum of every archive. No
 Download, verify and unpack (use `linux-arm64` on an arm64 host):
 
 ```bash
-v=0.3.2
+v=0.3.4
 curl -LO https://github.com/salihcantekin/ruvio/releases/download/ruvio-$v/ruvio-$v-linux-x64.tar.gz
 curl -LO https://github.com/salihcantekin/ruvio/releases/download/ruvio-$v/SHA256SUMS
 sha256sum --ignore-missing -c SHA256SUMS
@@ -198,6 +215,13 @@ The image runs the evented server as a non-root user:
 docker build -t ruvio .
 docker run --rm -p 6379:6379 -e RUVIO_REQUIREPASS=change-me ruvio
 ```
+
+The image has a `HEALTHCHECK` that runs `ruvio-ctl ping` (a RESP `PING` to `RUVIO_ADDR`'s port on
+127.0.0.1; a `NOAUTH` reply counts as alive). With TLS on, a plaintext `PING` cannot work: start the
+container with `--health-cmd 'ruvio-ctl ping --connect-only'` (it only opens the connection).
+
+The base images in both Dockerfiles are pinned by digest; Dependabot (`.github/dependabot.yml`,
+weekly) opens a PR when a digest moves, so security updates still arrive.
 
 `Dockerfile.linux` is the same runtime, used by the benchmark script. It does not need `seccomp=unconfined`.
 

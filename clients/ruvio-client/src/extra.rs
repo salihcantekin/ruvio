@@ -18,6 +18,7 @@ use crate::models::{
     JsonSetCondition, ListPositionOptions, ListSide, RangeBy, RangeOptions, RestoreOptions,
     SetScanPage, SortedSetAddOptions, SortedSetCombine, SortedSetEntry, SortedSetScanPage,
 };
+use crate::ttl::ttl_words;
 use crate::value::RespValue;
 
 impl Client {
@@ -63,8 +64,8 @@ impl Client {
     ///
     /// # Returns
     /// How many replicas reached the position. With `port_mode = "per-shard"` this covers the
-    /// connection's shard plus shards its writes were forwarded to. Blocks this connection, so
-    /// set a longer read timeout or none.
+    /// connection's shard plus shards its writes were forwarded to. Blocks this connection; the
+    /// command timeout is extended by `timeout` (none when it is zero).
     pub fn wait(&mut self, replicas: u64, timeout: Duration) -> Result<i64, Error> {
         let replicas = Num::uint(replicas);
         let timeout = Num::wide(duration_millis(timeout));
@@ -262,7 +263,7 @@ impl Client {
     }
 
     /// Sends `INCRBYFLOAT`: adds a decimal to the value (missing counts as 0) and returns the new
-    /// value. Ruvio computes in double precision and prints 15 significant digits.
+    /// value. Ruvio computes in double precision and prints 16 significant digits.
     ///
     /// # Errors
     /// [`Error::Server`] if the value is not a number or the result is NaN/infinite.
@@ -894,7 +895,8 @@ impl Client {
 
     /// Sends `BF.INSERT`: adds items, optionally creating the filter.
     ///
-    /// The creation options in [`BloomInsertOptions`] (`capacity`, `error_rate`, `expansion`,
+    /// `ttl` sets the key's deadline (`EX`/`PX`) when the call creates the filter. The creation
+    /// options in [`BloomInsertOptions`] (`capacity`, `error_rate`, `expansion`,
     /// `non_scaling`) apply only when the key is new; with `no_create` a missing key is an error.
     /// Returns one flag per item as [`Client::bf_madd`].
     pub fn bf_insert(
@@ -906,9 +908,14 @@ impl Client {
         let capacity = options.capacity.map(Num::uint);
         let error_rate = options.error_rate.map(Num::float);
         let expansion = options.expansion.map(Num::uint);
-        let mut arguments = Vec::with_capacity(11 + items.len());
+        let ttl = options.ttl.map(ttl_words).transpose()?;
+        let mut arguments = Vec::with_capacity(13 + items.len());
 
         arguments.extend(["BF.INSERT", key]);
+
+        if let Some((word, count)) = &ttl {
+            arguments.extend([*word, count.as_str()]);
+        }
 
         if let Some(capacity) = &capacity {
             arguments.extend(["CAPACITY", capacity.as_str()]);
@@ -1242,9 +1249,9 @@ impl Client {
 
     // ---- geo -------------------------------------------------------------------------------
 
-    /// Sends `GEOADD key [NX|XX] [CH] lon lat member...`.
+    /// Sends `GEOADD key [EX|PX] [NX|XX] [CH] lon lat member...`.
     ///
-    /// Only `if_not_exists` (`NX`), `if_exists` (`XX`) and `changed` (`CH`) of
+    /// Only `ttl` (`EX`/`PX`, set when the call creates the key), `if_not_exists` (`NX`), `if_exists` (`XX`) and `changed` (`CH`) of
     /// [`SortedSetAddOptions`] apply; the other flags are ignored. Places as [`Client::geo_add`]
     /// (longitude first; longitude -180..180, latitude -85.05112878..85.05112878). Without `CH`
     /// the result counts new members only; with `CH` also moved ones.
@@ -1258,9 +1265,14 @@ impl Client {
             .iter()
             .map(|(longitude, latitude, _)| (Num::float(*longitude), Num::float(*latitude)))
             .collect();
-        let mut arguments = Vec::with_capacity(4 + places.len() * 3);
+        let ttl = options.ttl.map(ttl_words).transpose()?;
+        let mut arguments = Vec::with_capacity(8 + places.len() * 3);
 
         arguments.extend(["GEOADD", key]);
+
+        if let Some((word, count)) = &ttl {
+            arguments.extend([*word, count.as_str()]);
+        }
 
         if options.if_not_exists {
             arguments.push("NX");
@@ -1415,6 +1427,23 @@ impl Client {
             owner.as_bytes(),
             result,
         ])?;
+
+        match reply {
+            RespValue::Integer(value) => Ok(value > 0),
+            other => Err(unexpected("IDEM", &other)),
+        }
+    }
+
+    /// Sends `IDEM key ABORT fingerprint owner`.
+    ///
+    /// Returns `true` when the pending record of this owner and fingerprint was removed, so the
+    /// next `BEGIN` acquires the key at once. Returns `false` when the key is missing, already
+    /// completed (its result is never removed), or held by another owner or fingerprint.
+    ///
+    /// Abort only when the work did not take effect or is safe to run again; a retry after an
+    /// abort runs it again.
+    pub fn idem_abort(&mut self, key: &str, fingerprint: &str, owner: &str) -> Result<bool, Error> {
+        let reply = self.execute(&["IDEM", key, "ABORT", fingerprint, owner])?;
 
         match reply {
             RespValue::Integer(value) => Ok(value > 0),

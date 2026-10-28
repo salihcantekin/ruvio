@@ -83,6 +83,7 @@ pub(super) fn expire_key<'a, C: Clock, I: StorageIndex, S: MutationSink>(
     key: crate::protocol::Bytes<'a>,
     timestamp: i64,
     absolute: bool,
+    condition: crate::protocol::ExpireCondition,
 ) -> Result<Response<'a>, S::Error> {
     if !shard.contains_key(&key) {
         return Ok(Response::Integer(0));
@@ -96,6 +97,22 @@ pub(super) fn expire_key<'a, C: Clock, I: StorageIndex, S: MutationSink>(
     } else {
         timestamp <= 0
     };
+
+    if condition != crate::protocol::ExpireCondition::Always {
+        // A deadline already past counts as the earliest one; a key without one as infinite.
+        let target = if delete {
+            0
+        } else if absolute {
+            u64::try_from(timestamp).unwrap_or(0)
+        } else {
+            now.get()
+                .saturating_add(u64::try_from(timestamp).unwrap_or(0))
+        };
+
+        if !expire_condition_holds(condition, shard.expires_at(&key), target) {
+            return Ok(Response::Integer(0));
+        }
+    }
 
     if delete {
         // A deadline already past deletes the key, which a full store still allows.
@@ -132,6 +149,22 @@ pub(super) fn expire_key<'a, C: Clock, I: StorageIndex, S: MutationSink>(
 
     shard.expire_at(&key, deadline);
     Ok(Response::Integer(1))
+}
+
+fn expire_condition_holds(
+    condition: crate::protocol::ExpireCondition,
+    current: Option<crate::UnixMillis>,
+    target: u64,
+) -> bool {
+    use crate::protocol::ExpireCondition;
+
+    match (condition, current) {
+        (ExpireCondition::Always, _) => true,
+        (ExpireCondition::Nx, current) => current.is_none(),
+        (ExpireCondition::Xx, current) => current.is_some(),
+        (ExpireCondition::Gt, current) => current.is_some_and(|at| target > at.get()),
+        (ExpireCondition::Lt, current) => current.is_none_or(|at| target < at.get()),
+    }
 }
 
 pub(super) fn persist_key<'a, C: Clock, I: StorageIndex, S: MutationSink>(
@@ -187,6 +220,7 @@ pub(super) fn scan_keys<'a, C: Clock, I: StorageIndex>(
     pattern: Option<&[u8]>,
     count: usize,
     type_name: Option<&[u8]>,
+    slot: Option<u16>,
 ) -> Response<'a> {
     let kind = match type_name {
         None => None,
@@ -198,9 +232,15 @@ pub(super) fn scan_keys<'a, C: Clock, I: StorageIndex>(
 
     let (cursor, keys) = shard.scan(cursor, count, pattern, kind);
 
+    // `SLOT` filters the same walk: `COUNT` still bounds the work, a page may come back
+    // shorter or empty, and the cursor ends the walk at 0 as usual.
     Response::Scan {
         cursor,
-        keys: keys.into_iter().map(Cow::Borrowed).collect(),
+        keys: keys
+            .into_iter()
+            .filter(|key| slot.is_none_or(|slot| crate::routing::hash_slot(key) == slot))
+            .map(Cow::Borrowed)
+            .collect(),
     }
 }
 

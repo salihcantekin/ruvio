@@ -11,12 +11,13 @@ use crate::error::Error;
 use crate::keywords::{ClientType, InfoSection, StreamTrim};
 use crate::models::{
     BitFieldOffset, BitFieldOp, BitFieldText, FieldExpireCondition, FillOutcome, GeoOrder, GeoUnit,
-    HashScanPage, InsertPosition, KeyType, ListSide, PubSubMessage, ScanPage, SortedSetAddOptions,
-    SortedSetEntry, StreamClaimOptions, StreamEntry, StreamPendingEntry, StreamPendingFilter,
-    StreamReadOptions, StreamReadResult,
+    HashScanPage, InsertPosition, KeyType, LimitOutcome, ListSide, PubSubMessage, ScanPage,
+    SortedSetAddOptions, SortedSetEntry, StreamClaimOptions, StreamEntry, StreamPendingEntry,
+    StreamPendingFilter, StreamReadOptions, StreamReadResult,
 };
 
 use crate::args::Num;
+use crate::ttl::ttl_words;
 use crate::value::RespValue;
 
 macro_rules! args {
@@ -103,6 +104,154 @@ impl Client {
             .ok_or_else(|| unexpected("LIMIT", &value))
     }
 
+    /// Sends `LIMIT key max window_ms SLIDING` (Ruvio): a sliding-window limit.
+    ///
+    /// The previous window counts for the part of it that still overlaps the last
+    /// `window_ms`, so a burst at a window edge is not doubled. The key keeps two counters, not
+    /// one entry per call. A key keeps the mode it was created with.
+    ///
+    /// # Arguments
+    /// * `key` - limiter key (for example `"rl:user:42"`).
+    /// * `max` - calls allowed per window, at most 2147483647.
+    /// * `window_ms` - window length in milliseconds.
+    ///
+    /// # Returns
+    /// `Some(remaining)` when this call fit; `None` when it did not (nothing was counted).
+    ///
+    /// # Errors
+    /// [`Error::Server`] `WRONGTYPE` if the key holds another type, or an error if the key was
+    /// created by another `LIMIT` mode.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use ruvio_client::*;
+    /// # fn run(client: &mut Client) -> Result<(), Error> {
+    /// if client.limit_sliding("rl:user:42", 100, 60_000)?.is_none() {
+    ///     println!("slow down");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn limit_sliding(
+        &mut self,
+        key: &str,
+        max: u64,
+        window_ms: u64,
+    ) -> Result<Option<i64>, Error> {
+        let value = self.run([
+            "LIMIT",
+            key,
+            Num::uint(max).as_str(),
+            Num::uint(window_ms).as_str(),
+            "SLIDING",
+        ])?;
+
+        limit_remaining(&value)
+    }
+
+    /// Sends `LIMIT key capacity refill_ms TOKENS [COST cost]` (Ruvio): a token bucket.
+    ///
+    /// The bucket holds `capacity` tokens and refills completely over `refill_ms`; a call takes
+    /// `cost` tokens. The key keeps one timestamp and disappears when the bucket is full again.
+    ///
+    /// # Arguments
+    /// * `key` - limiter key.
+    /// * `capacity` - bucket size, 1 to 1000000.
+    /// * `refill_ms` - time to refill an empty bucket, up to 4294967295 ms.
+    /// * `cost` - tokens this call takes, 1 to `capacity`.
+    ///
+    /// # Returns
+    /// `Some(remaining)` tokens left when the call fit; `None` when the bucket held too few
+    /// (nothing was taken).
+    ///
+    /// # Errors
+    /// [`Error::Server`] `WRONGTYPE` if the key holds another type, or an error if the key was
+    /// created by another `LIMIT` mode.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use ruvio_client::*;
+    /// # fn run(client: &mut Client) -> Result<(), Error> {
+    /// // 10 tokens per second, this call takes 2.
+    /// let left = client.limit_tokens("rl:api:7", 10, 1_000, 2)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn limit_tokens(
+        &mut self,
+        key: &str,
+        capacity: u64,
+        refill_ms: u64,
+        cost: u64,
+    ) -> Result<Option<i64>, Error> {
+        let value = self.run([
+            "LIMIT",
+            key,
+            Num::uint(capacity).as_str(),
+            Num::uint(refill_ms).as_str(),
+            "TOKENS",
+            "COST",
+            Num::uint(cost).as_str(),
+        ])?;
+
+        limit_remaining(&value)
+    }
+
+    /// [`Client::limit_sliding`] with `WITHRETRY`: the answer also says how long to wait.
+    ///
+    /// # Returns
+    /// A [`LimitOutcome`]; `retry_after_ms` is the wait until the same call would pass.
+    ///
+    /// # Errors
+    /// As [`Client::limit_sliding`].
+    pub fn limit_sliding_with_retry(
+        &mut self,
+        key: &str,
+        max: u64,
+        window_ms: u64,
+    ) -> Result<LimitOutcome, Error> {
+        let value = self.run([
+            "LIMIT",
+            key,
+            Num::uint(max).as_str(),
+            Num::uint(window_ms).as_str(),
+            "SLIDING",
+            "WITHRETRY",
+        ])?;
+
+        limit_outcome(&value)
+    }
+
+    /// [`Client::limit_tokens`] with `WITHRETRY`: the answer also says how long to wait.
+    ///
+    /// # Returns
+    /// A [`LimitOutcome`]; `retry_after_ms` is the wait until the same call would pass.
+    ///
+    /// # Errors
+    /// As [`Client::limit_tokens`].
+    pub fn limit_tokens_with_retry(
+        &mut self,
+        key: &str,
+        capacity: u64,
+        refill_ms: u64,
+        cost: u64,
+    ) -> Result<LimitOutcome, Error> {
+        let value = self.run([
+            "LIMIT",
+            key,
+            Num::uint(capacity).as_str(),
+            Num::uint(refill_ms).as_str(),
+            "TOKENS",
+            "COST",
+            Num::uint(cost).as_str(),
+            "WITHRETRY",
+        ])?;
+
+        limit_outcome(&value)
+    }
+
     /// Sends `ONCE key ttl_ms` (Ruvio): a "do this only once until the deadline" marker.
     ///
     /// # Arguments
@@ -184,6 +333,25 @@ impl Client {
         self.integer(["IDEM", key, "COMPLETE", fingerprint, owner, result])
     }
 
+    /// Sends `IDEM key ABORT fingerprint owner`: removes a pending record. See
+    /// [`Client::idem_abort`] for the typed wrapper.
+    ///
+    /// # Arguments
+    /// * `key`, `fingerprint`, `owner` - as passed to [`Client::idempotency_begin`].
+    ///
+    /// # Returns
+    /// `1` when the pending record of this owner and fingerprint was removed; `0` when the key is
+    /// missing, already completed (its result is never removed), or held by another owner or
+    /// fingerprint.
+    pub fn idempotency_abort(
+        &mut self,
+        key: &str,
+        fingerprint: &str,
+        owner: &str,
+    ) -> Result<i64, Error> {
+        self.integer(["IDEM", key, "ABORT", fingerprint, owner])
+    }
+
     /// Sends `TAKE key count` (Ruvio): subtracts from an integer only if the key holds enough.
     ///
     /// # Arguments
@@ -221,6 +389,82 @@ impl Client {
             .as_integer()
             .map(Some)
             .ok_or_else(|| unexpected("TAKE", &value))
+    }
+
+    /// Sends `TRANSFER source destination amount [MAX cap]`: moves `amount` from the integer at
+    /// `source` to the integer at `destination` in one step, only when `source` holds at least
+    /// that much. A missing `destination` starts at 0. Both keys are written as one WAL record.
+    ///
+    /// # Arguments
+    /// * `amount` - a positive integer to move.
+    /// * `max` - optional ceiling for `destination` after the move.
+    ///
+    /// # Returns
+    /// `Some((source_after, destination_after))`, or `None` when `source` is missing or short,
+    /// or `destination` would overflow or pass `max`; nothing is written then.
+    ///
+    /// # Errors
+    /// [`Error::Server`] if a value is not an integer, a key has another type, `amount` is not
+    /// positive, or (on a sharded server) the two keys are in different slots (`CROSSSLOT`);
+    /// hash tags such as `{user:42}` put them in one slot.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use ruvio_client::*;
+    /// # fn run(client: &mut Client) -> Result<(), Error> {
+    /// match client.transfer("{u:42}:wallet", "{u:42}:escrow", 30, None)? {
+    ///     Some((wallet, escrow)) => println!("moved: {wallet} left, {escrow} held"),
+    ///     None => println!("not enough balance"),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn transfer(
+        &mut self,
+        source: &str,
+        destination: &str,
+        amount: i64,
+        max: Option<i64>,
+    ) -> Result<Option<(i64, i64)>, Error> {
+        let mut command = args!["TRANSFER", source, destination, amount];
+
+        if let Some(max) = max {
+            command.extend(args!["MAX", max]);
+        }
+
+        let value = self.run(command)?;
+
+        balance_pair("TRANSFER", value)
+    }
+
+    /// Sends `HTRANSFER key from to amount [MAX cap]`: [`Client::transfer`] between two integer
+    /// fields of one hash. A missing `to` field starts at 0 and field TTLs stay.
+    ///
+    /// # Returns
+    /// `Some((from_after, to_after))`, or `None` when the key or the `from` field is missing or
+    /// short, or `to` would overflow or pass `max`; nothing is written then.
+    ///
+    /// # Errors
+    /// [`Error::Server`] if a field is not an integer, the key is not a hash, or `amount` is
+    /// not positive.
+    pub fn htransfer(
+        &mut self,
+        key: &str,
+        from: &str,
+        to: &str,
+        amount: i64,
+        max: Option<i64>,
+    ) -> Result<Option<(i64, i64)>, Error> {
+        let mut command = args!["HTRANSFER", key, from, to, amount];
+
+        if let Some(max) = max {
+            command.extend(args!["MAX", max]);
+        }
+
+        let value = self.run(command)?;
+
+        balance_pair("HTRANSFER", value)
     }
 
     /// Sends `GETEX key PX ttl_ms`: returns the string and sets a new TTL in one step (sliding
@@ -384,6 +628,26 @@ impl Client {
     /// token (nothing changes).
     pub fn release(&mut self, key: &str, token: u64) -> Result<i64, Error> {
         self.integer(["RELEASE", key, Num::uint(token).as_str()])
+    }
+
+    /// Sends `RENEW key token ttl_ms`: moves the deadline of a lease or semaphore slot you hold
+    /// to now + `ttl_ms`, without releasing it.
+    ///
+    /// # Arguments
+    /// * `token` - the value returned by [`Client::lease`] or [`Client::semaphore`].
+    /// * `ttl_ms` - the new lifetime in milliseconds (positive); it replaces the remaining time,
+    ///   so it can also be shorter.
+    ///
+    /// # Returns
+    /// `1` when the token is a live holder and its deadline moved; `0` when it expired, was
+    /// released or belongs to someone else (nothing is created or changed).
+    pub fn renew(&mut self, key: &str, token: u64, ttl_ms: u64) -> Result<i64, Error> {
+        self.integer([
+            "RENEW",
+            key,
+            Num::uint(token).as_str(),
+            Num::uint(ttl_ms).as_str(),
+        ])
     }
 
     /// Sends `SETV key value [version]` (Ruvio): optimistic-locking write of a versioned string.
@@ -866,8 +1130,8 @@ impl Client {
     /// # Returns
     /// `Some((key, value))`, or `None` when the timeout passes.
     ///
-    /// The connection is busy while it waits; set a read timeout longer than `timeout` (or none)
-    /// with [`Client::set_read_timeout`].
+    /// The connection is busy while it waits. The command timeout is extended by `timeout` for
+    /// this call, and `Duration::ZERO` has no deadline at all.
     ///
     /// # Examples
     ///
@@ -1246,6 +1510,18 @@ impl Client {
         self.integer(args!["HINCRBY", key, field, delta])
     }
 
+    /// Sends `HMSET`: sets fields like [`Client::hset`] but replies `OK` instead of the
+    /// count of new fields. Redis marks it deprecated; it is here for code that still uses it.
+    ///
+    /// # Arguments
+    /// * `fields` - `(field, value)` pairs, at least one.
+    ///
+    /// # Errors
+    /// [`Error::Server`] `WRONGTYPE` for a non-hash.
+    pub fn hmset(&mut self, key: &str, fields: &[(&str, &str)]) -> Result<(), Error> {
+        self.ok(with_pairs(args!["HMSET", key], fields))
+    }
+
     /// Sends `HSETNX`: sets `field` only if it does not exist. `false` when it already existed.
     pub fn hsetnx(&mut self, key: &str, field: &str, value: &str) -> Result<bool, Error> {
         self.flag(["HSETNX", key, field, value])
@@ -1444,7 +1720,9 @@ impl Client {
         self.zadd_with(key, SortedSetAddOptions::default(), entries)
     }
 
-    /// Sends `ZADD` with [`SortedSetAddOptions`] (`NX`, `XX`, `GT`, `LT`, `CH`).
+    /// Sends `ZADD` with [`SortedSetAddOptions`] (`EX`/`PX` via `ttl`, `NX`, `XX`, `GT`, `LT`, `CH`).
+    ///
+    /// With `ttl` set the key's deadline is set only when this call creates the key.
     ///
     /// Returns the number of new members, or with `changed` set the number of new **and**
     /// updated members. The server rejects `NX` with `XX`/`GT`/`LT`, and `GT` with `LT`
@@ -1471,9 +1749,14 @@ impl Client {
             .iter()
             .map(|(_, score)| Num::float(*score))
             .collect();
-        let mut arguments: Vec<&str> = Vec::with_capacity(7 + entries.len() * 2);
+        let ttl = options.ttl.map(ttl_words).transpose()?;
+        let mut arguments: Vec<&str> = Vec::with_capacity(9 + entries.len() * 2);
 
         arguments.extend(["ZADD", key]);
+
+        if let Some((word, count)) = &ttl {
+            arguments.extend([*word, count.as_str()]);
+        }
 
         for (enabled, flag) in [
             (options.if_not_exists, "NX"),
@@ -1505,7 +1788,7 @@ impl Client {
         delta: f64,
         options: SortedSetAddOptions,
     ) -> Result<Option<f64>, Error> {
-        let mut arguments = zadd_arguments(key, options);
+        let mut arguments = zadd_arguments(key, options)?;
 
         arguments.extend(args!["INCR", delta, member]);
         self.bulk_or_null(arguments)?
@@ -1864,6 +2147,46 @@ impl Client {
         sorted_set(&self.run(args!["ZPOPMAX", key, count])?)
     }
 
+    /// Sends `ZPOPBYSCORE key max MIN min COUNT count WITHSCORES`: removes and returns up to
+    /// `count` members (1 to 10000) whose score lies between `min` and `max`, lowest score
+    /// first. With scores set to due times, this takes the jobs that are ready.
+    ///
+    /// `min`/`max` are score text: `-inf`, `+inf`, `(` prefix for exclusive. Returns an empty
+    /// list when nothing is due.
+    pub fn zpopbyscore(
+        &mut self,
+        key: &str,
+        min: &str,
+        max: &str,
+        count: u64,
+    ) -> Result<Vec<SortedSetEntry>, Error> {
+        sorted_set(&self.run(args![
+            "ZPOPBYSCORE",
+            key,
+            max,
+            "MIN",
+            min,
+            "COUNT",
+            count,
+            "WITHSCORES"
+        ])?)
+    }
+
+    /// Sends `ZMOVEDUE source destination max COUNT count`: moves up to `count` members
+    /// (1 to 10000) whose score is at most `max` from the sorted set `source` to the tail of
+    /// the list `destination`, lowest score first, and returns how many moved. Both keys must
+    /// hash to the same slot on a sharded server; clients blocked on `destination` are served
+    /// first.
+    pub fn zmovedue(
+        &mut self,
+        source: &str,
+        destination: &str,
+        max: &str,
+        count: u64,
+    ) -> Result<i64, Error> {
+        self.integer(args!["ZMOVEDUE", source, destination, max, "COUNT", count])
+    }
+
     /// Sends `BZPOPMIN`: waits for the lowest-scored member of the first non-empty set.
     ///
     /// # Arguments
@@ -1871,8 +2194,8 @@ impl Client {
     /// * `timeout` - wait time rounded up to whole seconds; `Duration::ZERO` waits forever.
     ///
     /// # Returns
-    /// `Some((key, entry))`, or `None` on timeout. Set a read timeout longer than `timeout`
-    /// (see [`Client::set_read_timeout`]).
+    /// `Some((key, entry))`, or `None` on timeout. The command timeout is extended by
+    /// `timeout` for this call.
     pub fn bzpopmin(
         &mut self,
         keys: &[&str],
@@ -2493,9 +2816,79 @@ impl Client {
     }
 
     /// Sends `CONFIG GET`: returns `(parameter, value)` pairs matching a name or glob. Ruvio
-    /// lists its own settings and redacts `requirepass`; `CONFIG SET` is not supported.
+    /// lists its own settings and redacts `requirepass`.
     pub fn config_get(&mut self, parameter: &str) -> Result<Vec<(String, String)>, Error> {
         pairs(&self.run(["CONFIG", "GET", parameter])?)
+    }
+
+    /// Sends `CONFIG SET`: changes live settings (names as `CONFIG GET` shows them) on every
+    /// shard of the server before it answers. All pairs apply or none: an unknown or
+    /// restart-only name, or an invalid value, fails the call and changes nothing. Not
+    /// written to the config file (see [`Client::config_rewrite`]) and not replicated.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use ruvio_client::*;
+    /// # fn run(client: &mut Client) -> Result<(), Error> {
+    /// client.config_set(&[("maxmemory", "1073741824"), ("maxmemory-policy", "allkeys-lru")])?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn config_set(&mut self, pairs: &[(&str, &str)]) -> Result<(), Error> {
+        self.ok(with_pairs(args!["CONFIG", "SET"], pairs))
+    }
+
+    /// Sends `CONFIG REWRITE`: writes the live settings into the config file the server
+    /// started from.
+    pub fn config_rewrite(&mut self) -> Result<(), Error> {
+        self.ok(["CONFIG", "REWRITE"])
+    }
+
+    /// Sends `REPLICAOF host port`: every shard of the server stops taking writes and follows
+    /// the primary at `host:port` (shard `i` dials `port + i`). A shard continues from its own
+    /// log when the new primary's history allows it, otherwise it takes a full copy. Lasts
+    /// until the server restarts.
+    pub fn replicaof(&mut self, host: &str, port: u16) -> Result<(), Error> {
+        let port = port.to_string();
+
+        self.ok(["REPLICAOF", host, port.as_str()])
+    }
+
+    /// Sends `REPLICAOF NO ONE`: promotes a replica in place, one epoch above its old primary.
+    /// `force` adds `FORCE`, which promotes even when a shard has not finished copying its
+    /// primary and may lose writes.
+    pub fn replicaof_no_one(&mut self, force: bool) -> Result<(), Error> {
+        if force {
+            self.ok(["REPLICAOF", "NO", "ONE", "FORCE"])
+        } else {
+            self.ok(["REPLICAOF", "NO", "ONE"])
+        }
+    }
+
+    /// Sends `RUVIO MOVESLOTS first-last shard`: moves the hash slots `first..=last` to shard
+    /// `shard` (counted from 0) of the same server, which keeps serving them meanwhile. Returns
+    /// once the move has started; [`Client::move_slots_status`] follows it. One move runs at
+    /// a time, and every slot of the range must be on one shard.
+    pub fn move_slots(&mut self, first: u16, last: u16, shard: u16) -> Result<(), Error> {
+        let range = format!("{first}-{last}");
+        let shard = shard.to_string();
+
+        self.ok(["RUVIO", "MOVESLOTS", range.as_str(), shard.as_str()])
+    }
+
+    /// Sends `RUVIO MOVESLOTS STATUS`: the running or last move as name/value pairs. `state`
+    /// is `none`, `copying`, `cleaning`, `cancelling`, `done` or `cancelled`; the others are
+    /// `first`, `last`, `from`, `to`, `keys`, `rounds`, `elapsed_ms`, `freeze_ms` and `error`.
+    pub fn move_slots_status(&mut self) -> Result<Vec<(String, String)>, Error> {
+        pairs(&self.run(["RUVIO", "MOVESLOTS", "STATUS"])?)
+    }
+
+    /// Sends `ROLE`: raw reply for the shard this connection is on. A primary answers
+    /// `["master", sequence, []]`; a replica `["slave", host, port, "connect"|"connected",
+    /// sequence]`.
+    pub fn role(&mut self) -> Result<RespValue, Error> {
+        self.run(["ROLE"])
     }
 
     /// Sends `SAVE`: writes a snapshot now and waits.
@@ -2645,6 +3038,31 @@ impl Client {
         arguments: &[&str],
     ) -> Result<RespValue, Error> {
         self.run(script_arguments("EVALSHA", sha, keys, arguments))
+    }
+
+    /// Runs a script by its SHA1 and sends the whole script only when the shard does not have
+    /// it: `EVALSHA`, then `EVAL` once on `NOSCRIPT`. The SHA1 is computed here, and `EVAL`
+    /// also caches the script on that shard. Arguments as [`Client::eval`].
+    ///
+    /// The retry is safe because `NOSCRIPT` is answered before any command of the script ran,
+    /// so a script never runs twice.
+    ///
+    /// # Errors
+    /// As [`Client::eval`].
+    pub fn eval_cached(
+        &mut self,
+        script: &str,
+        keys: &[&str],
+        arguments: &[&str],
+    ) -> Result<RespValue, Error> {
+        let sha = crate::sha1::hex_digest(script.as_bytes());
+
+        match self.evalsha(&sha, keys, arguments) {
+            Err(Error::Server(message)) if message.starts_with("NOSCRIPT") => {
+                self.eval(script, keys, arguments)
+            }
+            other => other,
+        }
     }
 
     /// Sends `SCRIPT LOAD`: caches a script and returns its SHA1 for [`Client::evalsha`].
@@ -2803,6 +3221,29 @@ impl Client {
     /// client decodes RESP2 only, so this is of limited use here.
     pub fn client_tracking(&mut self, enabled: bool) -> Result<(), Error> {
         self.ok(["CLIENT", "TRACKING", if enabled { "ON" } else { "OFF" }])
+    }
+
+    /// Sends `CLIENT DURABILITY REPLICAS replicas [TIMEOUT ms]` for this shard's connection:
+    /// replies are held until `replicas` replicas have every earlier write on disk, and become
+    /// `-NOREPLICAS` after `timeout_ms` (server default 5000 when `None`); the writes stay
+    /// applied. 0 turns it off. Refused inside `MULTI` and on a server without replication.
+    /// Use [`ClientOptions::durability`] to set it on every connection.
+    pub fn client_durability(
+        &mut self,
+        replicas: u32,
+        timeout_ms: Option<u32>,
+    ) -> Result<(), Error> {
+        match timeout_ms {
+            Some(timeout) => self.ok(args![
+                "CLIENT",
+                "DURABILITY",
+                "REPLICAS",
+                replicas,
+                "TIMEOUT",
+                timeout
+            ]),
+            None => self.ok(args!["CLIENT", "DURABILITY", "REPLICAS", replicas]),
+        }
     }
 
     /// Sends `HELLO protocol` (2 or 3). Connecting does not send it, and this client only
@@ -3218,7 +3659,7 @@ impl Client {
     ///
     /// `timeout` rounds up to whole seconds; `Duration::ZERO` waits forever. Returns the element
     /// or `None` on timeout. Ruvio retries every 5 ms instead of parking a waiter, and `BLMOVE`
-    /// is refused inside `MULTI` and scripts. Set a longer (or no) read timeout on the client.
+    /// is refused inside `MULTI` and scripts. The command timeout is extended by `timeout`.
     pub fn blmove(
         &mut self,
         source: &str,
@@ -3544,8 +3985,15 @@ fn push_streams(arguments: &mut Vec<String>, streams: &[(&str, &str)]) {
     arguments.extend(streams.iter().map(|(_, id)| (*id).to_owned()));
 }
 
-fn zadd_arguments(key: &str, options: SortedSetAddOptions) -> Vec<String> {
+fn zadd_arguments(key: &str, options: SortedSetAddOptions) -> Result<Vec<String>, Error> {
+    let ttl = options.ttl.map(ttl_words).transpose()?;
     let mut arguments = args!["ZADD", key];
+
+    if let Some((word, count)) = ttl {
+        arguments.push(word.to_owned());
+        arguments.push(count.as_str().to_owned());
+    }
+
     let flags = [
         (options.if_not_exists, "NX"),
         (options.if_exists, "XX"),
@@ -3560,7 +4008,7 @@ fn zadd_arguments(key: &str, options: SortedSetAddOptions) -> Vec<String> {
         }
     }
 
-    arguments
+    Ok(arguments)
 }
 
 fn claim_arguments(
@@ -3717,6 +4165,34 @@ fn pubsub_message(reply: &RespValue) -> Result<Option<PubSubMessage>, Error> {
     }))
 }
 
+fn limit_remaining(value: &RespValue) -> Result<Option<i64>, Error> {
+    if value.is_null() {
+        return Ok(None);
+    }
+
+    value
+        .as_integer()
+        .map(Some)
+        .ok_or_else(|| unexpected("LIMIT", value))
+}
+
+fn limit_outcome(value: &RespValue) -> Result<LimitOutcome, Error> {
+    let [remaining, retry_after_ms] = value.as_array().unwrap_or_default() else {
+        return Err(unexpected("LIMIT", value));
+    };
+    let (Some(remaining), Some(retry_after_ms)) =
+        (remaining.as_integer(), retry_after_ms.as_integer())
+    else {
+        return Err(unexpected("LIMIT", value));
+    };
+
+    Ok(LimitOutcome {
+        allowed: remaining >= 0,
+        remaining: remaining.max(0),
+        retry_after_ms: retry_after_ms.max(0) as u64,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{field_block, integer_array, parse_fill, pop_many, pubsub_message};
@@ -3815,5 +4291,20 @@ mod tests {
             .unwrap()
             .is_none()
         );
+    }
+}
+
+/// `[a, b]` from `TRANSFER` and `HTRANSFER`; null (nothing moved) is `None`.
+fn balance_pair(command: &str, value: RespValue) -> Result<Option<(i64, i64)>, Error> {
+    if value.is_null() {
+        return Ok(None);
+    }
+
+    match value.as_array() {
+        Some([first, second]) => match (first.as_integer(), second.as_integer()) {
+            (Some(first), Some(second)) => Ok(Some((first, second))),
+            _ => Err(unexpected(command, &value)),
+        },
+        _ => Err(unexpected(command, &value)),
     }
 }

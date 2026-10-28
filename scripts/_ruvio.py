@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import os
 import socket
+import ssl
 import sys
 import time
 
@@ -99,6 +100,8 @@ def wait_ready(
     pid: int | None = None,
     data_dir: str | None = None,
     cluster: bool = False,
+    tls_ca: str | None = None,
+    tls_client: tuple[str, str] | None = None,
 ) -> None:
     """Waits until `host:port` answers `PING` with `+PONG`.
 
@@ -107,15 +110,24 @@ def wait_ready(
     yet", until `timeout` seconds pass. With `process` (a `subprocess.Popen`) or `pid`, fails as
     soon as that process exits. With `data_dir`, the server must also report that directory in
     `CONFIG GET dir`, so a stranger already on the port is never taken for ours. With `cluster`,
-    `CLUSTER INFO` must also report `cluster_state:ok`.
+    `CLUSTER INFO` must also report `cluster_state:ok`. With `tls_ca` (a PEM file) the connection
+    is TLS, verified against that CA; `tls_client` is a `(certificate, key)` pair for mutual TLS.
     """
+    context = None
+    if tls_ca is not None:
+        context = ssl.create_default_context(cafile=tls_ca)
+        # The default already refuses TLS 1.0 and 1.1 on current Pythons; said explicitly.
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        if tls_client is not None:
+            context.load_cert_chain(*tls_client)
     deadline = time.monotonic() + timeout
     last = "no answer"
     while True:
         if not _alive(process, pid):
             raise RuntimeError(f"the server for {host}:{port} exited before it answered PING")
         try:
-            with socket.create_connection((host, port), timeout=2) as client:
+            with socket.create_connection((host, port), timeout=2) as raw:
+                client = context.wrap_socket(raw, server_hostname=host) if context else raw
                 stream = client.makefile("rwb")
                 reply = request(stream, b"PING")
                 if reply != (b"+", b"PONG"):
@@ -130,6 +142,56 @@ def wait_ready(
             last = f"{type(error).__name__}: {error}"
         if time.monotonic() >= deadline:
             raise TimeoutError(f"{host}:{port} did not answer PING with PONG within {timeout} s ({last})")
+        time.sleep(0.05)
+
+
+def wait_replicas(port: int, replicas: int, host: str = "127.0.0.1", timeout: float = 20.0) -> None:
+    """Waits until every range in `CLUSTER SLOTS` on `host:port` lists `replicas` replicas."""
+    deadline = time.monotonic() + timeout
+    last = "no answer"
+    while True:
+        try:
+            with socket.create_connection((host, port), timeout=2) as client:
+                prefix, ranges = request(client.makefile("rwb"), b"CLUSTER", b"SLOTS")
+                if prefix != b"*" or not ranges:
+                    last = f"CLUSTER SLOTS answered {prefix!r}"
+                elif all(len(entry[1]) >= 3 + replicas for entry in ranges):
+                    return
+                else:
+                    last = "a range has too few replicas"
+        except (OSError, AssertionError, ValueError, TypeError) as error:
+            last = f"{type(error).__name__}: {error}"
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"{host}:{port} did not list {replicas} replica(s) within {timeout} s ({last})")
+        time.sleep(0.05)
+
+
+def wait_primary(
+    port: int, master: str, primary: str, host: str = "127.0.0.1", timeout: float = 20.0, pid: int | None = None
+) -> None:
+    """Waits until the coordinator on `host:port` names `primary` (`host:port`) for `master` in
+    `SENTINEL get-master-addr-by-name`. With `pid`, fails as soon as that process exits."""
+    deadline = time.monotonic() + timeout
+    last = "no answer"
+    while True:
+        if not _alive(None, pid):
+            raise RuntimeError(f"the coordinator for {host}:{port} exited before it named a primary")
+        try:
+            with socket.create_connection((host, port), timeout=2) as client:
+                prefix, value = request(
+                    client.makefile("rwb"), b"SENTINEL", b"get-master-addr-by-name", master.encode()
+                )
+                if prefix == b"*" and value and len(value) == 2:
+                    named = f"{value[0][1].decode()}:{value[1][1].decode()}"
+                    if named == primary:
+                        return
+                    last = f"names {named}"
+                else:
+                    last = f"answered {prefix!r} {value!r}"
+        except (OSError, AssertionError, ValueError, TypeError, AttributeError) as error:
+            last = f"{type(error).__name__}: {error}"
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"the coordinator {host}:{port} did not name {primary} within {timeout} s ({last})")
         time.sleep(0.05)
 
 
@@ -151,7 +213,38 @@ def main(argv: list[str]) -> int:
     ready.add_argument("--pid", type=int, help="fail at once when this process exits")
     ready.add_argument("--data-dir", help="the data directory the server must report")
     ready.add_argument("--cluster", action="store_true", help="also wait for cluster_state:ok")
+    ready.add_argument("--tls-ca", help="connect with TLS, verified against this PEM file")
+    ready.add_argument("--tls-cert", help="client certificate (PEM) for mutual TLS; needs --tls-key")
+    ready.add_argument("--tls-key", help="private key (PEM) of --tls-cert")
+    replicas = commands.add_parser("wait-replicas")
+    replicas.add_argument("--host", default="127.0.0.1")
+    replicas.add_argument("--port", type=int, required=True)
+    replicas.add_argument("--timeout", type=float, default=20.0)
+    replicas.add_argument("--replicas", type=int, default=1)
+    primary = commands.add_parser("wait-primary")
+    primary.add_argument("--host", default="127.0.0.1")
+    primary.add_argument("--port", type=int, required=True)
+    primary.add_argument("--timeout", type=float, default=20.0)
+    primary.add_argument("--pid", type=int, help="fail at once when this process exits")
+    primary.add_argument("--master", required=True, help="the group name")
+    primary.add_argument("--primary", required=True, help="the host:port the coordinator must name")
     options = parser.parse_args(argv)
+    if options.command == "wait-primary":
+        try:
+            wait_primary(
+                options.port, options.master, options.primary, host=options.host, timeout=options.timeout, pid=options.pid
+            )
+        except (RuntimeError, TimeoutError) as error:
+            print(error, file=sys.stderr)
+            return 1
+        return 0
+    if options.command == "wait-replicas":
+        try:
+            wait_replicas(options.port, options.replicas, host=options.host, timeout=options.timeout)
+        except TimeoutError as error:
+            print(error, file=sys.stderr)
+            return 1
+        return 0
     try:
         wait_ready(
             options.port,
@@ -160,6 +253,8 @@ def main(argv: list[str]) -> int:
             pid=options.pid,
             data_dir=options.data_dir,
             cluster=options.cluster,
+            tls_ca=options.tls_ca,
+            tls_client=(options.tls_cert, options.tls_key) if options.tls_cert else None,
         )
     except (RuntimeError, TimeoutError) as error:
         print(error, file=sys.stderr)

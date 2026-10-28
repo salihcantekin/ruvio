@@ -14,6 +14,7 @@ internal static class Keywords
     private static readonly byte[][] GeoOrders = Encode("ASC", "DESC");
     private static readonly byte[][] Positions = Encode("BEFORE", "AFTER");
     private static readonly byte[][] Sides = Encode("LEFT", "RIGHT");
+    private static readonly byte[][] ExpireConditions = Encode("NX", "XX", "GT", "LT");
     private static readonly byte[] MaxLenToken = Encoding.ASCII.GetBytes("MAXLEN");
     private static readonly byte[] MinIdToken = Encoding.ASCII.GetBytes("MINID");
     private static readonly byte[][] TrimModes = Encode("=", "~");
@@ -57,6 +58,15 @@ internal static class Keywords
         _ => throw new ArgumentOutOfRangeException(nameof(side)),
     };
 
+    internal static string Word(ExpireCondition condition) => condition switch
+    {
+        ExpireCondition.Nx => "NX",
+        ExpireCondition.Xx => "XX",
+        ExpireCondition.Gt => "GT",
+        ExpireCondition.Lt => "LT",
+        _ => throw new ArgumentOutOfRangeException(nameof(condition)),
+    };
+
     internal static string Word(KeyType type) => type switch
     {
         KeyType.String => "string",
@@ -97,6 +107,8 @@ internal static class Keywords
     internal static RespArg Arg(InsertPosition position) => RespArg.Token(Lookup(Positions, (int)position, nameof(position)));
 
     internal static RespArg Arg(ListSide side) => RespArg.Token(Lookup(Sides, (int)side, nameof(side)));
+
+    internal static RespArg Arg(ExpireCondition condition) => RespArg.Token(Lookup(ExpireConditions, (int)condition, nameof(condition)));
 
     internal static string Word(StreamTrimStrategy strategy) => strategy switch
     {

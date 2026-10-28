@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Version>0.1.0</Version>
+    <Description>Run work once per key outside HTTP (message consumers, background jobs, gRPC) with Ruvio's native IDEM command: a repeat replays the stored result instead of running the work again.</Description>
+    <PackageId>Ruvio.Extensions.Idempotency</PackageId>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>ruvio;idempotency;exactly-once;deduplication;messaging</PackageTags>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <IsAotCompatible>true</IsAotCompatible>
+    <IsTrimmable>true</IsTrimmable>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Options" />
+    <Compile Include="../Common/RuvioStartupChecks.cs" Link="Common/RuvioStartupChecks.cs" />
+    <ProjectReference Include="../../../clients/csharp/Ruvio.Client/Ruvio.Client.csproj" />
+    <None Include="README.md" Pack="true" PackagePath="/" />
+    <None Include="../../../brand/ruvio-icon-square.png" Pack="true" PackagePath="ruvio-icon.png" />
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>Ruvio.Extensions.Idempotency.Tests</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
+</Project>

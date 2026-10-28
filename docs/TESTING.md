@@ -3,7 +3,9 @@
 This page summarizes what has been exercised, how the checks are run, and
 which production claims still need evidence. A test surface being present in
 CI is not the same as a recent successful run. Each result below is labeled by
-where and how it was obtained.
+where and how it was obtained. Runs of hours on a multi-node cluster under load and
+injected faults, made with [tests/soak](../tests/soak), are summarized on the
+[long-run tests](https://ruviodb.com/testing/) page.
 
 ## Local gate
 
@@ -18,13 +20,16 @@ before every `git push` from that clone. The toolchain is pinned in `rust-toolch
 ## Automated test surface
 
 `.github/workflows/pr-gate.yml` runs automatically for pull requests and
-pushes to `main` on Linux. It checks Rust formatting and core tests,
+pushes to `main` and `dev` on Linux. It checks Rust formatting and core tests,
 `scripts/check.sh`, hot-path instruction counts, Python benchmark-regression
 units, a real two-shard routing smoke, and every client suite (Rust, C# with the
 .NET integrations, Go on its `go.mod` floor, Node, Python 3.9 and 3.13, Java)
 against live servers started by `scripts/run_with_servers.sh`. Live client
 tests skip themselves without `RUVIO_TEST_ADDR`, so a suite run without a
-server proves only the offline tests. The extended workflow at
+server proves only the offline tests. The script also starts three
+`ruvio coordinator` processes over a two-node group, and each client has one
+live test that kills that group's primary and follows the failover; it adds
+about 5-8 s to each client suite (see `docs/CLIENT_BEHAVIOR.md`, *Tests*). The extended workflow at
 `.github/workflows/ci.yml` is **manual-dispatch only**. When dispatched, it
 defines these additional checks:
 
@@ -51,6 +56,25 @@ re-run of the principal Rust suite is:
 ```bash
 cargo test --lib --bins --tests
 ```
+
+## Nightly fault scenarios
+
+`.github/workflows/nightly.yml` (every night at 02:17 UTC from `main`, and by manual dispatch) runs the coordinator fault scenarios on real
+processes and real network partitions, each scenario three times by default (`runs` input):
+
+- `scripts/coordinator_faults.py ./ruvio partition leader minority restart loss durable stall coord-partition`:
+  three data nodes, three coordinators and TCP proxies on one machine. `durable` expects no
+  acknowledged write lost; `loss` allows only the last writes before the crash to be lost.
+- `scripts/docker_partition.sh ./ruvio leader lease-off lease-on`: Docker networks cut with
+  `docker network disconnect`. `lease-on` asserts that the old primary refuses writes before the
+  other side promotes a replica and acknowledges none after its first refusal; `lease-off` prints the
+  same numbers without asserting them.
+
+Each job has a 25-minute limit and builds nothing but `--profile release-fast --bin ruvio`. A
+failed scheduled run opens one issue labelled `nightly-failure` (later failures comment on it).
+Both scripts run locally with the same arguments; the Docker one needs `docker`, `redis-cli` and
+`python3`, and runs the binary in `ubuntu:24.04` (`RUVIO_DOCKER_IMAGE`), so build it on a glibc no
+newer than that image's.
 
 ## Test rules
 
@@ -128,6 +152,21 @@ so a hang fails the run instead of stalling it.
 The live groups (`tests/*_live.rs`) start the real `ruvio` binary on free local ports and
 finish in seconds. A test marked `#[ignore]` names a known gap in its reason; run it with
 `cargo test -- --ignored <name>`.
+
+## Long runs on a multi-node cluster
+
+[`tests/soak/`](../tests/soak/README.md) runs a two-group cluster (three hosts, each with one
+coordinator and one member of each group) for minutes locally or hours on four Azure VMs built
+from Bicep. Workers write counters, lists and registers with and without `CLIENT DURABILITY`
+and record every operation; faults (killed or frozen primaries and replicas, a killed
+coordinator leader, a whole host killed, a host cut off with nftables, netem delay and loss)
+come on a schedule, and after the run every key is read back and the history is checked for
+lost acknowledged writes, duplicates, values never written, order violations and stale reads.
+A run writes `status.json` (and uploads it to Azure Blob when a SAS URL is configured). The
+checker's unit tests run in the PR gate (`python3 tests/soak/test_soak.py`); the runs themselves
+are started by hand. Local, debug build: `plans/local-smoke.json` (60 s, every local fault kind) ends with
+no durable write lost (lost `default` writes around a killed primary are counted as warnings); `plans/local-restart-as-configured.json` reproduces
+[#142](https://github.com/salihcantekin/ruvio/issues/142). The Azure path is not measured yet.
 
 ## Long model-check sessions
 
@@ -256,7 +295,7 @@ Engine 29.8.0 (`linux/aarch64`), using image
 
 ## Native in-flight process-crash run
 
-On 2026-10-03, the current Apple M4 Pro ran three randomized kills during
+On 2026-10-03, the current Apple silicon Mac ran three randomized kills during
 concurrent pipelined writes for each WAL-backed durability profile. All six
 trials recovered a continuous key prefix. `always` preserved every observed
 acknowledged write; in-flight records beyond the client-observed replies were
@@ -304,7 +343,7 @@ published production-hardware latency or durability evidence.
 | Evidence gap | What remains |
 | --- | --- |
 | Host and device failure | Power-loss testing and validation of flush behavior on production-like Linux filesystems and storage |
-| Long-duration stability | A 24-hour mixed-workload soak with resource and recovery evidence |
+| Long-duration stability | A 24-hour mixed-workload soak with resource and recovery evidence; the tooling is in `tests/soak/`, no long run yet |
 | Native macOS faults | Process/filesystem fault scenarios against a Ruvio process running directly on macOS, rather than inside Docker's Linux VM |
 | Production performance | Published Linux bare-metal p50/p95/p99 latency and repeatable throughput measurements |
 | Failure operations | Repeated failover/promotion drills with measured recovery time and client behavior; promotion is currently manual |

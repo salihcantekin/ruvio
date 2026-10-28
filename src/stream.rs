@@ -677,7 +677,11 @@ impl StreamValue {
             return (now_millis, 0);
         }
 
-        (self.last_millis, self.last_sequence.saturating_add(1))
+        match self.last_sequence.checked_add(1) {
+            Some(sequence) => (self.last_millis, sequence),
+            // The sequence is used up: continue in the next millisecond, as Redis does.
+            None => (self.last_millis.saturating_add(1), 0),
+        }
     }
 
     pub(crate) fn delete(&mut self, millis: u64, sequence: u64) -> bool {
@@ -1380,23 +1384,9 @@ pub(crate) fn parse_id(bytes: &[u8]) -> Option<(u64, u64)> {
 /// `millis-sequence`, written digit by digit: XADD replies with one per call and `format!`
 /// cost more than the append itself.
 pub(crate) fn format_id(millis: u64, sequence: u64) -> Vec<u8> {
-    fn digits(mut value: u64, buffer: &mut [u8; 20]) -> &[u8] {
-        let mut at = buffer.len();
-
-        loop {
-            at -= 1;
-            buffer[at] = b'0' + (value % 10) as u8;
-            value /= 10;
-
-            if value == 0 {
-                return &buffer[at..];
-            }
-        }
-    }
-
     let (mut left, mut right) = ([0; 20], [0; 20]);
-    let millis = digits(millis, &mut left);
-    let sequence = digits(sequence, &mut right);
+    let millis = crate::output::decimal(millis, &mut left);
+    let sequence = crate::output::decimal(sequence, &mut right);
     let mut id = Vec::with_capacity(millis.len() + 1 + sequence.len());
 
     id.extend_from_slice(millis);

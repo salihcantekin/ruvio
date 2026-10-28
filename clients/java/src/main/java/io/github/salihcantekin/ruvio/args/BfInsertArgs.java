@@ -3,6 +3,8 @@ package io.github.salihcantekin.ruvio.args;
 
 import io.github.salihcantekin.ruvio.internal.Args;
 
+import java.time.Duration;
+
 /**
  * Options of {@code BF.INSERT}: how to create the Bloom filter when the key is missing (capacity, error rate, expansion), and whether to create it at all. The creation settings are ignored for an existing filter.
  *
@@ -13,6 +15,7 @@ public final class BfInsertArgs {
     public BfInsertArgs() {
     }
 
+    private Duration ttl;
     private long capacity = -1;
     private double error = -1;
     private long expansion = -1;
@@ -82,11 +85,25 @@ public final class BfInsertArgs {
     }
 
     /**
+     * Sets {@code EX} or {@code PX}: gives the filter a time to live, but only when this call creates it; an existing key keeps its own deadline.
+     * Whole seconds are sent as {@code EX}, anything finer as {@code PX}.
+     *
+     * @param ttl the time to live (above zero)
+     * @return this builder
+     * @throws IllegalArgumentException when {@code ttl} is zero, negative or too large (checked when the command is built)
+     */
+    public BfInsertArgs ttl(Duration ttl) {
+        this.ttl = ttl;
+        return this;
+    }
+
+    /**
      * Appends these options to a command being encoded. Used by the client; you do not call it.
      *
      * @param a the argument writer
      */
     public void write(Args a) {
+        if (ttl != null) a.ttl(ttl);
         if (capacity >= 0) a.s("CAPACITY").l(capacity);
         if (error >= 0) a.s("ERROR").d(error);
         if (expansion >= 0) a.s("EXPANSION").l(expansion);

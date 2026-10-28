@@ -37,9 +37,9 @@ COMMANDS = _command_methods()
 
 # Sub-forms and options with their own methods (also checked for existence and live use).
 EXTRA = [
-    "command_count", "command_info", "command_docs", "slowlog_len", "slowlog_reset", "idem_complete",
+    "command_count", "command_info", "command_docs", "slowlog_len", "slowlog_reset", "idem_complete", "idem_abort",
     "changes_start", "object_idletime", "object_freq", "json_index_drop", "json_index_list", "xpending_range",
-    "rate_limit", "seen_before", "push_recent", "json_get_obj", "json_set_obj", "json_mget_obj",
+    "rate_limit", "limit_sliding", "limit_tokens", "limit_sliding_with_retry", "limit_tokens_with_retry", "seen_before", "push_recent", "json_get_obj", "json_set_obj", "json_mget_obj",
     "execute_command", "lock", "lease_scope", "semaphore_scope", "get_or_create", "idempotent",
     "scan_iter", "hscan_iter", "sscan_iter", "zscan_iter", "pipeline", "transaction", "pubsub", "dedicated",
 ]

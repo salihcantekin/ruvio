@@ -1,11 +1,11 @@
 use std::{
     collections::{HashMap, VecDeque},
-    io::{self, Read, Write},
+    io::{self},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc::{Receiver, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
@@ -13,12 +13,14 @@ use std::{
 };
 
 use tracing::warn;
+use wire::Wire;
 
 use crate::{
     KvShard, OwnedMutation,
     persistence::{
-        CheckpointManager, FrameCursor, FrameRead, PersistenceConfig, PersistenceError, WalSink,
-        apply_mutation, decode_record, read_frames, read_frames_resuming,
+        CheckpointManager, DurableSequence, FrameCursor, FrameRead, PersistenceConfig,
+        PersistenceError, WalSink, apply_mutation, decode_record, read_frames,
+        read_frames_resuming,
     },
     protocol::ProtocolLimits,
 };
@@ -26,23 +28,79 @@ use crate::{
 pub const HANDSHAKE_MAGIC: &[u8; 8] = b"RUVREP01";
 /// Handshake versions this build speaks; the version also names the request: resume from the
 /// replica's log, resync from a snapshot at a sequence, or resync an incomplete image.
-pub const VERSION_RESUME: u16 = 6;
-pub const VERSION_RESYNC: u16 = 7;
-pub const VERSION_RESYNC_INCOMPLETE: u16 = 8;
+pub const VERSION_RESUME: u16 = 15;
+pub const VERSION_RESYNC: u16 = 16;
+pub const VERSION_RESYNC_INCOMPLETE: u16 = 17;
 const SUPPORTED_VERSIONS: std::ops::RangeInclusive<u16> =
     VERSION_RESUME..=VERSION_RESYNC_INCOMPLETE;
+/// Versions of builds whose handshake and reply are this build's, but whose stream has no
+/// control frames. Read in full, then refused in this build's reply format.
+const NO_CONTROL_VERSIONS: std::ops::RangeInclusive<u16> = 12..=14;
 /// Versions of builds whose handshake ended after the password and whose reply carried no
 /// history id. They are refused in their own reply format so they log the refusal.
 const LEGACY_VERSIONS: std::ops::RangeInclusive<u16> = 1..=5;
 const LEGACY_REPLY_LEN: usize = 8 + 2 + 8 + CHECKSUM_LEN;
+/// Versions of builds whose handshake and reply carried a history id but no epoch. Refused in
+/// their own formats, like the legacy ones.
+const HISTORY_ONLY_VERSIONS: std::ops::RangeInclusive<u16> = 6..=8;
+const HISTORY_ONLY_TAIL: usize = HISTORY_LEN + 4;
+const HISTORY_ONLY_REPLY_LEN: usize = 8 + 2 + 8 + HISTORY_LEN + CHECKSUM_LEN;
+/// Versions of builds whose handshake carried an epoch but no client address. Their reply
+/// is this build's reply without the address that follows it.
+const EPOCH_ONLY_VERSIONS: std::ops::RangeInclusive<u16> = 9..=11;
+const EPOCH_ONLY_TAIL: usize = HISTORY_LEN + 4 + 8;
 const VERSION_MISMATCH: &str =
     "primary and replicas must run the same Ruvio version (replication handshake version mismatch)";
 pub const READONLY_LINE: &[u8] = b"READONLY You can't write against a read only replica.";
+pub const FENCED_LINE: &[u8] =
+    b"READONLY This primary was replaced: a replica has followed a newer epoch.";
+pub const NOREPLICAS_LINE: &[u8] = b"NOREPLICAS Not enough good replicas to write.";
+/// Same code as [`NOREPLICAS_LINE`], so clients treat both alike.
+pub const NOLEASE_LINE: &[u8] =
+    b"NOREPLICAS Primary lease expired: too few coordinators renewed it.";
+/// A replica that has nothing new to acknowledge repeats its last acknowledgement this
+/// often, so a primary can tell a quiet replica from a lost one (`min-replicas-max-lag`).
+pub const ACK_HEARTBEAT: Duration = Duration::from_secs(1);
+/// A replica silent for longer than this (ten missed heartbeats) is no longer listed for
+/// reads, even while its connection looks open: a host that lost power sends no reset.
+pub const LISTED_REPLICA_LAG: Duration = Duration::from_secs(10);
+
+/// Whether a shard takes writes, and the error it answers when it does not. Read for every
+/// write command as one byte, like the role check it replaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteGate {
+    Open,
+    /// A replica: writes come only from its primary.
+    Replica,
+    /// A primary that learned a newer epoch exists: another primary replaced it.
+    Fenced,
+    /// A primary with fewer recently acknowledging replicas than `min-replicas-to-write`.
+    NoReplicas,
+    /// A primary with `primary-lease` on whose lease from the coordinators is not running.
+    NoLease,
+}
+
+impl WriteGate {
+    /// The error a write gets, or `None` while writes are taken.
+    pub fn refusal(self) -> Option<&'static [u8]> {
+        match self {
+            Self::Open => None,
+            Self::Replica => Some(READONLY_LINE),
+            Self::Fenced => Some(FENCED_LINE),
+            Self::NoReplicas => Some(NOREPLICAS_LINE),
+            Self::NoLease => Some(NOLEASE_LINE),
+        }
+    }
+}
 pub const UNCOPIED_LINE: &[u8] = b"ERR replication does not copy this command";
 pub const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(30);
 pub const QUEUE_FRAMES: usize = 1024;
 pub const QUEUE_BYTES: usize = 16 * 1024 * 1024;
 const SHIPPER_READ_BYTES: usize = 16 * 1024 * 1024;
+/// One socket read on the replica: large enough to take many small frames at once.
+const RECEIVE_READ_BYTES: usize = 64 * 1024;
+/// Log records gathered into one write to a replica: one syscall per batch, not per record.
+const SHIPPER_WRITE_BYTES: usize = 256 * 1024;
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// First reconnect pause. Unit tests start replicas before primaries and must not wait a second.
@@ -61,10 +119,15 @@ const PASSWORD_LEN_OFFSET: usize = 22;
 pub type HistoryId = [u8; HISTORY_LEN];
 
 pub const HISTORY_LEN: usize = 16;
-/// History id (16) and shard count (4) follow the password; the checksum closes the frame.
-const HANDSHAKE_TAIL: usize = HISTORY_LEN + 4;
+/// History id (16), shard count (4), epoch (8), client port (2) and client host length (2)
+/// follow the password; the host and the checksum close the frame.
+const HANDSHAKE_TAIL: usize = HISTORY_LEN + 4 + 8 + 2 + 2;
 const HANDSHAKE_MIN: usize = HANDSHAKE_PREFIX + HANDSHAKE_TAIL + CHECKSUM_LEN;
-const REPLY_LEN: usize = 8 + 2 + 8 + HISTORY_LEN + CHECKSUM_LEN;
+/// The reply up to its first checksum; every reply to a current handshake is followed by
+/// the primary's client address (see [`encode_address`]).
+const REPLY_LEN: usize = 8 + 2 + 8 + HISTORY_LEN + 8 + CHECKSUM_LEN;
+/// Client port (2), host length (2) and checksum (4) of an address frame, around the host.
+const ADDRESS_FRAME_MIN: usize = 2 + 2 + CHECKSUM_LEN;
 const CHECKSUM_LEN: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +143,8 @@ pub enum HandshakeStatus {
     Snapshot = 8,
     /// The replica follows another write history than this primary's.
     History = 9,
+    /// The other side has seen a newer epoch: this primary was replaced.
+    Stale = 10,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,6 +156,103 @@ pub struct Handshake {
     /// History of the primary this replica last followed; all zero when it has none.
     pub history: HistoryId,
     pub shard_count: u32,
+    /// Highest epoch this replica has seen; a primary below it was replaced.
+    pub epoch: u64,
+    /// Where clients reach this replica shard; `None` keeps it out of the primary's topology.
+    pub announce: Option<Endpoint>,
+}
+
+/// Where clients reach one shard of a node: the host and the shard's own client port.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Endpoint {
+    pub host: String,
+    pub port: u16,
+}
+
+/// Port, host length and host of an optional endpoint; port 0 and no host stand for none.
+fn put_endpoint(bytes: &mut Vec<u8>, endpoint: Option<&Endpoint>) -> Result<(), ()> {
+    let (port, host) = endpoint.map_or((0, &b""[..]), |endpoint| {
+        (endpoint.port, endpoint.host.as_bytes())
+    });
+    let Ok(host_len) = u16::try_from(host.len()) else {
+        return Err(());
+    };
+
+    put_u16(bytes, port);
+    put_u16(bytes, host_len);
+    bytes.extend_from_slice(host);
+    Ok(())
+}
+
+/// Longest host a node announces; longer ones are not announced.
+pub const MAX_ANNOUNCED_HOST: usize = 255;
+
+/// Whether `host` may be written into `CLUSTER NODES` and `INFO`: a host name or an IP
+/// address (with an IPv6 zone or brackets), nothing that could split a line or a field.
+pub fn announceable_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= MAX_ANNOUNCED_HOST
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b".-_:%[]".contains(&byte))
+}
+
+/// An announced endpoint; a host that is not [`announceable_host`] is treated as no
+/// announcement, so a peer cannot write arbitrary text into the cluster answers.
+fn read_endpoint(port: u16, host: &[u8]) -> Result<Option<Endpoint>, FrameError> {
+    if port == 0 || host.is_empty() {
+        return Ok(None);
+    }
+
+    let host = std::str::from_utf8(host).map_err(|_| "client host is not UTF-8")?;
+
+    if !announceable_host(host) {
+        warn!(
+            host = host
+                .chars()
+                .take(64)
+                .collect::<String>()
+                .escape_debug()
+                .to_string(),
+            "announced client host is not a host name or address; not listed"
+        );
+
+        return Ok(None);
+    }
+
+    Ok(Some(Endpoint {
+        host: host.to_owned(),
+        port,
+    }))
+}
+
+/// The frame that follows every reply to a current handshake: the primary shard's client
+/// address, with its own checksum.
+pub fn encode_address(endpoint: Option<&Endpoint>) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(ADDRESS_FRAME_MIN + 64);
+
+    // A host too long for the frame is announced as none.
+    if put_endpoint(&mut bytes, endpoint).is_err() {
+        bytes.clear();
+        let _ = put_endpoint(&mut bytes, None);
+    }
+
+    append_checksum(&mut bytes);
+    bytes
+}
+
+pub fn decode_address(bytes: &[u8]) -> Result<Option<Endpoint>, FrameError> {
+    if bytes.len() < ADDRESS_FRAME_MIN
+        || bytes.len() != ADDRESS_FRAME_MIN + usize::from(read_u16(bytes, 2))
+    {
+        return Err("address frame length");
+    }
+
+    if !checksum_matches(bytes) {
+        return Err("address frame checksum mismatch");
+    }
+
+    read_endpoint(read_u16(bytes, 0), &bytes[4..bytes.len() - CHECKSUM_LEN])
 }
 
 pub fn encode_handshake(handshake: &Handshake) -> Result<Vec<u8>, ()> {
@@ -98,7 +260,7 @@ pub fn encode_handshake(handshake: &Handshake) -> Result<Vec<u8>, ()> {
         return Err(());
     };
 
-    let mut bytes = Vec::with_capacity(HANDSHAKE_MIN + handshake.password.len());
+    let mut bytes = Vec::with_capacity(HANDSHAKE_MIN + handshake.password.len() + 64);
 
     bytes.extend_from_slice(HANDSHAKE_MAGIC);
     put_u16(&mut bytes, handshake.version);
@@ -108,6 +270,8 @@ pub fn encode_handshake(handshake: &Handshake) -> Result<Vec<u8>, ()> {
     bytes.extend_from_slice(&handshake.password);
     bytes.extend_from_slice(&handshake.history);
     put_u32(&mut bytes, handshake.shard_count);
+    put_u64(&mut bytes, handshake.epoch);
+    put_endpoint(&mut bytes, handshake.announce.as_ref())?;
     append_checksum(&mut bytes);
     Ok(bytes)
 }
@@ -125,9 +289,16 @@ pub fn decode_handshake(bytes: &[u8]) -> Result<Handshake, FrameError> {
     }
 
     let password_len = usize::from(read_u16(bytes, PASSWORD_LEN_OFFSET));
+    let tail = HANDSHAKE_PREFIX + password_len;
 
-    if bytes.len() != HANDSHAKE_MIN + password_len {
+    if bytes.len() < HANDSHAKE_MIN + password_len {
         return Err("handshake length does not match its password length");
+    }
+
+    let host_len = usize::from(read_u16(bytes, tail + HANDSHAKE_TAIL - 2));
+
+    if bytes.len() != HANDSHAKE_MIN + password_len + host_len {
+        return Err("handshake length does not match its password and host lengths");
     }
 
     if !checksum_matches(bytes) {
@@ -137,12 +308,15 @@ pub fn decode_handshake(bytes: &[u8]) -> Result<Handshake, FrameError> {
     let version = read_u16(bytes, 8);
     let shard_id = read_u32(bytes, 10);
     let after_sequence = read_u64(bytes, 14);
-    let tail = bytes.len() - CHECKSUM_LEN - HANDSHAKE_TAIL;
     let password = bytes[HANDSHAKE_PREFIX..tail].to_vec();
     let mut history = [0; HISTORY_LEN];
 
     history.copy_from_slice(&bytes[tail..tail + HISTORY_LEN]);
     let shard_count = read_u32(bytes, tail + HISTORY_LEN);
+    let epoch = read_u64(bytes, tail + HISTORY_LEN + 4);
+    let port = read_u16(bytes, tail + HISTORY_LEN + 12);
+    let host_at = tail + HANDSHAKE_TAIL;
+    let announce = read_endpoint(port, &bytes[host_at..host_at + host_len])?;
 
     Ok(Handshake {
         version,
@@ -151,24 +325,39 @@ pub fn decode_handshake(bytes: &[u8]) -> Result<Handshake, FrameError> {
         password,
         history,
         shard_count,
+        epoch,
+        announce,
     })
 }
 
 pub fn encode_reply(status: HandshakeStatus, next_sequence: u64) -> Vec<u8> {
-    encode_reply_with_history(status, next_sequence, &[0; HISTORY_LEN])
+    encode_reply_with_history(status, next_sequence, &Origin::NONE)
 }
 
 pub fn encode_reply_with_history(
     status: HandshakeStatus,
     next_sequence: u64,
-    history: &HistoryId,
+    origin: &Origin,
 ) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(REPLY_LEN);
 
     bytes.extend_from_slice(HANDSHAKE_MAGIC);
     put_u16(&mut bytes, status as u16);
     put_u64(&mut bytes, next_sequence);
-    bytes.extend_from_slice(history);
+    bytes.extend_from_slice(&origin.history);
+    put_u64(&mut bytes, origin.epoch);
+    append_checksum(&mut bytes);
+    bytes
+}
+
+/// A refusal in the reply format of builds with a history id but no epoch.
+fn encode_history_only_reply(status: HandshakeStatus) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(HISTORY_ONLY_REPLY_LEN);
+
+    bytes.extend_from_slice(HANDSHAKE_MAGIC);
+    put_u16(&mut bytes, status as u16);
+    put_u64(&mut bytes, 0);
+    bytes.extend_from_slice(&[0; HISTORY_LEN]);
     append_checksum(&mut bytes);
     bytes
 }
@@ -192,7 +381,7 @@ pub fn decode_reply(bytes: &[u8]) -> Result<(HandshakeStatus, u64), FrameError> 
 
 pub fn decode_reply_with_history(
     bytes: &[u8],
-) -> Result<(HandshakeStatus, u64, HistoryId), FrameError> {
+) -> Result<(HandshakeStatus, u64, Origin), FrameError> {
     if bytes.len() != REPLY_LEN {
         return Err("handshake reply length");
     }
@@ -210,8 +399,9 @@ pub fn decode_reply_with_history(
     let mut history = [0; HISTORY_LEN];
 
     history.copy_from_slice(&bytes[18..18 + HISTORY_LEN]);
+    let epoch = read_u64(bytes, 18 + HISTORY_LEN);
 
-    Ok((status, next_sequence, history))
+    Ok((status, next_sequence, Origin { history, epoch }))
 }
 
 /// Write-history identity of `data_dir`: random, created with the directory, so a wiped or
@@ -260,6 +450,121 @@ pub fn upstream_file_name(shard_id: u32) -> String {
     format!("UPSTREAM_{shard_id:04}")
 }
 
+/// A primary's write history and epoch, as its replicas see them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Origin {
+    pub history: HistoryId,
+    pub epoch: u64,
+}
+
+impl Origin {
+    pub const NONE: Self = Self {
+        history: [0; HISTORY_LEN],
+        epoch: 0,
+    };
+}
+
+/// The history one primary shard writes, and the history it forked from when a replica was
+/// promoted: replicas of the old primary that did not pass the fork continue from their log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lineage {
+    pub origin: Origin,
+    /// History this one continues up to `fork_sequence`; zeros when it has none.
+    pub parent: HistoryId,
+    pub fork_sequence: u64,
+}
+
+impl Lineage {
+    /// A history of its own with no parent: a new primary, or one written by an older build.
+    pub fn root(history: HistoryId) -> Self {
+        Self {
+            origin: Origin { history, epoch: 0 },
+            parent: [0; HISTORY_LEN],
+            fork_sequence: 0,
+        }
+    }
+
+    /// Whether a replica that followed `history` through `after` can continue from this log.
+    /// A replica past the fork holds records this primary never saw and must take a copy.
+    pub fn continues(&self, history: &HistoryId, after: u64) -> bool {
+        *history == self.origin.history
+            || (self.parent != [0; HISTORY_LEN]
+                && *history == self.parent
+                && after <= self.fork_sequence)
+    }
+}
+
+const LINEAGE_LEN: usize = HISTORY_LEN * 2 + 8 + 8;
+
+/// Name of the file holding primary shard `shard_id`'s lineage.
+pub fn lineage_file_name(shard_id: u32) -> String {
+    format!("LINEAGE_{shard_id:04}")
+}
+
+/// The lineage primary shard `shard_id` writes, deciding it on the shard's first start as a
+/// writer. A shard whose last role was replica (it has an upstream record and no lineage of
+/// its own) is being promoted: it forks a new history from the one it followed, at
+/// `last_sequence`, one epoch above it. A shard with neither continues the directory's
+/// `HISTORY`, as older builds did.
+pub fn resolve_lineage(data_dir: &Path, shard_id: u32, last_sequence: u64) -> io::Result<Lineage> {
+    let path = data_dir.join(lineage_file_name(shard_id));
+
+    if let Some(lineage) = read_lineage_file(&path) {
+        return Ok(lineage);
+    }
+
+    let lineage = match read_origin_file(&data_dir.join(upstream_file_name(shard_id))) {
+        Some(followed) => Lineage {
+            origin: Origin {
+                history: random_history_id(),
+                epoch: followed.epoch.saturating_add(1),
+            },
+            parent: followed.history,
+            fork_sequence: last_sequence,
+        },
+        None => Lineage::root(load_or_create_history(data_dir)?),
+    };
+
+    let mut bytes = Vec::with_capacity(LINEAGE_LEN);
+
+    bytes.extend_from_slice(&lineage.origin.history);
+    bytes.extend_from_slice(&lineage.parent);
+    put_u64(&mut bytes, lineage.fork_sequence);
+    put_u64(&mut bytes, lineage.origin.epoch);
+    write_durably(&path, &bytes)?;
+
+    Ok(lineage)
+}
+
+/// The lineage writer shard `shard_id` recorded, without deciding one; `None` for a shard that
+/// never replicated (its log is the root history, epoch zero).
+pub fn read_lineage(data_dir: &Path, shard_id: u32) -> Option<Lineage> {
+    read_lineage_file(&data_dir.join(lineage_file_name(shard_id)))
+}
+
+fn read_lineage_file(path: &Path) -> Option<Lineage> {
+    let bytes = std::fs::read(path).ok()?;
+
+    if bytes.len() != LINEAGE_LEN {
+        return None;
+    }
+
+    let mut history = [0; HISTORY_LEN];
+    let mut parent = [0; HISTORY_LEN];
+
+    history.copy_from_slice(&bytes[..HISTORY_LEN]);
+    parent.copy_from_slice(&bytes[HISTORY_LEN..2 * HISTORY_LEN]);
+
+    Some(Lineage {
+        origin: Origin {
+            history,
+            epoch: read_u64(&bytes, 2 * HISTORY_LEN + 8),
+        },
+        parent,
+        fork_sequence: read_u64(&bytes, 2 * HISTORY_LEN),
+    })
+}
+
 /// History of the primary shard `shard_id` of this replica last synchronised from; zeros when
 /// unknown, which makes the primary refuse a resume and send a full copy.
 ///
@@ -267,26 +572,66 @@ pub fn upstream_file_name(shard_id: u32) -> String {
 /// `HISTORY`, which is what it continues. A directory with the older shared `UPSTREAM` file
 /// cannot tell which shard that record was written for, so it claims nothing: each shard
 /// takes one full copy and records its own id.
+#[cfg(test)]
 pub fn upstream_history(data_dir: &Path, shard_id: u32) -> HistoryId {
-    read_history_file(&data_dir.join(upstream_file_name(shard_id)))
+    upstream_origin(data_dir, shard_id).history
+}
+
+/// History and epoch of the primary shard `shard_id` last synchronised from (see
+/// [`upstream_history`]); the epoch is zero when unknown.
+pub fn upstream_origin(data_dir: &Path, shard_id: u32) -> Origin {
+    read_origin_file(&data_dir.join(upstream_file_name(shard_id)))
         .or_else(|| {
             if data_dir.join("UPSTREAM").exists() {
                 None
             } else {
                 read_history_file(&data_dir.join("HISTORY"))
+                    .map(|history| Origin { history, epoch: 0 })
             }
         })
-        .unwrap_or([0; HISTORY_LEN])
+        .unwrap_or(Origin::NONE)
 }
 
-/// Records that shard `shard_id`'s log now continues history `id`. Called only once the log
-/// really does: on a resume the primary accepted, or after a snapshot from it is installed.
-pub fn record_upstream_history(data_dir: &Path, shard_id: u32, id: &HistoryId) -> io::Result<()> {
-    if upstream_history(data_dir, shard_id) == *id {
-        return Ok(());
+/// Records that shard `shard_id`'s log now continues `origin`'s history. Called only once the
+/// log really does: on a resume the primary accepted, or after a snapshot from it is
+/// installed. The shard no longer writes a history of its own, so its lineage goes: started as
+/// a writer again, it forks from `origin`.
+pub fn record_upstream_history(data_dir: &Path, shard_id: u32, origin: &Origin) -> io::Result<()> {
+    let path = data_dir.join(upstream_file_name(shard_id));
+
+    if read_origin_file(&path) != Some(*origin) {
+        let mut bytes = Vec::with_capacity(HISTORY_LEN + 8);
+
+        bytes.extend_from_slice(&origin.history);
+        put_u64(&mut bytes, origin.epoch);
+        write_durably(&path, &bytes)?;
     }
 
-    write_history_file(&data_dir.join(upstream_file_name(shard_id)), id)
+    match std::fs::remove_file(data_dir.join(lineage_file_name(shard_id))) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// An upstream record: a history id, followed by the epoch in files this build writes.
+fn read_origin_file(path: &Path) -> Option<Origin> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut history = [0; HISTORY_LEN];
+
+    match bytes.len() {
+        HISTORY_LEN => {
+            history.copy_from_slice(&bytes);
+            Some(Origin { history, epoch: 0 })
+        }
+        len if len == HISTORY_LEN + 8 => {
+            history.copy_from_slice(&bytes[..HISTORY_LEN]);
+            Some(Origin {
+                history,
+                epoch: read_u64(&bytes, HISTORY_LEN),
+            })
+        }
+        _ => None,
+    }
 }
 
 fn read_history_file(path: &Path) -> Option<HistoryId> {
@@ -295,10 +640,10 @@ fn read_history_file(path: &Path) -> Option<HistoryId> {
     <HistoryId>::try_from(bytes.as_slice()).ok()
 }
 
-fn write_history_file(path: &Path, id: &HistoryId) -> io::Result<()> {
+pub(crate) fn write_durably(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let temporary = path.with_extension("tmp");
 
-    std::fs::write(&temporary, id)?;
+    std::fs::write(&temporary, bytes)?;
     // Write access: Windows refuses to flush a read-only handle.
     std::fs::OpenOptions::new()
         .write(true)
@@ -615,8 +960,13 @@ fn transaction_needs_snapshot(shard: &mut KvShard, db: u8, mutations: &[OwnedMut
             | OwnedMutation::StreamGroupCreateConsumer { .. }
             | OwnedMutation::StreamHold { .. }
             | OwnedMutation::StreamGroupAdvance { .. } => {}
-            // A transaction record never nests another one.
-            OwnedMutation::Transaction { .. } => {}
+            // A transaction record never nests another one, nor a slot move's records
+            // (written on their own, and never while replication is on).
+            OwnedMutation::Transaction { .. }
+            | OwnedMutation::SlotCopy { .. }
+            | OwnedMutation::SlotsMoved { .. }
+            | OwnedMutation::SlotsIncoming { .. }
+            | OwnedMutation::SlotsGiven { .. } => {}
         }
         if missing {
             break;
@@ -703,6 +1053,10 @@ fn needs_snapshot(shard: &mut KvShard, mutation: &OwnedMutation) -> bool {
         | OwnedMutation::SetVersioned { .. }
         | OwnedMutation::LimitPut { .. }
         | OwnedMutation::OncePut { .. }
+        | OwnedMutation::SlotCopy { .. }
+        | OwnedMutation::SlotsMoved { .. }
+        | OwnedMutation::SlotsIncoming { .. }
+        | OwnedMutation::SlotsGiven { .. }
         | OwnedMutation::Transaction { .. } => false,
     }
 }
@@ -721,6 +1075,7 @@ pub fn apply_frame(
 
 pub const PUBLISH_MAGIC: &[u8; 8] = b"RUVPUB01";
 pub const ACK_MAGIC: &[u8; 8] = b"RUVACK01";
+pub const CONTROL_MAGIC: &[u8; 8] = b"RUVCTL01";
 const ACK_LEN: usize = 16;
 
 pub fn encode_ack(sequence: u64) -> [u8; ACK_LEN] {
@@ -739,9 +1094,36 @@ pub fn decode_ack(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(bytes[8..].try_into().ok()?))
 }
 
-/// Durable sequences reported by connected replicas. `SET` does not read this.
+/// One connected replica of a shard: what it acknowledged, and where clients reach it.
+#[derive(Clone)]
+struct AckSlot {
+    sequence: u64,
+    at: std::time::Instant,
+    /// False until the replica's first acknowledgement, which comes once any full copy is
+    /// installed: only then does it serve reads.
+    acknowledged: bool,
+    endpoint: Option<Endpoint>,
+}
+
+/// A replica a shard ships to that serves reads, as `CLUSTER SLOTS`, `ROLE` and `INFO` show it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicaPeer {
+    pub endpoint: Endpoint,
+    /// Highest sequence the replica reported durable.
+    pub sequence: u64,
+    /// Time since its last acknowledgement.
+    pub lag: Duration,
+}
+
+/// Durable sequences reported by connected replicas and the addresses they announced, and
+/// on a replica the address of the primary it follows. `SET` does not read this.
 pub struct DurableAcks {
-    slots: Mutex<Vec<Option<u64>>>,
+    /// Per connected replica: the sequence it reported and when it last reported.
+    slots: Mutex<Vec<Option<AckSlot>>>,
+    /// Where clients reach the primary this shard follows, from the last accepted handshake.
+    primary: Mutex<Option<Endpoint>>,
+    /// Whether this shard follows a primary now, known or not yet accepted.
+    following: AtomicBool,
     notify: tokio::sync::Notify,
 }
 
@@ -749,6 +1131,8 @@ impl DurableAcks {
     pub fn new() -> Self {
         Self {
             slots: Mutex::new(Vec::new()),
+            primary: Mutex::new(None),
+            following: AtomicBool::new(false),
             notify: tokio::sync::Notify::new(),
         }
     }
@@ -760,7 +1144,21 @@ impl DurableAcks {
             slots.resize(index + 1, None);
         }
 
-        slots[index] = Some(0);
+        slots[index] = Some(AckSlot {
+            sequence: 0,
+            at: std::time::Instant::now(),
+            acknowledged: false,
+            endpoint: None,
+        });
+    }
+
+    /// Records where clients reach the replica in slot `index`.
+    pub fn announce(&self, index: usize, endpoint: Option<Endpoint>) {
+        let mut slots = self.slots.lock().unwrap_or_else(|error| error.into_inner());
+
+        if let Some(Some(slot)) = slots.get_mut(index) {
+            slot.endpoint = endpoint;
+        }
     }
 
     pub fn observe(&self, index: usize, sequence: u64) {
@@ -770,12 +1168,64 @@ impl DurableAcks {
             slots.resize(index + 1, None);
         }
 
-        let current = slots[index].unwrap_or(0);
+        let slot = slots[index].get_or_insert(AckSlot {
+            sequence: 0,
+            at: std::time::Instant::now(),
+            acknowledged: false,
+            endpoint: None,
+        });
+        let current = slot.sequence;
 
+        slot.sequence = sequence.max(current);
+        slot.at = std::time::Instant::now();
+        slot.acknowledged = true;
         if sequence > current {
-            slots[index] = Some(sequence);
             self.notify.notify_waiters();
         }
+    }
+
+    /// Connected replicas that announced an address and acknowledged within
+    /// [`LISTED_REPLICA_LAG`], in slot order.
+    pub fn replicas(&self) -> Vec<ReplicaPeer> {
+        let slots = self.slots.lock().unwrap_or_else(|error| error.into_inner());
+
+        slots
+            .iter()
+            .flatten()
+            .filter(|slot| slot.acknowledged && slot.at.elapsed() <= LISTED_REPLICA_LAG)
+            .filter_map(|slot| {
+                Some(ReplicaPeer {
+                    endpoint: slot.endpoint.clone()?,
+                    sequence: slot.sequence,
+                    lag: slot.at.elapsed(),
+                })
+            })
+            .collect()
+    }
+
+    pub fn set_primary(&self, endpoint: Option<Endpoint>) {
+        *self
+            .primary
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = endpoint;
+    }
+
+    /// Records whether this shard follows a primary: set when its replica reader starts,
+    /// cleared when it is promoted.
+    pub fn set_following(&self, following: bool) {
+        self.following.store(following, Ordering::Release);
+    }
+
+    pub fn following(&self) -> bool {
+        self.following.load(Ordering::Acquire)
+    }
+
+    /// Where clients reach the primary this shard last followed, if it announced itself.
+    pub fn primary(&self) -> Option<Endpoint> {
+        self.primary
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
 
     pub fn clear(&self, index: usize) {
@@ -793,8 +1243,21 @@ impl DurableAcks {
 
         slots
             .iter()
-            .filter(|slot| slot.is_some_and(|sequence| sequence >= target))
+            .filter(|slot| slot.as_ref().is_some_and(|slot| slot.sequence >= target))
             .count() as u64
+    }
+
+    /// How many connected replicas acknowledged within `max_lag`.
+    pub fn fresh(&self, max_lag: Duration) -> usize {
+        let slots = self.slots.lock().unwrap_or_else(|error| error.into_inner());
+
+        slots
+            .iter()
+            .filter(|slot| {
+                slot.as_ref()
+                    .is_some_and(|slot| slot.at.elapsed() <= max_lag)
+            })
+            .count()
     }
 
     pub async fn notified(&self) {
@@ -825,6 +1288,76 @@ pub fn encode_copied_publish(sharded: bool, channel: &[u8], message: &[u8]) -> V
 
     frame.extend_from_slice(&checksum.to_le_bytes());
     frame
+}
+
+/// What a primary shard tells its replicas besides its log: the highest sequence a durable
+/// reply was released for, and whether a durable reply is waiting now.
+#[derive(Debug, Default)]
+pub struct DurableReplies {
+    committed: AtomicU64,
+    waiting: AtomicU32,
+}
+
+impl DurableReplies {
+    pub fn committed(&self) -> u64 {
+        self.committed.load(Ordering::Acquire)
+    }
+
+    pub fn commit(&self, sequence: u64) {
+        self.committed.fetch_max(sequence, Ordering::AcqRel);
+    }
+
+    /// Forgets what was committed: the shard follows another primary, and its log is no
+    /// longer the one those sequence numbers named.
+    pub fn reset(&self) {
+        self.committed.store(0, Ordering::Release);
+    }
+
+    /// While at least one durable reply waits, replicas sync and acknowledge every batch.
+    pub fn begin_wait(&self) {
+        self.waiting.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn end_wait(&self) {
+        self.waiting.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn state(&self) -> (u64, bool) {
+        (
+            self.committed.load(Ordering::Acquire),
+            self.waiting.load(Ordering::Acquire) != 0,
+        )
+    }
+}
+
+pub fn encode_control(committed: u64, ack_each: bool) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(32);
+
+    frame.extend_from_slice(&32u32.to_le_bytes());
+    frame.extend_from_slice(CONTROL_MAGIC);
+    frame.extend_from_slice(&committed.to_le_bytes());
+    frame.push(u8::from(ack_each));
+    frame.resize(28, 0);
+    let checksum = crc32c::crc32c(&frame);
+
+    frame.extend_from_slice(&checksum.to_le_bytes());
+    frame
+}
+
+/// `(committed, ack_each)` of a control frame; `None` for any other frame.
+pub fn decode_control(frame: &[u8]) -> Option<(u64, bool)> {
+    if frame.len() != 32 || &frame[4..12] != CONTROL_MAGIC {
+        return None;
+    }
+
+    if crc32c::crc32c(&frame[..28]) != u32::from_le_bytes(frame[28..].try_into().ok()?) {
+        return None;
+    }
+
+    Some((
+        u64::from_le_bytes(frame[12..20].try_into().ok()?),
+        frame[20] == 1,
+    ))
 }
 
 pub fn decode_copied_publish(frame: &[u8]) -> Option<(bool, Vec<u8>, Vec<u8>)> {
@@ -871,23 +1404,36 @@ pub fn decode_copied_publish(frame: &[u8]) -> Option<(bool, Vec<u8>, Vec<u8>)> {
 
 pub struct PublishFanout {
     senders: Mutex<Vec<SyncSender<Vec<u8>>>>,
+    /// Registered senders, readable without the lock so a publish with no replica builds nothing.
+    registered: std::sync::atomic::AtomicUsize,
 }
 
 impl PublishFanout {
     pub fn new() -> Self {
         Self {
             senders: Mutex::new(Vec::new()),
+            registered: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     pub fn register(&self) -> std::sync::mpsc::Receiver<Vec<u8>> {
         let (sender, receiver) = std::sync::mpsc::sync_channel(64);
-
-        self.senders
+        let mut senders = self
+            .senders
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .push(sender);
+            .unwrap_or_else(|error| error.into_inner());
+
+        senders.push(sender);
+        self.registered
+            .store(senders.len(), std::sync::atomic::Ordering::Release);
         receiver
+    }
+
+    /// Sends the frame `build` makes; with no replica registered nothing is built or locked.
+    pub fn send_with(&self, build: impl FnOnce() -> Vec<u8>) {
+        if self.registered.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            self.send(build());
+        }
     }
 
     pub fn send(&self, frame: Vec<u8>) {
@@ -901,6 +1447,8 @@ impl PublishFanout {
             Err(TrySendError::Full(_)) => true,
             Err(TrySendError::Disconnected(_)) => false,
         });
+        self.registered
+            .store(senders.len(), std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -929,6 +1477,7 @@ fn status_from_u16(value: u16) -> Result<HandshakeStatus, FrameError> {
         7 => Ok(HandshakeStatus::Local),
         8 => Ok(HandshakeStatus::Snapshot),
         9 => Ok(HandshakeStatus::History),
+        10 => Ok(HandshakeStatus::Stale),
         _ => Err("unknown handshake reply status"),
     }
 }
@@ -973,7 +1522,7 @@ fn put_u64(output: &mut Vec<u8>, value: u64) {
 pub struct Shipment {
     pub listen: SocketAddr,
     pub shard_id: u32,
-    pub published: Arc<AtomicU64>,
+    pub published: Arc<DurableSequence>,
     pub data_dir: PathBuf,
     pub requirepass: Vec<u8>,
     pub limits: ProtocolLimits,
@@ -984,9 +1533,18 @@ pub struct Shipment {
     pub fanout: Arc<PublishFanout>,
     pub snapshot_max_bytes: u64,
     pub shard_count: u32,
-    pub history: HistoryId,
+    pub lineage: Lineage,
+    /// Highest epoch a refused replica has followed; above `lineage`'s, this primary was
+    /// replaced and its shard stops taking writes.
+    pub newer_epoch: Arc<AtomicU64>,
     /// Request a coordinated checkpoint after a rejected delta; never used by ordinary streams.
     pub snapshot_requests: Arc<AtomicU64>,
+    /// Where clients reach this primary shard, sent to every replica with the reply.
+    pub announce: Option<Endpoint>,
+    /// Wraps each accepted replica connection in TLS; none leaves the link in cleartext.
+    pub tls: Option<Arc<crate::tls::TlsAcceptor>>,
+    /// Sent to every replica in control frames when it changes.
+    pub durable_replies: Arc<DurableReplies>,
 }
 
 struct ReplicaProgress {
@@ -1051,6 +1609,10 @@ impl CursorHold {
 
     fn ack(&self, sequence: u64) {
         self.progress.acks.observe(self.index, sequence);
+    }
+
+    fn announce(&self, endpoint: Option<Endpoint>) {
+        self.progress.acks.announce(self.index, endpoint);
     }
 }
 
@@ -1146,7 +1708,7 @@ pub enum ReplicaDelivery {
         hot: Option<Vec<u8>>,
         catchup_through: u64,
         /// The primary's history: the replica records it once the snapshot is installed.
-        history: HistoryId,
+        history: Origin,
     },
     CaughtUp(u64),
 }
@@ -1156,15 +1718,44 @@ pub enum ReplicaDelivery {
 pub struct LinkStatus {
     up: AtomicBool,
     last_io_millis: AtomicU64,
+    /// Set from the moment a full copy is queued until the shard has installed it and
+    /// caught up: the replica then sends no acknowledgement, so its primary neither lists
+    /// it for reads nor counts it for `WAIT` and `min-replicas-to-write`.
+    copying: AtomicBool,
+    /// Highest sequence the primary released a durable reply for.
+    committed: AtomicU64,
+    /// The primary has a durable reply waiting: sync and acknowledge every batch.
+    ack_each: AtomicBool,
 }
 
 impl LinkStatus {
+    pub(crate) fn set_copying(&self, copying: bool) {
+        self.copying.store(copying, Ordering::Release);
+    }
+
+    pub fn is_copying(&self) -> bool {
+        self.copying.load(Ordering::Acquire)
+    }
+
+    fn note_control(&self, committed: u64, ack_each: bool) {
+        self.committed.fetch_max(committed, Ordering::AcqRel);
+        self.ack_each.store(ack_each, Ordering::Release);
+    }
+
+    pub fn committed(&self) -> u64 {
+        self.committed.load(Ordering::Acquire)
+    }
+
+    pub fn ack_each(&self) -> bool {
+        self.ack_each.load(Ordering::Acquire)
+    }
+
     fn mark_up(&self) {
         self.up.store(true, Ordering::Release);
         self.touch();
     }
 
-    fn mark_down(&self) {
+    pub(crate) fn mark_down(&self) {
         self.up.store(false, Ordering::Release);
     }
 
@@ -1205,12 +1796,24 @@ pub struct ReplicaLink {
     pub snapshot_max_bytes: u64,
     /// Sequence of the first rejected frame, or zero when ordinary streaming is safe.
     pub resync_sequence: Arc<AtomicU64>,
+    /// Bytes of copied `PUBLISH` frames queued and not yet taken by the shard. They are
+    /// never logged, so `Outstanding` cannot reclaim them; this keeps them under `QUEUE_BYTES`.
+    pub publish_bytes: Arc<std::sync::atomic::AtomicUsize>,
     pub data_dir: PathBuf,
     pub shard_count: u32,
     pub status: Arc<LinkStatus>,
     /// Woken after every delivery so the shard applies frames as they arrive instead of
     /// on its next timer tick.
     pub wake_shard: Arc<tokio::sync::Notify>,
+    /// Where clients reach this replica shard, sent with the handshake.
+    pub announce: Option<Endpoint>,
+    /// Records the primary's client address from each accepted handshake.
+    pub peers: Arc<DurableAcks>,
+    /// Wraps the dialed connection in TLS; none leaves the link in cleartext.
+    pub tls: Option<Arc<crate::tls::ReplicaTlsClient>>,
+    /// `REPLICAOF ... YIELD`: send epoch zero and follow the primary whatever its epoch, so
+    /// an epoch this shard forked or followed does not fence the primary it was pointed at.
+    pub yields: bool,
 }
 
 pub fn spawn_replica_reader(link: ReplicaLink) -> ReplicationThread {
@@ -1221,7 +1824,7 @@ pub fn spawn_replica_reader(link: ReplicaLink) -> ReplicationThread {
     let join = thread::Builder::new()
         .name(format!("ruvio-replica-{}", link.shard_id))
         .spawn(move || {
-            let mut outstanding = VecDeque::new();
+            let mut outstanding = Outstanding::default();
             let mut delay = RETRY_START;
 
             while !thread_stop.load(Ordering::Acquire) {
@@ -1328,7 +1931,33 @@ fn accept_replicas_from(
                         .name("ruvio-ship-conn".into())
                         .spawn(move || {
                             let _ = stream.set_nonblocking(false);
-                            let _ = serve_replica(stream, &shipment, &progress, &connection_stop);
+
+                            let Some(acceptor) = shipment.tls.as_ref() else {
+                                let _ =
+                                    serve_replica(stream, &shipment, &progress, &connection_stop);
+
+                                return;
+                            };
+
+                            // A peer that never finishes the handshake must not hold this
+                            // thread: bound it, then hand the stream to the protocol, which
+                            // sets its own timeouts.
+                            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                            let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+
+                            match acceptor.handshake(stream) {
+                                Ok(secure) => {
+                                    let _ = serve_replica(
+                                        secure,
+                                        &shipment,
+                                        &progress,
+                                        &connection_stop,
+                                    );
+                                }
+                                Err(error) => {
+                                    warn!(%error, "replication tls handshake failed");
+                                }
+                            }
                         });
 
                 if let Ok(handle) = handle {
@@ -1366,7 +1995,7 @@ fn accept_replicas_from(
 }
 
 fn serve_replica(
-    mut stream: TcpStream,
+    mut stream: impl Wire,
     shipment: &Shipment,
     progress: &Arc<ReplicaProgress>,
     stop: &AtomicBool,
@@ -1389,6 +2018,8 @@ fn serve_replica(
             );
             let reply = if LEGACY_VERSIONS.contains(&version) {
                 encode_legacy_reply(HandshakeStatus::Version)
+            } else if HISTORY_ONLY_VERSIONS.contains(&version) {
+                encode_history_only_reply(HandshakeStatus::Version)
             } else {
                 encode_reply(HandshakeStatus::Version, 0)
             };
@@ -1432,9 +2063,31 @@ fn serve_replica(
     let forced_snapshot = handshake.version != VERSION_RESUME;
     let incomplete = handshake.version == VERSION_RESYNC_INCOMPLETE;
 
-    // A replica that resumes from its own log must have followed this very history; a
-    // wiped, restored or unrelated primary can reuse the same sequence numbers.
-    if !forced_snapshot && handshake.after_sequence > 0 && handshake.history != shipment.history {
+    // A replica that has seen a newer epoch follows a primary that replaced this one.
+    if handshake.epoch > shipment.lineage.origin.epoch {
+        warn!(
+            shard_id = shipment.shard_id,
+            epoch = shipment.lineage.origin.epoch,
+            replica_epoch = handshake.epoch,
+            "a replica has seen a newer primary; this one was replaced"
+        );
+        shipment
+            .newer_epoch
+            .fetch_max(handshake.epoch, Ordering::AcqRel);
+        refuse_handshake(&mut stream, HandshakeStatus::Stale)?;
+
+        return Ok(());
+    }
+
+    // A replica that resumes from its own log must have followed this very history, or the
+    // one it forked from no further than the fork; a wiped, restored or unrelated primary
+    // can reuse the same sequence numbers.
+    if !forced_snapshot
+        && handshake.after_sequence > 0
+        && !shipment
+            .lineage
+            .continues(&handshake.history, handshake.after_sequence)
+    {
         refuse_handshake(&mut stream, HandshakeStatus::History)?;
 
         return Ok(());
@@ -1442,6 +2095,11 @@ fn serve_replica(
 
     let through = shipment.published.load(Ordering::Acquire);
     let hold = progress.hold(handshake.after_sequence);
+
+    hold.announce(reachable_endpoint(
+        handshake.announce,
+        stream.peer_addr().ok().map(|peer| peer.ip()),
+    ));
     if forced_snapshot
         && (handshake.after_sequence > through
             || (!incomplete && handshake.after_sequence == through))
@@ -1449,13 +2107,12 @@ fn serve_replica(
         refuse_handshake(&mut stream, HandshakeStatus::Gap)?;
         return Ok(());
     }
-    // Where the shipper stopped in the log, so each chunk continues there.
-    let mut reader = FrameCursor::default();
+    let mut log = ShipperLog::default();
     let read = if forced_snapshot {
         Ok(FrameRead::Gap)
     } else {
         read_frames_resuming(
-            &mut reader,
+            &mut log.reader,
             &shipment.data_dir,
             shipment.shard_id,
             handshake.after_sequence,
@@ -1503,7 +2160,7 @@ fn serve_replica(
 
             if !write_live(
                 &mut stream,
-                &encode_reply_with_history(HandshakeStatus::Snapshot, through, &shipment.history),
+                &accepted_reply(HandshakeStatus::Snapshot, through, shipment),
                 stop,
             )? {
                 return Ok(());
@@ -1528,7 +2185,7 @@ fn serve_replica(
                 shipment,
                 &hold,
                 stop,
-                &mut reader,
+                &mut log,
                 last_sequence,
                 through,
             )?
@@ -1542,7 +2199,7 @@ fn serve_replica(
                 &hold,
                 &copied_publishes,
                 stop,
-                &mut reader,
+                &mut log,
                 last_sent,
             );
         }
@@ -1565,22 +2222,17 @@ fn serve_replica(
 
     if !write_live(
         &mut stream,
-        &encode_reply_with_history(HandshakeStatus::Ok, next_sequence, &shipment.history),
+        &accepted_reply(HandshakeStatus::Ok, next_sequence, shipment),
         stop,
     )? {
         return Ok(());
     }
 
-    let mut last_sent = handshake.after_sequence;
-
-    for frame in &frames {
-        if !write_live(&mut stream, frame, stop)? {
-            return Ok(());
-        }
-
-        last_sent = frame_sequence(frame);
-        hold.advance(last_sent);
-    }
+    let last_sent = match write_frames(&mut stream, &frames, &mut log.batch, &hold, stop)? {
+        Some(Some(sequence)) => sequence,
+        Some(None) => handshake.after_sequence,
+        None => return Ok(()),
+    };
 
     let _ = stream.flush();
 
@@ -1590,9 +2242,30 @@ fn serve_replica(
         &hold,
         &copied_publishes,
         stop,
-        &mut reader,
+        &mut log,
         last_sent,
     )
+}
+
+/// The address a peer announced, with its host replaced by the address of the connection
+/// when it announced a loopback host but is not on this machine: a node left at the default
+/// `advertised-host` is still listed where clients can reach it.
+fn reachable_endpoint(
+    announced: Option<Endpoint>,
+    peer: Option<std::net::IpAddr>,
+) -> Option<Endpoint> {
+    let mut endpoint = announced?;
+    let loopback = endpoint.host.eq_ignore_ascii_case("localhost")
+        || endpoint
+            .host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+
+    if loopback && let Some(peer) = peer.filter(|peer| !peer.is_loopback()) {
+        endpoint.host = peer.to_string();
+    }
+
+    Some(endpoint)
 }
 
 fn caught_up_cursor_is_retained(shipment: &Shipment, after_sequence: u64, through: u64) -> bool {
@@ -1627,23 +2300,30 @@ fn caught_up_cursor_is_retained(shipment: &Shipment, after_sequence: u64, throug
 /// Reads the replica's acknowledgements. False once the replica has hung up or the
 /// connection failed: an idle primary writes nothing that would find out, so without this
 /// the connection would hold one of the replica slots for good.
-fn poll_acks(stream: &mut TcpStream, hold: &CursorHold, pending: &mut Vec<u8>) -> bool {
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(1)));
+fn poll_acks(stream: &mut dyn Wire, hold: &CursorHold, pending: &mut Vec<u8>) -> bool {
+    // Only what has arrived. A read timeout, however short, rounds up to the kernel's timer
+    // tick (often 4 ms) and holds the sender here, where a synced record cannot wake it.
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
     let mut scratch = [0u8; 64];
-
-    loop {
+    let open = loop {
         match stream.read(&mut scratch) {
-            Ok(0) => return false,
+            Ok(0) => break false,
             Ok(read) => pending.extend_from_slice(&scratch[..read]),
             Err(error)
                 if error.kind() == io::ErrorKind::WouldBlock
                     || error.kind() == io::ErrorKind::TimedOut =>
             {
-                break;
+                break true;
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return false,
+            Err(_) => break false,
         }
+    };
+
+    if !open || stream.set_nonblocking(false).is_err() {
+        return false;
     }
 
     while pending.len() >= ACK_LEN {
@@ -1661,22 +2341,29 @@ fn poll_acks(stream: &mut TcpStream, hold: &CursorHold, pending: &mut Vec<u8>) -
 }
 
 struct AckSend {
+    /// While it reports a copy in progress, nothing is sent.
+    status: Arc<LinkStatus>,
+    /// The log's durable cursor, read without taking the log's lock.
+    durable: Arc<DurableSequence>,
     last: u64,
+    /// When `last` was sent: it is sent again after [`ACK_HEARTBEAT`].
+    sent_at: std::time::Instant,
     offset: usize,
     bytes: [u8; ACK_LEN],
     queued: bool,
 }
 
 impl AckSend {
-    fn poll(&mut self, stream: &mut TcpStream, wal: &Mutex<WalSink>) {
-        if !self.queued {
-            let durable = wal
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .durable()
-                .load(Ordering::Acquire);
+    fn poll(&mut self, stream: &mut dyn Wire) {
+        // The log of a replica still copying belongs to the history it is replacing.
+        if !self.queued && self.status.is_copying() {
+            return;
+        }
 
-            if durable == self.last {
+        if !self.queued {
+            let durable = self.durable.load(Ordering::Acquire);
+
+            if durable == self.last && self.sent_at.elapsed() < ACK_HEARTBEAT {
                 return;
             }
 
@@ -1693,6 +2380,7 @@ impl AckSend {
 
                 if self.offset == self.bytes.len() {
                     self.last = decode_ack(&self.bytes).unwrap_or(self.last);
+                    self.sent_at = std::time::Instant::now();
                     self.queued = false;
                 }
             }
@@ -1700,18 +2388,26 @@ impl AckSend {
     }
 }
 
+/// A replica shipper's place in the log and the buffer it gathers records into.
+#[derive(Default)]
+struct ShipperLog {
+    /// Where the shipper stopped in the log, so each chunk continues there.
+    reader: FrameCursor,
+    batch: Vec<u8>,
+}
+
 fn stream_frames_through(
-    stream: &mut TcpStream,
+    stream: &mut dyn Wire,
     shipment: &Shipment,
     hold: &CursorHold,
     stop: &AtomicBool,
-    reader: &mut FrameCursor,
+    log: &mut ShipperLog,
     mut cursor: u64,
     through: u64,
 ) -> io::Result<Option<u64>> {
     while cursor < through {
         let frames = match read_frames_resuming(
-            reader,
+            &mut log.reader,
             &shipment.data_dir,
             shipment.shard_id,
             cursor,
@@ -1722,27 +2418,88 @@ fn stream_frames_through(
             Ok(FrameRead::Frames(frames)) if !frames.is_empty() => frames,
             _ => return Ok(None),
         };
-        for frame in frames {
-            if !write_live(stream, &frame, stop)? {
-                return Ok(None);
-            }
-            cursor = frame_sequence(&frame);
-            hold.advance(cursor);
+        match write_frames(stream, &frames, &mut log.batch, hold, stop)? {
+            Some(Some(sequence)) => cursor = sequence,
+            Some(None) => {}
+            None => return Ok(None),
         }
     }
     Ok(Some(cursor))
 }
 
+/// Writes log records in order, gathered into writes of up to [`SHIPPER_WRITE_BYTES`]; a record
+/// that large is written on its own, so the buffer stays that small. The log this replica keeps
+/// retained moves past a record once the write holding it was accepted. `None` when the shipper must stop,
+/// otherwise the sequence of the last record written, if any.
+fn write_frames(
+    stream: &mut dyn Wire,
+    frames: &[Vec<u8>],
+    batch: &mut Vec<u8>,
+    hold: &CursorHold,
+    stop: &AtomicBool,
+) -> io::Result<Option<Option<u64>>> {
+    let mut last = None;
+    let mut pending = None;
+
+    batch.clear();
+
+    for frame in frames {
+        if !batch.is_empty() && batch.len() + frame.len() > SHIPPER_WRITE_BYTES {
+            if !write_live(stream, batch, stop)? {
+                return Ok(None);
+            }
+
+            batch.clear();
+            last = pending;
+            if let Some(sequence) = pending {
+                hold.advance(sequence);
+            }
+        }
+
+        if frame.len() >= SHIPPER_WRITE_BYTES {
+            if !write_live(stream, frame, stop)? {
+                return Ok(None);
+            }
+
+            let sequence = frame_sequence(frame);
+
+            last = Some(sequence);
+            pending = last;
+            hold.advance(sequence);
+            continue;
+        }
+
+        batch.extend_from_slice(frame);
+        pending = Some(frame_sequence(frame));
+    }
+
+    if !batch.is_empty() {
+        if !write_live(stream, batch, stop)? {
+            return Ok(None);
+        }
+
+        batch.clear();
+        last = pending;
+        if let Some(sequence) = pending {
+            hold.advance(sequence);
+        }
+    }
+
+    Ok(Some(last))
+}
+
 fn stream_new_frames(
-    stream: &mut TcpStream,
+    stream: &mut dyn Wire,
     shipment: &Shipment,
     hold: &CursorHold,
     copied_publishes: &Receiver<Vec<u8>>,
     stop: &AtomicBool,
-    reader: &mut FrameCursor,
+    log: &mut ShipperLog,
     mut last_sent: u64,
 ) -> io::Result<()> {
     let mut ack_bytes = Vec::new();
+    // What this replica was last told; a new connection starts from nothing committed.
+    let mut control = (0, false);
 
     loop {
         if stop.load(Ordering::Acquire) {
@@ -1753,22 +2510,57 @@ fn stream_new_frames(
             return Ok(());
         }
 
-        while let Ok(frame) = copied_publishes.try_recv() {
-            if !write_live(stream, &frame, stop)? {
+        let current = shipment.durable_replies.state();
+
+        if current != control {
+            if !write_live(stream, &encode_control(current.0, current.1), stop)? {
                 return Ok(());
             }
+
+            control = current;
+            let _ = stream.flush();
+        }
+
+        let batch = &mut log.batch;
+
+        batch.clear();
+
+        while let Ok(frame) = copied_publishes.try_recv() {
+            if frame.len() >= SHIPPER_WRITE_BYTES {
+                if !write_live(stream, batch, stop)? || !write_live(stream, &frame, stop)? {
+                    return Ok(());
+                }
+
+                batch.clear();
+                continue;
+            }
+
+            batch.extend_from_slice(&frame);
+
+            if batch.len() >= SHIPPER_WRITE_BYTES {
+                if !write_live(stream, batch, stop)? {
+                    return Ok(());
+                }
+
+                batch.clear();
+            }
+        }
+
+        if !batch.is_empty() && !write_live(stream, batch, stop)? {
+            return Ok(());
         }
 
         let through = shipment.published.load(Ordering::Acquire);
 
         if through <= last_sent {
-            thread::sleep(SHIPPER_POLL);
+            // A synced record wakes this thread; the timeout still polls acks and control.
+            shipment.published.wait_past(last_sent, SHIPPER_POLL);
 
             continue;
         }
 
         let Some(sent) =
-            stream_frames_through(stream, shipment, hold, stop, reader, last_sent, through)?
+            stream_frames_through(stream, shipment, hold, stop, log, last_sent, through)?
         else {
             return Ok(());
         };
@@ -1779,7 +2571,7 @@ fn stream_new_frames(
 
 pub(crate) fn follow_primary(
     link: &ReplicaLink,
-    outstanding: &mut VecDeque<(u64, usize)>,
+    outstanding: &mut Outstanding,
     stop: &AtomicBool,
     wake: &Mutex<Option<TcpStream>>,
 ) -> (bool, bool) {
@@ -1787,8 +2579,8 @@ pub(crate) fn follow_primary(
         return (false, false);
     }
 
-    let address = match dial_address(link) {
-        Ok(address) => address,
+    let addresses = match dial_addresses(link) {
+        Ok(addresses) => addresses,
         Err(error) => {
             warn!(%error, "replication dial failed");
 
@@ -1796,10 +2588,20 @@ pub(crate) fn follow_primary(
         }
     };
 
-    let mut stream = match TcpStream::connect_timeout(&address, Duration::from_millis(200)) {
+    // A name can resolve to several addresses (`localhost` to ::1 and 127.0.0.1); the primary
+    // may listen on only one of them, so each is tried in the resolver's order.
+    let mut dialed = Err(io::Error::from(io::ErrorKind::NotFound));
+
+    for address in &addresses {
+        dialed = TcpStream::connect_timeout(address, Duration::from_millis(200));
+        if dialed.is_ok() {
+            break;
+        }
+    }
+    let mut stream = match dialed {
         Ok(stream) => stream,
         Err(error) => {
-            warn!(%error, primary = %address, "replication dial failed");
+            warn!(%error, primary = ?addresses, "replication dial failed");
 
             return (!stop.load(Ordering::Acquire), false);
         }
@@ -1813,7 +2615,24 @@ pub(crate) fn follow_primary(
         *wake.lock().unwrap_or_else(|error| error.into_inner()) = Some(cloned);
     }
 
-    let (retry, steady) = read_primary(&mut stream, link, outstanding, stop);
+    let (retry, steady) = match &link.tls {
+        None => read_primary(&mut stream, link, outstanding, stop),
+        Some(client) => {
+            let name = match &link.primary_name {
+                Some((host, _)) => host.clone(),
+                None => link.primary.ip().to_string(),
+            };
+
+            match client.connect(&name, stream) {
+                Ok(mut secure) => read_primary(&mut secure, link, outstanding, stop),
+                Err(error) => {
+                    warn!(%error, primary = ?addresses, "replication tls handshake failed");
+
+                    (!stop.load(Ordering::Acquire), false)
+                }
+            }
+        }
+    };
 
     link.status.mark_down();
     *wake.lock().unwrap_or_else(|error| error.into_inner()) = None;
@@ -1825,20 +2644,30 @@ pub(crate) fn follow_primary(
     (retry, steady)
 }
 
-fn dial_address(link: &ReplicaLink) -> io::Result<SocketAddr> {
+fn dial_addresses(link: &ReplicaLink) -> io::Result<Vec<SocketAddr>> {
     let Some((host, port)) = &link.primary_name else {
-        return Ok(link.primary);
+        return Ok(vec![link.primary]);
     };
 
-    let port = port.wrapping_add(link.shard_id as u16);
-    let mut addresses = (host.as_str(), port).to_socket_addrs()?;
+    let port = u16::try_from(link.shard_id)
+        .ok()
+        .and_then(|shard| port.checked_add(shard))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "replication port plus shard id is above 65535",
+            )
+        })?;
+    let addresses: Vec<SocketAddr> = (host.as_str(), port).to_socket_addrs()?.collect();
 
-    addresses.next().ok_or_else(|| {
-        io::Error::new(
+    if addresses.is_empty() {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "replication primary did not resolve",
-        )
-    })
+        ));
+    }
+
+    Ok(addresses)
 }
 
 struct CatchupReconnect<'a> {
@@ -1862,9 +2691,9 @@ impl Drop for CatchupReconnect<'_> {
 }
 
 fn read_primary(
-    stream: &mut TcpStream,
+    stream: &mut dyn Wire,
     link: &ReplicaLink,
-    outstanding: &mut VecDeque<(u64, usize)>,
+    outstanding: &mut Outstanding,
     stop: &AtomicBool,
 ) -> (bool, bool) {
     let requested = link.resync_sequence.load(Ordering::Acquire);
@@ -1878,6 +2707,7 @@ fn read_primary(
         outstanding.clear();
     }
 
+    let followed = upstream_origin(&link.data_dir, link.shard_id);
     let handshake = Handshake {
         version: if requested == 0 {
             VERSION_RESUME
@@ -1889,8 +2719,10 @@ fn read_primary(
         shard_id: link.shard_id,
         after_sequence,
         password: link.password.clone(),
-        history: upstream_history(&link.data_dir, link.shard_id),
+        history: followed.history,
         shard_count: link.shard_count,
+        epoch: if link.yields { 0 } else { followed.epoch },
+        announce: link.announce.clone(),
     };
 
     let Ok(encoded) = encode_handshake(&handshake) else {
@@ -1903,7 +2735,7 @@ fn read_primary(
         return (true, false);
     }
 
-    let (status, snapshot_through, primary_history) = match read_reply(stream) {
+    let (status, snapshot_through, primary_history, primary_endpoint) = match read_reply(stream) {
         Ok(reply) => reply,
         Err(error) => {
             // A primary of another build cannot parse this handshake and closes the link (or
@@ -1927,6 +2759,38 @@ fn read_primary(
         );
 
         return (true, false);
+    }
+
+    if status == HandshakeStatus::Stale {
+        warn!(
+            shard_id = link.shard_id,
+            epoch = followed.epoch,
+            "the primary was replaced by a newer one; not following it"
+        );
+
+        return (true, false);
+    }
+
+    // A primary below the epoch this replica already followed is an old, replaced one.
+    if !link.yields
+        && matches!(status, HandshakeStatus::Ok | HandshakeStatus::Snapshot)
+        && primary_history.epoch < followed.epoch
+    {
+        warn!(
+            shard_id = link.shard_id,
+            epoch = followed.epoch,
+            primary_epoch = primary_history.epoch,
+            "the primary is older than the one this replica followed; not following it"
+        );
+
+        return (true, false);
+    }
+
+    if matches!(status, HandshakeStatus::Ok | HandshakeStatus::Snapshot) {
+        link.peers.set_primary(reachable_endpoint(
+            primary_endpoint,
+            stream.peer_addr().ok().map(|peer| peer.ip()),
+        ));
     }
 
     if status == HandshakeStatus::History {
@@ -1983,6 +2847,9 @@ fn read_primary(
             }
             _ => return (true, false),
         };
+        // Before the shard sees the copy, so not one acknowledgement of the log it replaces
+        // goes out in between.
+        link.status.set_copying(true);
         if link
             .inbound
             .send(ReplicaDelivery::Snapshot {
@@ -2031,58 +2898,85 @@ fn read_primary(
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(SHIPPER_POLL));
     let _ = stream.set_write_timeout(Some(SHIPPER_POLL));
+    let (segment_bytes, durable) = {
+        let wal = link.wal.lock().unwrap_or_else(|error| error.into_inner());
+
+        (wal.segment_bytes(), wal.durable())
+    };
     let mut acks = AckSend {
+        status: Arc::clone(&link.status),
+        durable,
         last: 0,
+        sent_at: std::time::Instant::now(),
         offset: 0,
         bytes: [0; ACK_LEN],
         queued: false,
     };
 
-    acks.poll(stream, &link.wal);
+    acks.poll(stream);
+    // The primary repeats what a durable reply needs after every handshake.
+    link.status.note_control(0, false);
     link.status.mark_up();
     // Frames carry records written under the primary's limits, not this replica's; but
     // none larger than this replica's own log segment can be stored, so a declared length
     // past it is refused before it is buffered.
-    let segment_bytes = link
-        .wal
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .segment_bytes();
     let mut reader = FrameReader {
         pending: Vec::new(),
+        start: 0,
+        scratch: vec![0; RECEIVE_READ_BYTES],
         max_frame_bytes: usize::try_from(segment_bytes)
             .unwrap_or(usize::MAX)
             .min(crate::persistence::WAL_RECORD_MAX_BYTES),
     };
 
+    // Frames handed to the shard since its last wake: the shard is woken once every frame
+    // that arrived in the same read is queued, instead of once per frame.
+    let mut unwoken = false;
+
     loop {
+        if unwoken && !reader.frame_buffered() {
+            link.wake_shard.notify_one();
+            unwoken = false;
+        }
+
         if !wait_for_queue_room(link, outstanding, stop) {
             return (!stop.load(Ordering::Acquire), true);
         }
 
-        let frame =
-            match reader.next_frame(stream, stop, &link.resync_sequence, &mut acks, &link.wal) {
-                Ok(Some(frame)) => frame,
-                Ok(None) => return (false, true),
-                Err(error) => {
-                    if error.kind() == io::ErrorKind::InvalidData {
-                        warn!(%error, "replication frame rejected");
-                    }
-
-                    return (!stop.load(Ordering::Acquire), true);
+        let frame = match reader.next_frame(stream, stop, link, &mut acks) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return (false, true),
+            Err(error) => {
+                if unwoken {
+                    link.wake_shard.notify_one();
                 }
-            };
+                if error.kind() == io::ErrorKind::InvalidData {
+                    warn!(%error, "replication frame rejected");
+                }
 
-        link.status.touch();
+                return (!stop.load(Ordering::Acquire), true);
+            }
+        };
+
+        if let Some((committed, ack_each)) = decode_control(&frame) {
+            link.status.note_control(committed, ack_each);
+            if ack_each {
+                link.wake_shard.notify_one();
+            }
+            acks.poll(stream);
+
+            continue;
+        }
 
         let sequence = if decode_copied_publish(&frame).is_some() {
             None
         } else {
             Some(frame_sequence(&frame))
         };
-        if !enqueue_frame(link, outstanding, frame, stop) {
+        if !enqueue_frame(link, outstanding, frame, sequence, stop) {
             return (!stop.load(Ordering::Acquire), true);
         }
+        unwoken = true;
         if let (Some(sequence), Some(through)) = (sequence, catchup.through)
             && sequence >= through
         {
@@ -2097,28 +2991,29 @@ fn read_primary(
             catchup.through = None;
         }
 
-        acks.poll(stream, &link.wal);
+        acks.poll(stream);
     }
 }
 
 struct FrameReader {
     pending: Vec<u8>,
+    /// Where the first frame not yet taken begins: taking a frame moves this offset
+    /// instead of shifting the rest of `pending`.
+    start: usize,
+    scratch: Vec<u8>,
     max_frame_bytes: usize,
 }
 
 impl FrameReader {
     fn next_frame(
         &mut self,
-        stream: &mut TcpStream,
+        stream: &mut dyn Wire,
         stop: &AtomicBool,
-        resync_sequence: &AtomicU64,
+        link: &ReplicaLink,
         acks: &mut AckSend,
-        wal: &Mutex<WalSink>,
     ) -> io::Result<Option<Vec<u8>>> {
-        let mut scratch = [0; 8192];
-
         loop {
-            if resync_sequence.load(Ordering::Acquire) != 0 {
+            if link.resync_sequence.load(Ordering::Acquire) != 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     "snapshot resync requested",
@@ -2132,7 +3027,11 @@ impl FrameReader {
                 return Ok(None);
             }
 
-            match stream.read(&mut scratch) {
+            // Only a partial frame is left: move it to the front before reading more.
+            self.pending.drain(..self.start);
+            self.start = 0;
+
+            match stream.read(&mut self.scratch) {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -2140,12 +3039,15 @@ impl FrameReader {
                     ));
                 }
 
-                Ok(read) => self.pending.extend_from_slice(&scratch[..read]),
+                Ok(read) => {
+                    self.pending.extend_from_slice(&self.scratch[..read]);
+                    link.status.touch();
+                }
                 Err(error)
                     if error.kind() == io::ErrorKind::WouldBlock
                         || error.kind() == io::ErrorKind::TimedOut =>
                 {
-                    acks.poll(stream, wal);
+                    acks.poll(stream);
                 }
 
                 Err(error) => return Err(error),
@@ -2153,12 +3055,21 @@ impl FrameReader {
         }
     }
 
+    /// Whether a whole frame is buffered, so the next call returns without reading.
+    fn frame_buffered(&self) -> bool {
+        let rest = &self.pending[self.start..];
+
+        rest.len() >= 4 && rest.len() >= u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize
+    }
+
     fn take_frame(&mut self) -> io::Result<Option<Vec<u8>>> {
-        if self.pending.len() < 4 {
+        let rest = &self.pending[self.start..];
+
+        if rest.len() < 4 {
             return Ok(None);
         }
 
-        let length = u32::from_le_bytes(self.pending[..4].try_into().unwrap()) as usize;
+        let length = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
 
         if !(32..=self.max_frame_bytes).contains(&length) {
             return Err(io::Error::new(
@@ -2167,17 +3078,21 @@ impl FrameReader {
             ));
         }
 
-        if self.pending.len() < length {
+        if rest.len() < length {
             return Ok(None);
         }
 
-        Ok(Some(self.pending.drain(..length).collect()))
+        let frame = rest[..length].to_vec();
+
+        self.start += length;
+
+        Ok(Some(frame))
     }
 }
 
 fn wait_for_queue_room(
     link: &ReplicaLink,
-    outstanding: &mut VecDeque<(u64, usize)>,
+    outstanding: &mut Outstanding,
     stop: &AtomicBool,
 ) -> bool {
     loop {
@@ -2185,11 +3100,14 @@ fn wait_for_queue_room(
             return false;
         }
 
-        let queued_bytes = reclaim_applied(link, outstanding);
+        // The log's lock is taken only when the queue looks full, not for every frame.
+        if outstanding.has_room() {
+            return true;
+        }
 
-        if outstanding.len() < QUEUE_FRAMES
-            && (outstanding.is_empty() || queued_bytes < QUEUE_BYTES)
-        {
+        reclaim_applied(link, outstanding);
+
+        if outstanding.has_room() {
             return true;
         }
 
@@ -2199,30 +3117,58 @@ fn wait_for_queue_room(
     }
 }
 
-fn reclaim_applied(link: &ReplicaLink, outstanding: &mut VecDeque<(u64, usize)>) -> usize {
+/// Frames handed to the shard and not yet seen applied, with their total size kept as
+/// they come and go.
+#[derive(Default)]
+pub(crate) struct Outstanding {
+    frames: VecDeque<(u64, usize)>,
+    bytes: usize,
+}
+
+impl Outstanding {
+    fn has_room(&self) -> bool {
+        self.frames.len() < QUEUE_FRAMES && (self.frames.is_empty() || self.bytes < QUEUE_BYTES)
+    }
+
+    fn push(&mut self, sequence: u64, len: usize) {
+        self.frames.push_back((sequence, len));
+        self.bytes += len;
+    }
+
+    fn clear(&mut self) {
+        self.frames.clear();
+        self.bytes = 0;
+    }
+
+    fn reclaim_through(&mut self, applied: u64) {
+        while let Some(&(sequence, len)) = self.frames.front()
+            && sequence <= applied
+        {
+            self.frames.pop_front();
+            self.bytes -= len;
+        }
+    }
+}
+
+fn reclaim_applied(link: &ReplicaLink, outstanding: &mut Outstanding) {
     let applied = {
         let wal = link.wal.lock().unwrap_or_else(|error| error.into_inner());
 
         wal.last_sequence()
     };
 
-    while outstanding
-        .front()
-        .is_some_and(|(sequence, _)| *sequence <= applied)
-    {
-        outstanding.pop_front();
-    }
-
-    outstanding.iter().map(|(_, len)| *len).sum()
+    outstanding.reclaim_through(applied);
 }
 
+/// `sequence` is `None` for a copied publish: it is never logged, so the log's last
+/// sequence never passes it and it must not wait in `outstanding` to be reclaimed.
 fn enqueue_frame(
     link: &ReplicaLink,
-    outstanding: &mut VecDeque<(u64, usize)>,
+    outstanding: &mut Outstanding,
     mut frame: Vec<u8>,
+    sequence: Option<u64>,
     stop: &AtomicBool,
 ) -> bool {
-    let sequence = frame_sequence(&frame);
     let len = frame.len();
 
     loop {
@@ -2230,10 +3176,26 @@ fn enqueue_frame(
             return false;
         }
 
+        // A copied publish waits while the ones already queued hold the byte budget; one
+        // alone always goes through, however large, so a message bigger than the budget
+        // is not stuck forever.
+        if sequence.is_none() {
+            let queued = link.publish_bytes.load(Ordering::Acquire);
+            if queued != 0 && queued.saturating_add(len) > QUEUE_BYTES {
+                link.wake_shard.notify_one();
+                thread::park_timeout(SHIPPER_POLL);
+                continue;
+            }
+        }
+
         match link.inbound.try_send(ReplicaDelivery::Frame(frame)) {
             Ok(()) => {
-                outstanding.push_back((sequence, len));
-                link.wake_shard.notify_one();
+                match sequence {
+                    Some(sequence) => outstanding.push(sequence, len),
+                    None => {
+                        link.publish_bytes.fetch_add(len, Ordering::AcqRel);
+                    }
+                }
 
                 return true;
             }
@@ -2263,7 +3225,7 @@ enum Incoming {
     Unsupported(u16),
 }
 
-fn read_handshake(stream: &mut TcpStream) -> io::Result<Incoming> {
+fn read_handshake(stream: &mut dyn Wire) -> io::Result<Incoming> {
     let mut prefix = [0; HANDSHAKE_PREFIX];
 
     stream.read_exact(&mut prefix)?;
@@ -2280,23 +3242,43 @@ fn read_handshake(stream: &mut TcpStream) -> io::Result<Incoming> {
 
     // Decided before the rest is read: other builds send a different tail, and waiting for
     // bytes that never come would stall both sides until the read timeout.
-    if !SUPPORTED_VERSIONS.contains(&version) {
-        if LEGACY_VERSIONS.contains(&version) {
-            // Their handshake ends with the password and checksum; consume it so the peer
-            // reads the refusal instead of a reset.
-            let mut rest = vec![0; password_len + CHECKSUM_LEN];
+    if !SUPPORTED_VERSIONS.contains(&version) && !NO_CONTROL_VERSIONS.contains(&version) {
+        // Consume what older builds send after the prefix so the peer reads the refusal
+        // instead of a reset: the legacy ones end with the password, the history-only ones
+        // add a history id and shard count.
+        let rest_len = if LEGACY_VERSIONS.contains(&version) {
+            Some(password_len + CHECKSUM_LEN)
+        } else if HISTORY_ONLY_VERSIONS.contains(&version) {
+            Some(password_len + HISTORY_ONLY_TAIL + CHECKSUM_LEN)
+        } else if EPOCH_ONLY_VERSIONS.contains(&version) {
+            Some(password_len + EPOCH_ONLY_TAIL + CHECKSUM_LEN)
+        } else {
+            None
+        };
+
+        if let Some(rest_len) = rest_len {
+            let mut rest = vec![0; rest_len];
 
             let _ = stream.read_exact(&mut rest);
         }
 
         return Ok(Incoming::Unsupported(version));
     }
-    let mut rest = vec![0; password_len + HANDSHAKE_TAIL + CHECKSUM_LEN];
-
-    stream.read_exact(&mut rest)?;
     let mut bytes = prefix.to_vec();
 
-    bytes.extend_from_slice(&rest);
+    bytes.resize(HANDSHAKE_PREFIX + password_len + HANDSHAKE_TAIL, 0);
+    stream.read_exact(&mut bytes[HANDSHAKE_PREFIX..])?;
+    // The client host and the checksum follow the fixed tail.
+    let host_len = usize::from(read_u16(&bytes, bytes.len() - 2));
+    let read = bytes.len();
+
+    bytes.resize(read + host_len + CHECKSUM_LEN, 0);
+    stream.read_exact(&mut bytes[read..])?;
+
+    if NO_CONTROL_VERSIONS.contains(&version) {
+        return Ok(Incoming::Unsupported(version));
+    }
+
     decode_handshake(&bytes)
         .map(Incoming::Handshake)
         .map_err(|reason| io::Error::new(io::ErrorKind::InvalidData, reason))
@@ -2304,14 +3286,14 @@ fn read_handshake(stream: &mut TcpStream) -> io::Result<Incoming> {
 
 /// A fake primary's side of the handshake, for tests outside this module.
 #[cfg(test)]
-pub(crate) fn read_current_handshake(stream: &mut TcpStream) -> Handshake {
+pub(crate) fn read_current_handshake(stream: &mut dyn Wire) -> Handshake {
     match read_handshake(stream) {
         Ok(Incoming::Handshake(handshake)) => handshake,
         _ => panic!("replica sent no current handshake"),
     }
 }
 
-pub fn read_snapshot_blob(stream: &mut TcpStream, maximum: u64) -> io::Result<Vec<u8>> {
+pub fn read_snapshot_blob(stream: &mut dyn Wire, maximum: u64) -> io::Result<Vec<u8>> {
     let mut length_bytes = [0; 8];
 
     stream.read_exact(&mut length_bytes)?;
@@ -2333,40 +3315,59 @@ pub fn read_snapshot_blob(stream: &mut TcpStream, maximum: u64) -> io::Result<Ve
     Ok(bytes)
 }
 
-fn read_reply(stream: &mut TcpStream) -> io::Result<(HandshakeStatus, u64, HistoryId)> {
+/// The primary's reply and the client address that follows it. A version refusal comes
+/// from a build that may not send the address, so nothing more is read after one.
+fn read_reply(
+    stream: &mut dyn Wire,
+) -> io::Result<(HandshakeStatus, u64, Origin, Option<Endpoint>)> {
+    let invalid = |reason| io::Error::new(io::ErrorKind::InvalidData, reason);
     let mut bytes = [0; REPLY_LEN];
 
     stream.read_exact(&mut bytes)?;
-    decode_reply_with_history(&bytes)
-        .map_err(|reason| io::Error::new(io::ErrorKind::InvalidData, reason))
+    let (status, next, origin) = decode_reply_with_history(&bytes).map_err(invalid)?;
+
+    if status == HandshakeStatus::Version {
+        return Ok((status, next, origin, None));
+    }
+
+    let mut address = vec![0; 4];
+
+    stream.read_exact(&mut address)?;
+    let host_len = usize::from(read_u16(&address, 2));
+
+    address.resize(ADDRESS_FRAME_MIN + host_len, 0);
+    stream.read_exact(&mut address[4..])?;
+    let endpoint = decode_address(&address).map_err(invalid)?;
+
+    Ok((status, next, origin, endpoint))
 }
 
-fn refuse_handshake(stream: &mut TcpStream, status: HandshakeStatus) -> io::Result<()> {
+fn refuse_handshake(stream: &mut dyn Wire, status: HandshakeStatus) -> io::Result<()> {
     warn!(?status, "replication handshake rejected");
-    write_status(stream, status, 0)
-}
+    let mut reply = encode_reply(status, 0);
 
-fn write_status(
-    stream: &mut TcpStream,
-    status: HandshakeStatus,
-    next_sequence: u64,
-) -> io::Result<()> {
-    stream.write_all(&encode_reply(status, next_sequence))?;
+    reply.extend_from_slice(&encode_address(None));
+    stream.write_all(&reply)?;
     stream.flush()
 }
 
-fn write_snapshot_blob(
-    stream: &mut TcpStream,
-    bytes: &[u8],
-    stop: &AtomicBool,
-) -> io::Result<bool> {
+/// A reply to a current handshake that the primary follows with its log: the reply and the
+/// primary shard's client address.
+fn accepted_reply(status: HandshakeStatus, next_sequence: u64, shipment: &Shipment) -> Vec<u8> {
+    let mut reply = encode_reply_with_history(status, next_sequence, &shipment.lineage.origin);
+
+    reply.extend_from_slice(&encode_address(shipment.announce.as_ref()));
+    reply
+}
+
+fn write_snapshot_blob(stream: &mut dyn Wire, bytes: &[u8], stop: &AtomicBool) -> io::Result<bool> {
     let mut payload = (bytes.len() as u64).to_le_bytes().to_vec();
 
     payload.extend_from_slice(bytes);
     write_live(stream, &payload, stop)
 }
 
-fn write_live(stream: &mut TcpStream, bytes: &[u8], stop: &AtomicBool) -> io::Result<bool> {
+fn write_live(stream: &mut dyn Wire, bytes: &[u8], stop: &AtomicBool) -> io::Result<bool> {
     let mut offset = 0;
     let mut last_progress = std::time::Instant::now();
 
@@ -2408,3 +3409,4 @@ fn write_live(stream: &mut TcpStream, bytes: &[u8], stop: &AtomicBool) -> io::Re
 
 #[cfg(test)]
 mod tests;
+mod wire;

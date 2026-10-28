@@ -6,10 +6,13 @@ import path from "node:path";
 const repo = path.resolve(process.cwd(), "..");
 const readJson = (rel: string) => JSON.parse(fs.readFileSync(path.join(repo, rel), "utf8"));
 
+// Records name the host as "Azure F16as_v6, AMD ..."; say plainly that the AMD CPU is an Azure VM.
+const azureVm = (m: string) => m.replace(/^Azure (?!VM)/, "Azure VM ");
+
 export type Row = { label: string; ruvio: number; redis: number; ratio: number; ratioLo: number; ratioHi: number; rounds: number };
 export type MemRow = { label: string; ruvioKib: number; redisKib: number; saved: number };
 export type Platform = {
-  id: "mac" | "linux";
+  id: "mac" | "azure";
   name: string;
   short: string;
   file: string;
@@ -34,8 +37,17 @@ export type Platform = {
 
 const cleanLabel = (s: string) => s.replace(/\s*\(baseline, for scale\)/, "");
 
-function load(id: Platform["id"], file: string, name: string, short: string): Platform {
+function load(id: Platform["id"], file: string, name: string, short: string, part?: string): Platform {
   const d = readJson(file);
+  // The Azure record keeps the command grid under `features`, next to its own host and method fields.
+  if (part) {
+    const runs = d[part].rows[0]?.samples?.ruvio?.length ?? 1;
+    Object.assign(d, d[part], {
+      redis_version: `v=${String(d.build?.redis ?? "").match(/\d+\.\d+\.\d+/)?.[0] ?? ""}`,
+      config: { rounds: runs, clients: 50, pipeline: 16 },
+      environment: { machine: d.host?.description ?? "", durability: "memory", shards: 1, commit: d.build?.ruvio_commit ?? "", pinning: "server on cpu 0, load generator on cpus 2 and 4" },
+    });
+  }
   // ratioLo/ratioHi: the slowest Ruvio round against the fastest Redis round, and the reverse.
   const rows: Row[] = d.rows.map((r: any) => {
     const sr: number[] = r.samples?.ruvio ?? [r.ruvio], sx: number[] = r.samples?.redis ?? [r.redis];
@@ -56,7 +68,8 @@ function load(id: Platform["id"], file: string, name: string, short: string): Pl
   const redisVersion = (String(d.redis_version).match(/v=([\d.]+)/) || [])[1] ?? "";
   return {
     id, name, short, file, date: d.date,
-    machine: d.environment?.machine ?? "",
+    // The site names the Mac by its architecture, not its model.
+    machine: String(d.environment?.machine ?? "").replace(/Apple M\d+( Pro| Max)?/, "Apple silicon"),
     durability: d.environment?.durability ?? "", shards: d.environment?.shards ?? 1, rounds: d.config.rounds,
     pinning: d.environment?.pinning ?? "", commit: d.build?.commit ?? d.environment?.commit ?? "",
     clients: d.config.clients, pipeline: d.config.pipeline, redisVersion,
@@ -69,8 +82,8 @@ function load(id: Platform["id"], file: string, name: string, short: string): Pl
 }
 
 export const platforms: Platform[] = [
-  load("mac", "benchmark/records/mac-2026-10-14.json", "Apple M4 Pro", "Apple M4 Pro"),
-  load("linux", "benchmark/records/linux-hostinger-2026-10-14.json", "AMD EPYC, 2 vCPU", "AMD EPYC (x86)"),
+  load("mac", "benchmark/records/mac-2026-10-28.json", "Mac (ARM)", "Mac"),
+  load("azure", "benchmark/records/x86-azure-2026-10-11.json", "Azure VM (x86)", "Azure", "features"),
 ];
 export const primary = platforms[0];
 
@@ -80,7 +93,7 @@ export type LoadRow = { label: string; shards: number; ruvio: { rps: number; p99
 export const loadRun = {
   file: "benchmark/records/x86-azure-2026-10-11.json",
   date: azure.date as string,
-  machine: `${azure.host.cpu}, ${azure.host.vcpus} vCPU (Azure VM)`,
+  machine: `Azure VM, ${azure.host.cpu}, ${azure.host.vcpus} vCPU`,
   commit: azure.build.ruvio_commit as string,
   rows: azure.concurrency.map((c: any) => ({
     label: c.label, shards: c.ruvio_shards,
@@ -159,7 +172,7 @@ function loadScale(file: string): Scale {
   const redisVersion = (String(d.redis_version).match(/v=([\d.]+)/) || [])[1] ?? "";
   return {
     file, date: d.date, shards: n, pipeline: d.config.pipeline, clients: d.config.clients, rounds: d.config.rounds,
-    durability: d.config.durability, machine: d.host?.description ?? d.host?.cpu ?? "", commit: d.build?.ruvio_commit ?? "", redisVersion,
+    durability: d.config.durability, machine: azureVm(d.host?.description ?? d.host?.cpu ?? ""), commit: d.build?.ruvio_commit ?? "", redisVersion,
     rows, memory,
     geomeanCluster: gm(steady.map((r) => r.vsCluster)), geomeanPerCore: gm(steady.map((r) => r.perCore)),
     atParCluster: rows.filter((r) => r.vsCluster >= 0.97).length, fasterThanCluster: rows.filter((r) => r.vsCluster >= 1).length,
@@ -175,3 +188,54 @@ function loadScale(file: string): Scale {
 export const scale = loadScale("benchmark/records/x86-azure-2026-10-16-8-shards-final.json");
 export const scaleDeep = loadScale("benchmark/records/x86-azure-2026-10-16-8-shards-p64-after.json");
 export const scaleEverysec = loadScale("benchmark/records/x86-azure-2026-10-16-8-shards-everysec-after.json");
+
+// Shard scaling with a cluster-aware client on both sides, and the one-port path before and after the
+// forwarding wake fix (benchmark/azure/shard-bench.sh). Medians over the rounds.
+type ShardRow = { shards: number; system: string; client: string; set: number; get: number };
+const shardFile = "benchmark/records/x86-azure-2026-10-26-shard-scaling.json";
+const shardRaw = readJson(shardFile);
+const shardRow = (shards: number, system: string, client: string): ShardRow => {
+  const found = (shardRaw.rows as ShardRow[]).find((r) => r.shards === shards && r.system === system && r.client === client);
+  if (!found) throw new Error(`${shardFile} has no row ${shards} ${system} ${client}`);
+  return found;
+};
+export const shardScaling = {
+  file: shardFile,
+  date: shardRaw.date as string,
+  machine: azureVm(shardRaw.host.description as string),
+  commit: shardRaw.build.ruvio_commit as string,
+  rounds: shardRaw.config.rounds as number,
+  pipeline: shardRaw.config.pipeline as number,
+  redisVersion: ((String(shardRaw.redis_version).match(/v=([\d.]+)/) || [])[1] ?? "") as string,
+  // 8 shards are left out: eight load threads were the limit for both systems there.
+  routed: [1, 4].map((n) => ({ shards: n, ruvio: shardRow(n, "ruvio", "cluster-aware"), redis: shardRow(n, "redis", "cluster-aware") })),
+  onePort: [4, 8].map((n) => ({ shards: n, before: shardRow(n, "ruvio_before", "one-port"), after: shardRow(n, "ruvio", "one-port") })),
+  oneShard: (shardRaw.one_shard.rows as { label: string; redis: number; ruvio: number }[]).map((r) => ({ ...r, ratio: r.ruvio / r.redis })),
+};
+
+// One Ruvio command against the Lua script that does the same on Redis (scripts/bench_scripted_equivalents.py).
+export type ScriptedRow = { label: string; ruvio: number; redis: number; ratio: number; ruvioP50: number; redisP50: number; ruvioP99: number; redisP99: number };
+export type ScriptedMem = { label: string; ruvioBytes: number; redisBytes: number; ratio: number };
+const scriptedFile = "benchmark/records/mac-scripted-2026-10-19.json";
+const scriptedRaw = readJson(scriptedFile);
+export const scripted = {
+  file: scriptedFile,
+  date: scriptedRaw.date as string,
+  machine: `${String(scriptedRaw.host.cpu).replace(/Apple M\d+( Pro| Max)?/, "Apple silicon")}, ${scriptedRaw.host.cores} cores`,
+  commit: scriptedRaw.build.commit as string,
+  clients: scriptedRaw.config.clients as number,
+  pipeline: scriptedRaw.config.pipeline as number,
+  rounds: scriptedRaw.config.rounds as number,
+  redisVersion: ((String(scriptedRaw.redis_version).match(/v=([\d.]+)/) || [])[1] ?? "") as string,
+  rows: scriptedRaw.rows
+    .filter((r: any) => !r.skipped && !/for scale/.test(r.label))
+    .map((r: any) => ({
+      label: r.label.replace(/\s*\(\d+ due\)/, ""), ruvio: r.ruvio, redis: r.redis, ratio: r.ruvio / r.redis,
+      ruvioP50: r.ruvio_p50, redisP50: r.redis_p50, ruvioP99: r.ruvio_p99, redisP99: r.redis_p99,
+    })) as ScriptedRow[],
+  memory: scriptedRaw.memory.map((m: any) => ({
+    label: m.label,
+    ruvioBytes: (m.ruvio.delta_kib * 1024) / m.keys, redisBytes: (m.redis.delta_kib * 1024) / m.keys,
+    ratio: m.ruvio.delta_kib / m.redis.delta_kib,
+  })) as ScriptedMem[],
+};

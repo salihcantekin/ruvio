@@ -384,7 +384,7 @@
     },
     {
       "name": "DECR",
-      "arity": 2,
+      "arity": -2,
       "flags": [
         "write",
         "fast",
@@ -399,7 +399,7 @@
     },
     {
       "name": "DECRBY",
-      "arity": 3,
+      "arity": -3,
       "flags": [
         "write",
         "fast",
@@ -939,7 +939,7 @@
     },
     {
       "name": "HINCRBY",
-      "arity": 4,
+      "arity": -4,
       "flags": [
         "write",
         "fast",
@@ -1000,6 +1000,21 @@
       "flags": [
         "readonly",
         "fast"
+      ],
+      "keys": {
+        "kind": "range",
+        "first": 1,
+        "last": 1,
+        "step": 1
+      }
+    },
+    {
+      "name": "HMSET",
+      "arity": -4,
+      "flags": [
+        "write",
+        "fast",
+        "denyoom"
       ],
       "keys": {
         "kind": "range",
@@ -1151,6 +1166,21 @@
       }
     },
     {
+      "name": "HTRANSFER",
+      "arity": -5,
+      "flags": [
+        "write",
+        "fast",
+        "denyoom"
+      ],
+      "keys": {
+        "kind": "range",
+        "first": 1,
+        "last": 1,
+        "step": 1
+      }
+    },
+    {
       "name": "HTTL",
       "arity": -5,
       "flags": [
@@ -1193,7 +1223,7 @@
     },
     {
       "name": "INCR",
-      "arity": 2,
+      "arity": -2,
       "flags": [
         "write",
         "fast",
@@ -1223,7 +1253,7 @@
     },
     {
       "name": "INCRBYFLOAT",
-      "arity": 3,
+      "arity": -3,
       "flags": [
         "write",
         "fast",
@@ -1493,7 +1523,7 @@
     },
     {
       "name": "JSON.SET",
-      "arity": 4,
+      "arity": -4,
       "flags": [
         "write",
         "denyoom"
@@ -2143,6 +2173,28 @@
       }
     },
     {
+      "name": "RENEW",
+      "arity": 4,
+      "flags": [
+        "write",
+        "fast"
+      ],
+      "keys": {
+        "kind": "range",
+        "first": 1,
+        "last": 1,
+        "step": 1
+      }
+    },
+    {
+      "name": "REPLICAOF",
+      "arity": -3,
+      "flags": [],
+      "keys": {
+        "kind": "none"
+      }
+    },
+    {
       "name": "RESTORE",
       "arity": -4,
       "flags": [
@@ -2154,6 +2206,16 @@
         "first": 1,
         "last": 1,
         "step": 1
+      }
+    },
+    {
+      "name": "ROLE",
+      "arity": 1,
+      "flags": [
+        "fast"
+      ],
+      "keys": {
+        "kind": "none"
       }
     },
     {
@@ -2362,7 +2424,7 @@
     },
     {
       "name": "SETBIT",
-      "arity": 4,
+      "arity": -4,
       "flags": [
         "write",
         "denyoom"
@@ -2713,6 +2775,21 @@
         "kind": "range",
         "first": 1,
         "last": -1,
+        "step": 1
+      }
+    },
+    {
+      "name": "TRANSFER",
+      "arity": -4,
+      "flags": [
+        "write",
+        "fast",
+        "denyoom"
+      ],
+      "keys": {
+        "kind": "range",
+        "first": 1,
+        "last": 2,
         "step": 1
       }
     },
@@ -3071,7 +3148,7 @@
     },
     {
       "name": "ZINCRBY",
-      "arity": 4,
+      "arity": -4,
       "flags": [
         "write",
         "fast",
@@ -3124,10 +3201,38 @@
       }
     },
     {
+      "name": "ZMOVEDUE",
+      "arity": -4,
+      "flags": [
+        "write",
+        "denyoom"
+      ],
+      "keys": {
+        "kind": "range",
+        "first": 1,
+        "last": 2,
+        "step": 1
+      }
+    },
+    {
       "name": "ZMSCORE",
       "arity": -3,
       "flags": [
         "readonly",
+        "fast"
+      ],
+      "keys": {
+        "kind": "range",
+        "first": 1,
+        "last": 1,
+        "step": 1
+      }
+    },
+    {
+      "name": "ZPOPBYSCORE",
+      "arity": -3,
+      "flags": [
+        "write",
         "fast"
       ],
       "keys": {

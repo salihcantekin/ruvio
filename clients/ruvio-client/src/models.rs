@@ -55,6 +55,9 @@ pub struct SortedSetAddOptions {
     pub less_than: bool,
     /// Count changed members as well as new ones (`CH`).
     pub changed: bool,
+    /// Deadline for the key, sent as `EX` / `PX`; set only when the call creates the key (an
+    /// existing key keeps its deadline). A zero `Duration` is refused before sending.
+    pub ttl: Option<Duration>,
 }
 
 /// `XREAD` and `XREADGROUP` options.
@@ -213,6 +216,9 @@ pub struct BloomInsertOptions {
     pub no_create: bool,
     /// `NONSCALING` for a new filter.
     pub non_scaling: bool,
+    /// Deadline for the key, sent as `EX` / `PX`; set only when the call creates the filter (an
+    /// existing key keeps its deadline). A zero `Duration` is refused before sending.
+    pub ttl: Option<Duration>,
 }
 
 /// The `BF.INFO` reply.
@@ -863,6 +869,19 @@ pub struct RateLimit {
     pub allowed: bool,
     /// Calls left in the window after this one (0 when refused).
     pub remaining: i64,
+}
+
+/// The answer of the `*_with_retry` limit calls ([`Client::limit_sliding_with_retry`](crate::Client::limit_sliding_with_retry),
+/// [`Client::limit_tokens_with_retry`](crate::Client::limit_tokens_with_retry)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LimitOutcome {
+    /// True when this call was let through.
+    pub allowed: bool,
+    /// Allowance left after this call (0 when refused).
+    pub remaining: i64,
+    /// Milliseconds until the same call would pass (0 when it was let through). Fit for a
+    /// `Retry-After` header.
+    pub retry_after_ms: u64,
 }
 
 #[cfg(test)]

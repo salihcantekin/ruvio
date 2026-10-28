@@ -231,6 +231,22 @@ public abstract class Reply<T> {
         }
     };
 
+    /** Two integers (the reply of {@code TRANSFER} and {@code HTRANSFER}); nil gives null. */
+    public static final Reply<List<Long>> LONG_PAIR = new Reply<List<Long>>() {
+        @Override
+        public List<Long> decode(RespReader r, Request<?> q) {
+            int n = r.arrayLength();
+            if (n < 0) {
+                return null;
+            }
+            List<Long> out = new ArrayList<>(n);
+            for (int i = 0; i < n; i++) {
+                out.add(r.readLongOrNull());
+            }
+            return out;
+        }
+    };
+
     /** An array of integer flags, 0 as false and anything else as true. */
     public static final Reply<List<Boolean>> BOOL_LIST = new Reply<List<Boolean>>() {
         @Override

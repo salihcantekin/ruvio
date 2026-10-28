@@ -6,12 +6,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // ErrCrossSlot is returned, without sending anything, for a multi-key command, pipeline
@@ -31,6 +34,19 @@ type topology struct {
 	owner [slotCount]uint16 // index into nodes, noOwner when the slot is unassigned
 	nodes []*Client
 	addrs []string
+
+	// replicas lists, per node, the replica addresses CLUSTER SLOTS gave after it. read
+	// holds, per node, the replica its reads go to (nil when it has none); empty with
+	// ReadPrimary. The routes are shared by the copies a MOVED makes, so a replica marked
+	// unusable stays so until the next load.
+	replicas [][]string
+	read     []*replicaRoute
+}
+
+// replicaRoute is the replica chosen for one node's reads.
+type replicaRoute struct {
+	node *Client
+	bad  atomic.Bool // could not be connected, or answered LOADING: skipped until the next load
 }
 
 func (t *topology) nodeAt(slot int, seed *Client) *Client {
@@ -56,13 +72,22 @@ type cluster struct {
 	seed       *Client
 	t          atomic.Pointer[topology]
 	standalone atomic.Bool // the seed answered "cluster mode is disabled"
+	policy     ReadPolicy  // Options.ReadPolicy
 
 	mu    sync.Mutex // guards nodes, refresh and slot patches
 	nodes map[string]*Client
+
+	// seeds are the configured Options.Seeds addresses, asked for the slot map when no
+	// known node answers. Empty without Options.Seeds.
+	seeds []string
 }
 
 func newCluster(seed *Client) *cluster {
-	return &cluster{seed: seed, nodes: map[string]*Client{seed.opts.Addr: seed}}
+	cl := &cluster{seed: seed, policy: seed.opts.ReadPolicy, nodes: map[string]*Client{seed.opts.Addr: seed}}
+	if len(seed.addrs) > 1 {
+		cl.seeds = seed.addrs
+	}
+	return cl
 }
 
 // node returns the Client for addr, creating it (no connection yet). Caller holds cl.mu.
@@ -72,9 +97,23 @@ func (cl *cluster) node(addr string) *Client {
 	}
 	o := cl.seed.opts
 	o.Addr = addr
+	o.Seeds = nil
 	o.Cluster = false
+	o.SentinelMaster = ""
+	o.DisableFollowPrimary = true
 	n := NewClient(o)
 	cl.nodes[addr] = n
+	return n
+}
+
+// replicaNode returns the Client for the replica at addr, creating it (no connection yet);
+// it sends READONLY on every connection it opens. Caller holds cl.mu.
+func (cl *cluster) replicaNode(addr string) *Client {
+	if n := cl.nodes[addr]; n != nil {
+		return n
+	}
+	n := cl.node(addr)
+	n.readOnly = true
 	return n
 }
 
@@ -110,8 +149,19 @@ func isClusterDisabled(err error) bool {
 		strings.Contains(e.Msg, "unknown command") || strings.Contains(e.Msg, "unknown subcommand"))
 }
 
+// open reports whether the node has a connection that has not failed.
+func (c *Client) open() bool {
+	cn := c.cur.Load()
+	return cn != nil && !cn.dead.Load()
+}
+
 // refresh reloads the slot table with CLUSTER SLOTS. first is the discovery call: a
 // "cluster mode is disabled" reply switches the client to standalone for good.
+//
+// Nodes with an open socket are asked first. When none of them answers (the usual case after
+// a node went away), every other known node and then every seed is opened in turn, one
+// connect attempt each, until one returns a slot map. Seeds that were only added for this
+// call and are not in the new table are dropped again.
 func (cl *cluster) refresh(ctx context.Context, first bool) (*topology, error) {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
@@ -123,40 +173,78 @@ func (cl *cluster) refresh(ctx context.Context, first bool) (*topology, error) {
 			return nil, nil
 		}
 	}
-	candidates := []*Client{cl.seed}
+	known := []*Client{cl.seed}
 	if t := cl.t.Load(); t != nil {
 		for _, n := range t.nodes {
 			if n != cl.seed {
-				candidates = append(candidates, n)
+				known = append(known, n)
 			}
 		}
 	}
 	var lastErr error
-	for _, n := range candidates {
+	// ask returns done=true when the call is finished: t is the new table (nil when the
+	// server turned out to be standalone) or err the final error.
+	ask := func(n *Client) (t *topology, done bool, err error) {
 		v, err := n.execLocal(ctx, newCmd(2, cCLUSTER).t(tSLOTS))
 		if err != nil {
 			if first && isClusterDisabled(err) {
 				cl.standalone.Store(true)
-				return nil, nil
+				return nil, true, nil
 			}
 			lastErr = err
 			if ctx.Err() != nil {
-				break
+				return nil, true, err
 			}
-			continue
+			return nil, false, nil
 		}
-		t, err := cl.build(v)
+		t, err = cl.build(v, n.opts.Addr)
 		if err != nil {
-			return nil, err
+			return nil, true, err
 		}
 		cl.t.Store(t)
-		return t, nil
+		return t, true, nil
+	}
+	for _, n := range known {
+		if n.open() {
+			if t, done, err := ask(n); done {
+				return t, err
+			}
+		}
+	}
+	for _, n := range known {
+		if !n.open() {
+			if t, done, err := ask(n); done {
+				return t, err
+			}
+		}
+	}
+	var added []string
+	defer func() {
+		for _, addr := range added {
+			if t := cl.t.Load(); t != nil && t.indexOf(addr) >= 0 {
+				continue
+			}
+			if n := cl.nodes[addr]; n != nil {
+				delete(cl.nodes, addr)
+				n.Close()
+			}
+		}
+	}()
+	for _, addr := range cl.seeds {
+		if cl.nodes[addr] != nil {
+			continue
+		}
+		added = append(added, addr)
+		if t, done, err := ask(cl.node(addr)); done {
+			return t, err
+		}
 	}
 	return nil, lastErr
 }
 
-// build turns a CLUSTER SLOTS reply into a topology. Caller holds cl.mu.
-func (cl *cluster) build(v Value) (*topology, error) {
+// build turns a CLUSTER SLOTS reply from fromAddr into a topology; a node address the reply
+// leaves empty means fromAddr's host. Caller holds cl.mu.
+func (cl *cluster) build(v Value, fromAddr string) (*topology, error) {
 	if v.Kind != KindArray || len(v.Array) == 0 {
 		return nil, fmt.Errorf("ruvio: invalid CLUSTER SLOTS reply: %s", v.String())
 	}
@@ -166,7 +254,7 @@ func (cl *cluster) build(v Value) (*topology, error) {
 		b, _ := ranges[j].Array[0].AsInt64()
 		return a < b
 	})
-	seedHost, _, _ := net.SplitHostPort(cl.seed.opts.Addr)
+	seedHost, _, _ := net.SplitHostPort(fromAddr)
 	t := &topology{}
 	for i := range t.owner {
 		t.owner[i] = noOwner
@@ -191,9 +279,39 @@ func (cl *cluster) build(v Value) (*topology, error) {
 			idx = len(t.addrs)
 			t.addrs = append(t.addrs, addr)
 			t.nodes = append(t.nodes, cl.node(addr))
+			t.replicas = append(t.replicas, nil)
+		}
+		// Replicas follow the primary; one that cannot be read is skipped, not fatal.
+		for _, rep := range rg.Array[3:] {
+			if rep.Kind != KindArray || len(rep.Array) < 2 {
+				continue
+			}
+			rport, err := rep.Array[1].AsInt64()
+			if err != nil || rport < 1 || rport > 65535 {
+				continue
+			}
+			rhost := rep.Array[0].Str()
+			if rhost == "" {
+				rhost = seedHost
+			}
+			raddr := net.JoinHostPort(rhost, strconv.FormatInt(rport, 10))
+			if !slices.Contains(t.replicas[idx], raddr) {
+				t.replicas[idx] = append(t.replicas[idx], raddr)
+			}
 		}
 		for s := lo; s <= hi; s++ {
 			t.owner[s] = uint16(idx)
+		}
+	}
+	if cl.policy != ReadPrimary {
+		// Each node's reads go to one of its replicas, picked at random per load so many
+		// clients spread over the replicas, and kept until the next load.
+		pick := rand.Uint64()
+		t.read = make([]*replicaRoute, len(t.nodes))
+		for i, reps := range t.replicas {
+			if len(reps) > 0 {
+				t.read[i] = &replicaRoute{node: cl.replicaNode(reps[pick%uint64(len(reps))])}
+			}
 		}
 	}
 	return t, nil
@@ -204,7 +322,36 @@ func parseMoved(msg []byte) (slot int, addr string, ok bool) {
 	if len(msg) < 8 || string(msg[:6]) != "MOVED " {
 		return 0, "", false
 	}
-	rest := msg[6:]
+	return parseSlotAddr(msg[6:])
+}
+
+// parseAsk decodes "ASK <slot> host:port".
+func parseAsk(msg []byte) (slot int, addr string, ok bool) {
+	if len(msg) < 6 || string(msg[:4]) != "ASK " {
+		return 0, "", false
+	}
+	return parseSlotAddr(msg[4:])
+}
+
+// isTryAgain reports whether an error reply is -TRYAGAIN.
+func isTryAgain(msg []byte) bool {
+	return len(msg) >= 8 && string(msg[:8]) == "TRYAGAIN"
+}
+
+// isRedirectErr reports whether an error reply is one the cluster client follows: -MOVED,
+// -ASK or -TRYAGAIN.
+func isRedirectErr(msg []byte) bool {
+	if _, _, ok := parseMoved(msg); ok {
+		return true
+	}
+	if _, _, ok := parseAsk(msg); ok {
+		return true
+	}
+	return isTryAgain(msg)
+}
+
+// parseSlotAddr decodes "<slot> host:port", the part after the prefix of -MOVED and -ASK.
+func parseSlotAddr(rest []byte) (slot int, addr string, ok bool) {
 	sp := -1
 	for i, c := range rest {
 		if c == ' ' {
@@ -222,9 +369,17 @@ func parseMoved(msg []byte) (slot int, addr string, ok bool) {
 	return n, string(rest[sp+1:]), true
 }
 
-// maxRedirects is how many -MOVED replies one command follows before the last one is
-// returned to the caller.
+// maxRedirects is how many -MOVED and -ASK replies one command follows before the last
+// one is returned to the caller.
 const maxRedirects = 3
+
+// maxTryAgain is how many times one command is sent again after -TRYAGAIN; the wait before
+// retry n is tryAgainWait << (n-1), 635 ms in all: a slot range moving between nodes is
+// frozen for a few hundred milliseconds.
+const (
+	maxTryAgain  = 7
+	tryAgainWait = 5 * time.Millisecond
+)
 
 // applyMoved updates the table after -MOVED and returns the node to retry on: the one the
 // MOVED named. The slot is patched at once; the whole table is reloaded only when the target
@@ -253,19 +408,20 @@ func (cl *cluster) applyMoved(ctx context.Context, slot int, addr string, reload
 
 // rt sends r on c and waits. ok=false: r was handed back to the reader (or recycled); the
 // caller must not touch it. ok=true: r is the caller's, its reply is in r.val / r.err.
-func (c *Client) rt(ctx context.Context, r *request, blocking bool) (bool, error) {
+//
+// With keep set, a connection that could not be opened is reported as ok=true with the error
+// in r.err and r untouched, so the caller can send it elsewhere.
+func (c *Client) rt(ctx context.Context, r *request, blocking, keep bool) (bool, error) {
 	if !blocking {
 		cn, err := c.shared(ctx)
 		if err != nil {
-			putReq(r)
-			return false, err
+			return openFailed(r, err, keep)
 		}
 		return cn.roundTrip(ctx, r)
 	}
 	cn, err := c.acquire(ctx)
 	if err != nil {
-		putReq(r)
-		return false, err
+		return openFailed(r, err, keep)
 	}
 	ok, err := cn.roundTrip(ctx, r)
 	if !ok || r.err != nil {
@@ -274,6 +430,15 @@ func (c *Client) rt(ctx context.Context, r *request, blocking bool) (bool, error
 		c.release(cn)
 	}
 	return ok, err
+}
+
+func openFailed(r *request, err error, keep bool) (bool, error) {
+	if keep && isConnectError(err) {
+		r.err = err
+		return true, nil
+	}
+	putReq(r)
+	return false, err
 }
 
 // stats sums the counters of every node connection.

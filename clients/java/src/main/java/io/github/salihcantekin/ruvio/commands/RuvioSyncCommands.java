@@ -38,12 +38,14 @@ import io.github.salihcantekin.ruvio.model.GeoResult;
 import io.github.salihcantekin.ruvio.model.GeoValue;
 import io.github.salihcantekin.ruvio.model.IdemResult;
 import io.github.salihcantekin.ruvio.model.KeyValue;
+import io.github.salihcantekin.ruvio.model.LimitOutcome;
 import io.github.salihcantekin.ruvio.model.PendingEntry;
 import io.github.salihcantekin.ruvio.model.PendingSummary;
 import io.github.salihcantekin.ruvio.model.ScanResult;
 import io.github.salihcantekin.ruvio.model.ScoredValue;
 import io.github.salihcantekin.ruvio.model.StreamEntry;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -239,6 +241,64 @@ public abstract class RuvioSyncCommands<K, V> {
     }
 
     /**
+     * Sends the Ruvio command {@code SET key value IFGT [EX|PX|EXAT|PXAT|KEEPTTL]}: writes when the key is missing or {@code value} is greater than the stored integer (a watermark, a version, the highest bid).
+     * Any TTL is cleared; use the overload with {@code SetOptions} to set one.
+     *
+     * <pre>{@code
+     * boolean advanced = client.setIfGreater("watermark", 1_700_000_000L);
+     * }</pre>
+     *
+     * @param key the key to write
+     * @param value the new number
+     * @return {@code true} when the value was written, {@code false} when the stored number is greater or equal
+     * @throws RuvioServerException {@code WRONGTYPE} when the key holds a non-string; an error when the stored string is not an integer
+     */
+    public Boolean setIfGreater(K key, long value) {
+        return await(async.setIfGreater(key, value));
+    }
+
+    /**
+     * Sends the Ruvio command {@code SET key value IFGT [EX|PX|EXAT|PXAT|KEEPTTL]}: writes when the key is missing or {@code value} is greater than the stored integer (a watermark, a version, the highest bid).
+     *
+     * @param key the key to write
+     * @param value the new number
+     * @param expiry the expiry to apply
+     * @return {@code true} when written, {@code false} when refused
+     */
+    public Boolean setIfGreater(K key, long value, SetOptions expiry) {
+        return await(async.setIfGreater(key, value, expiry));
+    }
+
+    /**
+     * Sends the Ruvio command {@code SET key value IFLT [EX|PX|EXAT|PXAT|KEEPTTL]}: writes when the key is missing or {@code value} is smaller than the stored integer (the lowest price, the earliest deadline).
+     * Any TTL is cleared; use the overload with {@code SetOptions} to set one.
+     *
+     * <pre>{@code
+     * boolean lowered = client.setIfLess("best:price", 4_99L);
+     * }</pre>
+     *
+     * @param key the key to write
+     * @param value the new number
+     * @return {@code true} when the value was written, {@code false} when the stored number is smaller or equal
+     * @throws RuvioServerException {@code WRONGTYPE} when the key holds a non-string; an error when the stored string is not an integer
+     */
+    public Boolean setIfLess(K key, long value) {
+        return await(async.setIfLess(key, value));
+    }
+
+    /**
+     * Sends the Ruvio command {@code SET key value IFLT [EX|PX|EXAT|PXAT|KEEPTTL]}: writes when the key is missing or {@code value} is smaller than the stored integer (the lowest price, the earliest deadline).
+     *
+     * @param key the key to write
+     * @param value the new number
+     * @param expiry the expiry to apply
+     * @return {@code true} when written, {@code false} when refused
+     */
+    public Boolean setIfLess(K key, long value, SetOptions expiry) {
+        return await(async.setIfLess(key, value, expiry));
+    }
+
+    /**
      * Sends the Ruvio command {@code SETV key value}: starts a versioned string and returns its version.
      * It works on a missing key or a plain string (the key becomes versioned, version 1). Once a key is
      * versioned, later writes must use {@link #setv(Object, Object, long)} with the current version.
@@ -294,6 +354,46 @@ public abstract class RuvioSyncCommands<K, V> {
      */
     public Long take(K key, long count) {
         return await(async.take(key, count));
+    }
+
+    /**
+     * Sends the Ruvio command {@code TRANSFER source destination amount}: moves {@code amount} from the
+     * integer at {@code source} to the integer at {@code destination} in one step, only when {@code source}
+     * holds at least that much. A missing {@code destination} starts at 0. Both writes are one WAL record.
+     *
+     * <pre>{@code
+     * client.set("{u}:wallet", "50");
+     * List<Long> after = client.transfer("{u}:wallet", "{u}:escrow", 30); // [20, 30]
+     * List<Long> none = client.transfer("{u}:wallet", "{u}:escrow", 30);  // null, nothing changed
+     * }</pre>
+     *
+     * @param source the key to subtract from (a decimal integer string)
+     * @param destination the key to add to; in a cluster it must share a slot with {@code source}
+     * (use a hash tag such as {@code {user:42}})
+     * @param amount the amount to move; must be greater than zero
+     * @return {@code [sourceAfter, destinationAfter]}, or {@code null} when {@code source} is missing or
+     * short, or {@code destination} would overflow (nothing is written)
+     * @throws RuvioServerException {@code ERR} when {@code amount} is not positive, the keys are the same or a
+     * value is not an integer; {@code WRONGTYPE} for a non-string; {@code CROSSSLOT} when the keys are in different slots
+     */
+    public List<Long> transfer(K source, K destination, long amount) {
+        return await(async.transfer(source, destination, amount));
+    }
+
+    /**
+     * Sends the Ruvio command {@code TRANSFER source destination amount MAX max}: {@link #transfer(Object, Object, long)}
+     * that also refuses when {@code destination} would end above {@code max}.
+     *
+     * @param source the key to subtract from (a decimal integer string)
+     * @param destination the key to add to; in a cluster it must share a slot with {@code source}
+     * @param amount the amount to move; must be greater than zero
+     * @param max the highest value {@code destination} may reach
+     * @return {@code [sourceAfter, destinationAfter]}, or {@code null} when nothing was moved
+     * @throws RuvioServerException {@code ERR} when {@code amount} is not positive, the keys are the same or a
+     * value is not an integer; {@code WRONGTYPE} for a non-string; {@code CROSSSLOT} when the keys are in different slots
+     */
+    public List<Long> transfer(K source, K destination, long amount, long max) {
+        return await(async.transfer(source, destination, amount, max));
     }
 
     /**
@@ -429,6 +529,24 @@ public abstract class RuvioSyncCommands<K, V> {
     }
 
     /**
+     * Sends {@code INCR key EX|PX ttl}: like {@link #incr(Object)}, and a counter this call creates gets a time to live.
+     * An existing key keeps its deadline.
+     *
+     * <pre>{{@code
+     * long hits = client.incr("page:hits", Duration.ofMinutes(1));
+     * }}</pre>
+     *
+     * @param key the counter key
+     * @param ttl time to live of a newly created key: whole seconds are sent as {@code EX}, anything finer as {@code PX}
+     * @return the value after the increment
+     * @throws IllegalArgumentException when {@code ttl} is null, zero, negative or too large
+     * @throws RuvioServerException {@code ERR} when the value is not a signed 64-bit integer or the result overflows; {@code WRONGTYPE} for a non-string
+     */
+    public Long incr(K key, Duration ttl) {
+        return await(async.incr(key, ttl));
+    }
+
+    /**
      * Sends {@code DECR key}: subtracts one from a decimal integer string. A missing key counts as 0; an existing TTL is kept.
      *
      * @param key the counter key
@@ -437,6 +555,20 @@ public abstract class RuvioSyncCommands<K, V> {
      */
     public Long decr(K key) {
         return await(async.decr(key));
+    }
+
+    /**
+     * Sends {@code DECR key EX|PX ttl}: like {@link #decr(Object)}, and a counter this call creates gets a time to live.
+     * An existing key keeps its deadline.
+     *
+     * @param key the counter key
+     * @param ttl time to live of a newly created key: whole seconds are sent as {@code EX}, anything finer as {@code PX}
+     * @return the value after the decrement
+     * @throws IllegalArgumentException when {@code ttl} is null, zero, negative or too large
+     * @throws RuvioServerException {@code ERR} when the value is not a signed 64-bit integer or the result overflows; {@code WRONGTYPE} for a non-string
+     */
+    public Long decr(K key, Duration ttl) {
+        return await(async.decr(key, ttl));
     }
 
     /**
@@ -450,6 +582,21 @@ public abstract class RuvioSyncCommands<K, V> {
      */
     public Long incrby(K key, long delta) {
         return await(async.incrby(key, delta));
+    }
+
+    /**
+     * Sends {@code INCRBY key delta EX|PX ttl}: like {@link #incrby(Object, long)}, and a counter this call creates gets a time
+     * to live. An existing key keeps its deadline.
+     *
+     * @param key the counter key
+     * @param delta the signed amount to add
+     * @param ttl time to live of a newly created key: whole seconds are sent as {@code EX}, anything finer as {@code PX}
+     * @return the value after the addition
+     * @throws IllegalArgumentException when {@code ttl} is null, zero, negative or too large
+     * @throws RuvioServerException {@code ERR} when the value is not a signed 64-bit integer or the result overflows; {@code WRONGTYPE} for a non-string
+     */
+    public Long incrby(K key, long delta, Duration ttl) {
+        return await(async.incrby(key, delta, ttl));
     }
 
     /**
@@ -472,6 +619,26 @@ public abstract class RuvioSyncCommands<K, V> {
     }
 
     /**
+     * Sends {@code INCRBY key delta EX|PX ttl MAX limit}: like {@link #incrbyMax(Object, long, long)}, and a counter this call
+     * creates gets a time to live (a fixed-window quota in one command). An existing key keeps its deadline.
+     *
+     * <pre>{{@code
+     * Long used = client.incrbyMax("quota:user1", 1, 100, Duration.ofMinutes(1)); // null once 100 is reached
+     * }}</pre>
+     *
+     * @param key the counter key
+     * @param delta the signed amount to add
+     * @param limit the highest value the counter may reach
+     * @param ttl time to live of a newly created key: whole seconds are sent as {@code EX}, anything finer as {@code PX}
+     * @return the value after the addition, or {@code null} when the result would pass {@code limit} (nothing is written)
+     * @throws IllegalArgumentException when {@code ttl} is null, zero, negative or too large
+     * @throws RuvioServerException {@code ERR} when the value is not a signed 64-bit integer; {@code WRONGTYPE} for a non-string
+     */
+    public Long incrbyMax(K key, long delta, long limit, Duration ttl) {
+        return await(async.incrbyMax(key, delta, limit, ttl));
+    }
+
+    /**
      * Sends {@code DECRBY key delta}: subtracts {@code delta} from a decimal integer string. A missing key counts as 0; an existing TTL is kept.
      *
      * @param key the counter key
@@ -484,8 +651,23 @@ public abstract class RuvioSyncCommands<K, V> {
     }
 
     /**
+     * Sends {@code DECRBY key delta EX|PX ttl}: like {@link #decrby(Object, long)}, and a counter this call creates gets a time
+     * to live. An existing key keeps its deadline.
+     *
+     * @param key the counter key
+     * @param delta the amount to subtract (a negative value adds)
+     * @param ttl time to live of a newly created key: whole seconds are sent as {@code EX}, anything finer as {@code PX}
+     * @return the value after the subtraction
+     * @throws IllegalArgumentException when {@code ttl} is null, zero, negative or too large
+     * @throws RuvioServerException {@code ERR} when the value is not a signed 64-bit integer or the result overflows; {@code WRONGTYPE} for a non-string
+     */
+    public Long decrby(K key, long delta, Duration ttl) {
+        return await(async.decrby(key, delta, ttl));
+    }
+
+    /**
      * Sends {@code INCRBYFLOAT key delta}: adds a floating-point number to a numeric string. A missing key
-     * counts as 0. Ruvio computes in double precision and stores 15 significant digits (Redis uses long double).
+     * counts as 0. Ruvio computes in double precision and stores 16 significant digits (Redis uses long double).
      *
      * @param key the key to change
      * @param delta the amount to add (may be negative)
@@ -494,6 +676,21 @@ public abstract class RuvioSyncCommands<K, V> {
      */
     public Double incrbyfloat(K key, double delta) {
         return await(async.incrbyfloat(key, delta));
+    }
+
+    /**
+     * Sends {@code INCRBYFLOAT key delta EX|PX ttl}: like {@link #incrbyfloat(Object, double)}, and a key this call creates gets a
+     * time to live. An existing key keeps its deadline.
+     *
+     * @param key the key to change
+     * @param delta the amount to add (may be negative)
+     * @param ttl time to live of a newly created key: whole seconds are sent as {@code EX}, anything finer as {@code PX}
+     * @return the value after the addition
+     * @throws IllegalArgumentException when {@code ttl} is null, zero, negative or too large
+     * @throws RuvioServerException {@code ERR} when the value is not a number or the result is NaN or infinite; {@code WRONGTYPE} for a non-string
+     */
+    public Double incrbyfloat(K key, double delta, Duration ttl) {
+        return await(async.incrbyfloat(key, delta, ttl));
     }
 
     /**
@@ -690,6 +887,73 @@ public abstract class RuvioSyncCommands<K, V> {
     }
 
     /**
+     * Sends the Ruvio command {@code LIMIT key max window_ms SLIDING}: a sliding-window rate limiter.
+     * The previous window counts for the part of it that still overlaps the last {@code windowMillis}, so a burst
+     * at a window edge is not doubled. The key keeps two counters, not one entry per call. A key keeps the mode it
+     * was created with.
+     *
+     * <pre>{@code
+     * Long left = client.limitSliding("rl:user:1", 100, 60_000); // null when the call does not fit
+     * }</pre>
+     *
+     * @param key the limiter key
+     * @param max calls per window; from 1 to 2147483647
+     * @param windowMillis window length in milliseconds; must be greater than zero
+     * @return the calls left after this one, or {@code null} when it does not fit (nothing is counted)
+     * @throws RuvioServerException {@code ERR} when an argument is out of range or the key was created by another {@code LIMIT} mode; {@code WRONGTYPE} when the key holds another type
+     */
+    public Long limitSliding(K key, long max, long windowMillis) {
+        return await(async.limitSliding(key, max, windowMillis));
+    }
+
+    /**
+     * Sends the Ruvio command {@code LIMIT key capacity refill_ms TOKENS COST cost}: a token bucket.
+     * The bucket holds {@code capacity} tokens and refills completely over {@code refillMillis}; a call takes
+     * {@code cost} tokens. The key keeps one timestamp and disappears when the bucket is full again.
+     *
+     * <pre>{@code
+     * Long left = client.limitTokens("rl:api:7", 10, 1_000, 2); // 10 tokens per second, this call takes 2
+     * }</pre>
+     *
+     * @param key the limiter key
+     * @param capacity bucket size; from 1 to 1000000
+     * @param refillMillis time to refill an empty bucket in milliseconds; up to 4294967295
+     * @param cost tokens this call takes; from 1 to {@code capacity}
+     * @return the tokens left after this call, or {@code null} when the bucket holds too few (nothing is taken)
+     * @throws RuvioServerException {@code ERR} when an argument is out of range or the key was created by another {@code LIMIT} mode; {@code WRONGTYPE} when the key holds another type
+     */
+    public Long limitTokens(K key, long capacity, long refillMillis, long cost) {
+        return await(async.limitTokens(key, capacity, refillMillis, cost));
+    }
+
+    /**
+     * Sends {@code LIMIT key max window_ms SLIDING WITHRETRY}: {@link #limitSliding} that also says how long to wait.
+     *
+     * @param key the limiter key
+     * @param max calls per window; from 1 to 2147483647
+     * @param windowMillis window length in milliseconds; must be greater than zero
+     * @return the outcome; {@code retryAfterMillis} is the wait until the same call would pass
+     * @throws RuvioServerException as {@link #limitSliding}
+     */
+    public LimitOutcome limitSlidingWithRetry(K key, long max, long windowMillis) {
+        return await(async.limitSlidingWithRetry(key, max, windowMillis));
+    }
+
+    /**
+     * Sends {@code LIMIT key capacity refill_ms TOKENS COST cost WITHRETRY}: {@link #limitTokens} that also says how long to wait.
+     *
+     * @param key the limiter key
+     * @param capacity bucket size; from 1 to 1000000
+     * @param refillMillis time to refill an empty bucket in milliseconds; up to 4294967295
+     * @param cost tokens this call takes; from 1 to {@code capacity}
+     * @return the outcome; {@code retryAfterMillis} is the wait until the same call would pass
+     * @throws RuvioServerException as {@link #limitTokens}
+     */
+    public LimitOutcome limitTokensWithRetry(K key, long capacity, long refillMillis, long cost) {
+        return await(async.limitTokensWithRetry(key, capacity, refillMillis, cost));
+    }
+
+    /**
      * Sends the Ruvio command {@code IDEM key BEGIN fingerprint owner ttl_ms}: reserves a request so it runs once.
      * The server only compares the tokens; it does not hash the request or check who the owner is. Use a digest of
      * every input that defines the request as the fingerprint, and an unguessable per-attempt value as the owner.
@@ -741,6 +1005,28 @@ public abstract class RuvioSyncCommands<K, V> {
      */
     public Long idemComplete(K key, String fingerprint, String owner, byte[] result) {
         return await(async.idemComplete(key, fingerprint, owner, result));
+    }
+
+    /**
+     * Sends {@code IDEM key ABORT fingerprint owner}: gives up the pending record that this attempt got from
+     * {@link #idemBegin}, so the next {@code BEGIN} acquires the key at once. A completed record is never
+     * removed. Abort only when the work did not take effect or is safe to run again; a retry after an abort
+     * runs it again.
+     *
+     * <pre>{@code
+     * boolean freed = client.idemAbort("order:42", digest, attemptToken); // true
+     * }</pre>
+     *
+     * @param key the idempotency key
+     * @param fingerprint the same fingerprint used in {@code idemBegin}
+     * @param owner the same owner token used in {@code idemBegin}
+     * @return {@code true} when the pending record of this owner and fingerprint was removed; {@code false} when
+     * nothing changed (the key is missing or expired, the record is completed, or another owner or fingerprint holds it)
+     * @throws RuvioServerException {@code ERR} for invalid tokens; {@code INVALID} or {@code WRONGTYPE} for a key
+     * that holds no IDEM record
+     */
+    public Boolean idemAbort(K key, String fingerprint, String owner) {
+        return await(async.idemAbort(key, fingerprint, owner));
     }
 
     /**
@@ -815,6 +1101,21 @@ public abstract class RuvioSyncCommands<K, V> {
      */
     public Long semaphore(K key, long max, long ttlMillis) {
         return await(async.semaphore(key, max, ttlMillis));
+    }
+
+    /**
+     * Sends the Ruvio command {@code RENEW key token ttl}: moves the deadline of a lease or semaphore slot you hold to
+     * now + {@code ttlMillis}. The fencing token does not change and no holder is created.
+     *
+     * @param key the lease or semaphore key
+     * @param token the token returned by {@link #lease(Object, long)} or {@link #semaphore(Object, long, long)}
+     * @param ttlMillis the new lifetime in milliseconds (positive); it replaces the remaining time
+     * @return {@code true} when the token was live and its deadline moved, {@code false} when the key is missing or the
+     * token is stale or does not match
+     * @throws RuvioServerException {@code WRONGTYPE} when the key holds something other than a lease or semaphore
+     */
+    public Boolean renew(K key, long token, long ttlMillis) {
+        return await(async.renew(key, token, ttlMillis));
     }
 
     /**
@@ -1045,6 +1346,19 @@ public abstract class RuvioSyncCommands<K, V> {
     }
 
     /**
+     * Sends {@code EXPIRE key seconds NX|XX|GT|LT}: like {@link #expire(Object, long)}, applied only when the condition holds. A key
+     * without a deadline counts as infinite, so {@code GT} never applies to it and {@code LT} always does.
+     *
+     * @param key the key
+     * @param seconds seconds from now
+     * @param condition when to apply it: {@code NX} only without a deadline, {@code XX} only with one, {@code GT} only when later, {@code LT} only when earlier; {@link ExpireCondition#ALWAYS} sends no flag
+     * @return {@code true} when the deadline was set, {@code false} when the key does not exist or the condition failed
+     */
+    public Boolean expire(K key, long seconds, ExpireCondition condition) {
+        return await(async.expire(key, seconds, condition));
+    }
+
+    /**
      * Sends {@code PEXPIRE key milliseconds}: like {@link #expire(Object, long)} in milliseconds.
      *
      * @param key the key
@@ -1053,6 +1367,19 @@ public abstract class RuvioSyncCommands<K, V> {
      */
     public Boolean pexpire(K key, long millis) {
         return await(async.pexpire(key, millis));
+    }
+
+    /**
+     * Sends {@code PEXPIRE key millis NX|XX|GT|LT}: like {@link #pexpire(Object, long)}, applied only when the condition holds. A key
+     * without a deadline counts as infinite, so {@code GT} never applies to it and {@code LT} always does.
+     *
+     * @param key the key
+     * @param millis milliseconds from now
+     * @param condition when to apply it: {@code NX} only without a deadline, {@code XX} only with one, {@code GT} only when later, {@code LT} only when earlier; {@link ExpireCondition#ALWAYS} sends no flag
+     * @return {@code true} when the deadline was set, {@code false} when the key does not exist or the condition failed
+     */
+    public Boolean pexpire(K key, long millis, ExpireCondition condition) {
+        return await(async.pexpire(key, millis, condition));
     }
 
     /**
@@ -1067,6 +1394,19 @@ public abstract class RuvioSyncCommands<K, V> {
     }
 
     /**
+     * Sends {@code EXPIREAT key unixSeconds NX|XX|GT|LT}: like {@link #expireat(Object, long)}, applied only when the condition holds. A key
+     * without a deadline counts as infinite, so {@code GT} never applies to it and {@code LT} always does.
+     *
+     * @param key the key
+     * @param unixSeconds seconds since 1970-01-01 UTC
+     * @param condition when to apply it: {@code NX} only without a deadline, {@code XX} only with one, {@code GT} only when later, {@code LT} only when earlier; {@link ExpireCondition#ALWAYS} sends no flag
+     * @return {@code true} when the deadline was set, {@code false} when the key does not exist or the condition failed
+     */
+    public Boolean expireat(K key, long unixSeconds, ExpireCondition condition) {
+        return await(async.expireat(key, unixSeconds, condition));
+    }
+
+    /**
      * Sends {@code PEXPIREAT key timestamp}: expires a key at an absolute Unix time in milliseconds.
      *
      * @param key the key
@@ -1075,6 +1415,19 @@ public abstract class RuvioSyncCommands<K, V> {
      */
     public Boolean pexpireat(K key, long unixMillis) {
         return await(async.pexpireat(key, unixMillis));
+    }
+
+    /**
+     * Sends {@code PEXPIREAT key unixMillis NX|XX|GT|LT}: like {@link #pexpireat(Object, long)}, applied only when the condition holds. A key
+     * without a deadline counts as infinite, so {@code GT} never applies to it and {@code LT} always does.
+     *
+     * @param key the key
+     * @param unixMillis milliseconds since 1970-01-01 UTC
+     * @param condition when to apply it: {@code NX} only without a deadline, {@code XX} only with one, {@code GT} only when later, {@code LT} only when earlier; {@link ExpireCondition#ALWAYS} sends no flag
+     * @return {@code true} when the deadline was set, {@code false} when the key does not exist or the condition failed
+     */
+    public Boolean pexpireat(K key, long unixMillis, ExpireCondition condition) {
+        return await(async.pexpireat(key, unixMillis, condition));
     }
 
     /**
@@ -1312,6 +1665,23 @@ public abstract class RuvioSyncCommands<K, V> {
     }
 
     /**
+     * Sends {@code HMSET key field value [field value ...]}: sets several fields like {@link #hset(Object, Map)} but
+     * the server replies {@code OK} instead of the count of new fields. Redis marks {@code HMSET} deprecated; prefer
+     * {@code hset} in new code.
+     *
+     * <pre>{@code
+     * client.hmset("user:1", Map.of("name", "Ada", "city", "London"));
+     * }</pre>
+     *
+     * @param key the hash key
+     * @param fields the field names and values to set; must not be empty
+     * @throws RuvioServerException {@code WRONGTYPE} when the key holds a non-hash
+     */
+    public void hmset(K key, Map<K, V> fields) {
+        await(async.hmset(key, fields));
+    }
+
+    /**
      * Sends {@code HGET key field}.
      *
      * @param key the hash key
@@ -1422,6 +1792,57 @@ public abstract class RuvioSyncCommands<K, V> {
      */
     public Long hincrby(K key, K field, long delta) {
         return await(async.hincrby(key, field, delta));
+    }
+
+    /**
+     * Sends {@code HINCRBY key field delta EX|PX ttl}: like {@link #hincrby(Object, Object, long)}, and a hash this call creates
+     * gets a time to live. An existing key keeps its deadline.
+     *
+     * @param key the hash key
+     * @param field the field to change
+     * @param delta the signed amount to add
+     * @param ttl time to live of a newly created key: whole seconds are sent as {@code EX}, anything finer as {@code PX}
+     * @return the field value after the addition
+     * @throws IllegalArgumentException when {@code ttl} is null, zero, negative or too large
+     * @throws RuvioServerException {@code ERR} when the field is not a signed 64-bit integer or the result overflows; {@code WRONGTYPE} when the key holds a non-hash
+     */
+    public Long hincrby(K key, K field, long delta, Duration ttl) {
+        return await(async.hincrby(key, field, delta, ttl));
+    }
+
+    /**
+     * Sends {@code HTRANSFER key from to amount}: moves {@code amount} between two integer fields of one hash
+     * in one step, only when {@code from} holds at least that much. A missing {@code to} field starts at 0 and
+     * field TTLs stay.
+     *
+     * @param key the hash key
+     * @param from the field to subtract from
+     * @param to the field to add to
+     * @param amount the amount to move; must be greater than zero
+     * @return {@code [fromAfter, toAfter]}, or {@code null} when the key or {@code from} is missing or short, or
+     * {@code to} would overflow (nothing is written)
+     * @throws RuvioServerException {@code ERR} when {@code amount} is not positive, the fields are the same or a
+     * field is not an integer; {@code WRONGTYPE} when the key holds a non-hash
+     */
+    public List<Long> htransfer(K key, K from, K to, long amount) {
+        return await(async.htransfer(key, from, to, amount));
+    }
+
+    /**
+     * Sends {@code HTRANSFER key from to amount MAX max}: {@link #htransfer(Object, Object, Object, long)} that
+     * also refuses when {@code to} would end above {@code max}.
+     *
+     * @param key the hash key
+     * @param from the field to subtract from
+     * @param to the field to add to
+     * @param amount the amount to move; must be greater than zero
+     * @param max the highest value {@code to} may reach
+     * @return {@code [fromAfter, toAfter]}, or {@code null} when nothing was moved
+     * @throws RuvioServerException {@code ERR} when {@code amount} is not positive, the fields are the same or a
+     * field is not an integer; {@code WRONGTYPE} when the key holds a non-hash
+     */
+    public List<Long> htransfer(K key, K from, K to, long amount, long max) {
+        return await(async.htransfer(key, from, to, amount, max));
     }
 
     /**
@@ -2680,6 +3101,22 @@ public abstract class RuvioSyncCommands<K, V> {
     }
 
     /**
+     * Sends {@code ZINCRBY key increment member EX|PX ttl}: like {@link #zincrby(Object, double, Object)}, and a sorted set this
+     * call creates gets a time to live. An existing key keeps its deadline.
+     *
+     * @param key the sorted set key
+     * @param increment the amount to add
+     * @param member the member
+     * @param ttl time to live of a newly created key: whole seconds are sent as {@code EX}, anything finer as {@code PX}
+     * @return the new score
+     * @throws IllegalArgumentException when {@code ttl} is null, zero, negative or too large
+     * @throws RuvioServerException {@code WRONGTYPE} for a non-sorted-set
+     */
+    public Double zincrby(K key, double increment, V member, Duration ttl) {
+        return await(async.zincrby(key, increment, member, ttl));
+    }
+
+    /**
      * Sends {@code ZCARD key}.
      *
      * @param key the sorted set key
@@ -2760,6 +3197,34 @@ public abstract class RuvioSyncCommands<K, V> {
      */
     public List<ScoredValue<V>> zpopmin(K key, long count) {
         return await(async.zpopmin(key, count));
+    }
+
+    /**
+     * Sends {@code ZPOPBYSCORE key max MIN min COUNT count WITHSCORES}: removes and returns the members that are due, up to {@code count} of them with a score between {@code min} and {@code max}, lowest score first. With scores set to due times this takes the jobs that are ready.
+     *
+     * @param key the sorted set key
+     * @param min the lower score bound ({@code -inf}, {@code (5}, {@code 5})
+     * @param max the upper score bound ({@code +inf}, {@code (5}, {@code 5})
+     * @param count how many to remove, 1 to 10000
+     * @return members with scores, lowest first; empty when nothing is due
+     * @throws RuvioServerException {@code ERR} for a bad bound or a count outside 1 to 10000; {@code WRONGTYPE} for a non-sorted-set
+     */
+    public List<ScoredValue<V>> zpopbyscore(K key, String min, String max, long count) {
+        return await(async.zpopbyscore(key, min, max, count));
+    }
+
+    /**
+     * Sends {@code ZMOVEDUE source destination max COUNT count}: moves the members that are due from a sorted set to the tail of a list, up to {@code count} members with a score of at most {@code max}, lowest score first. Clients blocked on {@code destination} are served first.
+     *
+     * @param source the sorted set to take members from
+     * @param destination the list that receives them
+     * @param max the upper score bound ({@code +inf}, {@code (5}, {@code 5})
+     * @param count how many to move, 1 to 10000
+     * @return how many members moved
+     * @throws RuvioServerException {@code ERR} for a bad bound or a count outside 1 to 10000; {@code WRONGTYPE} when {@code source} is not a sorted set or {@code destination} is not a list; {@code CROSSSLOT} in a cluster
+     */
+    public Long zmovedue(K source, K destination, String max, long count) {
+        return await(async.zmovedue(source, destination, max, count));
     }
 
     /**
@@ -3154,6 +3619,29 @@ public abstract class RuvioSyncCommands<K, V> {
     @SafeVarargs
     public final Long geoadd(K key, boolean nx, boolean xx, boolean ch, GeoValue<V>... members) {
         return await(async.geoadd(key, nx, xx, ch, members));
+    }
+
+    /**
+     * Sends {@code GEOADD key EX|PX ttl [NX|XX] [CH] longitude latitude member ...}: like the overload without {@code ttl}, and a geo
+     * key this call creates gets a time to live. An existing key keeps its deadline.
+     *
+     * <pre>{@code
+     * client.geoadd("drivers", false, false, false, Duration.ofMinutes(5), GeoValue.of(13.36, 38.11, "d1"));
+     * }</pre>
+     *
+     * @param key the geo key
+     * @param nx {@code true} to add only new members (existing ones are not moved)
+     * @param xx {@code true} to update only existing members (new ones are not added)
+     * @param ch {@code true} to count members whose position changed as well as new ones
+     * @param ttl time to live of a newly created key: whole seconds are sent as {@code EX}, anything finer as {@code PX}
+     * @param members the places; longitude -180 to 180, latitude -85.05112878 to 85.05112878
+     * @return how many members were new, or with {@code ch} new plus changed
+     * @throws IllegalArgumentException when {@code ttl} is null, zero, negative or too large
+     * @throws RuvioServerException {@code ERR} for an out-of-range coordinate or {@code nx} together with {@code xx}; {@code WRONGTYPE} for a non-sorted-set
+     */
+    @SafeVarargs
+    public final Long geoadd(K key, boolean nx, boolean xx, boolean ch, Duration ttl, GeoValue<V>... members) {
+        return await(async.geoadd(key, nx, xx, ch, ttl, members));
     }
 
     /**
@@ -3898,6 +4386,22 @@ public abstract class RuvioSyncCommands<K, V> {
     }
 
     /**
+     * Sends {@code JSON.SET key path json EX|PX ttl}: like {@link #jsonSet(Object, String, String)}, and a document this call
+     * creates gets a time to live. An existing key keeps its deadline.
+     *
+     * @param key the JSON key
+     * @param path where to write
+     * @param json the new value as JSON text
+     * @param ttl time to live of a newly created key: whole seconds are sent as {@code EX}, anything finer as {@code PX}
+     * @return {@code true} when written, {@code false} when the target cannot be reached
+     * @throws IllegalArgumentException when {@code ttl} is null, zero, negative or too large
+     * @throws RuvioServerException {@code ERR invalid JSON value} or {@code ERR invalid JSON path}; {@code WRONGTYPE} when the key holds a non-JSON value
+     */
+    public Boolean jsonSet(K key, String path, String json, Duration ttl) {
+        return await(async.jsonSet(key, path, json, ttl));
+    }
+
+    /**
      * Sends {@code JSON.SET key path json NX}: writes only when the path does not exist yet.
      *
      * @param key the JSON key
@@ -3911,6 +4415,22 @@ public abstract class RuvioSyncCommands<K, V> {
     }
 
     /**
+     * Sends {@code JSON.SET key path json NX EX|PX ttl}: like {@link #jsonSetNx(Object, String, String)}, and a document this call
+     * creates gets a time to live. An existing key keeps its deadline.
+     *
+     * @param key the JSON key
+     * @param path where to write
+     * @param json the new value as JSON text
+     * @param ttl time to live of a newly created key: whole seconds are sent as {@code EX}, anything finer as {@code PX}
+     * @return {@code true} when written, {@code false} when the path already exists (or cannot be reached)
+     * @throws IllegalArgumentException when {@code ttl} is null, zero, negative or too large
+     * @throws RuvioServerException {@code ERR invalid JSON value} or {@code ERR invalid JSON path}; {@code WRONGTYPE} when the key holds a non-JSON value
+     */
+    public Boolean jsonSetNx(K key, String path, String json, Duration ttl) {
+        return await(async.jsonSetNx(key, path, json, ttl));
+    }
+
+    /**
      * Sends {@code JSON.SET key path json XX}: writes only when the path already exists.
      *
      * @param key the JSON key
@@ -3921,6 +4441,22 @@ public abstract class RuvioSyncCommands<K, V> {
      */
     public Boolean jsonSetXx(K key, String path, String json) {
         return await(async.jsonSetXx(key, path, json));
+    }
+
+    /**
+     * Sends {@code JSON.SET key path json XX EX|PX ttl}: like {@link #jsonSetXx(Object, String, String)}, and a document this call
+     * creates gets a time to live. An existing key keeps its deadline.
+     *
+     * @param key the JSON key
+     * @param path where to write
+     * @param json the new value as JSON text
+     * @param ttl time to live of a newly created key: whole seconds are sent as {@code EX}, anything finer as {@code PX}
+     * @return {@code true} when written, {@code false} when the path does not exist
+     * @throws IllegalArgumentException when {@code ttl} is null, zero, negative or too large
+     * @throws RuvioServerException {@code ERR invalid JSON value} or {@code ERR invalid JSON path}; {@code WRONGTYPE} when the key holds a non-JSON value
+     */
+    public Boolean jsonSetXx(K key, String path, String json, Duration ttl) {
+        return await(async.jsonSetXx(key, path, json, ttl));
     }
 
     /**
@@ -4444,6 +4980,24 @@ public abstract class RuvioSyncCommands<K, V> {
     }
 
     /**
+     * Runs a script by its SHA1 and sends the whole script only when the shard does not have it: {@code EVALSHA}, then {@code EVAL} once on {@code NOSCRIPT}. The digest is computed here, and {@code EVAL} also caches the script on that shard. The retry is safe because {@code NOSCRIPT} is answered before any command of the script ran, so a script never runs twice.
+     *
+     * <pre>{@code
+     * Object v = client.evalCached("return ARGV[1]", new String[0], "x");
+     * }</pre>
+     *
+     * @param script the Lua source
+     * @param keys the keys the script may touch (pass an empty array for none)
+     * @param arguments extra values available as {@code ARGV}
+     * @return the script result, converted as for {@link #eval}
+     * @throws RuvioServerException as for {@link #eval}
+     */
+    @SafeVarargs
+    public final Object evalCached(String script, K[] keys, V... arguments) {
+        return await(async.evalCached(script, keys, arguments));
+    }
+
+    /**
      * Sends {@code SCRIPT LOAD script}: compiles a script into the cache of the shard the command reaches, without running it. In a cluster, load it on every node you call {@code evalsha} on (see {@link io.github.salihcantekin.ruvio.RuvioClient#onNode}).
      *
      * @param script the Lua source
@@ -4539,6 +5093,22 @@ public abstract class RuvioSyncCommands<K, V> {
      */
     public Long setbit(K key, long offset, boolean value) {
         return await(async.setbit(key, offset, value));
+    }
+
+    /**
+     * Sends {@code SETBIT key offset value EX|PX ttl}: like {@link #setbit(Object, long, boolean)}, and a bitmap this call creates
+     * gets a time to live. An existing key keeps its deadline.
+     *
+     * @param key the bitmap key
+     * @param offset the bit position, from 0 to 134,217,727
+     * @param value the new bit
+     * @param ttl time to live of a newly created key: whole seconds are sent as {@code EX}, anything finer as {@code PX}
+     * @return the previous bit, {@code 0} or {@code 1}
+     * @throws IllegalArgumentException when {@code ttl} is null, zero, negative or too large
+     * @throws RuvioServerException {@code ERR bit offset is not an integer or out of range}; {@code WRONGTYPE} for a non-string
+     */
+    public Long setbit(K key, long offset, boolean value, Duration ttl) {
+        return await(async.setbit(key, offset, value, ttl));
     }
 
     /**
@@ -4755,6 +5325,27 @@ public abstract class RuvioSyncCommands<K, V> {
     }
 
     /**
+     * Sends {@code RUVIO MOVESLOTS first-last shard}: moves the hash slots {@code first..last} to {@code shard} (counted from 0) of the same server, which keeps serving them meanwhile. Completes once the move has started; {@link #moveSlotsStatus()} follows it. One move runs at a time, and every slot of the range must be on one shard.
+     *
+     * @param first first hash slot of the range (0-16383)
+     * @param last last hash slot of the range, inclusive
+     * @param shard shard of the same server to move it to
+     * @throws RuvioServerException when the range is already on that shard, spans shards, another move runs, the server has one shard, or replication is on
+     */
+    public void moveSlots(int first, int last, int shard) {
+        await(async.moveSlots(first, last, shard));
+    }
+
+    /**
+     * Sends {@code RUVIO MOVESLOTS STATUS}: the running or last slot move. {@code state} is {@code none}, {@code copying}, {@code cleaning}, {@code cancelling}, {@code done} or {@code cancelled}; the other names are {@code first}, {@code last}, {@code from}, {@code to}, {@code keys}, {@code rounds}, {@code elapsed_ms}, {@code freeze_ms} and {@code error}.
+     *
+     * @return name to value, as text
+     */
+    public Map<String, String> moveSlotsStatus() {
+        return await(async.moveSlotsStatus());
+    }
+
+    /**
      * Sends {@code PING}: checks that the server answers.
      *
      * <pre>{@code
@@ -4907,6 +5498,27 @@ public abstract class RuvioSyncCommands<K, V> {
      */
     public void clientTracking(boolean on) {
         await(async.clientTracking(on));
+    }
+
+    /**
+     * Sends {@code CLIENT DURABILITY REPLICAS n}. While set, the server holds this connection's replies until {@code replicas} replicas have every earlier write on disk. After the default 5000 ms the replies of the batch become {@code NOREPLICAS} errors and the writes stay applied. The options' {@code durability} sets it on every (re)connect.
+     *
+     * @param replicas the replicas that must hold each write; 0 turns it off
+     * @throws RuvioServerException {@code ERR} on a server without replication or inside {@code MULTI}
+     */
+    public void clientDurability(long replicas) {
+        await(async.clientDurability(replicas));
+    }
+
+    /**
+     * Sends {@code CLIENT DURABILITY REPLICAS n TIMEOUT ms}. Same as {@link #clientDurability(long)} with a longest wait.
+     *
+     * @param replicas the replicas that must hold each write; 0 turns it off
+     * @param timeoutMillis the longest wait in milliseconds
+     * @throws RuvioServerException {@code ERR} on a server without replication or inside {@code MULTI}
+     */
+    public void clientDurability(long replicas, long timeoutMillis) {
+        await(async.clientDurability(replicas, timeoutMillis));
     }
 
     /**
@@ -5138,13 +5750,64 @@ public abstract class RuvioSyncCommands<K, V> {
     }
 
     /**
-     * Sends {@code CONFIG GET pattern}: reads settings. {@code CONFIG SET} is not supported; change settings in the config file, environment or flags. The password ({@code requirepass}) is redacted.
+     * Sends {@code CONFIG GET pattern}: reads settings. The password ({@code requirepass}) is redacted.
      *
      * @param pattern a glob such as {@code max*} or {@code *}
      * @return setting name to value
      */
     public Map<String, String> configGet(String pattern) {
         return await(async.configGet(pattern));
+    }
+
+    /**
+     * Sends {@code CONFIG SET name value ...}: changes live settings, named as {@code CONFIG GET} shows them. Every shard of the server applies the change before it answers. All pairs apply or none: an unknown or restart-only name, or an invalid value, fails the call and changes nothing. Not written to the config file (see {@link #configRewrite()}) and not replicated.
+     *
+     * <pre>{@code
+     * client.configSet(Map.of("maxmemory", "1073741824", "maxmemory-policy", "allkeys-lru"));
+     * }</pre>
+     *
+     * @param settings setting names and values; iteration order is the send order
+     * @throws RuvioServerException {@code ERR} for an unknown, restart-only or invalid setting
+     */
+    public void configSet(Map<String, String> settings) {
+        await(async.configSet(settings));
+    }
+
+    /**
+     * Sends {@code CONFIG REWRITE}: writes the live settings into the config file the server started from.
+     *
+     * @throws RuvioServerException {@code ERR} when the server runs without a config file
+     */
+    public void configRewrite() {
+        await(async.configRewrite());
+    }
+
+    /**
+     * Sends {@code REPLICAOF host port}: every shard of the server follows the primary at {@code host:port} (shard {@code i} dials {@code port + i}). Writes are refused at once. A shard continues from its own log when the new primary's history allows it, otherwise it takes a full copy. Lasts until the server restarts.
+     *
+     * @param host the primary's host
+     * @param port the primary's base replication port
+     */
+    public void replicaOf(String host, int port) {
+        await(async.replicaOf(host, port));
+    }
+
+    /**
+     * Sends {@code REPLICAOF NO ONE}: promotes a replica in place, one epoch above its old primary.
+     *
+     * @param force adds {@code FORCE}: promote even when a shard has not finished copying its primary, which may lose writes
+     */
+    public void replicaOfNoOne(boolean force) {
+        await(async.replicaOfNoOne(force));
+    }
+
+    /**
+     * Sends {@code ROLE} for the shard this connection is on.
+     *
+     * @return {@code ["master", sequence, []]} on a primary; {@code ["slave", host, port, "connect"|"connected", sequence]} on a replica
+     */
+    public List<Object> role() {
+        return await(async.role());
     }
 
     /**

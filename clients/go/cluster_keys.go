@@ -82,6 +82,19 @@ type cmdSpec struct {
 	scan  bool // SCAN: walks every node
 }
 
+// Server flag bits of a command (see scripts/gen_client_keys.py).
+const (
+	flagReadonly = 2
+	flagBlocking = 16
+)
+
+// reads reports whether the command only reads and may go to a replica: flagged readonly
+// by the server, and not blocking.
+func (s cmdSpec) reads() bool {
+	f := s.keys.flags
+	return f&flagReadonly != 0 && f&flagBlocking == 0
+}
+
 var (
 	// firstKey routes a command missing from the table by its first argument.
 	firstKey = commandKeyRule{kind: ruleRange, a: 1, b: 1, c: 1}

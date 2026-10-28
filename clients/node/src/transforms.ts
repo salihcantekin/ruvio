@@ -37,6 +37,8 @@ export const T = {
   },
   float: (v: unknown): number | null => (v === null ? null : toFloat(v)),
   floatArr: (v: unknown[]): (number | null)[] => v.map((x) => (x === null ? null : toFloat(x))),
+  balances: (v: unknown): [number, number] | null =>
+    v === null ? null : [T.int((v as unknown[])[0]), T.int((v as unknown[])[1])],
   int: (v: unknown): number => (typeof v === 'number' ? v : Number(str(v))),
   intOrNull: (v: unknown): number | null => (v === null ? null : typeof v === 'number' ? v : Number(str(v))),
   token: (v: unknown): string | null => (v === null ? null : String(typeof v === 'bigint' || typeof v === 'number' ? v : str(v))),
@@ -142,8 +144,9 @@ function toFloat(v: unknown): number {
 function entry(e: unknown): StreamEntry {
   const a = e as unknown[];
   const f = a[1] as unknown[] | null;
-  const fields: Record<string, string> = {};
-  if (f !== null && f !== undefined) for (let i = 0; i + 1 < f.length; i += 2) fields[str(f[i])] = f[i + 1] as string;
+  // A list, not an object: field names may repeat and their order matters.
+  const fields: [string, string][] = [];
+  if (f !== null && f !== undefined) for (let i = 0; i + 1 < f.length; i += 2) fields.push([str(f[i]), f[i + 1] as string]);
   return { id: str(a[0]), fields };
 }
 

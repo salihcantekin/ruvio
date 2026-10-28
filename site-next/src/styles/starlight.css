@@ -7,6 +7,8 @@
 @import "./tokens.css";
 
 :root {
+  /* One step larger than Starlight's default; every rem-based size follows */
+  font-size: 106.25%;
   --sl-font: var(--f-sans);
   --sl-font-mono: var(--f-mono);
   --sl-nav-height: 4rem;
@@ -54,38 +56,6 @@
 }
 
 :root[data-theme="light"] {
-  --bg: #f5f6f8;
-  --bg-band: #eef0f3;
-  --surface: #ffffff;
-  --surface-2: #eceef2;
-  --line: #dde1e8;
-  --line-soft: rgba(19, 26, 42, 0.12);
-
-  --ink: #131a2a;
-  --mute: #5b6577;
-  --faint: #606877;
-  --paper: rgba(255, 255, 255, 0.82);
-  --paper-solid: #ffffff;
-  --paper-line: #dde1e8;
-  --ground-glow-a: rgba(63, 90, 128, 0.08);
-  --ground-glow-b: rgba(168, 70, 31, 0.06);
-  --ground-dot: rgba(19, 26, 42, 0.07);
-  --ground:
-    radial-gradient(70vw 60vh at 8% -8%, var(--ground-glow-a), transparent 70%),
-    radial-gradient(60vw 55vh at 100% 105%, var(--ground-glow-b), transparent 70%),
-    radial-gradient(circle, var(--ground-dot) 1px, transparent 1.4px) 0 0 / 24px 24px,
-    #fbfbfc;
-  --ink-body: #2b3343;
-
-  --accent: #a8461f;
-  --accent-hover: #933b19;
-  --accent-ink: #ffffff;
-  --c2: #3f5a80;
-
-  --code-bg: #ffffff;
-  --code-ink: #131a2a;
-  --code-dim: rgba(19, 26, 42, 0.55);
-
   --sl-color-text: color-mix(in srgb, var(--ink) 86%, var(--mute));
   --sl-color-text-accent: var(--accent);
   --sl-color-accent-low: color-mix(in srgb, var(--accent) 10%, var(--surface));
@@ -96,7 +66,6 @@
   --sl-color-blue-high: color-mix(in srgb, var(--c2) 70%, var(--ink));
   --sl-shadow-md: 0 1px 2px rgba(19, 26, 42, 0.08);
   --sl-shadow-lg: 0 12px 32px -12px rgba(19, 26, 42, 0.25);
-
   color-scheme: light;
 }
 
@@ -156,7 +125,7 @@ site-search button[data-open-modal] {
 /* Content */
 .sl-markdown-content a:not(:where(.not-content *)) {
   color: var(--sl-color-text-accent);
-  text-decoration-color: color-mix(in srgb, var(--sl-color-text-accent) 45%, transparent);
+  text-decoration-color: color-mix(in srgb, var(--sl-color-text-accent) 30%, transparent);
   text-underline-offset: 3px;
 }
 .sl-markdown-content a:not(:where(.not-content *)):hover {
@@ -172,6 +141,12 @@ site-search button[data-open-modal] {
   padding: 0.1em 0.3em;
   overflow-wrap: anywhere;
 }
+/* Light theme: inline code gets a warm tint and full-strength ink so commands stay legible */
+:root[data-theme="light"] .sl-markdown-content code:not(:where(.not-content *, pre *)) {
+  color: var(--ink);
+  background-color: var(--surface-2);
+  border-color: var(--line);
+}
 .sl-markdown-content table:not(:where(.not-content *)) {
   font-size: var(--sl-text-sm);
   border: 1px solid var(--line);
@@ -181,7 +156,6 @@ site-search button[data-open-modal] {
 }
 .sl-markdown-content :is(th, td):not(:where(.not-content *)) {
   border-bottom: 1px solid var(--line);
-  border-inline-end: 0;
   padding: 0.55rem 0.8rem;
 }
 .sl-markdown-content tr:last-child td:not(:where(.not-content *)) {
@@ -192,8 +166,21 @@ site-search button[data-open-modal] {
   color: var(--ink);
   font-weight: 600;
 }
-.sl-markdown-content tr:nth-child(2n):not(:where(.not-content *)) {
-  background-color: transparent;
+.sl-markdown-content tbody tr:nth-child(2n):not(:where(.not-content *)) {
+  background-color: var(--row-alt);
+}
+.sl-markdown-content tbody tr:hover:not(:where(.not-content *)) {
+  background-color: var(--row-hover);
+}
+.sl-markdown-content :is(th, td):not(:where(.not-content *)) + :is(th, td) {
+  border-inline-start: 1px solid var(--line);
+}
+.sl-markdown-content table:not(:where(.not-content *)) {
+  background-color: var(--surface);
+  border-color: var(--grid);
+}
+.sl-markdown-content :is(th, td):not(:where(.not-content *)) {
+  border-bottom-color: var(--grid);
 }
 .sl-markdown-content td code:not(:where(.not-content *)) {
   white-space: nowrap;
@@ -280,7 +267,7 @@ site-search button[data-open-modal] {
   background: linear-gradient(180deg, color-mix(in srgb, var(--sky-1) 60%, transparent) 0%, transparent 100%);
 }
 :root[data-theme="light"] .main-pane .content-panel:first-child {
-  background: linear-gradient(180deg, rgba(63, 90, 128, 0.07) 0%, transparent 100%);
+  background: linear-gradient(180deg, rgba(59, 87, 128, 0.05) 0%, transparent 100%);
 }
 
 /* Page title */
@@ -319,6 +306,9 @@ h1#_top {
   min-width: 0;
 }
 .docs-index-group h2 {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
   margin: 0 0 0.75rem;
   font-size: var(--sl-text-base);
   font-weight: 600;
@@ -331,6 +321,9 @@ h1#_top {
   padding: 0;
 }
 .docs-index-group li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: 0.7rem;
   padding: 0.5rem 0;
   border-top: 1px solid var(--line);
 }
@@ -348,6 +341,32 @@ h1#_top {
 .docs-index-group a:hover {
   color: var(--sl-color-text-accent);
 }
+.docs-index-group li > .di {
+  grid-row: 1 / span 2;
+  margin-top: 0.1rem;
+}
+.docs-index-group .di {
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0.3rem;
+  border-radius: 7px;
+  flex: none;
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+}
+.docs-index-group h2 .di {
+  width: 1.9rem;
+  height: 1.9rem;
+  padding: 0.4rem;
+}
+.docs-index-group li:hover > .di {
+  background: color-mix(in srgb, var(--accent) 14%, var(--surface-2));
+}
 .docs-index-group span {
   display: block;
   margin-top: 0.15rem;
@@ -360,3 +379,40 @@ h1#_top {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* Reading aids: section markers, rust bullets, quiet table hover and tinted quotes */
+.sl-markdown-content .sl-heading-wrapper.level-h2 h2 {
+  padding-left: 0.7rem;
+  border-left: 3px solid var(--accent);
+  line-height: 1.25;
+}
+.sl-markdown-content :is(ul, ol):not(:where(.not-content *)) li::marker {
+  color: var(--accent);
+}
+.sl-markdown-content blockquote:not(:where(.not-content *)) {
+  border-inline-start: 3px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  border-radius: 0 var(--radius-s) var(--radius-s) 0;
+  padding: 0.6rem 1rem;
+  margin-inline: 0;
+}
+.sl-markdown-content blockquote:not(:where(.not-content *)) > :first-child { margin-top: 0; }
+.sl-markdown-content blockquote:not(:where(.not-content *)) > :last-child { margin-bottom: 0; }
+
+/* Light theme: rust only on what is selected or interactive (current menu item, links, section marks, buttons) */
+:root[data-theme="light"] .sidebar-content a[aria-current="page"] {
+  background-color: color-mix(in srgb, var(--accent) 10%, var(--surface));
+  color: var(--ink);
+}
+:root[data-theme="light"] .sidebar-content a:hover:not([aria-current="page"]) {
+  background-color: color-mix(in srgb, var(--ink) 6%, transparent);
+}
+:root[data-theme="light"] .sl-markdown-content th:not(:where(.not-content *)) {
+  background-color: var(--surface-2);
+}
+:root[data-theme="light"] .sl-markdown-content table:not(:where(.not-content *)) {
+  background-color: var(--surface);
+}
+:root[data-theme="light"] .docs-index-group { background: var(--surface); }
+:root[data-theme="light"] .docs-index-group:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+:root[data-theme="light"] .right-sidebar-panel a[aria-current="true"] { color: var(--accent); }

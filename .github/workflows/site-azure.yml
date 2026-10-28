@@ -4,10 +4,19 @@ name: site-azure
 # Builds site-next/ (Astro) and uploads the static output to Azure Static Web Apps.
 # Azure does not build: the docs are generated from docs/, clients/ and integrations/ in this
 # repository, so the build runs here with a pinned Node and Azure only receives site-next/dist.
-# Secrets: AZURE_STATIC_WEB_APPS_API_TOKEN, the deployment token from the Static Web App's
-# Overview page ("Manage deployment token").
+# Targets: production builds main and publishes to the production Static Web App; dev builds the
+# dev branch (with a noindex header) and publishes to the Ruvio-Dev Static Web App.
+# Secrets: AZURE_STATIC_WEB_APPS_API_TOKEN (production) and AZURE_STATIC_WEB_APPS_API_TOKEN_DEV
+# (Ruvio-Dev), the deployment tokens from each Static Web App's Overview page
+# ("Manage deployment token").
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: Which site to publish
+        type: choice
+        options: [production, dev]
+        default: production
 
 permissions:
   contents: read
@@ -21,8 +30,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.target == 'dev' && 'dev' || 'main' }}
+          # The changelog page is built from the history of main and dev and the release tags.
+          fetch-depth: 0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24
           cache: npm
@@ -37,12 +50,17 @@ jobs:
           npm ci
           npm run check
           npm run build
+      - name: Mark the dev site noindex
+        if: inputs.target == 'dev'
+        run: |
+          jq '.globalHeaders["X-Robots-Tag"] = "noindex, nofollow"' site-next/dist/staticwebapp.config.json > "$RUNNER_TEMP/swa.json"
+          mv "$RUNNER_TEMP/swa.json" site-next/dist/staticwebapp.config.json
       - name: Upload to Azure Static Web Apps
-        uses: Azure/static-web-apps-deploy@v1
+        uses: Azure/static-web-apps-deploy@1a947af9992250f3bc2e68ad0754c0b0c11566c9 # v1
         with:
-          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+          azure_static_web_apps_api_token: ${{ inputs.target == 'dev' && secrets.AZURE_STATIC_WEB_APPS_API_TOKEN_DEV || secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
           action: upload
           app_location: site-next/dist
           skip_app_build: true
 
-# Started by hand from the Actions tab only.
+# Started by hand from the Actions tab only; choose the target when running it.

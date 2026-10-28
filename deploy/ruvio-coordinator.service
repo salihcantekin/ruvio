@@ -1,0 +1,29 @@
+[Unit]
+Description=Ruvio coordinator (automatic failover)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ruvio
+Group=ruvio
+ExecStart=/usr/local/bin/ruvio coordinator --config /etc/ruvio/coordinator.toml
+Restart=on-failure
+RestartSec=1
+NoNewPrivileges=true
+StateDirectory=ruvio-coordinator
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/ruvio-coordinator
+
+[Install]
+WantedBy=multi-user.target

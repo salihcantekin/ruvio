@@ -806,3 +806,21 @@ mod model {
         }
     }
 }
+
+#[test]
+fn auto_id_moves_to_the_next_millisecond_when_the_sequence_is_used_up() {
+    let mut stream = StreamValue::new();
+
+    stream
+        .append(10, u64::MAX, &[(b"f".as_slice(), b"a".as_slice())])
+        .unwrap();
+
+    let (millis, sequence) = stream.next_auto_id(10);
+
+    assert_eq!((millis, sequence), (11, 0));
+    assert!(
+        stream
+            .append(millis, sequence, &[(b"f".as_slice(), b"b".as_slice())])
+            .is_ok()
+    );
+}

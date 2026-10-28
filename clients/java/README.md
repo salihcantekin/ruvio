@@ -97,11 +97,11 @@ Anything without a typed method: `c.async().execute("COMMAND", arg, ...)`.
 
 ## Coverage
 
-All 287 commands of `docs/compatibility-matrix.json` have a typed method (`CoverageTest` maps every
-matrix name to a method and fails otherwise), including the Ruvio options: `SET ... IFEQ`,
+All 299 commands of `docs/compatibility-matrix.json` have a typed method (`CoverageTest` maps every
+matrix name to a method and fails otherwise), including the Ruvio options: `SET ... IFEQ`, `SET ... IFGT/IFLT` (`setIfGreater`, `setIfLess`),
 `INCRBY ... MAX`, `FILLGET ... WAIT`, `FILLSET ... SWR`, `GETEX`, `DELEX key IFEQ v`, `LPUSHCAP/RPUSHCAP`,
-`BF.*`, `JSON.*` incl. `JSON.INDEX/FIND`, `IDEM BEGIN/COMPLETE`, `LEASE/RELEASE`, `SEMAPHORE`, `ONCE`,
-`TAKE`, `SETV`, `CHANGES`, `LIMIT`. Not typed (use `execute`): `FLUSHDB ASYNC`, `HELLO ... SETNAME`.
+`BF.*`, `JSON.*` incl. `JSON.INDEX/FIND`, `IDEM BEGIN/COMPLETE/ABORT`, `LEASE/RELEASE`, `SEMAPHORE`, `ONCE`,
+`TAKE`, `TRANSFER/HTRANSFER`, `SETV`, `CHANGES`, `LIMIT`. Not typed (use `execute`): `FLUSHDB ASYNC`, `HELLO ... SETNAME`.
 
 ## Typed keywords
 
@@ -120,6 +120,21 @@ c.zrangebyscore("board", RangeBounds.NEGATIVE_INFINITY, RangeBounds.exclusive(10
 c.bitfield("bits", BitFieldArgs.builder().get(BitFieldArgs.Type.unsigned(8), 0));
 ```
 
+## TTL on create
+
+Counters and other keys that are created by their first write can get their deadline in the same command. The `Duration` overloads send `EX` for a whole number of seconds and `PX` otherwise; the deadline is set only when the call creates the key, and an existing key keeps its own. A zero, negative or too large duration throws `IllegalArgumentException` before anything is sent.
+
+```java
+c.incr("hits:1.2.3.4", Duration.ofMinutes(1));                  // INCR key EX 60
+c.incrbyMax("quota:u1", 1, 100, Duration.ofMillis(1500));       // INCRBY key 1 PX 1500 MAX 100
+c.hincrby("h", "f", 1, ttl); c.zincrby("z", 1, "m", ttl); c.setbit("b", 7, true, ttl);
+c.zadd("z", ZAddArgs.builder().ttl(ttl).nx(), Map.of("a", 1.0));  // also XAddArgs, BfInsertArgs
+c.geoadd("g", false, false, false, ttl, GeoValue.of(13.36, 38.11, "p"));
+c.jsonSet("j", "$", "{}", ttl);                                  // also jsonSetNx, jsonSetXx
+```
+
+Also: `incr`, `decr`, `incrby`, `decrby`, `incrbyfloat` take a trailing `Duration`. `expire`, `pexpire`, `expireat` and `pexpireat` accept an `ExpireCondition` (`NX`, `XX`, `GT`, `LT`; `ALWAYS` sends no flag). A key without a deadline counts as infinite, so `GT` never applies to it and `LT` always does; a failed condition returns `false`.
+
 ## Helpers
 
 | Helper | Built on |
@@ -127,8 +142,12 @@ c.bitfield("bits", BitFieldArgs.builder().get(BitFieldArgs.Type.unsigned(8), 0))
 | `tryLock` / `lock(key, ttl, wait)` -> `RuvioLock` (`renew`, `isHeld`, `close`) | `SET NX PX`, `SET IFEQ PX`, `DELEX IFEQ` (never deletes another owner's lock) |
 | `tryLease` -> `RuvioToken` (fencing `token()`), `tryAcquirePermit` | `LEASE`/`SEMAPHORE` + `RELEASE` |
 | `rateLimit(key, max, window)` -> `RateLimitResult(allowed, remaining)` | `LIMIT` |
+| `limitSliding(key, max, windowMs)`, `limitTokens(key, capacity, refillMs, cost)` -> remaining or `null` | `LIMIT ... SLIDING`, `LIMIT ... TOKENS` |
+| `limitSlidingWithRetry(...)`, `limitTokensWithRetry(...)` -> `LimitOutcome(allowed, remaining, retryAfterMillis)` | `LIMIT ... WITHRETRY` |
 | `getOrCreate(key, ttl, factory)` (+ stale-while-revalidate form) | `FILLGET`/`FILLSET`; losers poll plain `FILLGET` with backoff (WAIT would park the shared socket) |
 | `idempotent(key, fingerprint, ttl, wait, action)` | `IDEM BEGIN/COMPLETE` |
+| `idempotent(key, fingerprint, ttl, wait, action, abortOnError)` | `IDEM BEGIN/COMPLETE/ABORT`: with `abortOnError` set (the overload above is `false`), an exception from `action` sends `ABORT` and is rethrown, so a retry runs the action again at once instead of finding the key pending until `ttl`; a failed abort is ignored. Use it only when a failed action did not take effect or is safe to run again |
+| `idemAbort(key, fingerprint, owner)` -> `boolean` | `IDEM ABORT`: `true` when the pending record of that owner and fingerprint was removed; `false` for a missing key, a completed record (its result is never removed) or another owner. Abort only when the work did not take effect or is safe to run again; a retry after an abort runs it again |
 | `scanIterable/scanStream`, `hscan*`, `sscan*`, `zscan*` | lazy cursor-driven pages |
 | `jsonSetObject/jsonGetObject/jsonMgetObjects` + `setJsonCodec(JsonCodec)` | `JSON.*`; the JDK has no JSON, so plug in Jackson/Gson/... through the 2-method `JsonCodec` (default: String passthrough) |
 | `pushRecent` / `recent` | `LPUSHCAP` |
@@ -150,7 +169,7 @@ client, including `database(n)`. In cluster mode the database option is ignored 
 database 0). Every node gets its own lazily opened multiplexed connection with the same fast path as
 the standalone one; the standalone path itself only pays one `router == null` check per command.
 
-How it routes (the key table covers all 287 matrix commands, `CoverageTest` fails when one has no rule):
+How it routes (the key table covers all 299 matrix commands, `CoverageTest` fails when one has no rule):
 
 | Command shape | Routing |
 | --- | --- |
@@ -169,6 +188,12 @@ pipelined commands; use `{hashtag}` keys to keep related keys in one slot.
   table is re-read with `CLUSTER SLOTS` only when the named node is unknown, or from the second MOVED for the same
   command on; the retry still goes to the node the MOVED named. The retry runs on a small background thread, never on a connection reader thread. The router keeps a copy of each
   command's frame for this (about 100 bytes allocated per routed command: the request object and the copy).
+* **ASK**: `ASKING` and the command are sent to the named node in one write (an unknown node is opened first), the
+  `+OK` is dropped and the command's reply is returned; the slot table is not changed, so the next command for the
+  slot still goes to its owner. ASK and MOVED share the 3-redirect budget.
+* **TRYAGAIN**: the command is sent again, routed by the current slot table, at most 7 times after waits of 5, 10,
+  20, 40, 80, 160 and 320 ms (635 ms in all; scheduled on the background thread, never a sleep); the error is
+  returned after the 7th retry.
 * **Connection loss**: only commands in flight on that node fail (`RuvioConnectionException`); nothing is
   replayed, the other nodes keep working, and the node's connection reopens with its next command.
 * **Pipelines** (`pipeline()`): commands are routed when queued and grouped per node; `flush()` sends one write
@@ -187,7 +212,154 @@ pipelined commands; use `{hashtag}` keys to keep related keys in one slot.
   connection per node and subscribes one slot per command.
 * **Helpers** (locks, leases, semaphores, rate limit, `getOrCreate`, idempotency, capped list, Bloom, typed JSON)
   only issue single-key commands, so they work unchanged; `ClusterLiveTest` runs them on the cluster.
-* Replicas, `ASK` redirects, `READONLY` reads and `CLUSTERDOWN` handling: not implemented.
+* `CLUSTERDOWN` handling: not implemented (`ASK` redirects and `TRYAGAIN` retries are, see above). Reads from replicas: see below.
+
+## Durable replies
+
+`RuvioOptions.Builder.durability(replicas)` or `durability(replicas, timeoutMillis)` makes the server hold every reply of a connection until that many replicas have the earlier writes on disk. Every connection the client opens (reconnects, Pub/Sub, and the per-node connections of a cluster client) sends `CLIENT DURABILITY REPLICAS n [TIMEOUT ms]` after its other connect commands, and the connect fails if the server refuses (for example without replication). Nothing is sent by default. After the timeout (5000 ms unless set) the replies of the batch become `NOREPLICAS` errors and the writes stay applied. `clientDurability(n)` / `clientDurability(n, timeoutMillis)` set it on one connection; `0` turns it off.
+
+```java
+RuvioOptions options = RuvioOptions.builder().host("10.0.0.1").durability(1, 5000).build();
+```
+
+## Reads from replicas
+
+`RuvioOptions.Builder.readPolicy(ReadPolicy)` sets where a cluster client sends read-only commands. A standalone
+connection ignores it.
+
+```java
+RuvioOptions options = RuvioOptions.builder()
+        .host("10.0.0.1").cluster(true)
+        .readPolicy(ReadPolicy.PREFER_REPLICA)
+        .build();
+```
+
+* `PRIMARY` (default): every command goes to the slot's primary, as before. No replica connection is opened.
+* `PREFER_REPLICA`: reads go to a replica of the slot's shard when one is known and reachable, else to the primary.
+* `REPLICA`: reads go to a replica; with none known or reachable they fail with a `RuvioException` ("no replica ...").
+
+Replication is asynchronous, so a read from a replica may miss recent writes, including your own.
+
+* Replicas come from `CLUSTER SLOTS` (listed after the primary). Each time the slot map loads, the client picks one
+  replica per primary at random and keeps it until the next load. Each replica connection sends `READONLY` right
+  after it is opened.
+* A read is a command the server flags `readonly` and not blocking (`GET`, `HGETALL`, `ZRANGE`, ...). Writes, keyless
+  commands, transactions, Pub/Sub, scans and blocking commands go to the primaries. `MGET`/`EXISTS`-style calls that
+  split by slot send each part by the same rule.
+* A pipeline goes to replicas only when every command in it is a read; otherwise the whole pipeline goes to the
+  primaries as before.
+* A replica that cannot be opened, or answers `LOADING`, is skipped until the next slot map load. Under
+  `PREFER_REPLICA` the read goes to the primary (a `LOADING` read is sent again there); under `REPLICA` the call
+  fails. A connection that drops after a command was sent still fails the command; nothing is replayed.
+* `ReplicaReadsFakeTest` covers the routing against scripted nodes; `ReplicaReadsLiveTest` runs against
+  `RUVIO_REPLICATED_ADDR` / `RUVIO_REPLICA_ADDR` (set by `scripts/run_with_servers.sh`) and skips without them.
+* `MultiNodeLiveTest` follows `MOVED` across a two-node cluster (`RUVIO_MULTINODE_A_ADDR`, `RUVIO_MULTINODE_B_ADDR`,
+  `RUVIO_MULTINODE_STALE_ADDR`, set by `scripts/run_with_servers.sh`) and skips without them.
+
+## Seed addresses
+
+`seeds(...)` takes `host:port` strings (an IPv6 address as `[::1]:6379`) and replaces `host`/`port`; without it
+`host` and `port` work as before.
+
+```java
+RuvioOptions options = RuvioOptions.builder()
+        .seeds("10.0.0.1:6379", "10.0.0.2:6379", "[::1]:6379")
+        .build();
+RuvioClient<String, String> client = RuvioClient.connect(options);
+```
+
+* **Connect**: the seeds are tried in order, one connect attempt each, and the first that answers is kept. A seed
+  that cannot be reached is skipped; a refused `AUTH` or `SELECT` stops at once. When none answers, the last
+  connect error is thrown.
+* **Standalone reconnect**: each reconnect attempt tries every seed once, starting with the seed after the
+  address that dropped and ending with it. The command that hit the drop still fails. A `pubSub(...)` subscriber
+  opened later starts at the address the command connection is on.
+* **Cluster**: `CLUSTER SLOTS` comes from the first reachable seed. A slot map reload asks the nodes that have an
+  open socket first; when none answers it opens every other known node and then every seed, one connect attempt
+  each, until one returns a slot map. A node that cannot be opened again triggers that reload and the command
+  goes to the owner the new map names; a keyless command goes to the first reachable node of the new map.
+  Seeds are not asked while the known nodes answer, so routing is unchanged. Pipelines are not re-routed: a
+  group whose node cannot be opened fails, as before.
+
+## Retry policies of your own
+
+`RuvioErrors` sorts what a call throws, for a retry policy of your own (resilience4j, Failsafe, a loop).
+The client already follows `MOVED`/`ASK`, waits out `TRYAGAIN` during a slot move and finds a new primary after
+a failover; these judge what still reaches you. A `CompletionException` or `ExecutionException` from the async
+API is judged by its cause.
+
+- `RuvioErrors.isTransient(e)`: trying again later can succeed. True for `RuvioConnectionException`,
+  `RuvioTimeoutException` (no reply within the command timeout) and `LOADING`, `MASTERDOWN`, `CLUSTERDOWN`,
+  `TRYAGAIN`, `READONLY` and `NOREPLICAS`; false for `WRONGTYPE`, `OOM`, syntax errors and an interrupted or
+  cancelled wait.
+- `RuvioErrors.mayHaveRun(e)`: the failed call may have changed data. False only for a server error reply (the
+  server refused the command), except `NOREPLICAS`: the write was applied and only the replica confirmation
+  timed out. A failed connection or a timeout may have run.
+
+Repeat a write only when it is safe to repeat or did not run:
+
+```java
+RetryConfig config = RetryConfig.custom()
+    .maxAttempts(3)
+    // INCR is not safe to repeat: retry it only when it surely did not run.
+    .retryOnException(e -> RuvioErrors.isTransient(e) && !RuvioErrors.mayHaveRun(e))
+    .build();
+long visits = Retry.of("visits", config).executeSupplier(() -> client.incr("visits"));
+```
+
+For a read, `isTransient` alone is enough.
+
+## Following a failover
+
+A standalone client with at least two seeds, or with a coordinator name, finds the primary again after a failover
+instead of staying on a node that is now a replica (the shared contract is in `docs/CLIENT_BEHAVIOR.md`, "Following a
+failover"). A cluster client keeps its `MOVED`/`ASK` rules and does not use any of this.
+
+```java
+RuvioOptions options = RuvioOptions.builder()
+        .seeds("10.0.0.1:6379", "10.0.0.2:6379")
+        .followPrimary(true)          // the default; false returns READONLY and keeps the plain seed order
+        // .sentinelMaster("main")    // the seeds are coordinators: SENTINEL get-master-addr-by-name main
+        .build();
+```
+
+* **On reconnect**: each attempt runs one round: every seed is asked `ROLE` on a short-lived socket (connect, `AUTH`,
+  one command, one reply; bounded by the smaller of `connectTimeoutMillis` and `commandTimeoutMillis`), a replica's
+  reported primary is asked once too, and the client connects to the node that answers `master`. With none found, or
+  when opening it fails with an I/O error, the plain seed order applies. The command that hit the drop still fails.
+* **On `READONLY`** (the error text is `READONLY` alone or followed by a space): the client runs up to 8 rounds
+  (waits of 100 ms doubling to 2 s, on a background thread, never on a reader thread), avoiding the address that
+  answered while it still says `master` (once it says it is a replica, a later round takes it when it is promoted), moves the shared connection to the primary it finds, and sends the refused command once more. The second
+  reply, a second `READONLY` included, is the result; there is never a third send. With no primary the original
+  `READONLY` error is returned and the connection stays. Other errors (`LOADING`, `MASTERDOWN`, `NOREPLICAS`) and I/O
+  errors are never retried.
+* **Not retried**: commands of a `pipeline()` (the `READONLY` reply is returned at its index and nothing follows) and
+  of a `multi()` transaction (its queued commands are lost with the socket, so the error is returned; the shared
+  connection still moves to the primary, so the next command works). Transactions run on their own sockets here, so
+  a `MULTI` sent by hand with `execute` on the shared connection is not tracked.
+* **Coordinator name**: with `sentinelMaster(name)` the first connect and every round ask each seed in order
+  `SENTINEL get-master-addr-by-name name`, confirm the named address with `ROLE`, and fail the connect with a
+  `RuvioException` naming the master when no coordinator names a primary. The same `AUTH` credentials go to
+  coordinators and data nodes.
+* **Cost**: while the connection is healthy nothing is sent and nothing is checked on the success path. A client that
+  follows keeps each command's encoded bytes in a per-thread scratch array (the way the cluster path does, no copy
+  per command) and uses a request object that can hold them; a client with one address does not.
+
+`FollowFailoverFakeTest` runs scripted nodes; `FailoverLiveTest` runs on the pair `scripts/run_with_servers.sh` starts
+(`RUVIO_FAILOVER_ADDRS` and `RUVIO_FAILOVER_REPLICATION`, comma separated, primary first) and skips without them.
+
+## TLS
+
+Plain TCP is the default. `tls()` turns TLS on for every socket the client opens (first connect, reconnects, shards, replicas, Pub/Sub and failover probes), trusting the JVM's default certificates. The certificate chain and the host name are always verified.
+
+```java
+RuvioOptions options = RuvioOptions.builder()
+        .host("cache.internal")
+        .tls(RuvioTls.context(Path.of("ca.pem"), null, null))
+        .build();
+```
+
+`RuvioTls.context(caPem, clientCertPem, clientKeyPem)` builds the context from PEM files: `caPem` trusts only your private CA (null keeps the JVM's certificates), and the client certificate chain and an unencrypted PKCS#8 key (`BEGIN PRIVATE KEY`) answer a server that demands mutual TLS (`tls_client_auth`). Pass any `SSLContext` to `tls(SSLContext)` instead if you manage key stores yourself. `tlsServerName(name)` is the name the certificate carries when you connect by IP address. `tlsInsecure()` accepts any certificate and skips the host name check, which removes the protection against someone in the middle: use it for a throwaway test only. The handshake is part of the connect (bounded by `connectTimeoutMillis`), so a refused certificate fails the connect with a `RuvioConnectionException`. Measured: the live TLS tests (`TlsLiveTest`); the latency TLS adds: not measured.
 
 ## Tests and benchmark
 
@@ -229,7 +401,7 @@ little about scaling; they are not release evidence.
 
 ## Not done / not verified
 
-* Cluster: replicas, `READONLY` replica reads, `ASK`, `CLUSTERDOWN`/`TRYAGAIN` retries, adding or removing
+* Cluster: `CLUSTERDOWN` retries, adding or removing
   nodes while running (the table is refreshed on MOVED only, there is no periodic refresh), and a cluster-wide
   `DBSIZE`/`KEYS`/`FLUSHALL` (use `onNode`) are not implemented. Cluster mode was only exercised against the
   3-shard Ruvio server (one process, `port_mode = "per-shard"`), not against a Redis Cluster.

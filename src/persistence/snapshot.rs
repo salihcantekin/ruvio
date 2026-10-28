@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeSet,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -27,7 +27,7 @@ use manifest::*;
 use reader::*;
 use writer::*;
 
-pub(crate) use entry::{encode_entry, encode_entry_with};
+pub(crate) use entry::{decode_entry_frame, encode_entry, encode_entry_with};
 pub(crate) use manifest::sweep_temporary_files;
 pub(crate) use reader::{ResyncBytes, decode_snapshot_blob, load_resync_bytes};
 pub(crate) use writer::SnapshotWriter;

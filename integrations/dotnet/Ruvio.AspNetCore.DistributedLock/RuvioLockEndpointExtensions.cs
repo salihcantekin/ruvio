@@ -84,11 +84,34 @@ public static class RuvioLockEndpointExtensions
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentNullException.ThrowIfNull(resource);
 
+        // Same rules as RuvioLockOptions, checked while the endpoint is mapped instead of on its first conflict.
+        if (lease is { } leaseValue && leaseValue < TimeSpan.FromMilliseconds(1))
+            throw new ArgumentOutOfRangeException(nameof(lease), "The lease must be at least one millisecond.");
+
+        if (wait < TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(wait), "The wait must not be negative.");
+
+        if (conflictStatusCode is < 400 or > 599)
+            throw new ArgumentOutOfRangeException(nameof(conflictStatusCode), "The conflict status must be a 4xx or 5xx status.");
+
         builder.AddEndpointFilter(async (invocation, next) =>
         {
             HttpContext context = invocation.HttpContext;
             string name = resource(context);
-            IRuvioLock? held = await RuvioLockHttp.TryTakeAsync(context, name, lease, wait).ConfigureAwait(false);
+            var take = await RuvioLockHttp.TryTakeAsync(context, name, lease, wait).ConfigureAwait(false);
+
+            if (take.Unavailable is not null)
+            {
+                return take.Unavailable;
+            }
+
+            if (take.Bypass)
+            {
+                // Ruvio is away and the application chose availability: no lock, so no exclusion.
+                return await next(invocation).ConfigureAwait(false);
+            }
+
+            IRuvioLock? held = take.Held;
 
             if (held is null)
             {
@@ -105,7 +128,7 @@ public static class RuvioLockEndpointExtensions
     }
 
     /// <summary>
-    /// The lock held for the current request, or null when the endpoint is not protected. Use its
+    /// The lock held for the current request (by <c>[RuvioLock]</c> or <c>WithDistributedLock</c>), or null when the endpoint is not protected. Use its
     /// <see cref="IRuvioLock.LockLost"/> token to stop work if the lock is lost mid-request.
     /// </summary>
     /// <param name="context">The current request.</param>

@@ -66,7 +66,7 @@ internal sealed class RecordingProxy : IAsyncDisposable
 {
     private static readonly HashSet<string> Containers = new(StringComparer.Ordinal)
     {
-        "ACL", "CLIENT", "CLUSTER", "CONFIG", "FUNCTION", "SCRIPT", "XGROUP", "XINFO",
+        "ACL", "CLIENT", "CLUSTER", "CONFIG", "FUNCTION", "RUVIO", "SCRIPT", "XGROUP", "XINFO",
     };
 
     private readonly TcpListener _listener = new(IPAddress.Loopback, 0);

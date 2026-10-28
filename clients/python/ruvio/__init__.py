@@ -42,6 +42,7 @@ from ._constants import (
     KeyType,
     LexBound,
     ListSide,
+    ExpireCondition,
     Overflow,
     ScoreBound,
     StreamId,
@@ -61,12 +62,13 @@ from ._models import (
     FillResult,
     GeoResult,
     IdemResult,
+    LimitOutcome,
     Message,
     PendingEntry,
     PendingSummary,
     StreamEntry,
 )
-from ._cluster import key_slot
+from ._cluster import ReadPolicy, key_slot
 from .client import Lock, Pipeline, PubSub, Ruvio, parse_url
 from .cluster import ClusterRuvio
 from .errors import (
@@ -84,6 +86,8 @@ from .errors import (
     TimeoutError,
     WatchError,
     WrongTypeError,
+    is_transient,
+    may_have_run,
 )
 
 __version__ = "0.1.2"
@@ -91,6 +95,7 @@ __version__ = "0.1.2"
 __all__ = [
     "Ruvio",
     "ClusterRuvio",
+    "ReadPolicy",
     "key_slot",
     "Pipeline",
     "PubSub",
@@ -110,6 +115,7 @@ __all__ = [
     "KeyType",
     "LexBound",
     "ListSide",
+    "ExpireCondition",
     "Overflow",
     "ScoreBound",
     "StreamId",
@@ -126,11 +132,14 @@ __all__ = [
     "AutoClaimResult",
     "FillResult",
     "GeoResult",
+    "LimitOutcome",
     "IdemResult",
     "Message",
     "PendingEntry",
     "PendingSummary",
     "StreamEntry",
+    "is_transient",
+    "may_have_run",
     "BusyError",
     "ConnectionError",
     "CrossSlotError",

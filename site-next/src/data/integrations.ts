@@ -36,7 +36,7 @@ const ecosystemDetails: Record<string, EcosystemDetails> = {
     base: {
       package: "Ruvio.Client.AspNetCore",
       docs: "/docs/clients/csharp-aspnetcore/",
-      note: "registers the shared connection and IRuvioClient once; every package below borrows it.",
+      note: "registers the shared connection and IRuvioClient once; every package below borrows it, and stops the app at startup with the fix named when it is missing.",
     },
   },
 };
@@ -44,7 +44,7 @@ const ecosystemDetails: Record<string, EcosystemDetails> = {
 const details: Record<string, Details> = {
   "Ruvio.Extensions.Caching": {
     summary:
-      "Binary-safe IDistributedCache for web, worker and console apps. Store strings and models as JSON without touching byte[]. GetOrCreate builds a missing entry once across every instance with FILLGET and FILLSET.",
+      "Binary-safe IDistributedCache for web, worker and console apps. Store strings and models as JSON without touching byte[]. GetOrCreate builds a missing entry once across every instance with FILLGET and FILLSET. Optional stale period (stale-while-revalidate and fail-safe) and tags removed in one call.",
     useCases: ["cache", "sessions"],
     example: cs(`builder.Services.AddRuvioClient(builder.Configuration.GetSection("Ruvio"));
 builder.Services.AddRuvioDistributedCache(options => options.InstanceName = "orders");
@@ -60,7 +60,18 @@ Invoice invoice = await cache.GetOrCreateJsonAsync(
     "invoice-model:42", token => LoadInvoiceAsync(token), AppJson.Default.Invoice, entry);
 
 // Already have a JSON string? Store it as a string.
-await cache.SetStringAsync("invoice-json:42", json, entry);`),
+await cache.SetStringAsync("invoice-json:42", json, entry);
+
+// Serve the last good value for an hour while one caller refreshes it, and tag it.
+var resilient = new RuvioCacheEntryOptions
+{
+    AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5),
+    StaleFor = TimeSpan.FromHours(1),
+    Tags = ["customer:7"],
+};
+Invoice cached = await cache.GetOrCreateJsonAsync(
+    "invoice-model:42", token => LoadInvoiceAsync(token), AppJson.Default.Invoice, resilient);
+await cache.RemoveByTagAsync("customer:7");   // every entry tagged customer:7 is gone`),
     caseExamples: {
       sessions: cs(`builder.Services.AddRuvioDistributedCache(o => o.InstanceName = "orders-session-v1");
 builder.Services.AddSession(o => o.IdleTimeout = TimeSpan.FromMinutes(20));
@@ -95,28 +106,63 @@ await store.EvictByTagAsync("catalog", cancellationToken);`),
   },
   "Ruvio.AspNetCore.RateLimiting": {
     summary:
-      "Distributed fixed-window budgets per endpoint with one atomic LIMIT call. Rejected requests get 429 with Retry-After; endpoints without the attribute pay nothing.",
+      "Distributed budgets per endpoint with one atomic LIMIT call. Define named policies once and refer to them by name; give a policy its own partition (IP for one endpoint, tenant for another), chain several limits, cap concurrent requests, set a default policy for every endpoint, and shape the rejection answer. Rejected requests get 429 with Retry-After; endpoints without the attribute pay nothing. Choose what happens when Ruvio is unreachable: throw, answer 503, or let requests through, with an optional circuit breaker.",
     useCases: ["rate-limits"],
     example: cs(`builder.Services.AddRuvioClient(builder.Configuration.GetSection("Ruvio"));
 builder.Services.AddRuvioRateLimiting(options =>
 {
     options.KeyPrefix = "orders:rate:v1:";
-    options.PartitionKey = context =>
-        context.User.FindFirst("tenant_id")?.Value
-        ?? throw new InvalidOperationException("An authenticated tenant is required.");
+
+    // Default budget owner for every policy that does not name its own: here the tenant.
+    options.PartitionKey = context => context.User.FindFirst("tenant_id")?.Value ?? "";
+
+    // A request without a tenant shares one budget instead of failing. It is never unlimited.
+    // The default (Throw) treats a blank key as a configuration error.
+    options.EmptyPartition = RuvioEmptyPartitionMode.SharedBucket;
+
+    // 100 requests a minute per tenant (uses options.PartitionKey).
+    options.AddPolicy("create-order", permits: 100, window: TimeSpan.FromMinutes(1));
+
+    // A policy can count something else: this one is per client IP, whatever the tenant is.
+    options.AddPolicy("login", permits: 5, window: TimeSpan.FromMinutes(1),
+        partitionKey: context => context.Connection.RemoteIpAddress?.ToString() ?? "");
+
+    // Chained limits: a request must pass all of them, in this order. Put the strictest first,
+    // because a request refused by a later limit has already used a permit of the earlier ones.
+    options.AddPolicy("search", policy => policy
+        .Limit(20, TimeSpan.FromSeconds(10),
+            partitionKey: context => context.Connection.RemoteIpAddress?.ToString() ?? "")  // per IP
+        .Limit(1000, TimeSpan.FromMinutes(1), algorithm: RuvioRateLimitAlgorithm.SlidingWindow)  // per tenant
+        .Concurrency(maxConcurrent: 8, maxRequestDuration: TimeSpan.FromSeconds(30)));  // 8 at once per tenant
+
+    // Applies to every routed endpoint that has no limit of its own. Opt out with DisableRuvioRateLimit().
+    options.DefaultPolicy = "create-order";
+
+    // Runs after the default 429 and Retry-After are set; change the status or write a body here.
+    options.OnRejected = async (context, rejection) =>
+    {
+        await context.Response.WriteAsJsonAsync(new
+        {
+            error = "rate_limited",
+            policy = rejection.Policy,
+            retryAfterSeconds = (int)rejection.RetryAfter.TotalSeconds,
+        });
+    };
 });
 
 app.UseRouting();
 app.UseAuthentication();
 app.UseAuthorization();
 app.UseRuvioRateLimiting();
-app.MapPost("/orders", HandleOrder)
-    .RequireAuthorization()
-    .WithRuvioRateLimit("create-order", permits: 100, window: TimeSpan.FromMinutes(1));`),
+
+app.MapPost("/login", HandleLogin).WithRuvioRateLimit("login");
+app.MapGet("/search", HandleSearch).WithRuvioRateLimit("search");
+app.MapPost("/orders", HandleOrder).RequireAuthorization();   // limited by DefaultPolicy
+app.MapGet("/health", () => "ok").DisableRuvioRateLimit();     // never limited`),
   },
   "Ruvio.AspNetCore.Idempotency": {
     summary:
-      "HTTP request deduplication and response replay on the native IDEM command. A retried request with the same Idempotency-Key gets the stored response instead of running twice.",
+      "HTTP request deduplication and response replay on the native IDEM command. A retried request with the same Idempotency-Key gets the stored response instead of running twice; a retry that arrives while the first is still running can wait for it and replay its result. Answer 409 or 422 for a key reused with a different request, and pick the replayed headers. Choose what happens when Ruvio is unreachable: throw, answer 503, or run unchecked, with an optional circuit breaker. Optionally free the key when the handler throws, so a retry runs at once.",
     useCases: ["idempotency"],
     example: cs(`builder.Services.AddRuvioClient(builder.Configuration.GetSection("Ruvio"));
 builder.Services.AddRuvioIdempotency(options =>
@@ -124,6 +170,8 @@ builder.Services.AddRuvioIdempotency(options =>
     options.Namespace = "orders-production-v1"; // stable across replicas
     options.ScopeSelector = context => context.User.FindFirst("tenant_id")?.Value;
     options.Retention = TimeSpan.FromHours(24);
+    // Optional: if the handler throws before doing its work, let a retry run at once instead of getting 409.
+    options.AbortOnException = true;
 });
 
 app.UseRouting();
@@ -134,9 +182,26 @@ app.MapPost("/orders", HandleOrder)
     .RequireAuthorization()
     .WithRuvioIdempotency();`),
   },
+  "Ruvio.Extensions.Idempotency": {
+    summary:
+      "Run work once per key outside HTTP: message consumers, background jobs, gRPC handlers. A redelivered message gets the stored result instead of running the work again; a running or failed attempt and other content under the same key are reported, and a failed attempt can optionally free its key at once.",
+    useCases: ["idempotency"],
+    example: cs(`builder.Services.AddRuvioIdempotentExecutor(o => o.KeyPrefix = "payments:");
+
+IdempotentResult<Receipt> result = await executor.ExecuteOnceAsync(
+    key: message.Id,
+    fingerprint: message.ContentHash,
+    work: ct => ChargeAsync(message, ct),
+    typeInfo: AppJson.Default.Receipt,
+    retention: TimeSpan.FromDays(1),
+    cancellationToken);
+
+if (result.Outcome == IdempotentOutcome.Pending)
+    await message.AbandonAsync();   // another consumer runs it; try again later`),
+  },
   "Ruvio.AspNetCore.DistributedLock": {
     summary:
-      "Locks with owner-checked release and automatic renewal, plus a [RuvioLock] endpoint attribute: 409 when taken, request cancelled if the lock is lost.",
+      "Locks with owner-checked release, automatic renewal and optional fencing tokens, a hosted service that runs on one instance at a time, plus a [RuvioLock] endpoint attribute: 409 when taken, request cancelled if the lock is lost. Choose what happens when Ruvio is unreachable: 503, throw, or run without the lock, with an optional circuit breaker.",
     useCases: ["locks"],
     example: cs(`services.AddRuvioDistributedLock(options => options.KeyPrefix = "myapp:lock:");
 
@@ -147,17 +212,27 @@ if (held is null) return;               // someone else runs it
 
 await RunReportAsync(held.LockLost);    // stops if the lock is lost mid-run
 
+// Or keep a background worker running on exactly one instance; another takes over if it stops.
+services.AddRuvioSingleton<OutboxPublisher>("outbox-publisher");
+
 // Or guard an endpoint: one request per order at a time, across every instance.
 app.UseRuvioLock();
 app.MapPost("/orders/{id}/pay", PayAsync).WithMetadata(new RuvioLockAttribute("order:{id}"));`),
   },
   "Ruvio.AspNetCore.DataProtection": {
     summary:
-      "Durable Data Protection key ring, so every instance can read the others' cookies and protected payloads. Encryption of the ring is required by default.",
+      "Durable Data Protection key ring, so every instance can read the others' cookies and protected payloads. Encryption of the ring is required by default, and it warns (or, if you ask, refuses) when the server keeps data in memory only.",
     useCases: ["sessions"],
-    example: cs(`builder.Services.AddDataProtection()
+    example: cs(`// The key ring on its own durable server; the cache can stay on a memory-only one.
+builder.Services.AddKeyedRuvioClient("key-ring", builder.Configuration.GetSection("RuvioDurable"));
+
+builder.Services.AddDataProtection()
     .SetApplicationName("orders-production")
-    .PersistKeysToRuvio(o => o.Key = "orders:production:data-protection:v1")
+    .PersistKeysToRuvio(o =>
+    {
+        o.ClientKey = "key-ring";
+        o.Key = "orders:production:data-protection:v1";
+    })
     .ProtectKeysWithCertificate(certificate);`),
   },
 };

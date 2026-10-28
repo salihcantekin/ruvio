@@ -66,6 +66,27 @@ public enum ListSide
     Right,
 }
 
+/// <summary>The condition of <c>EXPIRE</c>, <c>PEXPIRE</c>, <c>EXPIREAT</c> and <c>PEXPIREAT</c>. A key without a deadline counts as an infinite deadline for <see cref="Gt"/> and <see cref="Lt"/>.</summary>
+/// <example>
+/// <code>
+/// bool set = await client.ExpireAsync("session:ada", TimeSpan.FromMinutes(30), ExpireCondition.Gt);
+/// </code>
+/// </example>
+public enum ExpireCondition
+{
+    /// <summary>Only when the key has no deadline (<c>NX</c>).</summary>
+    Nx,
+
+    /// <summary>Only when the key already has a deadline (<c>XX</c>).</summary>
+    Xx,
+
+    /// <summary>Only when the new deadline is later than the current one (<c>GT</c>).</summary>
+    Gt,
+
+    /// <summary>Only when the new deadline is earlier than the current one (<c>LT</c>).</summary>
+    Lt,
+}
+
 /// <summary>The value type a <c>SCAN ... TYPE</c> filter accepts.</summary>
 /// <example>
 /// <code>

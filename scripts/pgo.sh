@@ -11,7 +11,7 @@
 #
 # Not part of the release build. Measured against the plain release build on the
 # 60-command comparison (scripts/redis_compare_features.py, pipeline 16): about
-# 4% slower on a 2 vCPU x86_64 server and equal on an Apple M4 Pro, because most
+# 4% slower on a 2 vCPU x86_64 server and equal on an Apple silicon Mac, because most
 # of those commands are not in the training mix.
 set -euo pipefail
 

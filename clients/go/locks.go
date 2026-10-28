@@ -125,6 +125,12 @@ func (c *cmds) AcquireLease(ctx context.Context, key string, ttl time.Duration) 
 	return &LeaseHandle{c: c, Key: key, Token: tok}, true, nil
 }
 
+// Renew extends the lease to now + ttl with RENEW key token ttl. It returns true when this
+// handle still held it, false when it had expired or been replaced.
+func (l *LeaseHandle) Renew(ctx context.Context, ttl time.Duration) (bool, error) {
+	return l.c.Renew(ctx, l.Key, l.Token, ttl)
+}
+
 // Release gives the lease back with RELEASE key token. It returns true when this handle
 // still held it, false when it had expired or been replaced.
 func (l *LeaseHandle) Release(ctx context.Context) (bool, error) {
@@ -165,6 +171,12 @@ func (c *cmds) AcquirePermit(ctx context.Context, key string, max int64, ttl tim
 		return nil, false, err
 	}
 	return &Permit{c: c, Key: key, Token: tok}, true, nil
+}
+
+// Renew extends the slot to now + ttl with RENEW key token ttl. It returns true if this
+// permit still held it, false if it had already expired.
+func (p *Permit) Renew(ctx context.Context, ttl time.Duration) (bool, error) {
+	return p.c.Renew(ctx, p.Key, p.Token, ttl)
 }
 
 // Release frees the slot with RELEASE key token. It returns true if this permit still

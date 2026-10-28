@@ -32,15 +32,16 @@ pub(super) fn evented_info(state: &ShardState, section: Option<&[u8]>) -> io::Re
     let shard_id = state.route.as_ref().map_or(0, |route| route.shard_id);
     let shard_count = state.route.as_ref().map_or(1, |route| route.shard_count);
     let mut info = Vec::with_capacity(512);
-    let counters = *state.command_metrics.borrow();
+    let counters = state.command_totals();
     let (net_input, net_output) = super::net::totals();
     let admission = crate::admission::admission_totals();
 
     write!(
         info,
-        "# Server\r\nruvio_version:{}\r\nruvio_backend:evented\r\nruvio_health:ok\r\nruvio_readiness:ready\r\nruvio_durability:{}\r\nruvio_persistence_state:{}\r\nrecovered_wal_records:{}\r\nwal_last_sequence:{}\r\nwal_unsynced_bytes:{}\r\nruvio_shard_id:{shard_id}\r\nruvio_shard_count:{shard_count}\r\n\
+        "# Server\r\nruvio_version:{}\r\nrun_id:{}\r\nruvio_backend:evented\r\nruvio_health:ok\r\nruvio_readiness:ready\r\nruvio_durability:{}\r\nruvio_persistence_state:{}\r\nrecovered_wal_records:{}\r\nwal_last_sequence:{}\r\nwal_unsynced_bytes:{}\r\nruvio_shard_id:{shard_id}\r\nruvio_shard_count:{shard_count}\r\n\
          # Stats\r\nconnected_clients:{}\r\ntotal_connections_received:{}\r\nrejected_connections:{}\r\ntotal_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\n# Buffers\r\ninput_buffer_peak_bytes:{}\r\noutput_buffer_peak_bytes:{}\r\npubsub_queue_peak_frames:{}\r\npubsub_queue_peak_bytes:{}\r\npubsub_cluster_dropped:{}\r\n# Memory\r\ncharged_memory_bytes:{}\r\n# Keyspace\r\nkeys:{}\r\nexpired_keys:{}\r\nexpired_keys_passive:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nexpires:{}\r\n",
         env!("CARGO_PKG_VERSION"),
+        run_id(),
         persistence.profile(),
         persistence_state,
         state.recovery.records_replayed,
@@ -90,7 +91,7 @@ pub(super) fn evented_info(state: &ShardState, section: Option<&[u8]>) -> io::Re
         u8::from(super::checkpoint::background_save_in_progress(state)),
     )?;
 
-    if state.published_config.latency_histograms {
+    if state.live.latency_histograms.get() {
         info.extend_from_slice(b"# Latencystats\r\n");
 
         for latency in command_latency(state) {
@@ -134,7 +135,7 @@ pub(super) fn evented_info(state: &ShardState, section: Option<&[u8]>) -> io::Re
     let durable_sequence = persistence.durable().load(Ordering::Acquire);
     let replica_count = persistence.replica_count().load(Ordering::Acquire);
     let oldest_sent = persistence.backlog_floor().load(Ordering::Acquire);
-    let role = match state.published_config.replication.role {
+    let role = match state.role.get() {
         crate::config::ReplicationRole::Off => "off",
         crate::config::ReplicationRole::Primary => "primary",
         crate::config::ReplicationRole::Replica => "replica",
@@ -151,9 +152,35 @@ pub(super) fn evented_info(state: &ShardState, section: Option<&[u8]>) -> io::Re
 
     write!(
         info,
-        "# Replication\r\nreplication_role:{role}\r\nwal_durable_sequence:{durable_sequence}\r\nreplication_replicas:{replica_count}\r\nreplication_replica_sequence:{replica_sequence}\r\nreplication_send_lag:{send_lag}\r\nreplica_retain_dropped:{dropped}\r\n"
+        "# Replication\r\nreplication_role:{role}\r\nwal_durable_sequence:{durable_sequence}\r\nreplication_replicas:{replica_count}\r\nreplication_replica_sequence:{replica_sequence}\r\nreplication_send_lag:{send_lag}\r\nreplica_retain_dropped:{dropped}\r\nreplication_epoch:{epoch}\r\nreplication_fenced:{fenced}\r\nreplication_committed_sequence:{committed}\r\n",
+        epoch = state.epoch.get(),
+        committed = if state.role.get() == crate::config::ReplicationRole::Replica {
+            state.replica_link.committed()
+        } else {
+            state.durable_replies.committed()
+        },
+        fenced = u8::from(state.write_gate.get() == crate::replication::WriteGate::Fenced),
     )?;
-    if state.published_config.replication.role == crate::config::ReplicationRole::Replica {
+    let (lease, grants, remaining) = super::replica::lease_report(state);
+
+    write!(
+        info,
+        "primary_lease:{}\r\nprimary_lease_grants:{grants}\r\nprimary_lease_remaining_ms:{remaining}\r\n",
+        if lease { "on" } else { "off" },
+    )?;
+    // Redis's lines for each replica that announced where clients reach it; replicas that
+    // announced nothing, or are still copying, are counted above but not listed.
+    for (index, replica) in state.durable_acks.replicas().iter().enumerate() {
+        write!(
+            info,
+            "slave{index}:ip={},port={},state=online,offset={},lag={}\r\n",
+            replica.endpoint.host,
+            replica.endpoint.port,
+            replica.sequence,
+            replica.lag.as_secs()
+        )?;
+    }
+    if state.role.get() == crate::config::ReplicationRole::Replica {
         let link = &state.replica_link;
         // A replica whose log refuses frames is not following its primary.
         let status = if link.is_up() && persistence.failure().is_none() {
@@ -183,6 +210,28 @@ pub(super) fn evented_info(state: &ShardState, section: Option<&[u8]>) -> io::Re
 /// The `# Name` blocks of `info` that `INFO name` asks for. Names compare without case or
 /// spaces (`commandcounters`); `all`, `everything` and `default` keep every block, and an
 /// unknown name gives an empty reply, as in Redis.
+/// This process's random identity, 40 hex digits as Redis's `run_id`: the same on every
+/// shard, new on every start. Coordinators use it to tell one node listed under two addresses.
+pub(crate) fn run_id() -> &'static str {
+    static RUN_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    RUN_ID.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+
+        (0..3)
+            .map(|round: u32| {
+                // `RandomState` is seeded from the operating system for each instance.
+                let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+
+                hasher.write_u32(round);
+                hasher.write_u32(std::process::id());
+                format!("{:016x}", hasher.finish())
+            })
+            .collect::<String>()[..40]
+            .to_owned()
+    })
+}
+
 fn only_section(info: &[u8], name: &[u8]) -> Vec<u8> {
     let wanted: Vec<u8> = name.to_ascii_lowercase();
 
@@ -231,7 +280,7 @@ fn command_latency(state: &ShardState) -> Vec<crate::metrics::CommandLatency> {
 
 pub(super) fn evented_snapshot(state: &ShardState) -> crate::metrics::MetricsSnapshot {
     let store = state.store.borrow();
-    let command_metrics = *state.command_metrics.borrow();
+    let command_metrics = state.command_totals();
     let persistence = state
         .persistence
         .lock()

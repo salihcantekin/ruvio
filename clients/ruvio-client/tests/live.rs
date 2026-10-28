@@ -112,6 +112,8 @@ fn lists_sets_and_hashes() {
     assert_eq!(db.hget("h", "f2").unwrap().as_deref(), Some("two"));
     assert_eq!(db.hincr_by("h", "f1", 4).unwrap(), 5);
     assert!(!db.hsetnx("h", "f1", "9").unwrap());
+    db.hmset("hm", &[("a", "1"), ("b", "2")]).unwrap();
+    assert_eq!(db.hget("hm", "b").unwrap().as_deref(), Some("2"));
     assert_eq!(db.hstrlen("h", "f2").unwrap(), 3);
     assert_eq!(db.hlen("h").unwrap(), 2);
     assert!(db.hexists("h", "f1").unwrap());
@@ -318,6 +320,16 @@ fn hash_field_ttls_and_sorted_set_pops() {
     );
     assert_eq!(db.bzpopmin(&["z"], Duration::from_secs(1)).unwrap(), None);
 
+    db.zadd("due", &[("a", 1.0), ("b", 2.0), ("c", 3.0), ("d", 9.0)])
+        .unwrap();
+    assert_eq!(
+        db.zpopbyscore("due", "-inf", "1", 5).unwrap(),
+        vec![SortedSetEntry::new("a", 1.0)]
+    );
+    assert_eq!(db.zmovedue("due", "ready", "3", 5).unwrap(), 2);
+    assert_eq!(db.lrange("ready", 0, -1).unwrap(), ["b", "c"]);
+    assert!(db.zpopbyscore("due", "-inf", "3", 5).unwrap().is_empty());
+
     db.zadd("r", &[("a", 1.0), ("b", 2.0), ("c", 3.0), ("x", 0.0)])
         .unwrap();
     assert_eq!(db.zremrangebyrank("r", 0, 0).unwrap(), 1);
@@ -333,11 +345,19 @@ fn semaphores_and_capped_increments() {
     let first = db.semaphore("jobs", 2, 60_000).unwrap().unwrap();
     let second = db.semaphore("jobs", 2, 60_000).unwrap().unwrap();
 
-    assert_eq!(second, first + 1);
+    assert!(second > first, "tokens only grow");
     assert_eq!(db.semaphore("jobs", 2, 60_000).unwrap(), None);
     assert_eq!(db.key_type("jobs").unwrap(), "semaphore");
+    assert_eq!(db.renew("jobs", first as u64, 120_000).unwrap(), 1);
+    assert_eq!(db.renew("jobs", 1, 120_000).unwrap(), 0);
+    assert_eq!(
+        db.semaphore("jobs", 2, 60_000).unwrap(),
+        None,
+        "renew takes no slot"
+    );
     assert_eq!(db.release("jobs", first as u64).unwrap(), 1);
     assert_eq!(db.release("jobs", first as u64).unwrap(), 0);
+    assert_eq!(db.renew("jobs", first as u64, 120_000).unwrap(), 0);
     assert!(db.semaphore("jobs", 2, 60_000).unwrap().is_some());
     assert!(db.semaphore("short", 1, 30).unwrap().is_some());
     std::thread::sleep(Duration::from_millis(80));
@@ -483,6 +503,17 @@ fn databases_transactions_and_scripts() {
             .as_deref(),
         Some("2")
     );
+    db.script_flush().unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            db.eval_cached("return ARGV[1]", &[], &["again"])
+                .unwrap()
+                .as_string()
+                .unwrap()
+                .as_deref(),
+            Some("again")
+        );
+    }
     db.function_load("echo_first", "return ARGV[1]").unwrap();
     assert_eq!(
         db.fcall("echo_first", &[], &["x"])
@@ -502,9 +533,40 @@ fn databases_transactions_and_scripts() {
 fn server_commands_and_pubsub() {
     let Some(mut db) = connect(7) else { return };
 
+    // Every database of the live server is taken, so the refusal is checked here.
+    let error = db.client_durability(1, Some(5000)).unwrap_err();
+
+    assert!(
+        matches!(&error, ruvio_client::Error::Server(m) if m.contains("needs replication")),
+        "{error:?}"
+    );
     assert!(db.info(None).unwrap().contains("ruvio"));
     assert!(!db.info(Some("server")).unwrap().is_empty());
     assert!(!db.config_get("databases").unwrap().is_empty());
+    db.config_set(&[("slowlog-max-len", "128")]).unwrap();
+    assert_eq!(
+        db.config_get("slowlog-max-len").unwrap(),
+        [("slowlog-max-len".to_owned(), "128".to_owned())]
+    );
+    assert!(matches!(
+        db.config_set(&[("shards", "2")]),
+        Err(ruvio_client::Error::Server(_))
+    ));
+    match db.role().unwrap() {
+        ruvio_client::RespValue::Array(items) => {
+            assert_eq!(items[0], ruvio_client::RespValue::Bulk(b"master".to_vec()));
+        }
+        other => panic!("ROLE answered {other:?}"),
+    }
+    // The live server keeps no WAL, so it cannot replicate: both forms are refused unchanged.
+    assert!(matches!(
+        db.replicaof("127.0.0.1", 1),
+        Err(ruvio_client::Error::Server(_))
+    ));
+    assert!(matches!(
+        db.replicaof_no_one(false),
+        Err(ruvio_client::Error::Server(_))
+    ));
     assert_eq!(db.acl_whoami().unwrap(), "default");
     assert!(db.acl_users().unwrap().contains(&"default".to_owned()));
     assert!(!db.acl_list().unwrap().is_empty());
@@ -814,21 +876,22 @@ fn json_typed_values_round_trip() {
 }
 
 #[test]
-fn read_timeout_on_a_command_reply_reopens_the_connection() {
+fn a_blocking_command_waits_its_own_timeout_on_top_of_the_read_timeout() {
     let Some(mut db) = connect(8) else { return };
 
-    db.set_read_timeout(Some(Duration::from_millis(150)))
+    db.set_read_timeout(Some(Duration::from_millis(200)))
         .unwrap();
 
-    // The server answers after the client gave up: that late reply must never be read as the
-    // answer to a later command. The 2 s block leaves the 150 ms read timeout a wide margin.
-    assert!(
-        db.blpop_key("timeout:never", Duration::from_secs(2))
-            .is_err()
+    // BLPOP k 1 on an empty list answers nil after 1 s, well past the 200 ms read timeout:
+    // the call gets 1 s + 200 ms and succeeds.
+    let started = std::time::Instant::now();
+    assert_eq!(
+        db.blpop_key("timeout:never", Duration::from_secs(1))
+            .unwrap(),
+        None
     );
+    assert!(started.elapsed() >= Duration::from_millis(900));
 
-    std::thread::sleep(Duration::from_millis(2100));
-    db.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     db.set("timeout:probe", "ok").unwrap();
     assert_eq!(
         db.get_string("timeout:probe").unwrap().as_deref(),

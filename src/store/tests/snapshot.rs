@@ -247,3 +247,26 @@ fn the_snapshot_walk_encodes_large_values_without_copying_them() {
     );
     assert_eq!(frames, 3);
 }
+
+#[test]
+fn a_lease_from_an_older_snapshot_gets_its_deadline_or_is_dropped() {
+    // Snapshots written before leases had their own deadline store a lease without one.
+    let mut shard = KvShard::with_clock(TestClock::new(2_000));
+    let lease = |key: &[u8], expires_at| SnapshotEntry {
+        database: 0,
+        key: key.to_vec(),
+        expires_at: None,
+        value: SnapshotValue::Lease {
+            token: 9,
+            expires_at,
+        },
+    };
+
+    shard.restore_snapshot_entry(lease(b"held", 5_000)).unwrap();
+    shard
+        .restore_snapshot_entry(lease(b"lapsed", 1_500))
+        .unwrap();
+
+    assert_eq!(shard.pttl(b"held"), 3_000);
+    assert_eq!(shard.pttl(b"lapsed"), -2);
+}

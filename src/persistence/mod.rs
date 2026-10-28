@@ -1,5 +1,6 @@
 mod codec;
 mod crash;
+mod durable_sequence;
 mod signature;
 mod snapshot;
 mod sync_worker;
@@ -31,13 +32,15 @@ use crate::{KvShard, OwnedMutation, time::UnixMillis};
 #[cfg(all(test, not(miri)))]
 pub(crate) use crash::{CrashSite, arm_io_fault};
 pub(crate) use snapshot::{
-    CheckpointManager, ShardCheckpoint, ShardFile, SnapshotWriter, encode_entry, encode_entry_with,
+    CheckpointManager, ShardCheckpoint, ShardFile, SnapshotWriter, decode_entry_frame,
+    encode_entry, encode_entry_with,
 };
 
 // The shipper consumes these in a later snapshot-resync task.
 #[allow(unused_imports)]
 pub(crate) use snapshot::{ResyncBytes, decode_snapshot_blob, load_resync_bytes};
 
+pub use durable_sequence::DurableSequence;
 pub use signature::{BackupSeal, verify_backup_signature};
 
 pub use tooling::{
@@ -117,10 +120,19 @@ pub(crate) fn validate_shard_layout(
         return Ok(());
     }
 
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    // Written beside the final name and renamed, so a crash leaves either no file or a whole
+    // one; a partial `SHARD_LAYOUT` would make every later start refuse the directory.
+    let temporary = config.data_dir.join(".SHARD_LAYOUT.tmp");
+    let mut file = private_file_options()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temporary)?;
     use io::Write;
     file.write_all(expected.as_bytes())?;
     file.sync_all()?;
+    drop(file);
+    fs::rename(&temporary, &path)?;
     #[cfg(unix)]
     File::open(&config.data_dir)?.sync_all()?;
     Ok(())
@@ -136,8 +148,8 @@ impl DataDirectoryLock {
             return Ok(None);
         }
 
-        fs::create_dir_all(&config.data_dir)?;
-        let file = OpenOptions::new()
+        create_private_directory(&config.data_dir)?;
+        let file = private_file_options()
             .create(true)
             .truncate(false)
             .read(true)
@@ -947,6 +959,20 @@ fn apply_in_active(
 
         OwnedMutation::FlushDatabase => shard.flush_database(database),
         OwnedMutation::FlushAll => shard.flush_all(),
+        OwnedMutation::SlotCopy { key, entry } => {
+            shard.forget_key(database, key);
+            if let Some(entry) = entry {
+                let mut entry = snapshot::decode_entry_frame(entry)?;
+
+                entry.database = database;
+                shard
+                    .restore_snapshot_entry(entry)
+                    .map_err(|error| PersistenceError::Corruption(error.into()))?;
+            }
+        }
+        OwnedMutation::SlotsMoved { .. }
+        | OwnedMutation::SlotsIncoming { .. }
+        | OwnedMutation::SlotsGiven { .. } => {}
         OwnedMutation::SwapDatabases { first, second } => shard.swap_databases(*first, *second),
         OwnedMutation::MoveKey { key, destination } => {
             if !shard.move_key(key, *destination) {
@@ -970,6 +996,35 @@ fn apply_in_active(
 /// mix: write a temporary file next to it, sync it, rename it over `path`, sync the directory.
 /// The temporary name is unique per call, so concurrent writers (one per shard) do not share
 /// it. `private` creates the file readable by its owner only (Unix).
+/// Options for a file that holds user data: created readable by the owner only, not by whatever
+/// the process umask allows. An existing file keeps its mode.
+pub(crate) fn private_file_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+    options
+}
+
+/// Creates the data directory (and missing parents) readable by the owner only. A directory that
+/// exists keeps its mode.
+pub(crate) fn create_private_directory(path: &std::path::Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
 pub(crate) fn write_file_atomically(
     path: &std::path::Path,
     bytes: &[u8],
@@ -1028,6 +1083,53 @@ pub(crate) fn write_file_atomically(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn data_files_and_new_directories_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let data = base.path().join("data/wal");
+        let file = data.join("segment");
+
+        create_private_directory(&data).unwrap();
+        private_file_options()
+            .create_new(true)
+            .write(true)
+            .open(&file)
+            .unwrap();
+
+        let mode =
+            |path: &std::path::Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(mode(&data), 0o700);
+        assert_eq!(mode(&base.path().join("data")), 0o700);
+    }
+
+    #[test]
+    fn the_shard_layout_file_is_written_whole_and_a_leftover_temporary_is_harmless() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = PersistenceConfig {
+            profile: DurabilityProfile::Always,
+            data_dir: directory.path().to_path_buf(),
+            ..PersistenceConfig::default()
+        };
+        let limits = crate::protocol::ProtocolLimits::default();
+
+        // A crash in an earlier start left a partial temporary behind.
+        fs::write(directory.path().join(".SHARD_LAYOUT.tmp"), b"ruvio-sh").unwrap();
+        validate_shard_layout(&config, 2, 2, limits).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(directory.path().join("SHARD_LAYOUT")).unwrap(),
+            "ruvio-shards-v1 2\n"
+        );
+        assert!(!directory.path().join(".SHARD_LAYOUT.tmp").exists());
+        validate_shard_layout(&config, 2, 2, limits).unwrap();
+        assert!(validate_shard_layout(&config, 3, 3, limits).is_err());
+    }
 
     #[test]
     fn data_directory_lock_excludes_a_second_owner() {

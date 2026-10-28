@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
-    <Version>0.1.2</Version>
+    <Version>0.2.0</Version>
     <Description>Binary-safe IDistributedCache integration for Ruvio.</Description>
     <PackageId>Ruvio.Extensions.Caching</PackageId>
     <PackageReadmeFile>README.md</PackageReadmeFile>
@@ -14,6 +14,9 @@
     <PackageReference Include="Microsoft.Extensions.Caching.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.Options" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+    <Compile Include="../Common/RuvioStartupChecks.cs" Link="Common/RuvioStartupChecks.cs" />
+    <Compile Include="../Common/RuvioOutageLog.cs" Link="Common/RuvioOutageLog.cs" />
     <ProjectReference Include="../../../clients/csharp/Ruvio.Client/Ruvio.Client.csproj" />
     <None Include="README.md" Pack="true" PackagePath="/" />
     <None Include="../../../brand/ruvio-icon-square.png" Pack="true" PackagePath="ruvio-icon.png" />

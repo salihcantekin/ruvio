@@ -2,6 +2,8 @@ using System.Security.Cryptography;
 using System.Xml;
 using System.Xml.Linq;
 using Microsoft.AspNetCore.DataProtection.Repositories;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Ruvio.Client;
 
@@ -18,6 +20,10 @@ public sealed class RuvioXmlRepository : IXmlRepository
     private readonly int maxElements;
     private readonly TimeSpan timeout;
     private readonly bool requireEncryption;
+    private readonly bool requireDurableStorage;
+    private readonly ILogger logger;
+    // Set once the server answered which durability profile it runs; a transport error leaves it for the next access.
+    private volatile bool durabilityChecked;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="RuvioXmlRepository"/> class.
@@ -25,6 +31,18 @@ public sealed class RuvioXmlRepository : IXmlRepository
     /// <param name="client">The Ruvio client used to interact with the underlying data store.</param>
     /// <param name="options">The options used to configure the repository.</param>
     public RuvioXmlRepository(IRuvioClient client, IOptions<RuvioDataProtectionOptions> options)
+        : this(client, options, null)
+    {
+    }
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="RuvioXmlRepository"/> class that logs a warning when the server
+    /// keeps the key ring in memory only.
+    /// </summary>
+    /// <param name="client">The Ruvio client used to interact with the underlying data store.</param>
+    /// <param name="options">The options used to configure the repository.</param>
+    /// <param name="logger">Receives the durability warning; null discards it.</param>
+    public RuvioXmlRepository(IRuvioClient client, IOptions<RuvioDataProtectionOptions> options, ILogger<RuvioXmlRepository>? logger)
     {
         ArgumentNullException.ThrowIfNull(client);
         ArgumentNullException.ThrowIfNull(options);
@@ -39,11 +57,14 @@ public sealed class RuvioXmlRepository : IXmlRepository
         maxElements = settings.MaxElements;
         timeout = settings.OperationTimeout;
         requireEncryption = settings.RequireEncryption;
+        requireDurableStorage = settings.RequireDurableStorage;
+        this.logger = logger ?? (ILogger)NullLogger.Instance;
     }
 
     /// <inheritdoc />
     public IReadOnlyCollection<XElement> GetAllElements()
     {
+        CheckDurability();
         string name = KeyName();
         long ttl = Run(token => client.GetTimeToLiveMillisecondsAsync(name, token));
 
@@ -93,6 +114,8 @@ public sealed class RuvioXmlRepository : IXmlRepository
         string value = xml;
         // Content addressing preserves every distinct key/revocation and makes identical writes idempotent.
         string field = Convert.ToHexString(SHA256.HashData(RuvioDataProtectionOptions.Utf8.GetBytes(value)));
+
+        CheckDurability();
         string name = KeyName();
         long ttl = Run(token => client.GetTimeToLiveMillisecondsAsync(name, token));
 
@@ -113,6 +136,57 @@ public sealed class RuvioXmlRepository : IXmlRepository
     }
 
     private string KeyName() => keyName;
+
+    // One INFO per repository: a ring on a memory-only server is gone after a restart, and every cookie with it.
+    private void CheckDurability()
+    {
+        if (durabilityChecked)
+            return;
+
+        string? profile;
+
+        try
+        {
+            profile = DurabilityProfile(Run(token => client.GetInfoAsync("server", token)));
+        }
+        catch (RuvioException error) when (error.IsServerReply)
+        {
+            // Refused (an ACL without INFO, a server that does not know the section): the profile stays unknown.
+            profile = null;
+        }
+
+        if (profile == "memory")
+        {
+            if (requireDurableStorage)
+                throw new RuvioException("The Ruvio server keeps data in memory only (durability profile 'memory'); "
+                    + "the Data Protection key ring would be lost on restart. Run it with persistence, or turn off RequireDurableStorage.");
+
+            logger.LogWarning("The Ruvio server keeps data in memory only (durability profile 'memory'). The Data Protection "
+                + "key ring is lost when it restarts, and cookies and protected payloads issued before then can no longer be read. "
+                + "Run the server with persistence (for example RUVIO_DURABILITY=everysec and RUVIO_DATA_DIR).");
+        }
+        else if (profile is null)
+        {
+            if (requireDurableStorage)
+                throw new RuvioException("Could not read the Ruvio server's durability profile (INFO server), so RequireDurableStorage cannot be met.");
+
+            logger.LogWarning("Could not read the Ruvio server's durability profile (INFO server); make sure the Data Protection "
+                + "key ring is stored with persistence.");
+        }
+
+        durabilityChecked = true;
+    }
+
+    internal static string? DurabilityProfile(string info)
+    {
+        foreach (string line in info.Split('\n'))
+        {
+            if (line.StartsWith("ruvio_durability:", StringComparison.Ordinal))
+                return line["ruvio_durability:".Length..].TrimEnd('\r');
+        }
+
+        return null;
+    }
 
     private T Run<T>(Func<CancellationToken, ValueTask<T>> call)
     {

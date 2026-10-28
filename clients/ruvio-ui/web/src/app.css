@@ -102,7 +102,7 @@ a, .success-note { color: var(--accent-text); }
 .scope-menu .hint { margin-top: .5rem; }
 .refresh-interval { display: flex; align-items: center; gap: .5rem; font-size: .8rem; color: var(--muted); }
 .refresh-interval select { width: auto; min-height: 38px; padding: .4rem .6rem; }
-.sidebar { border-right: 1px solid var(--line); background: linear-gradient(180deg, rgba(17, 22, 46, .45), transparent 420px); padding: 1.75rem 1rem; display: flex; flex-direction: column; gap: 1rem; }
+.sidebar { border-right: 1px solid var(--line); background: linear-gradient(180deg, var(--side-wash), transparent 420px); padding: 1.75rem 1rem; display: flex; flex-direction: column; gap: 1rem; }
 .sidebar-toggle { align-self: flex-end; display: grid; place-items: center; width: 32px; height: 32px; min-height: 32px; padding: 0; margin: -.6rem -.2rem -.4rem 0; }
 .sidebar-toggle .icon { width: 16px; height: 16px; }
 .sidebar-toggle-label { display: none; }
@@ -278,7 +278,8 @@ summary { cursor: pointer; color: var(--muted); min-height: 32px; padding: .3rem
   .top { height: auto; min-height: 66px; padding: .7rem 1rem; gap: .5rem; flex-wrap: wrap; }
   .top .mark { font-size: 1.3rem; }
   .top .product-label { display: none; }
-  .top > .quiet { margin-left: auto; }
+  .top > .theme-toggle { margin-left: auto; }
+  .top > .theme-toggle + .quiet { margin-left: 0; }
   .top { position: relative; z-index: 30; }
   .scope-dropdown { position: static; }
   .scope-menu { left: 1rem; right: 1rem; top: calc(100% + .25rem); width: auto; }
@@ -414,7 +415,7 @@ span.jtoggle { display: inline-block; }
 .console-foot:empty { display: none; }
 .console-foot .text-button { min-height: 0; padding: 0; }
 .console-error { padding: .7rem .9rem; border-left: 2px solid var(--danger); background: var(--danger-wash); border-radius: 0 6px 6px 0; font-family: var(--f-sans); overflow-wrap: anywhere; }
-.console-error.warn { border-color: var(--warn); background: rgba(240, 180, 90, .06); }
+.console-error.warn { border-color: var(--warn); background: var(--warn-wash); }
 .console-error p { margin-top: .3rem; color: var(--muted); font-size: .88rem; }
 .console-confirm { padding: .8rem var(--console-pad); border-top: 1px solid var(--line); background: var(--danger-wash); display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; flex: none; }
 .console-input { display: flex; align-items: center; gap: .6rem; padding: .75rem var(--console-pad); border-top: 1px solid var(--line); flex: none; }
@@ -443,3 +444,8 @@ span.jtoggle { display: inline-block; }
 .shard-toggle .icon { width: 18px; height: 18px; color: var(--muted); }
 .shard-toggle:hover .icon { color: var(--ink); }
 .shard-toggle:focus-visible { outline-offset: 6px; border-radius: 6px; }
+
+/* Theme switch: a square icon button, in the header and on the sign-in screen */
+.theme-toggle { display: grid; place-items: center; width: 36px; height: 36px; padding: 0; }
+.theme-toggle .icon { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.gate-theme { position: fixed; top: 1rem; right: 1rem; z-index: 2; }

@@ -2,7 +2,9 @@
 package io.github.salihcantekin.ruvio.commands;
 
 import io.github.salihcantekin.ruvio.RuvioCodec;
+import io.github.salihcantekin.ruvio.RuvioException;
 import io.github.salihcantekin.ruvio.RuvioServerException;
+import io.github.salihcantekin.ruvio.args.ExpireCondition;
 import io.github.salihcantekin.ruvio.args.KeyType;
 import io.github.salihcantekin.ruvio.args.RestoreArgs;
 import io.github.salihcantekin.ruvio.args.ScanArgs;
@@ -11,8 +13,10 @@ import io.github.salihcantekin.ruvio.internal.Cmd;
 import io.github.salihcantekin.ruvio.internal.Reply;
 import io.github.salihcantekin.ruvio.model.ChangeNote;
 import io.github.salihcantekin.ruvio.model.IdemResult;
+import io.github.salihcantekin.ruvio.model.LimitOutcome;
 import io.github.salihcantekin.ruvio.model.ScanResult;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -84,6 +88,83 @@ public abstract class KeyCommands<K, V> extends StringCommands<K, V> {
     }
 
     /**
+     * Sends the Ruvio command {@code LIMIT key max window_ms SLIDING}: a sliding-window rate limiter.
+     * The previous window counts for the part of it that still overlaps the last {@code windowMillis}, so a burst
+     * at a window edge is not doubled. The key keeps two counters, not one entry per call. A key keeps the mode it
+     * was created with.
+     *
+     * <pre>{@code
+     * Long left = client.limitSliding("rl:user:1", 100, 60_000); // null when the call does not fit
+     * }</pre>
+     *
+     * @param key the limiter key
+     * @param max calls per window; from 1 to 2147483647
+     * @param windowMillis window length in milliseconds; must be greater than zero
+     * @return the calls left after this one, or {@code null} when it does not fit (nothing is counted)
+     * @throws RuvioServerException {@code ERR} when an argument is out of range or the key was created by another {@code LIMIT} mode; {@code WRONGTYPE} when the key holds another type
+     */
+    public CompletableFuture<Long> limitSliding(K key, long max, long windowMillis) {
+        return send(args().w(Cmd.LIMIT).k(key).l(max).l(windowMillis).w(Cmd.SLIDING), Reply.LONG);
+    }
+
+    /**
+     * Sends the Ruvio command {@code LIMIT key capacity refill_ms TOKENS COST cost}: a token bucket.
+     * The bucket holds {@code capacity} tokens and refills completely over {@code refillMillis}; a call takes
+     * {@code cost} tokens. The key keeps one timestamp and disappears when the bucket is full again.
+     *
+     * <pre>{@code
+     * Long left = client.limitTokens("rl:api:7", 10, 1_000, 2); // 10 tokens per second, this call takes 2
+     * }</pre>
+     *
+     * @param key the limiter key
+     * @param capacity bucket size; from 1 to 1000000
+     * @param refillMillis time to refill an empty bucket in milliseconds; up to 4294967295
+     * @param cost tokens this call takes; from 1 to {@code capacity}
+     * @return the tokens left after this call, or {@code null} when the bucket holds too few (nothing is taken)
+     * @throws RuvioServerException {@code ERR} when an argument is out of range or the key was created by another {@code LIMIT} mode; {@code WRONGTYPE} when the key holds another type
+     */
+    public CompletableFuture<Long> limitTokens(K key, long capacity, long refillMillis, long cost) {
+        return send(args().w(Cmd.LIMIT).k(key).l(capacity).l(refillMillis).w(Cmd.TOKENS).w(Cmd.COST).l(cost), Reply.LONG);
+    }
+
+    /**
+     * Sends {@code LIMIT key max window_ms SLIDING WITHRETRY}: {@link #limitSliding} that also says how long to wait.
+     *
+     * @param key the limiter key
+     * @param max calls per window; from 1 to 2147483647
+     * @param windowMillis window length in milliseconds; must be greater than zero
+     * @return the outcome; {@code retryAfterMillis} is the wait until the same call would pass
+     * @throws RuvioServerException as {@link #limitSliding}
+     */
+    public CompletableFuture<LimitOutcome> limitSlidingWithRetry(K key, long max, long windowMillis) {
+        return send(args().w(Cmd.LIMIT).k(key).l(max).l(windowMillis).w(Cmd.SLIDING).w(Cmd.WITHRETRY), Reply.LONG_LIST)
+                .thenApply(KeyCommands::limitOutcome);
+    }
+
+    /**
+     * Sends {@code LIMIT key capacity refill_ms TOKENS COST cost WITHRETRY}: {@link #limitTokens} that also says how long to wait.
+     *
+     * @param key the limiter key
+     * @param capacity bucket size; from 1 to 1000000
+     * @param refillMillis time to refill an empty bucket in milliseconds; up to 4294967295
+     * @param cost tokens this call takes; from 1 to {@code capacity}
+     * @return the outcome; {@code retryAfterMillis} is the wait until the same call would pass
+     * @throws RuvioServerException as {@link #limitTokens}
+     */
+    public CompletableFuture<LimitOutcome> limitTokensWithRetry(K key, long capacity, long refillMillis, long cost) {
+        return send(args().w(Cmd.LIMIT).k(key).l(capacity).l(refillMillis).w(Cmd.TOKENS).w(Cmd.COST).l(cost).w(Cmd.WITHRETRY),
+                Reply.LONG_LIST).thenApply(KeyCommands::limitOutcome);
+    }
+
+    private static LimitOutcome limitOutcome(List<Long> reply) {
+        if (reply == null || reply.size() != 2) {
+            throw new RuvioException("LIMIT WITHRETRY expects two integers, got " + reply);
+        }
+        long remaining = reply.get(0);
+        return new LimitOutcome(remaining >= 0, Math.max(remaining, 0), Math.max(reply.get(1), 0));
+    }
+
+    /**
      * Sends the Ruvio command {@code IDEM key BEGIN fingerprint owner ttl_ms}: reserves a request so it runs once.
      * The server only compares the tokens; it does not hash the request or check who the owner is. Use a digest of
      * every input that defines the request as the fingerprint, and an unguessable per-attempt value as the owner.
@@ -135,6 +216,28 @@ public abstract class KeyCommands<K, V> extends StringCommands<K, V> {
      */
     public CompletableFuture<Long> idemComplete(K key, String fingerprint, String owner, byte[] result) {
         return send(args().w(Cmd.IDEM).k(key).w(Cmd.COMPLETE).s(fingerprint).s(owner).b(result), Reply.LONG);
+    }
+
+    /**
+     * Sends {@code IDEM key ABORT fingerprint owner}: gives up the pending record that this attempt got from
+     * {@link #idemBegin}, so the next {@code BEGIN} acquires the key at once. A completed record is never
+     * removed. Abort only when the work did not take effect or is safe to run again; a retry after an abort
+     * runs it again.
+     *
+     * <pre>{@code
+     * boolean freed = client.idemAbort("order:42", digest, attemptToken); // true
+     * }</pre>
+     *
+     * @param key the idempotency key
+     * @param fingerprint the same fingerprint used in {@code idemBegin}
+     * @param owner the same owner token used in {@code idemBegin}
+     * @return {@code true} when the pending record of this owner and fingerprint was removed; {@code false} when
+     * nothing changed (the key is missing or expired, the record is completed, or another owner or fingerprint holds it)
+     * @throws RuvioServerException {@code ERR} for invalid tokens; {@code INVALID} or {@code WRONGTYPE} for a key
+     * that holds no IDEM record
+     */
+    public CompletableFuture<Boolean> idemAbort(K key, String fingerprint, String owner) {
+        return send(args().w(Cmd.IDEM).k(key).w(Cmd.ABORT).s(fingerprint).s(owner), Reply.BOOL);
     }
 
     /**
@@ -209,6 +312,21 @@ public abstract class KeyCommands<K, V> extends StringCommands<K, V> {
      */
     public CompletableFuture<Long> semaphore(K key, long max, long ttlMillis) {
         return kll(Cmd.SEMAPHORE, key, max, ttlMillis, Reply.LONG);
+    }
+
+    /**
+     * Sends the Ruvio command {@code RENEW key token ttl}: moves the deadline of a lease or semaphore slot you hold to
+     * now + {@code ttlMillis}. The fencing token does not change and no holder is created.
+     *
+     * @param key the lease or semaphore key
+     * @param token the token returned by {@link #lease(Object, long)} or {@link #semaphore(Object, long, long)}
+     * @param ttlMillis the new lifetime in milliseconds (positive); it replaces the remaining time
+     * @return {@code true} when the token was live and its deadline moved, {@code false} when the key is missing or the
+     * token is stale or does not match
+     * @throws RuvioServerException {@code WRONGTYPE} when the key holds something other than a lease or semaphore
+     */
+    public CompletableFuture<Boolean> renew(K key, long token, long ttlMillis) {
+        return kll(Cmd.RENEW, key, token, ttlMillis, Reply.BOOL);
     }
 
     /**
@@ -447,6 +565,23 @@ public abstract class KeyCommands<K, V> extends StringCommands<K, V> {
     }
 
     /**
+     * Sends {@code EXPIRE key seconds NX|XX|GT|LT}: like {@link #expire(Object, long)}, applied only when the condition holds. A key
+     * without a deadline counts as infinite, so {@code GT} never applies to it and {@code LT} always does.
+     *
+     * @param key the key
+     * @param seconds seconds from now
+     * @param condition when to apply it: {@code NX} only without a deadline, {@code XX} only with one, {@code GT} only when later, {@code LT} only when earlier; {@link ExpireCondition#ALWAYS} sends no flag
+     * @return {@code true} when the deadline was set, {@code false} when the key does not exist or the condition failed
+     */
+    public CompletableFuture<Boolean> expire(K key, long seconds, ExpireCondition condition) {
+        Args a = args().w(Cmd.EXPIRE).k(key).l(seconds);
+        if (condition != null && condition != ExpireCondition.ALWAYS) {
+            a.w(condition.fragment());
+        }
+        return send(a, Reply.BOOL);
+    }
+
+    /**
      * Sends {@code PEXPIRE key milliseconds}: like {@link #expire(Object, long)} in milliseconds.
      *
      * @param key the key
@@ -455,6 +590,23 @@ public abstract class KeyCommands<K, V> extends StringCommands<K, V> {
      */
     public CompletableFuture<Boolean> pexpire(K key, long millis) {
         return kl(Cmd.PEXPIRE, key, millis, Reply.BOOL);
+    }
+
+    /**
+     * Sends {@code PEXPIRE key millis NX|XX|GT|LT}: like {@link #pexpire(Object, long)}, applied only when the condition holds. A key
+     * without a deadline counts as infinite, so {@code GT} never applies to it and {@code LT} always does.
+     *
+     * @param key the key
+     * @param millis milliseconds from now
+     * @param condition when to apply it: {@code NX} only without a deadline, {@code XX} only with one, {@code GT} only when later, {@code LT} only when earlier; {@link ExpireCondition#ALWAYS} sends no flag
+     * @return {@code true} when the deadline was set, {@code false} when the key does not exist or the condition failed
+     */
+    public CompletableFuture<Boolean> pexpire(K key, long millis, ExpireCondition condition) {
+        Args a = args().w(Cmd.PEXPIRE).k(key).l(millis);
+        if (condition != null && condition != ExpireCondition.ALWAYS) {
+            a.w(condition.fragment());
+        }
+        return send(a, Reply.BOOL);
     }
 
     /**
@@ -469,6 +621,23 @@ public abstract class KeyCommands<K, V> extends StringCommands<K, V> {
     }
 
     /**
+     * Sends {@code EXPIREAT key unixSeconds NX|XX|GT|LT}: like {@link #expireat(Object, long)}, applied only when the condition holds. A key
+     * without a deadline counts as infinite, so {@code GT} never applies to it and {@code LT} always does.
+     *
+     * @param key the key
+     * @param unixSeconds seconds since 1970-01-01 UTC
+     * @param condition when to apply it: {@code NX} only without a deadline, {@code XX} only with one, {@code GT} only when later, {@code LT} only when earlier; {@link ExpireCondition#ALWAYS} sends no flag
+     * @return {@code true} when the deadline was set, {@code false} when the key does not exist or the condition failed
+     */
+    public CompletableFuture<Boolean> expireat(K key, long unixSeconds, ExpireCondition condition) {
+        Args a = args().w(Cmd.EXPIREAT).k(key).l(unixSeconds);
+        if (condition != null && condition != ExpireCondition.ALWAYS) {
+            a.w(condition.fragment());
+        }
+        return send(a, Reply.BOOL);
+    }
+
+    /**
      * Sends {@code PEXPIREAT key timestamp}: expires a key at an absolute Unix time in milliseconds.
      *
      * @param key the key
@@ -477,6 +646,23 @@ public abstract class KeyCommands<K, V> extends StringCommands<K, V> {
      */
     public CompletableFuture<Boolean> pexpireat(K key, long unixMillis) {
         return kl(Cmd.PEXPIREAT, key, unixMillis, Reply.BOOL);
+    }
+
+    /**
+     * Sends {@code PEXPIREAT key unixMillis NX|XX|GT|LT}: like {@link #pexpireat(Object, long)}, applied only when the condition holds. A key
+     * without a deadline counts as infinite, so {@code GT} never applies to it and {@code LT} always does.
+     *
+     * @param key the key
+     * @param unixMillis milliseconds since 1970-01-01 UTC
+     * @param condition when to apply it: {@code NX} only without a deadline, {@code XX} only with one, {@code GT} only when later, {@code LT} only when earlier; {@link ExpireCondition#ALWAYS} sends no flag
+     * @return {@code true} when the deadline was set, {@code false} when the key does not exist or the condition failed
+     */
+    public CompletableFuture<Boolean> pexpireat(K key, long unixMillis, ExpireCondition condition) {
+        Args a = args().w(Cmd.PEXPIREAT).k(key).l(unixMillis);
+        if (condition != null && condition != ExpireCondition.ALWAYS) {
+            a.w(condition.fragment());
+        }
+        return send(a, Reply.BOOL);
     }
 
     /**

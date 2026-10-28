@@ -20,6 +20,9 @@ public sealed class RuvioOutputCacheStore : IOutputCacheStore
     private static readonly Counter<long> StorageCommands = Meter.CreateCounter<long>("ruvio.output_cache.storage_commands");
     private static readonly Histogram<double> StorageDuration = Meter.CreateHistogram<double>(
         "ruvio.output_cache.storage_duration", "ms");
+    private static readonly Counter<long> Hits = Meter.CreateCounter<long>("ruvio.output_cache.hit");
+    private static readonly Counter<long> Misses = Meter.CreateCounter<long>("ruvio.output_cache.miss");
+    private static readonly Counter<long> TagEvictions = Meter.CreateCounter<long>("ruvio.output_cache.tag_evict");
     private static readonly ReadOnlyMemory<byte> Get = "GET"u8.ToArray();
     private static readonly ReadOnlyMemory<byte> Delete = "DEL"u8.ToArray();
     private static readonly ReadOnlyMemory<byte> Set = "SET"u8.ToArray();
@@ -30,6 +33,7 @@ public sealed class RuvioOutputCacheStore : IOutputCacheStore
     private readonly int maxValueBytes;
     private readonly int maxKeyBytes;
     private readonly int maxTags;
+    private readonly RuvioOutageOptions outage;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="RuvioOutputCacheStore"/> class.
@@ -56,6 +60,23 @@ public sealed class RuvioOutputCacheStore : IOutputCacheStore
         maxValueBytes = settings.MaxValueBytes;
         maxKeyBytes = settings.MaxKeyBytes;
         maxTags = settings.MaxTagsPerEntry;
+        outage = settings.Outage;
+    }
+
+    // Without an outage mode or a circuit breaker the public methods return the core task itself.
+    private bool Guarded => outage.Mode == RuvioOutageMode.FailOpen || outage.CircuitBreaker is not null;
+
+    private static readonly Counter<long> Outages = Meter.CreateCounter<long>("ruvio.output_cache.outage");
+
+    // Fail open drops the call; every other mode raises, with an open circuit as RuvioCircuitOpenException.
+    private void Unavailable(string operation, Exception? cause)
+    {
+        Outages.Add(1, new TagList
+        {
+            { "operation", operation },
+            { "mode", outage.Mode == RuvioOutageMode.FailOpen ? "fail_open" : "fail_closed" },
+            { "reason", cause is null ? "circuit_open" : "error" },
+        });
     }
 
     /// <summary>
@@ -70,7 +91,35 @@ public sealed class RuvioOutputCacheStore : IOutputCacheStore
     /// <exception cref="ArgumentException"></exception>
     /// <exception cref="ArgumentOutOfRangeException"></exception>
     /// <exception cref="RuvioException"></exception>
-    public async ValueTask SetAsync(string key, byte[] value, string[]? tags, TimeSpan validFor,
+    public ValueTask SetAsync(string key, byte[] value, string[]? tags, TimeSpan validFor,
+        CancellationToken cancellationToken)
+        => Guarded ? SetGuardedAsync(key, value, tags, validFor, cancellationToken) : SetCoreAsync(key, value, tags, validFor, cancellationToken);
+
+    private async ValueTask SetGuardedAsync(string key, byte[] value, string[]? tags, TimeSpan validFor,
+        CancellationToken cancellationToken)
+    {
+        if (!outage.TryEnter())
+        {
+            Unavailable("set", null);
+
+            if (outage.Mode == RuvioOutageMode.FailOpen)
+                return;
+
+            throw new RuvioCircuitOpenException(outage.RetryAfter);
+        }
+
+        try
+        {
+            await SetCoreAsync(key, value, tags, validFor, cancellationToken).ConfigureAwait(false);
+            outage.Succeeded();
+        }
+        catch (Exception error) when (outage.Failed(error, cancellationToken) && outage.Mode == RuvioOutageMode.FailOpen)
+        {
+            Unavailable("set", error);
+        }
+    }
+
+    private async ValueTask SetCoreAsync(string key, byte[] value, string[]? tags, TimeSpan validFor,
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -194,13 +243,47 @@ public sealed class RuvioOutputCacheStore : IOutputCacheStore
     /// <param name="key">The key of the cache entry to retrieve.</param>
     /// <param name="cancellationToken">A token to monitor for cancellation requests.</param>
     /// <returns>The cached entry as a byte array, or <c>null</c> if the entry does not exist or is invalid.</returns>
-    public async ValueTask<byte[]?> GetAsync(string key, CancellationToken cancellationToken)
+    public ValueTask<byte[]?> GetAsync(string key, CancellationToken cancellationToken)
+        => Guarded ? GetGuardedAsync(key, cancellationToken) : GetCoreAsync(key, cancellationToken);
+
+    private async ValueTask<byte[]?> GetGuardedAsync(string key, CancellationToken cancellationToken)
+    {
+        if (!outage.TryEnter())
+        {
+            Unavailable("get", null);
+
+            if (outage.Mode == RuvioOutageMode.FailOpen)
+                return null;
+
+            throw new RuvioCircuitOpenException(outage.RetryAfter);
+        }
+
+        try
+        {
+            byte[]? entry = await GetCoreAsync(key, cancellationToken).ConfigureAwait(false);
+            outage.Succeeded();
+
+            return entry;
+        }
+        catch (Exception error) when (outage.Failed(error, cancellationToken) && outage.Mode == RuvioOutageMode.FailOpen)
+        {
+            Unavailable("get", error);
+
+            return null; // a miss: the endpoint runs and answers
+        }
+    }
+
+    private async ValueTask<byte[]?> GetCoreAsync(string key, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var reply = await Execute("get_entry", [Get, KeyBytes("entry:", key)], cancellationToken).ConfigureAwait(false);
 
         if (reply.Kind == RespKind.Null)
+        {
+            CountMiss("absent");
+
             return null;
+        }
 
         if (reply.Kind != RespKind.Bulk)
             throw Unexpected();
@@ -222,11 +305,25 @@ public sealed class RuvioOutputCacheStore : IOutputCacheStore
             for (int i = 0; i < count; i++)
             {
                 if (!SameAscii(live[i], data.AsSpan(6 + i * 96 + 64, 32)))
+                {
+                    CountMiss("tag_evicted");
+
                     return null;
+                }
             }
         }
 
+        if (Hits.Enabled)
+            Hits.Add(1);
+
         return data.AsSpan(offset).ToArray();
+    }
+
+    // A missing entry and an entry whose tag was evicted are both misses; the reason tells them apart.
+    private static void CountMiss(string reason)
+    {
+        if (Misses.Enabled)
+            Misses.Add(1, new KeyValuePair<string, object?>("reason", reason));
     }
 
     /// <summary>
@@ -235,13 +332,43 @@ public sealed class RuvioOutputCacheStore : IOutputCacheStore
     /// <param name="tag">The tag of the cache entries to evict.</param>
     /// <param name="cancellationToken">A token to monitor for cancellation requests.</param>
     /// <returns>A task representing the asynchronous operation.</returns>
-    public async ValueTask EvictByTagAsync(string tag, CancellationToken cancellationToken)
+    public ValueTask EvictByTagAsync(string tag, CancellationToken cancellationToken)
+        => Guarded ? EvictGuardedAsync(tag, cancellationToken) : EvictCoreAsync(tag, cancellationToken);
+
+    private async ValueTask EvictGuardedAsync(string tag, CancellationToken cancellationToken)
+    {
+        if (!outage.TryEnter())
+        {
+            Unavailable("evict", null);
+
+            if (outage.Mode == RuvioOutageMode.FailOpen)
+                return;
+
+            throw new RuvioCircuitOpenException(outage.RetryAfter);
+        }
+
+        try
+        {
+            await EvictCoreAsync(tag, cancellationToken).ConfigureAwait(false);
+            outage.Succeeded();
+        }
+        catch (Exception error) when (outage.Failed(error, cancellationToken) && outage.Mode == RuvioOutageMode.FailOpen)
+        {
+            // The eviction is lost: entries that carry this tag can be served again once Ruvio is back.
+            Unavailable("evict", error);
+        }
+    }
+
+    private async ValueTask EvictCoreAsync(string tag, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var reply = await Execute("evict_tag", [Delete, KeyBytes("tag:", tag)], cancellationToken).ConfigureAwait(false);
 
         if (reply.Kind != RespKind.Integer || reply.Integer is < 0 or > 1)
             throw Unexpected();
+
+        if (TagEvictions.Enabled)
+            TagEvictions.Add(1);
     }
 
     internal string EntryKey(string key) => KeyText("entry:", key);

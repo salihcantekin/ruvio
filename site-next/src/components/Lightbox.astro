@@ -1,0 +1,106 @@
+---
+// Click-to-enlarge for content images on every page (marketing and docs).
+// Eligible: an <img> with alt text, outside links and buttons, not marked data-no-zoom,
+// and large enough to be a screenshot (logos, icons and badges are skipped).
+// The dialog is created on first use, so pages without images pay nothing.
+---
+
+<script>
+  const MIN_SIZE = 200;
+  let dialog: HTMLDialogElement | null = null;
+  let big: HTMLImageElement;
+  let caption: HTMLParagraphElement;
+  let opener: Element | null = null;
+
+  function zoomable(img: HTMLImageElement) {
+    return (
+      img.alt.trim() !== "" &&
+      !img.closest("a, button, [data-no-zoom]") &&
+      img.naturalWidth >= MIN_SIZE
+    );
+  }
+
+  function build() {
+    const d = document.createElement("dialog");
+    d.className = "lightbox";
+    d.setAttribute("aria-label", "Enlarged image");
+    d.innerHTML =
+      '<button type="button" class="lightbox-close" aria-label="Close">&times;</button>' +
+      '<img alt="" /><p></p>';
+    big = d.querySelector("img")!;
+    caption = d.querySelector("p")!;
+    // Clicks on the backdrop or the picture close; the native dialog handles Esc and focus.
+    d.addEventListener("click", () => d.close());
+    d.addEventListener("close", () => {
+      document.documentElement.classList.remove("lightbox-open");
+      (opener as HTMLElement | null)?.focus?.();
+    });
+    document.body.append(d);
+    return d;
+  }
+
+  function open(img: HTMLImageElement) {
+    dialog ??= build();
+    opener = img;
+    big.src = img.currentSrc || img.src;
+    big.alt = img.alt;
+    caption.textContent = img.alt;
+    document.documentElement.classList.add("lightbox-open");
+    dialog.showModal();
+    dialog.querySelector<HTMLElement>(".lightbox-close")!.focus();
+  }
+
+  function enable(img: HTMLImageElement) {
+    if (img.dataset.zoom || !zoomable(img)) return;
+    img.dataset.zoom = "1";
+    img.tabIndex = 0;
+    img.setAttribute("role", "button");
+    img.setAttribute("aria-label", `Enlarge image: ${img.alt}`);
+  }
+
+  function scan() {
+    document.querySelectorAll<HTMLImageElement>("img:not([data-zoom])").forEach((img) => {
+      if (img.complete) enable(img);
+      else img.addEventListener("load", () => enable(img), { once: true });
+    });
+  }
+
+  document.addEventListener("click", (e) => {
+    const img = (e.target as Element).closest?.("img[data-zoom]") as HTMLImageElement | null;
+    if (img) open(img);
+  });
+  document.addEventListener("keydown", (e) => {
+    const t = e.target as HTMLElement;
+    if ((e.key === "Enter" || e.key === " ") && t instanceof HTMLImageElement && t.dataset.zoom) {
+      e.preventDefault();
+      open(t);
+    }
+  });
+  scan();
+</script>
+
+<style is:global>
+  img[data-zoom] { cursor: zoom-in; }
+  img[data-zoom]:focus-visible { outline: 2px solid var(--accent, currentColor); outline-offset: 3px; }
+  html.lightbox-open { overflow: hidden; }
+  dialog.lightbox {
+    position: fixed; inset: 0; width: 100vw; height: 100vh; max-width: none; max-height: none;
+    margin: 0; padding: 24px; border: 0; background: rgba(5, 7, 12, 0.88);
+    display: none; flex-direction: column; align-items: center; justify-content: center; gap: 12px;
+    cursor: zoom-out;
+  }
+  dialog.lightbox[open] { display: flex; }
+  dialog.lightbox::backdrop { background: transparent; }
+  dialog.lightbox img {
+    max-width: 100%; max-height: calc(100vh - 96px); object-fit: contain;
+    border-radius: var(--radius, 8px); box-shadow: 0 12px 48px rgba(0, 0, 0, 0.6);
+  }
+  dialog.lightbox p { margin: 0; max-width: 70ch; text-align: center; font-size: 0.875rem; color: var(--mute, #959db0); }
+  .lightbox-close {
+    position: absolute; top: 12px; right: 12px; width: 40px; height: 40px; border-radius: 50%;
+    border: 1px solid var(--line-soft, rgba(160, 175, 215, 0.3)); background: var(--surface, #10131f);
+    color: var(--ink, #fff); font-size: 24px; line-height: 1; cursor: pointer;
+  }
+  .lightbox-close:hover { background: var(--surface-2, #151a2a); }
+  .lightbox-close:focus-visible { outline: 2px solid var(--accent, currentColor); outline-offset: 2px; }
+</style>

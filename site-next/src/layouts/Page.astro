@@ -2,6 +2,7 @@
 import "../styles/global.css";
 import Header from "../components/Header.astro";
 import Footer from "../components/Footer.astro";
+import Lightbox from "../components/Lightbox.astro";
 import Analytics from "../components/Analytics.astro";
 import { site } from "../config/site";
 
@@ -9,6 +10,7 @@ interface Props { title?: string; description?: string }
 const { title, description = site.description } = Astro.props;
 const fullTitle = title ? `${title} · Ruvio` : "Ruvio · Redis-compatible server in Rust";
 const canonical = new URL(Astro.url.pathname, site.url);
+const image = new URL(site.image, site.url);
 ---
 
 <!doctype html>
@@ -20,10 +22,30 @@ const canonical = new URL(Astro.url.pathname, site.url);
     <meta name="description" content={description} />
     <link rel="canonical" href={canonical} />
     <link rel="icon" href="/favicon.png" type="image/png" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content={site.name} />
+    <meta property="og:url" content={canonical} />
     <meta property="og:title" content={fullTitle} />
     <meta property="og:description" content={description} />
-    <meta property="og:image" content={new URL("/images/ruvio-social.png", site.url)} />
-    <meta name="theme-color" content="#0a0c14" />
+    <meta property="og:image" content={image} />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content={site.imageAlt} />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={fullTitle} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={image} />
+    <meta name="theme-color" content="#0a0c14" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#e9ecf2" media="(prefers-color-scheme: light)" />
+    <!-- Apply the saved theme before first paint. Same key as the docs ("starlight-theme"), so one choice covers the whole site. -->
+    <script is:inline>
+      (function () {
+        var t = "";
+        try { t = localStorage.getItem("starlight-theme") || ""; } catch (e) {}
+        if (t !== "light" && t !== "dark") t = matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+        document.documentElement.dataset.theme = t;
+      })();
+    </script>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" />
@@ -35,5 +57,6 @@ const canonical = new URL(Astro.url.pathname, site.url);
       <slot />
     </main>
     <Footer />
+    <Lightbox />
   </body>
 </html>

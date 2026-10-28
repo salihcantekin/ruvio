@@ -7,6 +7,8 @@ use crate::{OwnedMutation, mutation::Mutation, protocol::ProtocolLimits};
 
 use super::PersistenceError;
 
+mod crc;
+
 pub(crate) const WAL_MAGIC: &[u8; 8] = b"RUVWAL01";
 pub(crate) const WAL_HEADER_LEN: usize = 52;
 pub(crate) const RECORD_HEADER_LEN: usize = 28;
@@ -74,20 +76,26 @@ const FORMAT_MAJOR: u16 = 1;
 /// Minor 1 adds SetRange (58) and ListSet/ListInsert/ListRemove (59-61). A minor-0
 /// reader refuses these files instead of misreading them. Minor 2 adds BloomReserve with an
 /// explicit expansion (62) and BloomAddMany (63); a reserve with the default expansion still
-/// uses record 9. Minor 3 adds SetBytesExpiring (64).
-pub(crate) const FORMAT_MINOR: u16 = 3;
+/// uses record 9. Minor 3 adds SetBytesExpiring (64). Minor 4 adds SlotCopy (65) and
+/// SlotsMoved (66), written only by a slot move. Minor 5 adds SlotsIncoming (67) and
+/// SlotsGiven (68), written only by a move between nodes. Minor 6 adds SlotsArrived (69), the
+/// end of a range arriving from another node.
+pub(crate) const FORMAT_MINOR: u16 = 6;
 /// The first record type of each minor. A new record type goes in a new last row with the
 /// next minor, and `FORMAT_MINOR` follows it; the codec tests refuse a decoder that knows a
 /// record type this table does not.
 #[cfg(test)]
-const RECORD_MINORS: [(u16, u16); 4] = [
+const RECORD_MINORS: [(u16, u16); 7] = [
     (record::SET_BYTES, 0),
     (record::SET_RANGE, 1),
     (record::BLOOM_RESERVE, 2),
     (record::SET_BYTES_EXPIRING, 3),
+    (record::SLOT_COPY, 4),
+    (record::SLOTS_INCOMING, 5),
+    (record::SLOTS_ARRIVED, 6),
 ];
 #[cfg(test)]
-const LAST_RECORD_TYPE: u16 = record::SET_BYTES_EXPIRING;
+const LAST_RECORD_TYPE: u16 = record::SLOTS_ARRIVED;
 
 /// WAL record type numbers. Logs on disk and replicas depend on them, so a number is
 /// never reused or changed; a new record type takes the next number and a `RECORD_MINORS`
@@ -157,6 +165,13 @@ mod record {
     pub(super) const BLOOM_RESERVE: u16 = 62;
     pub(super) const BLOOM_ADD_MANY: u16 = 63;
     pub(super) const SET_BYTES_EXPIRING: u16 = 64;
+    pub(super) const SLOT_COPY: u16 = 65;
+    pub(super) const SLOTS_MOVED: u16 = 66;
+    pub(super) const SLOTS_INCOMING: u16 = 67;
+    pub(super) const SLOTS_GIVEN: u16 = 68;
+    /// `SlotsIncoming` with the `Completed` step: a reader of minor 5 refuses the segment
+    /// instead of an unknown step.
+    pub(super) const SLOTS_ARRIVED: u16 = 69;
 }
 
 pub(crate) struct SegmentHeader {
@@ -300,7 +315,7 @@ pub(crate) fn encode_record_into(
     bytes.clear();
     bytes.resize(RECORD_HEADER_LEN, 0);
     let record_type = encode_payload(mutation, bytes)?;
-    finish_record(bytes, shard_id, sequence, database, record_type)
+    finish_record_at(bytes, 0, shard_id, sequence, database, record_type)
 }
 
 /// Encodes a borrowed mutation without first copying it into an `OwnedMutation`.
@@ -314,14 +329,29 @@ pub(crate) fn encode_borrowed_record_into(
     mutation: &Mutation<'_>,
 ) -> Result<(), PersistenceError> {
     bytes.clear();
-    bytes.resize(RECORD_HEADER_LEN, 0);
+    encode_borrowed_record_appended(bytes, shard_id, sequence, database, mutation)
+}
+
+/// [`encode_borrowed_record_into`] that appends the record after what `bytes` already holds,
+/// so a WAL batch buffer takes it without a second copy. On error `bytes` may hold a partial
+/// record past its old length; the caller truncates it.
+pub(crate) fn encode_borrowed_record_appended(
+    bytes: &mut Vec<u8>,
+    shard_id: u32,
+    sequence: u64,
+    database: u8,
+    mutation: &Mutation<'_>,
+) -> Result<(), PersistenceError> {
+    let start = bytes.len();
+
+    bytes.resize(start + RECORD_HEADER_LEN, 0);
 
     let record_type = match encode_borrowed_payload(mutation, bytes)? {
         Some(record_type) => record_type,
         None => encode_payload(&Mutation::to_owned(*mutation), bytes)?,
     };
 
-    finish_record(bytes, shard_id, sequence, database, record_type)
+    finish_record_at(bytes, start, shard_id, sequence, database, record_type)
 }
 
 fn encode_borrowed_payload(
@@ -436,13 +466,16 @@ fn encode_borrowed_payload(
     Ok(Some(record_type))
 }
 
-fn finish_record(
-    bytes: &mut Vec<u8>,
+/// Fills the header of the record that starts at `start` and appends its checksum.
+fn finish_record_at(
+    buffer: &mut Vec<u8>,
+    start: usize,
     shard_id: u32,
     sequence: u64,
     database: u8,
     record_type: u16,
 ) -> Result<(), PersistenceError> {
+    let bytes = &mut buffer[start..];
     let payload_len = bytes.len() - RECORD_HEADER_LEN;
     let total_length = u32::try_from(bytes.len() + 4)
         .map_err(|_| PersistenceError::Failed("WAL record exceeds 4 GiB".into()))?;
@@ -458,9 +491,9 @@ fn finish_record(
             .map_err(|_| PersistenceError::Failed("WAL payload exceeds 4 GiB".into()))?
             .to_le_bytes(),
     );
-    let checksum = crc32c::crc32c(&bytes[field::LENGTH.end..]);
+    let checksum = crc::checksum(&bytes[field::LENGTH.end..]);
 
-    put_u32(bytes, checksum);
+    put_u32(buffer, checksum);
     Ok(())
 }
 
@@ -517,11 +550,15 @@ pub(crate) fn record_header_plausible(
         && le_u32(frame, field::PAYLOAD_LENGTH) as usize == frame.len() - RECORD_MIN_LEN
 }
 
-pub(crate) fn decode_record(
+/// Every check `decode_record` makes on `frame` except decoding its payload: the length,
+/// command limit, checksum, version, flags, shard and payload length. Returns the record's
+/// sequence. A reader that only forwards the frame (replication, CDC) needs no more, and
+/// whoever applies it decodes the payload then.
+pub(crate) fn verify_record_frame(
     frame: &[u8],
     expected_shard: u32,
     limits: ProtocolLimits,
-) -> Result<DecodedRecord, PersistenceError> {
+) -> Result<u64, PersistenceError> {
     let limits = record_read_limits(limits);
 
     if frame.len() < RECORD_MIN_LEN {
@@ -547,7 +584,7 @@ pub(crate) fn decode_record(
     let checksum_offset = frame.len() - 4;
     let expected_checksum = u32::from_le_bytes(frame[checksum_offset..].try_into().unwrap());
 
-    if crc32c::crc32c(&frame[field::LENGTH.end..checksum_offset]) != expected_checksum {
+    if crc::checksum(&frame[field::LENGTH.end..checksum_offset]) != expected_checksum {
         return Err(PersistenceError::Corruption(
             "WAL record checksum mismatch".into(),
         ));
@@ -557,7 +594,6 @@ pub(crate) fn decode_record(
         return Err(PersistenceError::Unsupported("WAL record version".into()));
     }
 
-    let record_type = le_u16(frame, field::TYPE);
     let flags = le_u32(frame, field::FLAGS);
 
     if flags & !RECORD_DATABASE_MASK != 0 {
@@ -566,17 +602,12 @@ pub(crate) fn decode_record(
         ));
     }
 
-    let database = (flags & RECORD_DATABASE_MASK) as u8;
-
-    let shard_id = le_u32(frame, field::SHARD);
-
-    if shard_id != expected_shard {
+    if le_u32(frame, field::SHARD) != expected_shard {
         return Err(PersistenceError::Corruption(
             "WAL record shard mismatch".into(),
         ));
     }
 
-    let sequence = le_u64(frame, field::SEQUENCE);
     let payload_length = le_u32(frame, field::PAYLOAD_LENGTH) as usize;
 
     if payload_length != checksum_offset - RECORD_HEADER_LEN {
@@ -585,10 +616,20 @@ pub(crate) fn decode_record(
         ));
     }
 
+    Ok(le_u64(frame, field::SEQUENCE))
+}
+
+pub(crate) fn decode_record(
+    frame: &[u8],
+    expected_shard: u32,
+    limits: ProtocolLimits,
+) -> Result<DecodedRecord, PersistenceError> {
+    let sequence = verify_record_frame(frame, expected_shard, limits)?;
+    let database = (le_u32(frame, field::FLAGS) & RECORD_DATABASE_MASK) as u8;
     let mutation = decode_payload(
-        record_type,
-        &frame[RECORD_HEADER_LEN..checksum_offset],
-        limits,
+        le_u16(frame, field::TYPE),
+        &frame[RECORD_HEADER_LEN..frame.len() - 4],
+        record_read_limits(limits),
     )?;
 
     Ok(DecodedRecord {
@@ -1135,6 +1176,59 @@ fn encode_payload(
             record::MOVE_KEY
         }
 
+        OwnedMutation::SlotCopy { key, entry } => {
+            put_bytes(payload, key)?;
+            match entry {
+                Some(entry) => {
+                    payload.push(1);
+                    put_bytes(payload, entry)?;
+                }
+                None => payload.push(0),
+            }
+            record::SLOT_COPY
+        }
+
+        OwnedMutation::SlotsMoved {
+            first,
+            last,
+            to,
+            position,
+        } => {
+            payload.extend_from_slice(&first.to_le_bytes());
+            payload.extend_from_slice(&last.to_le_bytes());
+            payload.extend_from_slice(&to.to_le_bytes());
+            put_u64(payload, *position);
+            record::SLOTS_MOVED
+        }
+
+        OwnedMutation::SlotsIncoming { first, last, step }
+            if *step == crate::slot_moves::IncomingStep::Completed as u8 =>
+        {
+            payload.extend_from_slice(&first.to_le_bytes());
+            payload.extend_from_slice(&last.to_le_bytes());
+            record::SLOTS_ARRIVED
+        }
+
+        OwnedMutation::SlotsIncoming { first, last, step } => {
+            payload.extend_from_slice(&first.to_le_bytes());
+            payload.extend_from_slice(&last.to_le_bytes());
+            payload.push(*step);
+            record::SLOTS_INCOMING
+        }
+
+        OwnedMutation::SlotsGiven {
+            first,
+            last,
+            address,
+            position,
+        } => {
+            payload.extend_from_slice(&first.to_le_bytes());
+            payload.extend_from_slice(&last.to_le_bytes());
+            put_bytes(payload, address)?;
+            put_u64(payload, *position);
+            record::SLOTS_GIVEN
+        }
+
         OwnedMutation::Transaction { mutations } => encode_transaction(mutations, payload)?,
     };
 
@@ -1471,6 +1565,56 @@ fn decode_payload(
         record::MOVE_KEY => OwnedMutation::MoveKey {
             key: decoder.key(limits)?,
             destination: decoder.u8()?,
+        },
+        // Minor 4: written only by a slot move. The entry is a checkpoint entry frame of a
+        // value the source already held, so only the record itself bounds it (a value may
+        // be larger than any one command).
+        record::SLOT_COPY => OwnedMutation::SlotCopy {
+            key: decoder.key(limits)?,
+            entry: match decoder.u8()? {
+                0 => None,
+                1 => Some(decoder.bytes(payload.len())?),
+                _ => {
+                    return Err(PersistenceError::Corruption(
+                        "invalid slot copy presence flag".into(),
+                    ));
+                }
+            },
+        },
+        record::SLOTS_MOVED => OwnedMutation::SlotsMoved {
+            first: decoder.u16()?,
+            last: decoder.u16()?,
+            to: decoder.u16()?,
+            position: decoder.u64()?,
+        },
+        // Minor 5: written only by a move between nodes.
+        record::SLOTS_INCOMING => OwnedMutation::SlotsIncoming {
+            first: decoder.u16()?,
+            last: decoder.u16()?,
+            step: match decoder.u8()? {
+                step if crate::slot_moves::IncomingStep::from_u8(step)
+                    .is_some_and(|step| step != crate::slot_moves::IncomingStep::Completed) =>
+                {
+                    step
+                }
+                _ => {
+                    return Err(PersistenceError::Corruption(
+                        "invalid incoming slot step".into(),
+                    ));
+                }
+            },
+        },
+        // Minor 6.
+        record::SLOTS_ARRIVED => OwnedMutation::SlotsIncoming {
+            first: decoder.u16()?,
+            last: decoder.u16()?,
+            step: crate::slot_moves::IncomingStep::Completed as u8,
+        },
+        record::SLOTS_GIVEN => OwnedMutation::SlotsGiven {
+            first: decoder.u16()?,
+            last: decoder.u16()?,
+            address: decoder.key(limits)?,
+            position: decoder.u64()?,
         },
         record::LIST_PUSH_BACK => OwnedMutation::ListPushBack {
             key: decoder.key(limits)?,

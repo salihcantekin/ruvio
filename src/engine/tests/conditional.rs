@@ -40,6 +40,102 @@ fn list(shard: &mut KvShard, sink: &mut DatabaseLog, key: &str) -> Vec<String> {
 }
 
 #[test]
+fn set_ifgt_and_iflt_keep_the_larger_or_smaller_number() {
+    let mut shard = KvShard::new();
+    let mut sink = DatabaseLog::default();
+
+    assert_eq!(
+        run(&mut shard, &mut sink, &["SET", "w", "10", "IFGT"]),
+        "OK",
+        "a missing key is written"
+    );
+    assert_eq!(
+        run(&mut shard, &mut sink, &["SET", "w", "9", "IFGT"]),
+        "nil"
+    );
+    assert_eq!(
+        run(&mut shard, &mut sink, &["SET", "w", "10", "IFGT"]),
+        "nil"
+    );
+    assert_eq!(
+        run(&mut shard, &mut sink, &["SET", "w", "11", "ifgt"]),
+        "OK"
+    );
+    assert_eq!(run(&mut shard, &mut sink, &["GET", "w"]), "bulk:11");
+
+    assert_eq!(
+        run(&mut shard, &mut sink, &["SET", "w", "12", "IFLT"]),
+        "nil"
+    );
+    assert_eq!(
+        run(&mut shard, &mut sink, &["SET", "w", "11", "IFLT"]),
+        "nil"
+    );
+    assert_eq!(
+        run(
+            &mut shard,
+            &mut sink,
+            &["SET", "w", "-3", "IFLT", "EX", "100"]
+        ),
+        "OK"
+    );
+    assert_eq!(run(&mut shard, &mut sink, &["GET", "w"]), "bulk:-3");
+    assert_eq!(run(&mut shard, &mut sink, &["TTL", "w"]), "int:100");
+
+    // Counters (integer encoding) compare too, and the bounds hold.
+    run(&mut shard, &mut sink, &["SET", "n", "41"]);
+    run(&mut shard, &mut sink, &["INCR", "n"]);
+    assert_eq!(
+        run(&mut shard, &mut sink, &["SET", "n", "42", "IFGT"]),
+        "nil"
+    );
+    assert_eq!(
+        run(
+            &mut shard,
+            &mut sink,
+            &["SET", "n", "9223372036854775807", "IFGT"]
+        ),
+        "OK"
+    );
+    assert_eq!(
+        run(
+            &mut shard,
+            &mut sink,
+            &["SET", "n", "-9223372036854775808", "IFLT"]
+        ),
+        "OK"
+    );
+
+    // A stored string that is not an integer writes nothing.
+    run(&mut shard, &mut sink, &["SET", "s", "abc"]);
+    assert_eq!(
+        run(&mut shard, &mut sink, &["SET", "s", "1", "IFGT"]),
+        "ERR value is not an integer or out of range"
+    );
+    assert_eq!(run(&mut shard, &mut sink, &["GET", "s"]), "bulk:abc");
+
+    run(&mut shard, &mut sink, &["RPUSH", "l", "a"]);
+    assert!(run(&mut shard, &mut sink, &["SET", "l", "1", "IFGT"]).starts_with("WRONGTYPE"));
+
+    for bad in [
+        &["SET", "k", "v", "IFGT"][..],
+        &["SET", "k", "1.5", "IFLT"][..],
+        &["SET", "k", "9223372036854775808", "IFGT"][..],
+        &["SET", "k", "1", "IFGT", "NX"][..],
+        &["SET", "k", "1", "IFLT", "XX"][..],
+        &["SET", "k", "1", "IFGT", "GET"][..],
+    ] {
+        assert!(parse_command(&words(bad)).is_err(), "{bad:?}");
+    }
+
+    let mut recovered = replayed(&sink);
+    assert_eq!(
+        run(&mut recovered, &mut DatabaseLog::default(), &["GET", "w"]),
+        "bulk:-3"
+    );
+}
+
+#[test]
 fn set_ifeq_writes_only_when_the_string_matches() {
     let mut shard = KvShard::new();
     let mut sink = DatabaseLog::default();

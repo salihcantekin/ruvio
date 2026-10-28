@@ -17,6 +17,7 @@ fails when one is added without a row:
 | Section | Field | Meaning |
 | --- | --- | --- |
 | Server | `ruvio_version` | Server version |
+| Server | `run_id` | 40 hex digits, random per process and the same on every shard; `ruvio coordinator` uses it to tell one node listed under two addresses |
 | Server | `ruvio_backend` | Runtime backend (`evented`) |
 | Server | `ruvio_health` | `ok` while the shard answers |
 | Server | `ruvio_readiness` | `ready` once recovery finished |
@@ -77,6 +78,13 @@ fails when one is added without a row:
 | Replication | `replication_replica_sequence` | Oldest sequence written to a connected replica socket, otherwise 0 |
 | Replication | `replication_send_lag` | `wal_durable_sequence` minus that oldest send; 0 means the bytes left the primary |
 | Replication | `replica_retain_dropped` | WAL holds for slow replicas dropped |
+| Replication | `replication_epoch` | Epoch of the history this primary writes; grows with each promotion (0 on a replica and on a server that never replicated) |
+| Replication | `slave<n>` | Primary only, one line per replica that announced a client address, finished copying and acknowledged within the last 10 seconds: `ip=…,port=…,state=online,offset=<acknowledged sequence>,lag=<seconds since its last acknowledgement>`; the replica's client port for this shard. `replication_replicas` also counts replicas that are still copying or announce nothing |
+| Replication | `replication_fenced` | 1 when a replica showed this primary a newer epoch: another primary replaced it and writes are refused |
+| Replication | `replication_committed_sequence` | Highest sequence a `CLIENT DURABILITY` reply was released for: on a primary its own, on a replica what its primary last sent. A failover should promote only a replica whose synced sequence reaches it |
+| Replication | `primary_lease` | `on` when `primary-lease` is set: a primary then takes writes only while a majority of the coordinators renewed its lease |
+| Replication | `primary_lease_grants` | Coordinators whose lease grant to this node is running (counted whether or not `primary-lease` is on) |
+| Replication | `primary_lease_remaining_ms` | How long the grants of a majority keep running; 0 when they do not. With `primary-lease` on, writes are refused at 300 or below |
 | Replication | `master_link_status` | Replica only: `up` or `down` |
 | Replication | `master_last_io_seconds_ago` | Replica only: seconds since the last frame, `-1` before the first |
 | Replication | `slave_repl_offset` | Replica only: last applied WAL sequence |
@@ -93,14 +101,9 @@ Prometheus text is available without adding hot-path atomics or a global lock:
 redis-cli INFO prometheus
 ```
 
-Optional HTTP scrape binds a separate listener. Set `metrics_address` /
-`RUVIO_METRICS_ADDR` / `--metrics-address`. Multi-shard processes increment
-that port by shard id (`9121`, `9122`, …). A scrape is a control-plane read on
-the owning shard; it does not update command counters.
-
-```bash
-curl http://127.0.0.1:9121/metrics
-```
+There is no HTTP scrape endpoint yet; `INFO prometheus` over the RESP port is the
+only way to read the metrics. A scrape is a control-plane read on the owning
+shard; it does not update command counters.
 
 Expiration and eviction counters live on the owning shard. Linux updates them
 as ordinary local integers; portable scrapes read the same shard fields. A
@@ -125,3 +128,66 @@ Prometheus text includes:
 Charged memory is a deterministic storage-budget model, not process RSS. See
 [MEMORY_ACCOUNTING.md](MEMORY_ACCOUNTING.md) for category definitions and
 limitations.
+
+## .NET client
+
+`Ruvio.Client` reports through `System.Diagnostics`, so it needs no OpenTelemetry package. The activity source
+and the meter are both named `Ruvio.Client`:
+
+```csharp
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracing => tracing.AddSource("Ruvio.Client"))
+    .WithMetrics(metrics => metrics.AddMeter("Ruvio.Client"));
+```
+
+- A client span per command, named after it (for example `GET`), with `db.system` = `ruvio`,
+  `db.operation.name` and `db.namespace` (the database number); on failure its status is `Error` and
+  `error.type` names the exception.
+- Internal spans `socket.queue`, `socket.write` and `socket.reply`, children of the command span.
+- Histogram `ruvio_client_command_duration_milliseconds` (ms), tagged `db.system`, `db.operation.name` and
+  `outcome` (`ok` or `error`).
+- Histogram `ruvio_client_socket_phase_duration_milliseconds` (ms), tagged `backend` and `phase`.
+- Counters `ruvio_client_socket_write_calls` and `ruvio_client_socket_written_bytes`.
+- Counter `ruvio_client_circuit_transitions`, tagged `state` (`open`, `half_open` or `closed`): one per change of a
+  `RuvioCircuitBreaker` (the integrations' `Outage.CircuitBreaker`). Nothing is recorded while no breaker changes state.
+
+Keys, values and arguments are never recorded. A command span covers every command sent through the typed methods,
+`ExecuteAsync` and `ExecuteBinaryAsync`; pipelines (`ExecuteManyAsync`) get only the socket spans. With no listener on
+the source or the meter a command pays one check and allocates nothing more; a measurement on a local server showed
+the same bytes per operation and throughput within noise. The cost with a listener attached was not measured.
+
+## .NET integrations
+
+Each integration package has a meter named after the package (for example `Ruvio.Extensions.Caching`); add the ones
+you use with `AddMeter(...)`. No instrument records keys, values, tags, tenant identifiers or idempotency keys, and
+with no listener attached an instrument costs one field read.
+
+- `Ruvio.Extensions.Caching`: `ruvio.cache.hit` and `ruvio.cache.miss` (tagged `operation`: `get` or
+  `get_or_create`), `ruvio.cache.fail_safe` (a stale value returned because the factory threw), `ruvio.cache.outage`.
+- `Ruvio.AspNetCore.OutputCaching`: `ruvio.output_cache.hit`, `ruvio.output_cache.miss` (tagged `reason`: `absent`
+  or `tag_evicted`), `ruvio.output_cache.tag_evict`, `ruvio.output_cache.outage`, and the storage instruments
+  `ruvio.output_cache.storage_calls`, `ruvio.output_cache.storage_commands` and `ruvio.output_cache.storage_duration`.
+- `Ruvio.AspNetCore.Idempotency`: `ruvio.idempotency.states` (tagged `state`, including `aborted` with `AbortOnException`), `ruvio.idempotency.outage`, and the storage instruments `ruvio.idempotency.storage_calls`,
+  `ruvio.idempotency.storage_commands` and `ruvio.idempotency.storage_duration`.
+- `Ruvio.Extensions.Idempotency`: `ruvio.idempotency.outcomes` (one per `ExecuteOnceAsync`, tagged `outcome`; plus one `aborted` for each record
+  freed by `AbortOnException`).
+- `Ruvio.AspNetCore.DistributedLock`: `ruvio.lock.acquired`, `ruvio.lock.rejected`, `ruvio.lock.lost`,
+  `ruvio.lock.errors`, `ruvio.lock.outage` and the histogram `ruvio.lock.wait_duration` (ms).
+- `Ruvio.AspNetCore.RateLimiting`: `ruvio.rate_limit.accepted`, `ruvio.rate_limit.rejected`,
+  `ruvio.rate_limit.errors`, `ruvio.rate_limit.outage`, and the storage instruments
+  `ruvio.rate_limit.storage_calls`, `ruvio.rate_limit.storage_commands` and `ruvio.rate_limit.storage_duration`.
+
+The tags of each instrument are listed in the package's README.
+
+With `Outage.CircuitBreaker` set, each of these packages (Data Protection has no breaker) also logs its circuit's
+changes through `ILogger`, with the package name as the category: `RuvioCircuitOpened` (Warning, with the break
+duration), `RuvioCircuitHalfOpen` (Information, the trial call) and `RuvioCircuitClosed` (Information).
+
+## Coordinators
+
+`ruvio coordinator` has no metrics endpoint; its `INFO` (after `AUTH secret`) is what to watch. On
+the leader (`is_leader:1`), alert on a group whose `state` is not `ok` for longer than a few
+`down_after_ms` (`state_ms`), on `members_answering` below the member count, and on a rising
+`failovers_total`. With the primary lease, `lease_grant_ms` above `primary_lease_ms` means this
+coordinator is not renewing the primary. A group that waits is also logged as a warning, at most every
+10 seconds. Fields are listed in [COORDINATOR.md](COORDINATOR.md).

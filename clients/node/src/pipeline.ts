@@ -67,6 +67,7 @@ class PipelineImpl extends Batch {
   exec(): Promise<unknown[]> {
     const n = this.tfs.length;
     if (n === 0) return Promise.resolve([]);
+    const block = this.benc.mayBlock;
     const bytes = this.benc.take();
     const tfs = this.tfs;
     const fls = this.fls;
@@ -74,7 +75,7 @@ class PipelineImpl extends Batch {
     this.fls = [];
     return new Promise<unknown[]>((resolve, reject) => {
       const sink = new PipelineSink(n, tfs, resolve, reject);
-      this.conn.writeFrames(bytes);
+      this.conn.writeFrames(bytes, block);
       this.conn.trackBatch(sink, fls, n);
     });
   }
@@ -130,6 +131,7 @@ class TransactionImpl extends Batch {
   /** Sends MULTI, the queued commands and EXEC. */
   exec(): Promise<unknown[] | null> {
     const n = this.tfs.length;
+    const block = this.benc.mayBlock;
     const body = this.benc.take();
     const tfs = this.tfs;
     const fls = this.fls;
@@ -144,7 +146,7 @@ class TransactionImpl extends Batch {
       const e = this.conn.encoder();
       e.begin(C_MULTI, 0);
       e.endFrame();
-      this.conn.writeFrames(body);
+      this.conn.writeFrames(body, block);
       e.begin(C_EXEC, 0);
       e.endFrame();
       this.conn.trackBatch(sink, allFl, n + 2);

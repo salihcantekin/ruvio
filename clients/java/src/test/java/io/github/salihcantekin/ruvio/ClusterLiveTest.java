@@ -59,6 +59,14 @@ class ClusterLiveTest {
     }
 
     @Test
+    void reportsSlotMovesAndRefusesARangeAlreadyInPlace() {
+        assertTrue(c.moveSlotsStatus().containsKey("state"));
+        // Slot 0 is on shard 0: nothing to move, and the server says why.
+        RuvioServerException refused = assertThrows(RuvioServerException.class, () -> c.moveSlots(0, 10, 0));
+        assertTrue(refused.getMessage().contains("already on that shard"), refused.getMessage());
+    }
+
+    @Test
     void detectsTheClusterAndBuildsTheSlotTable() {
         assertTrue(c.isCluster());
         assertEquals(3, c.nodeAddresses().size());

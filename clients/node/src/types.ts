@@ -10,7 +10,7 @@ export type Value = string | Buffer | number;
  * Options for {@link Commands.set}.
  *
  * Only one expiry option is sent, checked in the order `ex`, `px`, `exat`, `pxat`, `keepTtl`.
- * `nx` wins over `xx`. `ifEq` cannot be combined with `nx`, `xx` or `get`.
+ * `nx` wins over `xx`. `ifEq`, `ifGt` and `ifLt` cannot be combined with `nx`, `xx` or `get`.
  */
 export interface SetOptions {
   /** Time to live in seconds (`EX`). Must be positive. */
@@ -31,9 +31,35 @@ export interface SetOptions {
   get?: boolean;
   /** Ruvio compare-and-set (`IFEQ`): write only when the current string equals this value; otherwise the call returns `null`. */
   ifEq?: Value;
+  /** Ruvio watermark (`IFGT`): write the integer `value` only when the key is missing or `value` is greater than the stored integer; otherwise `null`. */
+  ifGt?: boolean;
+  /** Ruvio watermark (`IFLT`): like `ifGt` but writes when `value` is smaller than the stored integer. */
+  ifLt?: boolean;
 }
 
-/** Condition for `HEXPIRE` and friends. */
+/**
+ * TTL-on-create option shared by the counter, bitmap and JSON write commands.
+ * The deadline is set only when the call creates the key; an existing key keeps the deadline it has.
+ */
+export interface TtlOptions {
+  /**
+   * Time to live in seconds. A whole number is sent as `EX`, a fractional value as `PX` (milliseconds, rounded, at least 1).
+   * Must be positive and finite; anything else rejects the call with a `RangeError` before it is sent.
+   */
+  ttl?: number;
+}
+
+/** Options for {@link Commands.geoadd}. */
+export interface GeoAddOptions extends TtlOptions {
+  /** Only add new members; never update existing ones. */
+  nx?: boolean;
+  /** Only update existing members; never add new ones. */
+  xx?: boolean;
+  /** Count changed members too: the reply is added plus updated instead of added only. */
+  ch?: boolean;
+}
+
+/** Condition for `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT` and the `HEXPIRE` family. */
 export type ExpireCondition = 'NX' | 'XX' | 'GT' | 'LT';
 /**
  * Named {@link ExpireCondition} values for autocomplete, e.g. `c.hexpire('k', 60, ['f'], ExpireCondition.Nx)`.
@@ -99,6 +125,8 @@ export interface ZAddOptions {
   lt?: boolean;
   /** Count changed members too: the reply is added plus updated instead of added only. */
   ch?: boolean;
+  /** Time to live in seconds, set only when this call creates the key; an existing key keeps its deadline (`EX`, or `PX` for a fractional value). Must be positive and finite. */
+  ttl?: number;
 }
 
 /** Options for {@link Commands.zrange} and {@link Commands.zrangeWithScores}. */
@@ -251,14 +279,16 @@ export interface BfInsertOptions {
   noCreate?: boolean;
   /** Create a fixed-size filter. */
   nonScaling?: boolean;
+  /** Time to live in seconds, set only when this call creates the filter; an existing filter keeps its deadline. Must be positive and finite. */
+  ttl?: number;
 }
 
 /** One stream entry. */
 export interface StreamEntry {
   /** Entry id, `<ms>-<seq>`. */
   id: string;
-  /** Field names and values. */
-  fields: Record<string, string>;
+  /** `[name, value]` pairs in stored order; a name may repeat. */
+  fields: [string, string][];
 }
 
 /** Entries read from one stream by `XREAD` or `XREADGROUP`. */
@@ -438,6 +468,8 @@ export interface XAddOptions {
   approximate?: boolean;
   /** Ruvio: hold the entry back from `XREADGROUP` for this many milliseconds. */
   delayMs?: number;
+  /** Time to live in seconds, set only when this call creates the stream; an existing stream keeps its deadline. Must be positive and finite. */
+  ttl?: number;
 }
 
 /** Options for {@link Commands.xtrim}. Give `maxLen` or `minId`, not both. */
@@ -583,3 +615,13 @@ export type BitfieldType = `i${number}` | `u${number}`;
 export type BitfieldOverflow = 'WRAP' | 'SAT' | 'FAIL';
 /** Named {@link BitfieldOverflow} values, e.g. `BitfieldOp.overflow(BitfieldOverflow.Sat)`. */
 export const BitfieldOverflow = { Wrap: 'WRAP', Sat: 'SAT', Fail: 'FAIL' } as const;
+
+/** The answer of {@link Commands.limitSlidingWithRetry} and {@link Commands.limitTokensWithRetry}. */
+export interface LimitOutcome {
+  /** `true` when this call was let through. */
+  allowed: boolean;
+  /** Allowance left after this call (`0` when refused). */
+  remaining: number;
+  /** Milliseconds until the same call would pass (`0` when it was let through). Fit for a `Retry-After` header. */
+  retryAfterMs: number;
+}

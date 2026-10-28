@@ -1,0 +1,40 @@
+# One coordinator of three (or five), for a binary install; see docs/COORDINATOR.md.
+# Copy to /etc/ruvio/coordinator.toml on each coordinator machine and change `id` and `listen`.
+# Run with: ruvio coordinator --config /etc/ruvio/coordinator.toml (deploy/ruvio-coordinator.service).
+id = 1
+listen = "10.0.0.1:26400"
+data_dir = "/var/lib/ruvio-coordinator"
+peers = ["1@10.0.0.1:26400", "2@10.0.0.2:26400", "3@10.0.0.3:26400"]
+# Only for a coordinator added to running ones: set join = true and run COORDINATOR ADD on their
+# leader (see "Adding and removing coordinators" in docs/COORDINATOR.md).
+# join = true
+# The same on every coordinator. RUVIO_COORDINATOR_SECRET overrides it.
+secret = "change-me"
+ping_interval_ms = 500
+down_after_ms = 3000
+# true: when no replica holds every write a CLIENT DURABILITY reply was released for, promote the
+# best one anyway and lose those writes. false (default): wait (COORDINATOR FAILOVER group FORCE
+# overrides once).
+unclean_failover = false
+# Lease each coordinator grants the primary (ms); 0 = off. With the data nodes' primary-lease on, an
+# old primary stops taking writes before a replica is promoted. 2000 fits down_after_ms = 3000; see
+# "Primary lease" in docs/COORDINATOR.md for the order to turn it on.
+primary_lease_ms = 0
+# How coordinators log in to the data nodes (requirepass, or "user password").
+auth = "data-node-password"
+# TLS (all off by default): tls_cert/tls_key put the coordinator port (Raft and the Sentinel API) on
+# TLS, and then every coordinator must have them; node_tls dials the data nodes with TLS. tls_ca is
+# the CA that vouches for the other coordinators' and the data nodes' certificates.
+# tls_cert = "/etc/ruvio/coordinator.pem"
+# tls_key = "/etc/ruvio/coordinator.key"
+# tls_ca = "/etc/ruvio/ca.pem"
+# node_tls = true
+
+[[groups]]
+name = "main"
+# address: the RESP address clients use; replication: the node's replication.listen.
+members = [
+  { address = "10.0.0.1:6379", replication = "10.0.0.1:26379" },
+  { address = "10.0.0.2:6379", replication = "10.0.0.2:26379" },
+  { address = "10.0.0.3:6379", replication = "10.0.0.3:26379" },
+]

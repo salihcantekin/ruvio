@@ -65,7 +65,7 @@ fn take_and_getex_do_not_touch_the_plain_read_and_increment_paths() {
     );
     execute_with_sink(
         &mut shard,
-        Command::ListPush(owned(b"list"), vec![owned(b"a")]),
+        Command::ListPush(owned(b"list"), vec![owned(b"a")].into()),
         &mut sink,
     )
     .unwrap();
@@ -430,7 +430,7 @@ fn string_family_commands_match_redis_semantics() {
 
     execute(
         &mut shard,
-        Command::ListPush(owned(b"list"), vec![owned(b"item")]),
+        Command::ListPush(owned(b"list"), vec![owned(b"item")].into()),
     );
     assert_eq!(
         execute(&mut shard, Command::MGet(vec![owned(b"list")])),
@@ -524,6 +524,7 @@ fn getset_clears_ttl_append_and_incr_preserve_it() {
     execute(
         &mut shard,
         Command::Expire {
+            condition: crate::protocol::ExpireCondition::Always,
             key: owned(b"counter"),
             milliseconds: 60_000,
         },
@@ -602,7 +603,7 @@ fn keyspace_commands_cover_exists_type_scan_rename_and_dbsize() {
     execute(&mut shard, Command::set(owned(b"a"), owned(b"1")));
     execute(
         &mut shard,
-        Command::ListPush(owned(b"list"), vec![owned(b"item")]),
+        Command::ListPush(owned(b"list"), vec![owned(b"item")].into()),
     );
     assert_eq!(
         execute(
@@ -664,6 +665,7 @@ fn keyspace_commands_cover_exists_type_scan_rename_and_dbsize() {
             pattern: Some(owned(b"*")),
             count: 1,
             type_name: None,
+            slot: None,
         },
     );
     let (cursor, first_count) = match first {
@@ -684,6 +686,7 @@ fn keyspace_commands_cover_exists_type_scan_rename_and_dbsize() {
                 pattern: Some(owned(b"*")),
                 count: 1,
                 type_name: None,
+                slot: None,
             },
         );
         let Response::Scan { cursor: next, keys } = page else {
@@ -755,6 +758,71 @@ fn fillget_hands_one_client_the_token_and_fillset_is_fenced_by_it() {
     assert_eq!(fill_set(&mut shard, 1), Response::Integer(1));
     assert_eq!(fill_set(&mut shard, 1), Response::Integer(0));
     assert_eq!(fill_get(&mut shard), Some(b"HIT".to_vec()));
+}
+
+#[test]
+fn a_full_fill_table_keeps_the_soft_expiry_of_a_value_that_is_still_stored() {
+    let clock = crate::time::TestClock::new(1_000);
+    let mut shard = KvShard::with_clock(clock.clone());
+    let get = |shard: &mut KvShard<crate::time::TestClock>, key: &[u8], fill_ms: u64| {
+        let response = execute(
+            shard,
+            Command::FillGet {
+                key: owned(key),
+                fill_ms,
+                wait_ms: None,
+            },
+        );
+
+        String::from_utf8(fill_status(&response).unwrap()).unwrap()
+    };
+
+    assert_eq!(get(&mut shard, b"k", 5_000), "FILL");
+    assert_eq!(
+        execute(
+            &mut shard,
+            Command::FillSet {
+                key: owned(b"k"),
+                value: owned(b"v"),
+                ttl_ms: 100,
+                token: 1,
+                swr_ms: Some(10_000),
+            },
+        ),
+        Response::Integer(1)
+    );
+
+    // Fill the table with short fill tokens, then let them lapse and the value turn stale.
+    for index in 1..65_536u32 {
+        assert_eq!(get(&mut shard, &index.to_be_bytes(), 10), "FILL");
+    }
+
+    clock.set(2_000);
+    // A new key needs room: the purge drops the lapsed tokens but keeps the stale value's mark.
+    assert_eq!(get(&mut shard, b"new", 1_000_000), "FILL");
+    assert_eq!(get(&mut shard, b"k", 5_000), "STALE");
+
+    // Once the value's own deadline has passed, its mark is the only one the purge can drop.
+    clock.set(12_000);
+    for index in 1..65_535u32 {
+        assert_eq!(
+            get(&mut shard, &(index + 100_000).to_be_bytes(), 1_000_000),
+            "FILL"
+        );
+    }
+
+    assert_eq!(get(&mut shard, b"newer", 5_000), "FILL");
+    assert!(matches!(
+        execute(
+            &mut shard,
+            Command::FillGet {
+                key: owned(b"newest"),
+                fill_ms: 5_000,
+                wait_ms: None,
+            },
+        ),
+        Response::Error(_)
+    ));
 }
 
 fn fill_get_waiting(shard: &mut KvShard) -> String {
@@ -1158,4 +1226,52 @@ fn mset_matches_one_set_per_pair_across_windows_repeats_ttls_and_types() {
             "{pairs} pairs"
         );
     }
+}
+
+#[test]
+fn scan_with_a_slot_walks_the_keyspace_and_returns_only_that_slots_keys() {
+    let mut shard = KvShard::new();
+    let slot = crate::routing::hash_slot(b"{tag}a");
+
+    for key in [
+        &b"{tag}a"[..],
+        b"{tag}b",
+        b"{tag}c",
+        b"other:1",
+        b"other:2",
+        b"other:3",
+    ] {
+        shard.set_bytes(key, b"v");
+    }
+
+    let mut cursor = 0;
+    let mut found = Vec::new();
+
+    loop {
+        let page = execute(
+            &mut shard,
+            command_of(&[
+                b"SCAN",
+                cursor.to_string().as_bytes(),
+                b"COUNT",
+                b"1",
+                b"SLOT",
+                slot.to_string().as_bytes(),
+            ]),
+        );
+        let Response::Scan { cursor: next, keys } = page else {
+            panic!("expected scan {page:?}");
+        };
+
+        found.extend(keys.into_iter().map(|key| key.into_owned()));
+        cursor = next;
+        if cursor == 0 {
+            break;
+        }
+    }
+    found.sort();
+    assert_eq!(
+        found,
+        [b"{tag}a".to_vec(), b"{tag}b".to_vec(), b"{tag}c".to_vec()]
+    );
 }

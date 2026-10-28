@@ -14,7 +14,7 @@ use crate::{
 
 pub use crate::security::SecurityConfig;
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ReplicationRole {
     #[default]
@@ -42,6 +42,30 @@ pub struct ReplicationConfig {
     pub listen: Option<SocketAddr>,
     pub primary: Option<SocketAddr>,
     pub primary_name: Option<(String, u16)>,
+    /// A primary refuses writes while fewer replicas than this acknowledged within
+    /// `min_replicas_max_lag`; 0 turns the check off.
+    pub min_replicas_to_write: usize,
+    pub min_replicas_max_lag: Duration,
+    /// A primary takes writes only while a majority of `ruvio coordinator`s renewed its lease
+    /// (`RUVIO LEASE`); off by default.
+    pub primary_lease: bool,
+    /// The ids (`id` in `coordinator.toml`) of the `ruvio coordinator`s whose lease grants this
+    /// node takes. `RUVIO LEASE GRANT` from any other id, or naming another coordinator count,
+    /// is refused, so a client with `ruvio|lease` rights cannot fake a majority. Required
+    /// while `primary_lease` is on; the grants are refused while it is empty.
+    pub primary_lease_coordinators: Vec<u64>,
+    /// A replica announces its client address to its primary, which lists it in
+    /// `CLUSTER SLOTS`, `ROLE` and `INFO`; off keeps it out of the topology.
+    pub announced: bool,
+    /// Wrap the replication link in TLS. A primary reuses `security.tls_cert`/`tls_key`; a
+    /// replica verifies the primary against `tls_ca`. Off by default: nothing is loaded or
+    /// wrapped unless set.
+    pub tls: bool,
+    /// PEM issuer a replica trusts for the primary's certificate.
+    pub tls_ca: PathBuf,
+    /// Optional client certificate a replica presents when the primary asks for one.
+    pub tls_client_cert: PathBuf,
+    pub tls_client_key: PathBuf,
 }
 
 impl Default for ReplicationConfig {
@@ -51,6 +75,38 @@ impl Default for ReplicationConfig {
             listen: None,
             primary: None,
             primary_name: None,
+            min_replicas_to_write: 0,
+            min_replicas_max_lag: Duration::from_secs(10),
+            primary_lease: false,
+            primary_lease_coordinators: Vec::new(),
+            announced: true,
+            tls: false,
+            tls_ca: PathBuf::new(),
+            tls_client_cert: PathBuf::new(),
+            tls_client_key: PathBuf::new(),
+        }
+    }
+}
+
+impl ReplicationConfig {
+    /// Whether replication listens for, or dials, another machine. Replication traffic is
+    /// not covered by `tls_cert`, so this is where its cleartext matters.
+    pub fn leaves_the_host(&self) -> bool {
+        if self.tls {
+            return false;
+        }
+
+        match self.role {
+            ReplicationRole::Off => false,
+            ReplicationRole::Primary => self
+                .listen
+                .is_some_and(|address| !address.ip().is_loopback()),
+            ReplicationRole::Replica => {
+                self.primary_name.is_some()
+                    || self
+                        .primary
+                        .is_some_and(|address| !address.ip().is_loopback())
+            }
         }
     }
 }
@@ -117,6 +173,16 @@ pub struct AppConfig {
     /// Original `notify-keyspace-events` letters. Empty disables the feature.
     pub notify_keyspace_events: String,
     pub replication: ReplicationConfig,
+    /// A multi-node cluster map (`cluster_topology` in `docs/CONFIGURATION.md`). `None`
+    /// keeps every slot on this node.
+    pub cluster_topology: Option<PathBuf>,
+    /// This node's group in `cluster_topology`.
+    pub cluster_group: String,
+    /// The most bytes per second a range moving to another node copies; 0 = no limit.
+    pub migration_max_bytes_per_sec: u64,
+    /// The file this configuration was read from, where `CONFIG REWRITE` writes. Not a
+    /// setting: `None` (tests, embedded servers) refuses `CONFIG REWRITE`.
+    pub config_file: Option<PathBuf>,
 }
 
 impl AppConfig {
@@ -440,6 +506,16 @@ impl AppConfig {
             self.set_notify_keyspace_events(value)?;
         }
 
+        if let Some(value) = get("RUVIO_CLUSTER_TOPOLOGY") {
+            self.cluster_topology = (!value.is_empty()).then(|| PathBuf::from(value));
+        }
+        apply_string(&get, "RUVIO_CLUSTER_GROUP", &mut self.cluster_group);
+        apply_u64(
+            &get,
+            "RUVIO_MIGRATION_MAX_BYTES_PER_SEC",
+            &mut self.migration_max_bytes_per_sec,
+        )?;
+
         if let Some(value) = get("RUVIO_METRICS_ADDR") {
             self.metrics_address = if value.is_empty() { None } else { Some(value) };
         }
@@ -476,6 +552,29 @@ impl AppConfig {
 
         if let Some(value) = get("RUVIO_REPLICATION_PRIMARY") {
             self.set_replication_primary(&value)?;
+        }
+
+        apply_usize(
+            &get,
+            "RUVIO_MIN_REPLICAS_TO_WRITE",
+            &mut self.replication.min_replicas_to_write,
+        )?;
+        let mut max_lag = self.replication.min_replicas_max_lag.as_secs();
+
+        apply_u64(&get, "RUVIO_MIN_REPLICAS_MAX_LAG", &mut max_lag)?;
+        self.replication.min_replicas_max_lag = Duration::from_secs(max_lag);
+
+        if let Some(value) = get("RUVIO_PRIMARY_LEASE_COORDINATORS") {
+            self.replication.primary_lease_coordinators =
+                parse_coordinator_ids(&value, "RUVIO_PRIMARY_LEASE_COORDINATORS")?;
+        }
+
+        if let Some(value) = get("RUVIO_PRIMARY_LEASE") {
+            self.replication.primary_lease = parse_bool(&value, "RUVIO_PRIMARY_LEASE")?;
+        }
+
+        if let Some(value) = get("RUVIO_REPLICA_ANNOUNCED") {
+            self.replication.announced = parse_bool(&value, "RUVIO_REPLICA_ANNOUNCED")?;
         }
 
         Ok(())
@@ -564,6 +663,52 @@ impl AppConfig {
         };
     }
 
+    /// `primary_lease_coordinators`: distinct ids, at most [`crate::primary_lease::MAX_VOTERS`],
+    /// and some when the lease is on.
+    fn validate_primary_lease(&self) -> Result<(), String> {
+        let ids = &self.replication.primary_lease_coordinators;
+        let mut sorted = ids.clone();
+
+        sorted.sort_unstable();
+        sorted.dedup();
+        if sorted.len() != ids.len() || ids.len() > crate::primary_lease::MAX_VOTERS as usize {
+            return Err(format!(
+                "primary_lease_coordinators must list each coordinator id once, at most {}",
+                crate::primary_lease::MAX_VOTERS
+            ));
+        }
+        if self.replication.primary_lease && ids.is_empty() {
+            return Err(
+                "primary_lease needs primary_lease_coordinators: the ids of the coordinators whose grants this node takes"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_replication_tls(&self) -> Result<(), String> {
+        let replication = &self.replication;
+        let empty = |path: &Path| path.as_os_str().is_empty();
+
+        match replication.role {
+            ReplicationRole::Primary if !self.security.tls_enabled() => {
+                return Err("replication.tls on a primary requires tls_cert and tls_key".into());
+            }
+            ReplicationRole::Replica if empty(&replication.tls_ca) => {
+                return Err("replication.tls on a replica requires replication.tls_ca".into());
+            }
+            _ => {}
+        }
+
+        if empty(&replication.tls_client_cert) != empty(&replication.tls_client_key) {
+            return Err(
+                "replication.tls_client_cert and replication.tls_client_key go together".into(),
+            );
+        }
+
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.security.requirepass.len() > usize::from(u16::MAX) {
             return Err("requirepass must be at most 65535 bytes".into());
@@ -581,6 +726,18 @@ impl AppConfig {
         self.memory.validate().map_err(str::to_owned)?;
         self.validate_shard_memory_budget()?;
         self.scripts.validate().map_err(str::to_owned)?;
+
+        if self.cluster_topology.is_some() {
+            if self.cluster_group.is_empty() {
+                return Err("cluster_topology needs cluster_group (this node's group)".into());
+            }
+            if self.port_mode == PortMode::Single {
+                return Err("cluster_topology needs port_mode = \"per-shard\"".into());
+            }
+            if !self.hot_keys.is_empty() {
+                return Err("cluster_topology cannot be combined with hot_keys".into());
+            }
+        }
 
         if self.address.parse::<std::net::SocketAddr>().is_err() {
             return Err("address must be a numeric socket address".into());
@@ -619,6 +776,12 @@ impl AppConfig {
                 "a public replication listener requires replication_password or requirepass".into(),
             );
         }
+
+        if self.replication.tls && self.replication.role != ReplicationRole::Off {
+            self.validate_replication_tls()?;
+        }
+
+        self.validate_primary_lease()?;
 
         if self.shards == 0 {
             return Err("shard count must be greater than zero".into());
@@ -812,6 +975,18 @@ impl AppConfig {
                 self.notify_keyspace_events.clone(),
             ),
             (
+                "cluster-topology".into(),
+                self.cluster_topology
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+            ),
+            ("cluster-group".into(), self.cluster_group.clone()),
+            (
+                "migration-max-bytes-per-sec".into(),
+                self.migration_max_bytes_per_sec.to_string(),
+            ),
+            (
                 "hash-max-compact-entries".into(),
                 self.memory.hash_max_compact_entries.to_string(),
             ),
@@ -980,6 +1155,31 @@ impl AppConfig {
                 .into(),
             ),
             (
+                "min-replicas-to-write".into(),
+                self.replication.min_replicas_to_write.to_string(),
+            ),
+            (
+                "min-replicas-max-lag".into(),
+                self.replication.min_replicas_max_lag.as_secs().to_string(),
+            ),
+            (
+                "primary-lease".into(),
+                yes_no(self.replication.primary_lease),
+            ),
+            (
+                "primary-lease-coordinators".into(),
+                self.replication
+                    .primary_lease_coordinators
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            (
+                "replica-announced".into(),
+                yes_no(self.replication.announced),
+            ),
+            (
                 "replication-listen".into(),
                 self.replication
                     .listen
@@ -1059,6 +1259,10 @@ impl Default for AppConfig {
             hot_keys: Vec::new(),
             notify_keyspace_events: String::new(),
             replication: ReplicationConfig::default(),
+            cluster_topology: None,
+            cluster_group: String::new(),
+            migration_max_bytes_per_sec: 0,
+            config_file: None,
         }
     }
 }
@@ -1099,6 +1303,9 @@ struct FileConfig {
     hot_keys: Option<Vec<String>>,
     notify_keyspace_events: Option<String>,
     replication: ReplicationFileConfig,
+    cluster_topology: Option<PathBuf>,
+    cluster_group: Option<String>,
+    migration_max_bytes_per_sec: Option<u64>,
 }
 
 impl FileConfig {
@@ -1154,6 +1361,18 @@ impl FileConfig {
 
         if let Some(value) = self.notify_keyspace_events {
             config.set_notify_keyspace_events(value)?;
+        }
+
+        if let Some(value) = self.cluster_topology {
+            config.cluster_topology = (!value.as_os_str().is_empty()).then_some(value);
+        }
+
+        if let Some(value) = self.cluster_group {
+            config.cluster_group = value;
+        }
+
+        if let Some(value) = self.migration_max_bytes_per_sec {
+            config.migration_max_bytes_per_sec = value;
         }
 
         self.replication.apply(&mut config.replication)?;
@@ -1384,12 +1603,12 @@ fn listener_ranges_overlap(left: SocketAddr, right: SocketAddr, shards: usize) -
     u32::from(left.port()) <= right_end && u32::from(right.port()) <= left_end
 }
 
-struct ParsedPrimary {
-    socket: Option<SocketAddr>,
-    name: Option<(String, u16)>,
+pub(crate) struct ParsedPrimary {
+    pub(crate) socket: Option<SocketAddr>,
+    pub(crate) name: Option<(String, u16)>,
 }
 
-fn parse_replication_primary(value: &str) -> Result<ParsedPrimary, String> {
+pub(crate) fn parse_replication_primary(value: &str) -> Result<ParsedPrimary, String> {
     if let Ok(address) = value.parse::<SocketAddr>() {
         return Ok(ParsedPrimary {
             socket: Some(address),
@@ -1427,6 +1646,16 @@ struct ReplicationFileConfig {
     role: Option<ReplicationRole>,
     listen: Option<String>,
     primary: Option<String>,
+    min_replicas_to_write: Option<usize>,
+    /// Seconds, as Redis's `min-replicas-max-lag`.
+    min_replicas_max_lag: Option<u64>,
+    primary_lease: Option<bool>,
+    primary_lease_coordinators: Option<Vec<u64>>,
+    announced: Option<bool>,
+    tls: Option<bool>,
+    tls_ca: Option<PathBuf>,
+    tls_client_cert: Option<PathBuf>,
+    tls_client_key: Option<PathBuf>,
 }
 
 impl ReplicationFileConfig {
@@ -1453,6 +1682,27 @@ impl ReplicationFileConfig {
             replication.primary = parsed.socket;
             replication.primary_name = parsed.name;
         }
+
+        if let Some(count) = self.min_replicas_to_write {
+            replication.min_replicas_to_write = count;
+        }
+
+        if let Some(seconds) = self.min_replicas_max_lag {
+            replication.min_replicas_max_lag = Duration::from_secs(seconds);
+        }
+
+        assign(&mut replication.primary_lease, self.primary_lease);
+        assign(
+            &mut replication.primary_lease_coordinators,
+            self.primary_lease_coordinators,
+        );
+        if let Some(announced) = self.announced {
+            replication.announced = announced;
+        }
+        assign(&mut replication.tls, self.tls);
+        assign(&mut replication.tls_ca, self.tls_ca);
+        assign(&mut replication.tls_client_cert, self.tls_client_cert);
+        assign(&mut replication.tls_client_key, self.tls_client_key);
 
         Ok(())
     }
@@ -2304,6 +2554,32 @@ fn overlay_config(table: &mut toml::Table, loaded: &AppConfig, effective: &AppCo
         &replication_primary_text(&loaded.replication),
         &replication_primary_text(&effective.replication),
     );
+    sync_usize(
+        table,
+        &["replication", "min_replicas_to_write"],
+        loaded.replication.min_replicas_to_write,
+        effective.replication.min_replicas_to_write,
+    );
+    if loaded.replication.primary_lease != effective.replication.primary_lease {
+        set_toml(
+            table,
+            &["replication", "primary_lease"],
+            toml::Value::Boolean(effective.replication.primary_lease),
+        );
+    }
+    if loaded.replication.announced != effective.replication.announced {
+        set_toml(
+            table,
+            &["replication", "announced"],
+            toml::Value::Boolean(effective.replication.announced),
+        );
+    }
+    sync_u64(
+        table,
+        &["replication", "min_replicas_max_lag"],
+        loaded.replication.min_replicas_max_lag.as_secs(),
+        effective.replication.min_replicas_max_lag.as_secs(),
+    );
 
     if loaded.security.requirepass != effective.security.requirepass {
         set_toml(
@@ -2508,6 +2784,27 @@ fn overlay_config(table: &mut toml::Table, loaded: &AppConfig, effective: &AppCo
             text(&effective.notify_keyspace_events),
         );
     }
+
+    if loaded.cluster_topology != effective.cluster_topology {
+        let path = effective
+            .cluster_topology
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+
+        set_toml(table, &["cluster_topology"], text(&path));
+    }
+
+    if loaded.cluster_group != effective.cluster_group {
+        set_toml(table, &["cluster_group"], text(&effective.cluster_group));
+    }
+
+    sync_u64(
+        table,
+        &["migration_max_bytes_per_sec"],
+        loaded.migration_max_bytes_per_sec,
+        effective.migration_max_bytes_per_sec,
+    );
 }
 
 fn replication_primary_text(replication: &ReplicationConfig) -> Option<String> {
@@ -2608,6 +2905,18 @@ fn remove_toml(table: &mut toml::Table, path: &[&str]) {
     remove_toml(child, &path[1..]);
 }
 
+fn parse_coordinator_ids(value: &str, name: &str) -> Result<Vec<u64>, String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| {
+            id.parse()
+                .map_err(|_| format!("{name} must be a comma-separated list of coordinator ids"))
+        })
+        .collect()
+}
+
 fn parse_bool(value: &str, name: &str) -> Result<bool, String> {
     match value {
         "1" | "true" | "TRUE" | "yes" | "on" => Ok(true),
@@ -2615,6 +2924,10 @@ fn parse_bool(value: &str, name: &str) -> Result<bool, String> {
         _ => Err(format!("{name} must be a boolean")),
     }
 }
+
+mod live;
+
+pub use live::{LIVE_SETTINGS, RESTART_ONLY_SETTINGS};
 
 #[cfg(test)]
 mod tests;

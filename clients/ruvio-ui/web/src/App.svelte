@@ -19,6 +19,7 @@
   import PubSub from "./PubSub.svelte";
   import Users from "./Users.svelte";
   import Console from "./Console.svelte";
+  import ThemeToggle from "./ThemeToggle.svelte";
 
   const navigation = [
     { id: "overview", label: "Overview", icon: "overview" },
@@ -74,8 +75,10 @@
           const defaults = await api("/api/defaults");
           if (!active) return;
           const last = preference("connection", {});
-          host = last.host ?? defaults.host ?? host;
-          port = last.port ?? defaults.port ?? port;
+          // Host/port set through RUVIO_UI_TARGET_* win over the remembered connection.
+          const remembered = defaults.pinned ? {} : last;
+          host = remembered.host ?? defaults.host ?? host;
+          port = remembered.port ?? defaults.port ?? port;
           password = defaults.password ?? password;
         }
       } catch (error) {
@@ -197,6 +200,7 @@
   <main class="gate"><p role="status">Restoring session...</p></main>
 {:else if !connected}
   <main class="gate">
+    <div class="gate-theme"><ThemeToggle /></div>
     <div class="gate-intro">
       <div class="mark"><img class="logo" src="/mark.png" alt="" /> ruvio <span class="product-label">OPERATOR</span></div>
       <h1>Your data.<br />A clearer view.</h1>
@@ -243,6 +247,7 @@
           <p class="hint">Multiple selections filter Overview and Data scans. Keyed commands still route to their owner. One selection pins commands to that shard.</p>
         </div>
       </details>
+      <ThemeToggle />
       <button class="quiet" onclick={disconnect} aria-disabled={scopeBusy}>Sign out</button>
     </header>
     <div class="body">

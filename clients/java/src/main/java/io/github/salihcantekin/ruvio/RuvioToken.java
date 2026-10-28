@@ -51,6 +51,19 @@ public final class RuvioToken<K> implements AutoCloseable {
     }
 
     /**
+     * Extends the hold to now + {@code ttlMillis} with {@code RENEW key token ttl}. The token does not change.
+     *
+     * @param ttlMillis the new lifetime in milliseconds
+     * @return {@code true} when extended, {@code false} when it had expired or was already released
+     */
+    public boolean renew(long ttlMillis) {
+        if (released) {
+            return false;
+        }
+        return Link.await(commands.renew(key, token, ttlMillis), timeout);
+    }
+
+    /**
      * Releases the lease or slot with {@code RELEASE key token}. Calling it again does nothing.
      *
      * @return {@code true} when this call released it, {@code false} when it had expired or was already released

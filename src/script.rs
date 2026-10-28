@@ -1030,6 +1030,8 @@ fn seal_globals(lua: &Lua, commands: Table) -> LuaResult<Table> {
     };
     let globals = lua.globals();
 
+    // `redis` is the same table under the name scripts written for Redis use.
+    globals.raw_set("redis", &commands)?;
     globals.raw_set("ruvio", commands)?;
     let libraries: Vec<(Value, Table)> = globals
         .pairs::<Value, Value>()
@@ -1358,11 +1360,20 @@ fn scriptable(command: &Command<'_>) -> bool {
             command,
             Command::Wait { .. }
                 | Command::Save
+                | Command::ConfigSet(_)
+                | Command::ConfigRewrite
+                | Command::ReplicaOf { .. }
+                | Command::MoveSlots(_)
+                | Command::Topology(_)
+                | Command::PrimaryLease(_)
+                | Command::Migrate(_)
+                | Command::Role
                 | Command::Bgsave
                 | Command::Hello { .. }
                 | Command::ClientGetName
                 | Command::ClientSetName(_)
                 | Command::ClientTracking(_)
+                | Command::ClientDurability { .. }
                 | Command::ShardPublish { .. }
                 | Command::ShardSubscribe(_)
                 | Command::ShardUnsubscribe(_)
@@ -1404,6 +1415,7 @@ fn scriptable(command: &Command<'_>) -> bool {
                 | Command::FunctionList
                 | Command::FunctionDelete(_)
                 | Command::ClientId
+                | Command::ClientSetInfo
                 | Command::ClientInfo
                 | Command::ClientList { .. }
                 | Command::ClientKill { .. }
@@ -1580,6 +1592,27 @@ unsafe fn push_response(
                         &crate::engine::format_score(score),
                         index + 1,
                     )?;
+                }
+            }
+
+            Response::PoppedByScore(entries, with_scores) => {
+                let width = 1 + usize::from(with_scores);
+
+                push_table(state, budget, entries.len().saturating_mul(width))?;
+
+                for (position, (member, score)) in entries.iter().enumerate() {
+                    let index = position * width;
+
+                    push_item(state, budget, member, index)?;
+
+                    if with_scores {
+                        push_item(
+                            state,
+                            budget,
+                            &crate::engine::format_score(score),
+                            index + 1,
+                        )?;
+                    }
                 }
             }
 

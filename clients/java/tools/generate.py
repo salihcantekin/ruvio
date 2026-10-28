@@ -125,6 +125,7 @@ def gen_sync():
     header += ["import %s;" % i for i in used]
     src = BANNER + "package io.github.salihcantekin.ruvio.commands;\n\n" + "\n".join(header) + """
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;

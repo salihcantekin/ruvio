@@ -50,11 +50,16 @@ pub(super) fn recover_segments(
             break;
         }
 
+        // A segment written before `wal_segment_bytes` was lowered is longer than the setting
+        // (or than the default, for the offline tools): still a valid segment. The writer starts
+        // a new one before appending to it again.
         if physical_length > maximum_segment_bytes {
-            return Err(PersistenceError::Corruption(format!(
-                "WAL segment {} exceeds configured size",
-                path.display()
-            )));
+            tracing::warn!(
+                segment = %path.display(),
+                bytes = physical_length,
+                wal_segment_bytes = maximum_segment_bytes,
+                "WAL segment is longer than wal_segment_bytes; reading it anyway"
+            );
         }
 
         let mut header_bytes = [0; WAL_HEADER_LEN];

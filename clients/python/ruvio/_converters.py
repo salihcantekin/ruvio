@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 import json as _json
+from datetime import timedelta
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
-from ._models import AutoClaimResult, FillResult, GeoResult, IdemResult, PendingEntry, PendingSummary, StreamEntry
+from ._models import AutoClaimResult, FillResult, GeoResult, IdemResult, LimitOutcome, PendingEntry, PendingSummary, StreamEntry
 
 KeyT = Union[str, bytes]
 Conv = Optional[Callable[[Any], Any]]
@@ -51,6 +52,18 @@ def _pairs(r: Any) -> Dict[Any, Any]:
     return dict(zip(it, it))
 
 
+def _pair_list(r: Any) -> List[Tuple[Any, Any]]:
+    # Keeps order and repeated names, which a dict would drop.
+    if r is None:
+        return []
+    if type(r) is dict:
+        return list(r.items())
+    if r and type(r[0]) is list:  # RESP3 nested pairs
+        return [(k, v) for k, v in r]
+    it = iter(r)
+    return list(zip(it, it))
+
+
 def _pairs_text_keys(r: Any) -> Dict[str, Any]:
     if type(r) is dict:
         return {_s(k): v for k, v in r.items()}
@@ -83,6 +96,10 @@ def _scan_scored(r: Any) -> Tuple[int, List[Tuple[Any, float]]]:
 
 def _key_value(r: Any) -> Optional[Tuple[Any, Any]]:
     return None if r is None else (r[0], r[1])
+
+
+def _balances(r: Any) -> Optional[Tuple[int, int]]:
+    return None if r is None else (int(r[0]), int(r[1]))
 
 
 def _bzpop(r: Any) -> Optional[Tuple[Any, Any, float]]:
@@ -119,7 +136,7 @@ def _set_reply(r: Any) -> bool:
 def _entries(r: Any) -> List[StreamEntry]:
     if r is None:
         return []
-    return [StreamEntry(_s(e[0]), _pairs(e[1]) if e[1] is not None else {}) for e in r]
+    return [StreamEntry(_s(e[0]), _pair_list(e[1])) for e in r]
 
 
 def _xread(r: Any) -> Optional[List[Tuple[Any, List[StreamEntry]]]]:
@@ -158,7 +175,7 @@ def _xinfo_stream(r: Any) -> Dict[str, Any]:
     for k in ("first-entry", "last-entry"):
         e = info.get(k)
         if type(e) is list and len(e) == 2:
-            info[k] = StreamEntry(_s(e[0]), _pairs(e[1]))
+            info[k] = StreamEntry(_s(e[0]), _pair_list(e[1]))
     return info
 
 
@@ -232,6 +249,11 @@ def _limit(r: Any) -> Tuple[bool, int]:
     return (False, 0) if r is None else (True, int(r))
 
 
+def _limit_outcome(r: Any) -> LimitOutcome:
+    remaining, retry_after_ms = int(r[0]), int(r[1])
+    return LimitOutcome(remaining >= 0, max(remaining, 0), max(retry_after_ms, 0))
+
+
 def _bloom_seen(r: Any) -> List[bool]:
     # BF.MADD answers 1 for newly added items; "seen before" is the inverse
     return [x == 0 for x in r]
@@ -260,6 +282,29 @@ def _limit_args(args: List[Any], offset: Optional[int], count: Optional[int]) ->
         if offset is None or count is None:
             raise ValueError("offset and count must be given together")
         args += ["LIMIT", offset, count]
+
+
+def _ttl_args(ttl: Any) -> List[Any]:
+    """``["EX", s]`` or ``["PX", ms]`` for a TTL-on-create argument (seconds or ``timedelta``).
+
+    Whole seconds send ``EX``; a value with a sub-second part sends ``PX``. Zero, negative, ``bool`` and
+    non-numeric values raise ``ValueError`` / ``TypeError`` before anything is sent.
+    """
+    if isinstance(ttl, timedelta):
+        ms = ttl // timedelta(milliseconds=1)
+        if ms <= 0:
+            raise ValueError("ttl must be positive")
+        return ["EX", ms // 1000] if ms % 1000 == 0 else ["PX", ms]
+    if isinstance(ttl, bool) or not isinstance(ttl, (int, float)):
+        raise TypeError("ttl must be seconds (int or float) or a timedelta")
+    if not ttl > 0 or ttl == float("inf"):
+        raise ValueError("ttl must be positive and finite")
+    if isinstance(ttl, int) or ttl == int(ttl):
+        return ["EX", int(ttl)]
+    ms = int(round(ttl * 1000))
+    if ms <= 0:
+        raise ValueError("ttl must be at least 1 millisecond")
+    return ["PX", ms]
 
 
 def _expire_cond(nx: bool, xx: bool, gt: bool, lt: bool) -> List[str]:

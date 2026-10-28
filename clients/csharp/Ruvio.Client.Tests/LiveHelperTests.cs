@@ -11,6 +11,16 @@ public sealed class LiveHelperTests
     private const int Db = 12;
 
     [LiveFact(Timeout = 30000)]
+    public async Task SetDurabilityIsRefusedOnAServerWithoutReplication()
+    {
+        await using RuvioConnection connection = await LiveServer.ConnectAsync(Db);
+        RuvioClient db = await connection.GetDefaultDatabaseAsync();
+
+        RuvioException error = await Assert.ThrowsAsync<RuvioException>(async () => await db.SetDurabilityAsync(1));
+        Assert.Contains("needs replication", error.Message);
+    }
+
+    [LiveFact(Timeout = 30000)]
     public async Task Lock_is_exclusive_renewable_and_never_releases_another_owner()
     {
         await using RuvioConnection connection = await LiveServer.ConnectAsync(Db);
@@ -89,6 +99,16 @@ public sealed class LiveHelperTests
         Assert.Equal(new RateLimitResult(true, 1), await db.RateLimitAsync("rl", 2, TimeSpan.FromSeconds(10)));
         Assert.Equal(new RateLimitResult(true, 0), await db.RateLimitAsync("rl", 2, TimeSpan.FromSeconds(10)));
         Assert.Equal(new RateLimitResult(false, 0), await db.RateLimitAsync("rl", 2, TimeSpan.FromSeconds(10)));
+        Assert.Equal(1, await db.LimitSlidingAsync("sl", 2, 60_000));
+        Assert.Equal(0, await db.LimitSlidingAsync("sl", 2, 60_000));
+
+        LimitOutcome refused = await db.LimitSlidingWithRetryAsync("sl", 2, 60_000);
+
+        Assert.False(refused.Allowed);
+        Assert.True(refused.RetryAfterMs > 0);
+        Assert.Equal(3, await db.LimitTokensAsync("tk", 5, 60_000, 2));
+        Assert.Equal(new LimitOutcome(true, 0, 0), await db.LimitTokensWithRetryAsync("tk", 5, 60_000, 3));
+        Assert.Null(await db.LimitTokensAsync("tk", 5, 60_000));
     }
 
     [LiveFact(Timeout = 30000)]

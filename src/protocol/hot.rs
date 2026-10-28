@@ -47,17 +47,49 @@ fn parse_hot_frame(bytes: &[u8], limits: ProtocolLimits) -> Result<HotParse<'_>,
         return Ok(HotParse::Fallback);
     }
 
-    // Hot names are 3 to 6 bytes long: any other `$<len>\r\n` goes to the general
-    // parser before the name is read.
-    if let [b'$', length, b'\r', ..] = bytes[position.min(bytes.len())..]
-        && !matches!(length, b'3' | b'4' | b'5' | b'6')
-    {
-        return Ok(HotParse::Fallback);
-    }
-
+    // Hot names are 3 to 6 bytes long and start with one of a few letter pairs: any
+    // other `$<len>\r\n` or name head goes to the general parser before the name is read.
+    let rest = &bytes[position.min(bytes.len())..];
     let mut arguments = [&[][..]; 5];
-    let Some(name) = read_hot_bulk(bytes, &mut position, limits)? else {
-        return Ok(HotParse::Incomplete);
+    let name = match *rest {
+        [b'$', length @ b'3'..=b'6', b'\r', b'\n', first, second, ..] => {
+            if !hot_name_head(first, second) {
+                return Ok(HotParse::Fallback);
+            }
+
+            // The header is already checked: take the name when it, its CRLF and the
+            // limits are plainly fine, and let `read_hot_bulk` word anything else.
+            let length = (length - b'0') as usize;
+            let end = position + 4 + length;
+
+            if rest.get(4 + length..6 + length) == Some(b"\r\n")
+                && end + 2 <= limits.max_command_bytes
+                && length <= limits.max_bulk_bytes()
+            {
+                let name = &rest[4..4 + length];
+
+                position = end + 2;
+                name
+            } else {
+                let Some(name) = read_hot_bulk(bytes, &mut position, limits)? else {
+                    return Ok(HotParse::Incomplete);
+                };
+
+                name
+            }
+        }
+
+        [b'$', length, b'\r', ..] if !matches!(length, b'3'..=b'6') => {
+            return Ok(HotParse::Fallback);
+        }
+
+        _ => {
+            let Some(name) = read_hot_bulk(bytes, &mut position, limits)? else {
+                return Ok(HotParse::Incomplete);
+            };
+
+            name
+        }
     };
 
     arguments[0] = name;
@@ -65,11 +97,11 @@ fn parse_hot_frame(bytes: &[u8], limits: ProtocolLimits) -> Result<HotParse<'_>,
     // Anything else is parsed once by the full parser. Reading the payload here
     // would scan those bytes twice.
 
-    if !hot_command_name(name, argument_count) {
+    let Some(kind) = hot_command_kind(name, argument_count) else {
         return Ok(HotParse::Fallback);
-    }
+    };
 
-    for argument in arguments.iter_mut().take(argument_count).skip(1) {
+    for argument in &mut arguments[1..argument_count] {
         let Some(bulk) = read_hot_bulk(bytes, &mut position, limits)? else {
             return Ok(HotParse::Incomplete);
         };
@@ -77,155 +109,155 @@ fn parse_hot_frame(bytes: &[u8], limits: ProtocolLimits) -> Result<HotParse<'_>,
         *argument = bulk;
     }
 
-    let command = arguments[0];
-
-    if command.eq_ignore_ascii_case(b"PING") {
-        return match argument_count {
-            1 => Ok(HotParse::Complete(HotCommand::Ping(None), position)),
-            2 => {
-                validate_value(arguments[1], limits)?;
-                Ok(HotParse::Complete(
-                    HotCommand::Ping(Some(arguments[1])),
-                    position,
-                ))
-            }
-
-            _ => Ok(HotParse::Fallback),
-        };
-    }
-
-    if command.eq_ignore_ascii_case(b"GET") && argument_count == 2 {
-        validate_key(arguments[1], limits)?;
-
-        return Ok(HotParse::Complete(HotCommand::Get(arguments[1]), position));
-    }
-
-    if command.eq_ignore_ascii_case(b"SET") && (argument_count == 3 || argument_count == 5) {
-        validate_key(arguments[1], limits)?;
-        validate_value(arguments[2], limits)?;
-
-        if argument_count == 3 {
-            return Ok(HotParse::Complete(
-                HotCommand::Set(arguments[1], arguments[2], None),
-                position,
-            ));
+    let command = match kind {
+        HotKind::Ping if argument_count == 1 => HotCommand::Ping(None),
+        HotKind::Ping => {
+            validate_value(arguments[1], limits)?;
+            HotCommand::Ping(Some(arguments[1]))
         }
 
-        let ex = arguments[3].eq_ignore_ascii_case(b"EX");
-        let px = arguments[3].eq_ignore_ascii_case(b"PX");
-
-        if !ex && !px {
-            return Ok(HotParse::Fallback);
+        HotKind::Get => {
+            validate_key(arguments[1], limits)?;
+            HotCommand::Get(arguments[1])
         }
 
-        // A bad expiry takes the full parser, which words the error.
-        let Ok(parsed) = parse_i64(arguments[4]) else {
-            return Ok(HotParse::Fallback);
-        };
-        let milliseconds = if ex {
-            match parsed.checked_mul(1_000) {
-                Some(milliseconds) => milliseconds,
-                None => return Ok(HotParse::Fallback),
+        HotKind::Set => {
+            validate_key(arguments[1], limits)?;
+            validate_value(arguments[2], limits)?;
+
+            if argument_count == 3 {
+                HotCommand::Set(arguments[1], arguments[2], None)
+            } else {
+                let ex = arguments[3].eq_ignore_ascii_case(b"EX");
+                let px = arguments[3].eq_ignore_ascii_case(b"PX");
+
+                if !ex && !px {
+                    return Ok(HotParse::Fallback);
+                }
+
+                // A bad expiry takes the full parser, which words the error.
+                let Ok(parsed) = parse_i64(arguments[4]) else {
+                    return Ok(HotParse::Fallback);
+                };
+                let milliseconds = if ex {
+                    match parsed.checked_mul(1_000) {
+                        Some(milliseconds) => milliseconds,
+                        None => return Ok(HotParse::Fallback),
+                    }
+                } else {
+                    parsed
+                };
+
+                HotCommand::Set(arguments[1], arguments[2], Some(milliseconds))
             }
-        } else {
-            parsed
-        };
+        }
 
-        return Ok(HotParse::Complete(
-            HotCommand::Set(arguments[1], arguments[2], Some(milliseconds)),
-            position,
-        ));
-    }
+        HotKind::SetEx => {
+            validate_key(arguments[1], limits)?;
+            validate_value(arguments[3], limits)?;
 
-    if command.eq_ignore_ascii_case(b"SETEX") && argument_count == 4 {
-        validate_key(arguments[1], limits)?;
-        validate_value(arguments[3], limits)?;
-
-        // A bad or non-positive expiry takes the full parser, which words the error.
-        return Ok(
+            // A bad or non-positive expiry takes the full parser, which words the error.
             match parse_i64(arguments[2])
                 .ok()
                 .filter(|seconds| *seconds > 0)
                 .and_then(|seconds| seconds.checked_mul(1_000))
             {
-                Some(milliseconds) => HotParse::Complete(
-                    HotCommand::SetEx(arguments[1], arguments[3], milliseconds),
-                    position,
-                ),
-                None => HotParse::Fallback,
-            },
-        );
-    }
+                Some(milliseconds) => HotCommand::SetEx(arguments[1], arguments[3], milliseconds),
+                None => return Ok(HotParse::Fallback),
+            }
+        }
 
-    if (command.eq_ignore_ascii_case(b"DEL") || command.eq_ignore_ascii_case(b"UNLINK"))
-        && argument_count == 2
-    {
-        validate_key(arguments[1], limits)?;
+        HotKind::Delete => {
+            validate_key(arguments[1], limits)?;
+            HotCommand::Delete(arguments[1])
+        }
 
-        return Ok(HotParse::Complete(
-            HotCommand::Delete(arguments[1]),
-            position,
-        ));
-    }
+        HotKind::Increment => {
+            validate_key(arguments[1], limits)?;
+            HotCommand::Increment(arguments[1], 1)
+        }
 
-    if command.eq_ignore_ascii_case(b"INCR") && argument_count == 2 {
-        validate_key(arguments[1], limits)?;
+        HotKind::Decrement => {
+            validate_key(arguments[1], limits)?;
+            HotCommand::Increment(arguments[1], -1)
+        }
 
-        return Ok(HotParse::Complete(
-            HotCommand::Increment(arguments[1], 1),
-            position,
-        ));
-    }
+        HotKind::IncrementBy => {
+            validate_key(arguments[1], limits)?;
+            let Ok(delta) = parse_i64(arguments[2]) else {
+                return Ok(HotParse::Fallback);
+            };
 
-    if command.eq_ignore_ascii_case(b"DECR") && argument_count == 2 {
-        validate_key(arguments[1], limits)?;
+            HotCommand::Increment(arguments[1], delta)
+        }
 
-        return Ok(HotParse::Complete(
-            HotCommand::Increment(arguments[1], -1),
-            position,
-        ));
-    }
+        HotKind::DecrementBy => {
+            validate_key(arguments[1], limits)?;
+            let Some(delta) = parse_i64(arguments[2]).ok().and_then(i64::checked_neg) else {
+                return Ok(HotParse::Fallback);
+            };
 
-    if command.eq_ignore_ascii_case(b"INCRBY") && argument_count == 3 {
-        validate_key(arguments[1], limits)?;
-        let Ok(delta) = parse_i64(arguments[2]) else {
-            return Ok(HotParse::Fallback);
-        };
+            HotCommand::Increment(arguments[1], delta)
+        }
+    };
 
-        return Ok(HotParse::Complete(
-            HotCommand::Increment(arguments[1], delta),
-            position,
-        ));
-    }
-
-    if command.eq_ignore_ascii_case(b"DECRBY") && argument_count == 3 {
-        validate_key(arguments[1], limits)?;
-        let Some(delta) = parse_i64(arguments[2]).ok().and_then(i64::checked_neg) else {
-            return Ok(HotParse::Fallback);
-        };
-
-        return Ok(HotParse::Complete(
-            HotCommand::Increment(arguments[1], delta),
-            position,
-        ));
-    }
-
-    Ok(HotParse::Fallback)
+    Ok(HotParse::Complete(command, position))
 }
 
-pub(super) fn hot_command_name(name: &[u8], count: usize) -> bool {
+/// A hot command name with an argument count it takes, found once from the name.
+#[derive(Clone, Copy)]
+enum HotKind {
+    Ping,
+    Get,
+    Set,
+    SetEx,
+    Delete,
+    Increment,
+    Decrement,
+    IncrementBy,
+    DecrementBy,
+}
+
+/// The second letter of every hot name, by its first letter's low five bits (both
+/// lowercase): DEL/DECR*, GET, INCR*, PING, SET*, UNLINK.
+const HOT_SECOND: [u8; 32] = {
+    let mut table = [0; 32];
+
+    table[(b'd' & 31) as usize] = b'e';
+    table[(b'g' & 31) as usize] = b'e';
+    table[(b'i' & 31) as usize] = b'n';
+    table[(b'p' & 31) as usize] = b'i';
+    table[(b's' & 31) as usize] = b'e';
+    table[(b'u' & 31) as usize] = b'n';
+    table
+};
+
+/// Whether a name starting with these two bytes can be hot. One table read; a non-letter
+/// that aliases a pair only costs the full check, and an empty entry (zero) never matches
+/// since `second | 0x20` is never zero.
+#[inline(always)]
+fn hot_name_head(first: u8, second: u8) -> bool {
+    HOT_SECOND[(first & 31) as usize] == second | 0x20
+}
+
+fn hot_command_kind(name: &[u8], count: usize) -> Option<HotKind> {
     // Dispatch on length first: a name that cannot be hot costs one compare, not ten.
     let is = |word: &[u8]| name.eq_ignore_ascii_case(word);
+    let kind = match name.len() {
+        3 if is(b"GET") && count == 2 => HotKind::Get,
+        3 if is(b"DEL") && count == 2 => HotKind::Delete,
+        3 if is(b"SET") && (count == 3 || count == 5) => HotKind::Set,
+        4 if is(b"PING") && (count == 1 || count == 2) => HotKind::Ping,
+        4 if is(b"INCR") && count == 2 => HotKind::Increment,
+        4 if is(b"DECR") && count == 2 => HotKind::Decrement,
+        5 if is(b"SETEX") && count == 4 => HotKind::SetEx,
+        6 if is(b"UNLINK") && count == 2 => HotKind::Delete,
+        6 if is(b"INCRBY") && count == 3 => HotKind::IncrementBy,
+        6 if is(b"DECRBY") && count == 3 => HotKind::DecrementBy,
+        _ => return None,
+    };
 
-    match name.len() {
-        3 => (is(b"GET") || is(b"DEL")) && count == 2 || is(b"SET") && (count == 3 || count == 5),
-        4 => {
-            is(b"PING") && (count == 1 || count == 2) || (is(b"INCR") || is(b"DECR")) && count == 2
-        }
-        5 => is(b"SETEX") && count == 4,
-        6 => (is(b"UNLINK") && count == 2) || ((is(b"INCRBY") || is(b"DECRBY")) && count == 3),
-        _ => false,
-    }
+    Some(kind)
 }
 
 pub(super) fn read_hot_bulk<'a>(

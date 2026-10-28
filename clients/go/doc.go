@@ -68,6 +68,13 @@
 // Client.PubSub opens a subscription on its own connection and delivers messages on
 // a Go channel.
 //
+// # Seed addresses
+//
+// Options.Seeds lists host:port addresses to use in place of Options.Addr. Connecting
+// tries them in order and skips one that cannot be reached; after a dropped connection
+// the next command's reconnect starts with the seed after the one that dropped. In cluster
+// mode the seeds are also asked for the slot map when no known node answers.
+//
 // # Cluster mode
 //
 // Set Options.Cluster to give the client the address of any shard. It learns every

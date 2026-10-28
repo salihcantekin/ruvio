@@ -14,6 +14,7 @@ import io.github.salihcantekin.ruvio.model.KeyValue;
 import io.github.salihcantekin.ruvio.model.ScanResult;
 import io.github.salihcantekin.ruvio.model.ScoredValue;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -371,6 +372,22 @@ public abstract class SortedSetCommands<K, V> extends SetCommands<K, V> {
     }
 
     /**
+     * Sends {@code ZINCRBY key increment member EX|PX ttl}: like {@link #zincrby(Object, double, Object)}, and a sorted set this
+     * call creates gets a time to live. An existing key keeps its deadline.
+     *
+     * @param key the sorted set key
+     * @param increment the amount to add
+     * @param member the member
+     * @param ttl time to live of a newly created key: whole seconds are sent as {@code EX}, anything finer as {@code PX}
+     * @return the new score
+     * @throws IllegalArgumentException when {@code ttl} is null, zero, negative or too large
+     * @throws RuvioServerException {@code WRONGTYPE} for a non-sorted-set
+     */
+    public CompletableFuture<Double> zincrby(K key, double increment, V member, Duration ttl) {
+        return send(args().w(Cmd.ZINCRBY).k(key).d(increment).v(member).ttl(ttl), Reply.DOUBLE);
+    }
+
+    /**
      * Sends {@code ZCARD key}.
      *
      * @param key the sorted set key
@@ -451,6 +468,34 @@ public abstract class SortedSetCommands<K, V> extends SetCommands<K, V> {
      */
     public CompletableFuture<List<ScoredValue<V>>> zpopmin(K key, long count) {
         return kl(Cmd.ZPOPMIN, key, count, r(Reply.SCORED));
+    }
+
+    /**
+     * Sends {@code ZPOPBYSCORE key max MIN min COUNT count WITHSCORES}: removes and returns the members that are due, up to {@code count} of them with a score between {@code min} and {@code max}, lowest score first. With scores set to due times this takes the jobs that are ready.
+     *
+     * @param key the sorted set key
+     * @param min the lower score bound ({@code -inf}, {@code (5}, {@code 5})
+     * @param max the upper score bound ({@code +inf}, {@code (5}, {@code 5})
+     * @param count how many to remove, 1 to 10000
+     * @return members with scores, lowest first; empty when nothing is due
+     * @throws RuvioServerException {@code ERR} for a bad bound or a count outside 1 to 10000; {@code WRONGTYPE} for a non-sorted-set
+     */
+    public CompletableFuture<List<ScoredValue<V>>> zpopbyscore(K key, String min, String max, long count) {
+        return send(args().w(Cmd.ZPOPBYSCORE).k(key).s(max).s("MIN").s(min).w(Cmd.COUNT).l(count).w(Cmd.WITHSCORES), r(Reply.SCORED));
+    }
+
+    /**
+     * Sends {@code ZMOVEDUE source destination max COUNT count}: moves the members that are due from a sorted set to the tail of a list, up to {@code count} members with a score of at most {@code max}, lowest score first. Clients blocked on {@code destination} are served first.
+     *
+     * @param source the sorted set to take members from
+     * @param destination the list that receives them
+     * @param max the upper score bound ({@code +inf}, {@code (5}, {@code 5})
+     * @param count how many to move, 1 to 10000
+     * @return how many members moved
+     * @throws RuvioServerException {@code ERR} for a bad bound or a count outside 1 to 10000; {@code WRONGTYPE} when {@code source} is not a sorted set or {@code destination} is not a list; {@code CROSSSLOT} in a cluster
+     */
+    public CompletableFuture<Long> zmovedue(K source, K destination, String max, long count) {
+        return send(args().w(Cmd.ZMOVEDUE).k(source).k(destination).s(max).w(Cmd.COUNT).l(count), Reply.LONG);
     }
 
     /**

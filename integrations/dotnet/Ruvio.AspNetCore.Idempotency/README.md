@@ -94,32 +94,75 @@ and unguessable; use this only when that shared boundary is appropriate.
   handler or after idempotency. Outer middleware may still add fresh security
   headers/cookies, but these are never loaded from the stored result.
 - Only POST, PUT, PATCH, DELETE are supported (other marked methods: 405).
-  Each marked request requires one `Idempotency-Key`, 1–128 printable non-space
-  ASCII characters (invalid/missing: 400). Keep keys random and unguessable.
+  Each marked request requires one `Idempotency-Key` (or the header named by
+  `KeyHeader`), 1–128 printable non-space ASCII characters (invalid/missing: 400).
+  Keep keys random and unguessable.
 - SHA-256 length-delimited hashes cover namespace, authenticated subject, scope,
   and key for storage addressing, and method, path base, path, raw query,
   content type, raw body, namespace/subject/scope for the request fingerprint.
   Storage keys contain only a versioned prefix and one hex hash tag; no raw
   credentials, tenant, key, URL, or payload. Hashing is not encryption.
-  A key reused in the same scope for different request content returns 409.
+  A key reused in the same scope for different request content returns 409, or
+  `MismatchStatusCode` (set 422 to follow the IETF `Idempotency-Key` header draft).
 - Responses must depend only on this fingerprinted input. Headers such as Accept
   and API-version headers are **not** fingerprinted: normalize them upstream or
   place a validated variant in the scope. Streaming, upgrades, trailers, changing
   response body features and indefinite handlers are unsupported.
-- Matching completed requests replay status, body, and only `Content-Type`,
-  `Content-Language`, `ETag`, `Last-Modified`. `Content-Length` is recomputed.
-  Cookies, authorization, cache/security headers and redirects' `Location` are
-  **not** stored. Avoid endpoints whose result requires those headers.
+- Matching completed requests replay status, body, and only the headers in
+  `ReplayHeaders`: by default `Content-Type`, `Content-Language`, `ETag`,
+  `Last-Modified`. `Content-Length` is recomputed, and a replay carries
+  `Idempotent-Replayed: true`. Add `Location` for endpoints that answer
+  `201 Created`. Cookies, authentication, CORS and transport-security headers
+  are refused at startup and never stored. A stored header outside the list is
+  treated as a corrupt record (an error, never replayed), so removing a header
+  from the list fails the records stored with it until they expire.
   Normal returned error responses (including 4xx/5xx) are stored too.
   Thrown handler/storage errors and cancellation propagate, never become a
   success response, and are never automatically retried.
 
+## Waiting for a running request and per-endpoint settings
+
+A request whose key is still running answers `409` with `Retry-After: 1`. With
+`PendingWait` (default zero, at most 30 s) it waits instead: it asks Ruvio again
+with a growing delay of at most 25 ms and, when the first request completes,
+replays its result, so a double click or a client retry gets the real answer. If
+the first request does not finish in time the answer is the same `409`. The
+wait ends when the caller disconnects. A waiting request keeps its buffered body
+and costs one `IDEM BEGIN` per poll, which only reads.
+
+```csharp
+builder.Services.AddRuvioIdempotency(options =>
+{
+    options.Namespace = "orders-production-v1";
+    options.ScopeSelector = context => context.User.FindFirst("tenant_id")?.Value;
+    options.MismatchStatusCode = StatusCodes.Status422UnprocessableEntity;
+    options.PendingWait = TimeSpan.FromSeconds(2);
+    options.ReplayHeaders.Add("Location");
+});
+
+// Settings of its own for one endpoint; the rest come from the options above.
+app.MapPost("/payments", Pay).WithRuvioIdempotency(e =>
+{
+    e.RetentionSeconds = 7 * 24 * 3600;
+    e.KeyHeader = "X-Request-Id";
+});
+app.MapPost("/emails", Send).WithRuvioIdempotency(e => e.KeyRequired = false);
+// Controllers: [RuvioIdempotency(RetentionSeconds = 300, PendingWaitMilliseconds = 2000)]
+```
+
+`KeyRequired = false` lets a request without the key header run unchecked, before
+any body is read; a request that sends the key is checked as usual. Endpoint
+values are checked while the host starts: a value out of range stops start and
+names the endpoint. The same check also runs on each request.
+
 ## State and failure model (not downstream exactly-once)
 
 Native `IDEM key BEGIN ...` creates a **pending** record with a random ownership
-token and one retention TTL. An existing pending request returns 409, including
+token and one retention TTL. An existing pending request returns 409 (after
+`PendingWait`, when set), including
 after crashes, cancellation, response overflow or uncertain downstream outcomes.
-It is not deleted, renewed, stolen or retried by this package. Completion checks
+It is not renewed, stolen or retried by this package, and it is deleted only by
+the opt-in `AbortOnException` below. Completion checks
 the exact owner, fingerprint, pending state and positive remaining TTL, atomically
 stores the result and changes state to **completed**, preserving the original
 expiration. A lost owner/expired record fails completion. Nothing is sent from
@@ -146,6 +189,107 @@ Old hash records fail closed until they expire; they are not overwritten,
 converted or replayed via Lua. Drain old admissions, handlers and retry retention
 before switching all application instances. Do not delete old keys or change
 namespace to bypass this safety barrier. See [the native contract](../../../docs/IDEM.md).
+
+### Freeing the key after a handler exception
+
+By default a handler that throws leaves its record pending, so every retry with
+that key gets 409 until `Retention` ends (24 hours by default). For handlers that
+throw before their work takes effect, or whose work is safe to repeat, turn on
+`AbortOnException` (it needs a server that has `IDEM ABORT`; an older server answers an
+error, which is logged once as a warning and the record then stays pending):
+
+```csharp
+builder.Services.AddRuvioIdempotency(options =>
+{
+    options.Namespace = "orders";
+    options.AbortOnException = true;
+});
+```
+
+When the handler throws, the middleware sends `IDEM key ABORT fingerprint owner`
+before the exception continues up the pipeline. The record is removed only if it
+is still pending with this request's owner, so a result stored by another
+request is never removed, and the next retry runs the handler again. A response
+the handler returns, 5xx included, is stored and replayed exactly as before. If
+the abort itself fails (Ruvio unreachable), the handler's exception still
+reaches the caller and the record stays pending until its retention ends. Each
+removed record counts as state `aborted` on `ruvio.idempotency.states`, and each
+attempt as operation `abort` on `ruvio.idempotency.storage_calls`. Needs a
+server with `IDEM ... ABORT`.
+
+## A separate connection
+
+By default the middleware uses the unkeyed `IRuvioClient`. To give it a connection of its
+own (another server, database or set of options), register one with
+`AddKeyedRuvioClient` from `Ruvio.Client.AspNetCore` and name it in `ClientKey`:
+
+```csharp
+builder.Services.AddKeyedRuvioClient("idempotency", builder.Configuration.GetSection("RuvioDurable"));
+builder.Services.AddRuvioIdempotency(o =>
+{
+    o.ClientKey = "idempotency";
+    o.Namespace = "orders";
+    o.ScopeSelector = context => context.User.FindFirst("tenant")?.Value;
+});
+```
+
+The keyed client is looked up per request that the middleware handles, from the request's services. Host start fails
+when no client is registered under that key.
+
+## Startup checks
+
+A configuration mistake stops the host while it starts, before the server takes a request, with the fix named in the error. This package checks:
+
+- the client is registered: `AddRuvioClient(...)`, or `AddKeyedRuvioClient(key, ...)` when `ClientKey` is set. Only the registration is checked, no connection is opened, so a Ruvio that is down at start still follows the `Outage` settings;
+- `UseRuvioIdempotency()` throws at once when `AddRuvioIdempotency` was not called;
+- every endpoint with `[RuvioIdempotency]` or its builder form is checked once the pipeline is built: a value out of range stops start, and all bad endpoints are listed in one error.
+
+See [Startup checks](../README.md#startup-checks) for how the checks run.
+
+## When Ruvio is unreachable
+
+By default a storage error reaches your exception handling (`Outage.Mode = Throw`). Choose what to do instead:
+
+```csharp
+builder.Services.AddRuvioIdempotency(options =>
+{
+    options.Namespace = "orders";
+    options.ScopeSelector = context => context.User.FindFirst("tenant_id")?.Value;
+    options.Outage.Mode = RuvioOutageMode.FailOpen;   // or FailClosed: 503, the request does not run
+    options.Outage.CircuitBreaker = new RuvioCircuitBreakerOptions();   // optional
+});
+```
+
+- `FailClosed`: `503 Service Unavailable` and the handler does not run, so a retry later is safe.
+- `FailOpen`: the handler runs **without idempotency**. A client that retries with the same key during the outage runs the
+  operation again; accept this only where a duplicate is cheaper than refusing the request. If Ruvio is lost after the
+  handler ran, so its result cannot be recorded, the response is still delivered, and a retry with the same key finds the
+  request pending (409) rather than running it twice.
+- With `FailClosed`, the same loss after the handler ran answers `503` although the operation happened: the key stays
+  pending, so a retry gets `409` until the retention ends.
+
+See [When Ruvio is unreachable](../README.md#when-ruvio-is-unreachable) for the modes and the circuit breaker.
+
+### Watching the circuit
+
+Each change of the circuit is logged through `ILogger` under the category `Ruvio.AspNetCore.Idempotency`: a Warning when it opens (with the break
+duration), Information for the trial call and when it closes. The client counts the changes in
+`ruvio_client_circuit_transitions`. To react in your own code, for a health check or an alert, subscribe to the breaker
+after setting it:
+
+```csharp
+builder.Services.AddRuvioIdempotency(options =>
+{
+    options.Outage.Mode = RuvioOutageMode.FailOpen;
+    options.Outage.CircuitBreaker = new RuvioCircuitBreakerOptions();
+    // Subscribe after setting CircuitBreaker: setting it again replaces the breaker.
+    options.Outage.Breaker!.StateChanged += (_, change) =>
+        RuvioHealth.Down = change.Current == RuvioCircuitState.Open;   // your own flag, read by a health check
+});
+```
+
+The handler runs after the state changed, outside the breaker's lock; an exception it throws is caught and does not reach
+the call.
 
 ## Bounds and pipeline caveats
 
@@ -186,6 +330,12 @@ namespace to bypass this safety barrier. See [the native contract](../../../docs
 - Instrumentation is off by default. `EnableInstrumentation` enables the
   `Ruvio.AspNetCore.Idempotency` ActivitySource with an `idempotency` activity and
   only the bounded `idempotency.state` tag. No request/identity/key/body data.
+- Metrics are always published on the `Ruvio.AspNetCore.Idempotency` Meter (an exporter
+  only sees them when the host adds that Meter): `ruvio.idempotency.states`, tagged
+  `state` = `acquired` (the handler runs), `completed` (a stored result is replayed),
+  `pending` (the first request still runs: 409) or `conflict` (the key was used for a
+  different request: 409); `ruvio.idempotency.storage_calls`, `storage_commands`,
+  `storage_duration` (tagged `operation` and `outcome`); and `ruvio.idempotency.outage`.
 
 ## Tests
 

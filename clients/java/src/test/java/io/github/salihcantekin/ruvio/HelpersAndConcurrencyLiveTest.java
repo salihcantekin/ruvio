@@ -138,6 +138,19 @@ class HelpersAndConcurrencyLiveTest {
     }
 
     @Test
+    void idempotentAbortOnErrorFreesTheKey() {
+        assertThrows(IllegalStateException.class, () -> c.idempotent("idm-abort", "fp", 10_000, 100, () -> {
+            throw new IllegalStateException("boom");
+        }, true));
+        assertEquals("again", c.idempotent("idm-abort", "fp", 10_000, 100, () -> "again"));
+        // without the flag the key stays pending
+        assertThrows(IllegalStateException.class, () -> c.idempotent("idm-keep", "fp", 10_000, 100, () -> {
+            throw new IllegalStateException("boom");
+        }));
+        assertThrows(RuvioException.class, () -> c.idempotent("idm-keep", "fp", 10_000, 100, () -> "x"));
+    }
+
+    @Test
     void manyThreadsShareOneConnection() throws Exception {
         int threads = 32;
         int per = 2_000;

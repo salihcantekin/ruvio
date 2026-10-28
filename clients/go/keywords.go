@@ -67,6 +67,50 @@ func (u GeoUnit) token() []byte {
 	return nil
 }
 
+// ExpireCondition is the optional condition of EXPIRE, PEXPIRE, EXPIREAT and PEXPIREAT.
+// Valid values: ExpireNx ("NX", set only when the key has no deadline), ExpireXx ("XX",
+// only when it has one), ExpireGt ("GT", only when the new deadline is later) and
+// ExpireLt ("LT", only when it is earlier). A key without a deadline counts as having an
+// infinite one. The zero value means no condition.
+//
+//	ok, err := c.ExpireIf(ctx, "session:1", time.Hour, ruvio.ExpireGt)
+type ExpireCondition string
+
+// EXPIRE conditions.
+const (
+	ExpireNx ExpireCondition = "NX"
+	ExpireXx ExpireCondition = "XX"
+	ExpireGt ExpireCondition = "GT"
+	ExpireLt ExpireCondition = "LT"
+)
+
+// n is the number of arguments the condition adds.
+func (e ExpireCondition) n() int {
+	if e == "" {
+		return 0
+	}
+	return 1
+}
+
+// append writes the condition token, if any. Unknown values are sent as given and the
+// server decides.
+func (e ExpireCondition) append(r *request) *request {
+	switch e {
+	case "":
+	case ExpireNx:
+		r.t(tNX)
+	case ExpireXx:
+		r.t(tXX)
+	case ExpireGt:
+		r.t(tGT)
+	case ExpireLt:
+		r.t(tLT)
+	default:
+		r.s(string(e))
+	}
+	return r
+}
+
 // GeoOrder is a GEO result order. Valid values: GeoAsc ("ASC"), GeoDesc ("DESC");
 // the zero value leaves the order unspecified.
 //

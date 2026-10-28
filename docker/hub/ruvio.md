@@ -27,7 +27,7 @@ The default durability is `memory`. For a persistent deployment set `RUVIO_DURAB
 
 ## Not claimed
 
-Ruvio implements a listed subset of Redis, not the full surface. There is no cluster bus, online slot migration or automatic failover.
+Ruvio implements a listed subset of Redis, not the full surface. There is no cluster bus or online slot migration. Automatic failover of a primary and its replicas runs in separate `ruvio coordinator` processes from the same image (`docker run … salihcantekin/ruvio coordinator --config …`); see the coordinator docs.
 
 ## License
 

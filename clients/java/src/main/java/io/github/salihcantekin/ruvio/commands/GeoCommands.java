@@ -13,6 +13,7 @@ import io.github.salihcantekin.ruvio.model.GeoCoordinates;
 import io.github.salihcantekin.ruvio.model.GeoResult;
 import io.github.salihcantekin.ruvio.model.GeoValue;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -127,6 +128,36 @@ public abstract class GeoCommands<K, V> extends SortedSetCommands<K, V> {
     @SafeVarargs
     public final CompletableFuture<Long> geoadd(K key, boolean nx, boolean xx, boolean ch, GeoValue<V>... members) {
         Args a = args().w(Cmd.GEOADD).k(key);
+        if (nx) a.s("NX");
+        if (xx) a.s("XX");
+        if (ch) a.s("CH");
+        for (GeoValue<V> m : members) {
+            a.d(m.longitude()).d(m.latitude()).v(m.member());
+        }
+        return send(a, Reply.LONG);
+    }
+
+    /**
+     * Sends {@code GEOADD key EX|PX ttl [NX|XX] [CH] longitude latitude member ...}: like the overload without {@code ttl}, and a geo
+     * key this call creates gets a time to live. An existing key keeps its deadline.
+     *
+     * <pre>{@code
+     * client.geoadd("drivers", false, false, false, Duration.ofMinutes(5), GeoValue.of(13.36, 38.11, "d1"));
+     * }</pre>
+     *
+     * @param key the geo key
+     * @param nx {@code true} to add only new members (existing ones are not moved)
+     * @param xx {@code true} to update only existing members (new ones are not added)
+     * @param ch {@code true} to count members whose position changed as well as new ones
+     * @param ttl time to live of a newly created key: whole seconds are sent as {@code EX}, anything finer as {@code PX}
+     * @param members the places; longitude -180 to 180, latitude -85.05112878 to 85.05112878
+     * @return how many members were new, or with {@code ch} new plus changed
+     * @throws IllegalArgumentException when {@code ttl} is null, zero, negative or too large
+     * @throws RuvioServerException {@code ERR} for an out-of-range coordinate or {@code nx} together with {@code xx}; {@code WRONGTYPE} for a non-sorted-set
+     */
+    @SafeVarargs
+    public final CompletableFuture<Long> geoadd(K key, boolean nx, boolean xx, boolean ch, Duration ttl, GeoValue<V>... members) {
+        Args a = args().w(Cmd.GEOADD).k(key).ttl(ttl);
         if (nx) a.s("NX");
         if (xx) a.s("XX");
         if (ch) a.s("CH");

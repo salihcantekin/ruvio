@@ -14,6 +14,7 @@ fn charges_match_a_recount(shard: &KvShard<TestClock>) {
 
 mod eviction;
 mod expiry;
+mod fence;
 mod field_ttl;
 mod hashes;
 mod json;
@@ -22,6 +23,7 @@ mod lists;
 mod memory;
 mod sets;
 mod shrink;
+mod slot_watch;
 mod snapshot;
 mod sorted_sets;
 mod strings;

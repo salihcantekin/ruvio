@@ -50,6 +50,7 @@ const ticks = NICE.filter((v) => v >= lo && v <= hi);
   .ticks { position: relative; height: 14px; }
   .ticks span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
   .row { padding: 7px 0; outline: none; }
+  .row:hover, .row.is-on { background: var(--row-hover); }
   .row.is-on .lab { color: var(--ink); }
   .lab { font-size: 14px; color: var(--mute); overflow-wrap: anywhere; }
   .bars { position: relative; display: grid; gap: 3px; }

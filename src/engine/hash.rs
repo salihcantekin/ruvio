@@ -336,3 +336,100 @@ pub(super) fn persist_hash_fields<'a, C: Clock, I: StorageIndex, S: MutationSink
 
     Ok(Response::Exec(replies))
 }
+
+pub(super) fn hash_transfer<'a, C: Clock, I: StorageIndex, S: MutationSink>(
+    shard: &'a mut KvShard<C, I>,
+    sink: &mut S,
+    key: crate::protocol::Bytes<'a>,
+    from: crate::protocol::Bytes<'a>,
+    to: crate::protocol::Bytes<'a>,
+    amount: i64,
+    max: Option<i64>,
+) -> Result<Response<'a>, S::Error> {
+    let (left, right) = match shard.preview_hash_transfer(&key, &from, &to, amount, max) {
+        Ok(Some(balances)) => balances,
+        Ok(None) => return Ok(Response::Bulk(None)),
+        Err(error) => return Ok(increment_error(error)),
+    };
+
+    let pairs = [
+        (from, Cow::<[u8]>::Owned(crate::store::integer_bytes(left))),
+        (to, Cow::Owned(crate::store::integer_bytes(right))),
+    ];
+
+    if let Some(rejected) = before_mutation(
+        shard,
+        sink,
+        [key.as_ref()],
+        key.len()
+            + pairs
+                .iter()
+                .map(|(field, value)| field.len() + value.len() + ADMISSION_OVERHEAD_BYTES)
+                .sum::<usize>(),
+    )? {
+        return Ok(rejected);
+    }
+
+    // Field TTLs stay on both fields, like `HINCRBY`, and go out with the values in one record.
+    let kept = if shard.has_field_ttls() {
+        [
+            shard
+                .field_deadline(&key, &pairs[0].0)
+                .expect("hash type was validated"),
+            shard
+                .field_deadline(&key, &pairs[1].0)
+                .expect("hash type was validated"),
+        ]
+    } else {
+        [None, None]
+    };
+
+    if kept.iter().all(Option::is_none) {
+        sink.record(Mutation::HashSet {
+            key: &key,
+            pairs: &pairs,
+        })?;
+    } else {
+        let mut mutations = vec![
+            Mutation::HashSet {
+                key: &key,
+                pairs: &pairs,
+            }
+            .to_owned(),
+        ];
+
+        for (pair, at) in pairs.iter().zip(kept) {
+            if let Some(at) = at {
+                mutations.push(
+                    Mutation::HashFieldExpire {
+                        key: &key,
+                        fields: std::slice::from_ref(&pair.0),
+                        unix_millis: at,
+                    }
+                    .to_owned(),
+                );
+            }
+        }
+
+        sink.record(Mutation::Transaction {
+            mutations: &mutations,
+        })?;
+    }
+
+    if kept.iter().all(Option::is_none) {
+        shard
+            .hash_set(&key, &pairs)
+            .expect("hash type was validated before recording");
+    } else {
+        for (field, value) in &pairs {
+            shard
+                .hash_set_keep_ttl(&key, field, value)
+                .expect("hash type was validated before recording");
+        }
+    }
+
+    Ok(Response::Exec(vec![
+        Response::Integer(left),
+        Response::Integer(right),
+    ]))
+}

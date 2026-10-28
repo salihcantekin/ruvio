@@ -108,6 +108,9 @@ func toXStreams(v Value) ([]XStream, error) {
 // stream to about that many entries after the add; MinID drops entries with a smaller
 // id; if both are set MaxLen wins. Approx sends "~", but Ruvio always trims exactly.
 // Delay (Ruvio) keeps the new entry hidden from XReadGroup for that long (milliseconds).
+// TTL, when positive, sets a deadline on the stream only if this call creates it (EX for
+// whole seconds, otherwise PX); an existing stream keeps its deadline, and a negative TTL
+// returns ErrInvalidTTL.
 // Values are the entry fields, field, value, ... in pairs, at least one pair.
 type XAddArgs struct {
 	// Stream is the stream key.
@@ -126,6 +129,8 @@ type XAddArgs struct {
 	Trim *StreamTrim
 	// Delay hides the entry from consumer-group delivery until the duration has passed (Ruvio extension, sent as DELAY in milliseconds). 0 means deliver at once.
 	Delay time.Duration
+	// TTL sets a deadline on the stream when this call creates it (sent as EX for whole seconds, otherwise PX); an existing stream keeps its deadline. 0 means none.
+	TTL time.Duration
 	// Values are the entry fields as name, value, name, value ...; the count must be even and at least 2.
 	Values []string
 }
@@ -141,7 +146,14 @@ type XAddArgs struct {
 //	    Values: []string{"type", "signup", "user", "42"},
 //	})
 func (c *cmds) XAdd(ctx context.Context, a XAddArgs) (string, bool, error) {
+	ttok, tv, err := optTTL(a.TTL)
+	if err != nil {
+		return "", false, err
+	}
 	n := 3 + len(a.Values)
+	if ttok != nil {
+		n += 2
+	}
 	if a.Delay > 0 {
 		n += 2
 	}
@@ -157,6 +169,9 @@ func (c *cmds) XAdd(ctx context.Context, a XAddArgs) (string, bool, error) {
 		}
 	}
 	r := newCmd(n, cXADD).s(a.Stream)
+	if ttok != nil {
+		r.t(ttok).i(tv)
+	}
 	if a.Delay > 0 {
 		r.t(tDELAY).i(ms(a.Delay))
 	}

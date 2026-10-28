@@ -61,6 +61,7 @@ builder.Services.AddRuvioRateLimiting(options =>
 
         return runId;
     };
+    options.AddPolicy("probe", 20, TimeSpan.FromSeconds(60));
 });
 
 builder.Services.AddOpenTelemetry()
@@ -224,7 +225,7 @@ app.MapGet("/api/rate-limited", (ScenarioState state) =>
 
     return Results.Ok(new { accepted = true });
 })
-.WithMetadata(new RuvioRateLimitAttribute("probe", 20, 60));
+.WithRuvioRateLimit("probe");
 
 app.MapGet("/bench/catalog/{sku}", async (
     string sku,

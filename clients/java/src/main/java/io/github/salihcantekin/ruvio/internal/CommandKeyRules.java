@@ -34,7 +34,7 @@ public final class CommandKeyRules {
     public static final Map<String, Rule> RULES;
 
     static {
-        Map<String, Rule> rules = new HashMap<>(516);
+        Map<String, Rule> rules = new HashMap<>(532);
         rules.put("ACL", new Rule(0, 0, 0, 0, new String[0], 0));
         rules.put("APPEND", new Rule(1, 1, 1, 1, new String[0], 13));
         rules.put("AUTH", new Rule(0, 0, 0, 0, new String[0], 4));
@@ -112,6 +112,7 @@ public final class CommandKeyRules {
         rules.put("HKEYS", new Rule(1, 1, 1, 1, new String[0], 2));
         rules.put("HLEN", new Rule(1, 1, 1, 1, new String[0], 6));
         rules.put("HMGET", new Rule(1, 1, 1, 1, new String[0], 6));
+        rules.put("HMSET", new Rule(1, 1, 1, 1, new String[0], 13));
         rules.put("HPERSIST", new Rule(1, 1, 1, 1, new String[0], 5));
         rules.put("HPEXPIRE", new Rule(1, 1, 1, 1, new String[0], 13));
         rules.put("HPEXPIREAT", new Rule(1, 1, 1, 1, new String[0], 13));
@@ -122,6 +123,7 @@ public final class CommandKeyRules {
         rules.put("HSET", new Rule(1, 1, 1, 1, new String[0], 13));
         rules.put("HSETNX", new Rule(1, 1, 1, 1, new String[0], 13));
         rules.put("HSTRLEN", new Rule(1, 1, 1, 1, new String[0], 6));
+        rules.put("HTRANSFER", new Rule(1, 1, 1, 1, new String[0], 13));
         rules.put("HTTL", new Rule(1, 1, 1, 1, new String[0], 6));
         rules.put("HVALS", new Rule(1, 1, 1, 1, new String[0], 2));
         rules.put("IDEM", new Rule(1, 1, 1, 1, new String[0], 9));
@@ -198,7 +200,10 @@ public final class CommandKeyRules {
         rules.put("RELEASE", new Rule(1, 1, 1, 1, new String[0], 5));
         rules.put("RENAME", new Rule(1, 1, 2, 1, new String[0], 5));
         rules.put("RENAMENX", new Rule(1, 1, 2, 1, new String[0], 5));
+        rules.put("RENEW", new Rule(1, 1, 1, 1, new String[0], 5));
+        rules.put("REPLICAOF", new Rule(0, 0, 0, 0, new String[0], 0));
         rules.put("RESTORE", new Rule(1, 1, 1, 1, new String[0], 9));
+        rules.put("ROLE", new Rule(0, 0, 0, 0, new String[0], 4));
         rules.put("RPOP", new Rule(1, 1, 1, 1, new String[0], 5));
         rules.put("RPOPLPUSH", new Rule(1, 1, 2, 1, new String[0], 9));
         rules.put("RPUSH", new Rule(1, 1, 1, 1, new String[0], 13));
@@ -243,6 +248,7 @@ public final class CommandKeyRules {
         rules.put("SWAPDB", new Rule(0, 0, 0, 0, new String[0], 5));
         rules.put("TAKE", new Rule(1, 1, 1, 1, new String[0], 5));
         rules.put("TOUCH", new Rule(1, 1, -1, 1, new String[0], 6));
+        rules.put("TRANSFER", new Rule(1, 1, 2, 1, new String[0], 13));
         rules.put("TTL", new Rule(1, 1, 1, 1, new String[0], 6));
         rules.put("TYPE", new Rule(1, 1, 1, 1, new String[0], 6));
         rules.put("UNLINK", new Rule(1, 1, -1, 1, new String[0], 1));
@@ -274,7 +280,9 @@ public final class CommandKeyRules {
         rules.put("ZINTER", new Rule(2, 1, 0, 0, new String[0], 2));
         rules.put("ZINTERSTORE", new Rule(2, 2, 1, 0, new String[0], 9));
         rules.put("ZLEXCOUNT", new Rule(1, 1, 1, 1, new String[0], 6));
+        rules.put("ZMOVEDUE", new Rule(1, 1, 2, 1, new String[0], 9));
         rules.put("ZMSCORE", new Rule(1, 1, 1, 1, new String[0], 6));
+        rules.put("ZPOPBYSCORE", new Rule(1, 1, 1, 1, new String[0], 5));
         rules.put("ZPOPMAX", new Rule(1, 1, 1, 1, new String[0], 5));
         rules.put("ZPOPMIN", new Rule(1, 1, 1, 1, new String[0], 5));
         rules.put("ZRANDMEMBER", new Rule(1, 1, 1, 1, new String[0], 2));

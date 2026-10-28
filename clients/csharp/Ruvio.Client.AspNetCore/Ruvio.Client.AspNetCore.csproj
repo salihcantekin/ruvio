@@ -4,7 +4,7 @@
     <TargetFramework>net8.0</TargetFramework>
     <RootNamespace>Ruvio.Client.AspNetCore</RootNamespace>
     <AssemblyName>Ruvio.Client.AspNetCore</AssemblyName>
-    <Version>0.3.4</Version>
+    <Version>0.4.0</Version>
     <Description>ASP.NET Core integration for the Ruvio.Client RESP2 SDK.</Description>
     <PackageId>Ruvio.Client.AspNetCore</PackageId>
     <PackageReadmeFile>README.md</PackageReadmeFile>

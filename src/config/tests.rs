@@ -1013,6 +1013,14 @@ fn every_template_setting_answers_config_get() {
         ("protocol.max_key_bytes", "max-key-bytes"),
         ("protocol.max_pipeline_commands", "max-pipeline-commands"),
         ("protocol.max_value_bytes", "max-value-bytes"),
+        ("replication.announced", "replica-announced"),
+        ("replication.min_replicas_max_lag", "min-replicas-max-lag"),
+        ("replication.min_replicas_to_write", "min-replicas-to-write"),
+        ("replication.primary_lease", "primary-lease"),
+        (
+            "replication.primary_lease_coordinators",
+            "primary-lease-coordinators",
+        ),
         ("replication.role", "replication-role"),
         (
             "requests.max_output_buffer_bytes",
@@ -1069,4 +1077,214 @@ fn every_template_setting_answers_config_get() {
             "CONFIG GET does not answer {name} (template {key})"
         );
     }
+}
+
+/// Every `CONFIG GET` name is decided: live (`CONFIG SET` changes it) or restart-only. A
+/// setting added to `introspect` fails here until it is in exactly one list.
+#[test]
+fn every_config_get_name_is_live_or_restart_only() {
+    let names: Vec<String> = AppConfig::default()
+        .introspect()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+
+    for name in &names {
+        let live = super::LIVE_SETTINGS.contains(&name.as_str());
+        let restart = super::RESTART_ONLY_SETTINGS.contains(&name.as_str());
+
+        assert!(
+            live != restart,
+            "{name}: live {live}, restart-only {restart}"
+        );
+    }
+
+    for name in super::LIVE_SETTINGS
+        .iter()
+        .chain(super::RESTART_ONLY_SETTINGS)
+    {
+        assert!(
+            names.iter().any(|known| known == name),
+            "{name} is not a CONFIG GET name"
+        );
+    }
+}
+
+/// Each live setting takes the text `CONFIG GET` shows for it: setting every one to its own
+/// value changes nothing.
+#[test]
+fn every_live_setting_accepts_its_config_get_value() {
+    let config = AppConfig::default();
+
+    for (name, value) in config.introspect() {
+        if !super::LIVE_SETTINGS.contains(&name.as_str()) || name == "requirepass" {
+            continue;
+        }
+
+        let changed = config
+            .with_live_changes(&[(name.as_bytes(), value.as_bytes())])
+            .unwrap_or_else(|error| panic!("{name} = {value:?}: {error}"));
+
+        assert_eq!(changed, config, "{name} = {value:?}");
+    }
+}
+
+#[test]
+fn live_changes_apply_together_or_not_at_all() {
+    let config = AppConfig::default();
+    let changed = config
+        .with_live_changes(&[
+            (b"MAXMEMORY", b"200000000"),
+            (b"maxmemory-policy", b"allkeys-lfu"),
+            (b"notify-keyspace-events", b"Ex"),
+            (b"idle-timeout-ms", b"1500"),
+            (b"requirepass", b"pw"),
+        ])
+        .unwrap();
+
+    assert_eq!(changed.memory.max_process_bytes, 200_000_000);
+    assert_eq!(changed.memory.eviction_policy, EvictionPolicy::AllKeysLfu);
+    assert_ne!(changed.memory.notify_mask, 0);
+    assert_eq!(changed.timeouts.idle, Duration::from_millis(1500));
+    assert_eq!(changed.security.requirepass, "pw");
+
+    for (pairs, error) in [
+        (
+            &[(&b"maxmemory"[..], &b"1"[..]), (b"port-mode", b"single")][..],
+            "restart-only setting",
+        ),
+        (&[(b"maxmemory", b"lots")], "must be an unsigned integer"),
+        (
+            &[(b"maxmemory-policy", b"random")],
+            "unknown maxmemory-policy",
+        ),
+        (
+            &[(b"notify-keyspace-events", b"?")],
+            "notify-keyspace-events",
+        ),
+        (&[(b"nope", b"1")], "Unknown option"),
+    ] {
+        let message = config.with_live_changes(pairs).unwrap_err();
+
+        assert!(message.contains(error), "{message}");
+    }
+}
+
+/// Both tables of `docs/CONFIGURATION.md` agree with `LIVE_SETTINGS`: the `CONFIG SET` column
+/// of the environment table names each live setting once and says `no` for every other
+/// row, and the table under *Changing settings at runtime* lists each live setting once.
+#[test]
+fn the_configuration_tables_show_every_live_setting() {
+    let docs = include_str!("../../docs/CONFIGURATION.md");
+    let mut in_environment = Vec::new();
+    let mut in_runtime = Vec::new();
+
+    let runtime = docs
+        .split("## Changing settings at runtime")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .unwrap();
+
+    for row in docs.lines().filter(|line| line.starts_with("| `RUVIO_")) {
+        match row.split('|').nth(2).unwrap().trim() {
+            "no" => {}
+            cell => in_environment.push(cell.trim_matches('`')),
+        }
+    }
+
+    // Rows of the runtime table, after its header row.
+    for row in runtime
+        .lines()
+        .filter(|line| line.starts_with("| `"))
+        .skip(1)
+    {
+        in_runtime.push(row.split('|').nth(1).unwrap().trim().trim_matches('`'));
+    }
+
+    for shown in [&in_environment, &in_runtime] {
+        let mut sorted = shown.clone();
+        let mut live = super::LIVE_SETTINGS.to_vec();
+
+        sorted.sort_unstable();
+        live.sort_unstable();
+        assert_eq!(sorted, live);
+    }
+}
+
+#[test]
+fn replication_leaves_the_host_only_for_a_non_loopback_peer() {
+    let mut replication = ReplicationConfig::default();
+
+    assert!(!replication.leaves_the_host());
+
+    replication.role = ReplicationRole::Primary;
+    replication.listen = Some("127.0.0.1:7000".parse().unwrap());
+    assert!(!replication.leaves_the_host());
+    replication.listen = Some("10.0.0.5:7000".parse().unwrap());
+    assert!(replication.leaves_the_host());
+
+    replication.role = ReplicationRole::Replica;
+    replication.primary = Some("127.0.0.1:7000".parse().unwrap());
+    assert!(!replication.leaves_the_host());
+    replication.primary = None;
+    replication.primary_name = Some(("primary.internal".into(), 7000));
+    assert!(replication.leaves_the_host());
+}
+
+#[test]
+fn replication_tls_needs_its_material_and_stops_the_cleartext_warning() {
+    let mut config = AppConfig::default();
+
+    config
+        .apply_toml("[persistence]\nprofile = \"always\"\n")
+        .unwrap();
+
+    config.replication.role = ReplicationRole::Replica;
+    config.replication.primary_name = Some(("primary.internal".into(), 7000));
+    assert!(config.replication.leaves_the_host());
+
+    config.replication.tls = true;
+    assert!(!config.replication.leaves_the_host());
+    assert!(config.validate().unwrap_err().contains("tls_ca"));
+
+    config.replication.tls_ca = "ca.pem".into();
+    config.replication.tls_client_cert = "client.pem".into();
+    assert!(config.validate().unwrap_err().contains("go together"));
+
+    config.replication.tls_client_cert = Default::default();
+    config.validate().unwrap();
+
+    config.replication.role = ReplicationRole::Primary;
+    config.replication.listen = Some("127.0.0.1:7000".parse().unwrap());
+    assert!(config.validate().unwrap_err().contains("tls_cert"));
+}
+
+#[test]
+fn the_primary_lease_needs_the_coordinator_ids() {
+    let mut config = super::AppConfig::default();
+
+    config.replication.primary_lease = true;
+    assert!(config.validate().is_err(), "a lease without coordinators");
+
+    config
+        .apply_environment(|name| {
+            (name == "RUVIO_PRIMARY_LEASE_COORDINATORS").then(|| "1, 2,3".into())
+        })
+        .unwrap();
+
+    assert_eq!(config.replication.primary_lease_coordinators, [1, 2, 3]);
+    config.validate().unwrap();
+
+    let mut twice = config.clone();
+
+    twice.replication.primary_lease_coordinators = vec![1, 1];
+    assert!(twice.validate().is_err(), "an id listed twice");
+
+    // The lease cannot be turned on live while the list is empty.
+    let off = super::AppConfig::default();
+
+    assert!(
+        off.with_live_changes(&[(b"primary-lease", b"yes")])
+            .is_err()
+    );
 }

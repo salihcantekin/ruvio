@@ -543,6 +543,16 @@ impl<R> ListWaiters<R> {
             .collect()
     }
 
+    /// Removes every waiter blocked on a key `select` picks and returns its reply slot.
+    pub fn take_where(&mut self, select: impl Fn(&[u8]) -> bool) -> Vec<R> {
+        let (taken, kept): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut self.waiters)
+            .into_iter()
+            .partition(|waiter| waiter.keys.iter().any(|key| select(key)));
+
+        self.waiters = kept;
+        taken.into_iter().map(|waiter| waiter.reply).collect()
+    }
+
     /// Every parked waiter with its timeout reply, for shutdown.
     pub fn drain_all(&mut self) -> Vec<(R, Vec<u8>)> {
         self.soonest = None;

@@ -8,6 +8,8 @@ use std::sync::Mutex;
 use std::borrow::Cow;
 
 use crate::engine::Response;
+use std::convert::Infallible;
+
 use crate::mutation::{Mutation, MutationSink, NoopMutationSink};
 
 use crate::persistence::ShardCheckpoint;
@@ -84,22 +86,28 @@ pub(crate) fn execute<S: HotStringStore>(
     store: &S,
     now: UnixMillis,
     command: &Command<'_>,
-) -> Result<Response<'static>, S::Error> {
-    execute_with_write(store, now, command).map(|(response, _wrote)| response)
+) -> Result<Response<'static>, Infallible> {
+    execute_with_write(store, &mut NoopMutationSink, now, command)
+        .map(|(response, _wrote)| response)
 }
 
-pub(crate) fn execute_with_write<S: HotStringStore>(
+/// Runs a hot-key command. A write is recorded in `log` before the store applies it, under
+/// the store's lock, so a refused record leaves the key as it was for every reader.
+pub(crate) fn execute_with_write<S: HotStringStore, L: MutationSink>(
     store: &S,
+    log: &mut L,
     now: UnixMillis,
     command: &Command<'_>,
-) -> Result<(Response<'static>, bool), S::Error> {
+) -> Result<(Response<'static>, bool), L::Error> {
     match command {
-        Command::Get(key) => Ok((
-            Response::Bulk(store.get(now, key.as_ref())?.map(Cow::Owned)),
-            false,
-        )),
+        Command::Get(key) => {
+            let Ok(value) = store.get(now, key.as_ref());
+
+            Ok((Response::Bulk(value.map(Cow::Owned)), false))
+        }
         Command::Set(key, value, options) => {
-            let (applied, previous) = store.set(now, key.as_ref(), value.as_ref(), *options)?;
+            let (applied, previous) =
+                store.set(log, now, key.as_ref(), value.as_ref(), *options)?;
             let response = if options.get {
                 Response::Bulk(previous.map(Cow::Owned))
             } else if applied {
@@ -115,7 +123,7 @@ pub(crate) fn execute_with_write<S: HotStringStore>(
             let mut deleted = 0i64;
 
             for key in keys.iter() {
-                if store.del(now, key.as_ref())? {
+                if store.del(log, now, key.as_ref())? {
                     deleted += 1;
                 }
             }
@@ -129,18 +137,19 @@ pub(crate) fn execute_with_write<S: HotStringStore>(
 
 /// Answers a hot-key command whose [`dispatch`] the caller already found; `None` when it
 /// is not one (or there is no hot store).
-pub(crate) fn reply_dispatched<S: HotStringStore>(
+pub(crate) fn reply_dispatched<S: HotStringStore, L: MutationSink>(
     store: Option<&S>,
+    log: &mut L,
     handled: HotDispatch,
     now: UnixMillis,
     command: &Command<'_>,
-) -> Option<Result<(Response<'static>, bool), S::Error>> {
+) -> Option<Result<(Response<'static>, bool), L::Error>> {
     let store = store?;
 
     match handled {
         HotDispatch::PassThrough => None,
         HotDispatch::RejectUnsupported => Some(Ok((unsupported(command), false))),
-        HotDispatch::Handle => Some(execute_with_write(store, now, command)),
+        HotDispatch::Handle => Some(execute_with_write(store, log, now, command)),
     }
 }
 
@@ -161,18 +170,25 @@ fn set_deadline(
     }
 }
 
+/// `set` and `del` record the change in `log` before applying it and leave the key as it
+/// was when the record is refused (the [`MutationSink`] contract), so a refused write is
+/// never visible to another reader.
 pub(crate) trait HotStringStore: Send + Sync {
-    type Error;
-
-    fn get(&self, now: UnixMillis, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
-    fn set(
+    fn get(&self, now: UnixMillis, key: &[u8]) -> Result<Option<Vec<u8>>, Infallible>;
+    fn set<L: MutationSink>(
         &self,
+        log: &mut L,
         now: UnixMillis,
         key: &[u8],
         value: &[u8],
         options: SetOptions,
-    ) -> Result<(bool, Option<Vec<u8>>), Self::Error>;
-    fn del(&self, now: UnixMillis, key: &[u8]) -> Result<bool, Self::Error>;
+    ) -> Result<(bool, Option<Vec<u8>>), L::Error>;
+    fn del<L: MutationSink>(
+        &self,
+        log: &mut L,
+        now: UnixMillis,
+        key: &[u8],
+    ) -> Result<bool, L::Error>;
 
     fn checkpoint(&self, now: UnixMillis, shard_id: u32, last_sequence: u64) -> ShardCheckpoint;
 }
@@ -182,90 +198,42 @@ struct HotEntry {
     expire_at: Option<UnixMillis>,
 }
 
-pub(crate) struct ConcurrentMapStore<S> {
+pub(crate) struct ConcurrentMapStore {
     entries: Mutex<ahash::AHashMap<Vec<u8>, HotEntry>>,
-    sink: Mutex<S>,
     /// A replica: a key past its deadline reads as missing but stays until the
     /// primary's delete, as in the main store.
     keep_expired: std::sync::atomic::AtomicBool,
 }
 
-impl ConcurrentMapStore<NoopMutationSink> {
-    pub(crate) fn memory() -> Self {
-        Self::new(NoopMutationSink)
-    }
-}
-
-pub(crate) type SharedMemoryStore = std::sync::Arc<ConcurrentMapStore<NoopMutationSink>>;
+pub(crate) type SharedMemoryStore = std::sync::Arc<ConcurrentMapStore>;
 
 pub(crate) fn shared_memory_store(patterns: &[Vec<u8>]) -> Option<SharedMemoryStore> {
     (!patterns.is_empty()).then(|| std::sync::Arc::new(ConcurrentMapStore::memory()))
 }
 
-/// Records a hot-key write the shared store already applied. A SET is recorded with the
-/// deadline it gave the key, so EX, PX, EXAT, PXAT and KEEPTTL all replay as they ran;
-/// `kept` reads the deadline a KEEPTTL write left in place.
-pub(crate) fn record_applied_hot_command(
-    wal: &mut crate::persistence::WalSink,
-    now: UnixMillis,
-    kept: impl Fn(&[u8]) -> Option<UnixMillis>,
-    command: &Command<'_>,
-) -> Result<(), crate::persistence::PersistenceError> {
-    wal.select_database(0);
-
-    match command {
-        Command::Set(key, value, options) => {
-            match set_deadline(now, options.expiry, || kept(key.as_ref())) {
-                Some(deadline) => wal.record(Mutation::SetBytesExpiring {
-                    key: key.as_ref(),
-                    value: value.as_ref(),
-                    expires_at: deadline.get(),
-                }),
-                None => wal.record(Mutation::SetBytes {
-                    key: key.as_ref(),
-                    value: value.as_ref(),
-                }),
-            }
-        }
-
-        Command::Del(keys) => {
-            let owned: Vec<Cow<[u8]>> = keys
-                .iter()
-                .map(|key| Cow::Owned(key.as_ref().to_vec()))
-                .collect();
-
-            wal.record(Mutation::Delete { keys: &owned })
-        }
-
-        // A read leaves nothing to record. Any other command is refused before it runs
-        // (`dispatch`), so a new hot write must be given its record above.
-        other => {
-            debug_assert!(
-                matches!(other, Command::Get(_)),
-                "a hot write without a WAL record"
-            );
-            Ok(())
-        }
-    }
-}
-
-/// Removes every hot key, as FLUSHDB on database 0 and FLUSHALL do, and records one `Delete`.
-/// True when there was a key to remove (and so a record was made, or refused).
+/// Removes every hot key, as FLUSHDB on database 0 and FLUSHALL do, recording one `Delete`
+/// first: a refused record removes nothing. True when there was a key to remove (and so a
+/// record was made, or refused).
 pub(crate) fn flush(
     store: &SharedMemoryStore,
     wal: &mut crate::persistence::WalSink,
-    now: UnixMillis,
 ) -> Result<bool, crate::persistence::PersistenceError> {
-    let keys: Vec<Cow<[u8]>> = store.keys().into_iter().map(Cow::Owned).collect();
+    let mut entries = store.entries.lock().unwrap_or_else(|e| e.into_inner());
 
-    if keys.is_empty() {
+    if entries.is_empty() {
         return Ok(false);
     }
 
-    let command = Command::Del(keys.into());
-    let Ok(_) = execute_with_write(store.as_ref(), now, &command);
+    let keys: Vec<Cow<[u8]>> = entries.keys().map(|key| Cow::Borrowed(&key[..])).collect();
 
-    record_applied_hot_command(wal, now, |_| None, &command).map(|()| true)
+    wal.select_database(0);
+    wal.record(Mutation::Delete { keys: &keys })?;
+    drop(keys);
+    entries.clear();
+    if let Some(target) = crate::index::reclaim_capacity(0, entries.capacity()) {
+        entries.shrink_to(target);
+    }
+    Ok(true)
 }
 
 pub(crate) fn apply_owned(
@@ -331,11 +299,10 @@ pub(crate) fn apply_owned(
     }
 }
 
-impl<S: MutationSink> ConcurrentMapStore<S> {
-    pub(crate) fn new(sink: S) -> Self {
+impl ConcurrentMapStore {
+    pub(crate) fn memory() -> Self {
         Self {
             entries: Mutex::new(ahash::AHashMap::new()),
-            sink: Mutex::new(sink),
             keep_expired: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -349,15 +316,7 @@ impl<S: MutationSink> ConcurrentMapStore<S> {
         self.keep_expired.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// The deadline `key` holds, expired or not.
-    pub(crate) fn deadline(&self, key: &[u8]) -> Option<UnixMillis> {
-        self.entries
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(key)
-            .and_then(|entry| entry.expire_at)
-    }
-
+    #[cfg(test)]
     pub(crate) fn keys(&self) -> Vec<Vec<u8>> {
         self.entries
             .lock()
@@ -400,14 +359,10 @@ fn take_hot(entries: &mut ahash::AHashMap<Vec<u8>, HotEntry>, key: &[u8]) -> Opt
     removed
 }
 
-impl<S> HotStringStore for ConcurrentMapStore<S>
-where
-    S: MutationSink + Send,
-    S::Error: Send,
-{
-    type Error = S::Error;
-
-    fn get(&self, now: UnixMillis, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+impl HotStringStore for ConcurrentMapStore {
+    /// An expired key read here is dropped unlogged: its record already carries the
+    /// deadline, so replay drops it too.
+    fn get(&self, now: UnixMillis, key: &[u8]) -> Result<Option<Vec<u8>>, Infallible> {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let expired = entries
             .get(key)
@@ -419,12 +374,6 @@ where
 
         if expired {
             take_hot(&mut entries, key);
-            let owned = std::borrow::Cow::Owned(key.to_vec());
-
-            self.sink
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .record(Mutation::Delete { keys: &[owned] })?;
 
             return Ok(None);
         }
@@ -432,13 +381,14 @@ where
         Ok(entries.get(key).map(|entry| entry.value.clone()))
     }
 
-    fn set(
+    fn set<L: MutationSink>(
         &self,
+        log: &mut L,
         now: UnixMillis,
         key: &[u8],
         value: &[u8],
         options: SetOptions,
-    ) -> Result<(bool, Option<Vec<u8>>), Self::Error> {
+    ) -> Result<(bool, Option<Vec<u8>>), L::Error> {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some(entry) = entries.get(key)
@@ -463,18 +413,17 @@ where
             _ => {}
         }
 
-        let mut sink = self.sink.lock().unwrap_or_else(|e| e.into_inner());
-
+        // Recorded with the deadline it gives the key, so EX, PX, EXAT, PXAT and KEEPTTL
+        // all replay as they ran.
         match expire_at {
-            Some(deadline) => sink.record(Mutation::SetBytesExpiring {
+            Some(deadline) => log.record(Mutation::SetBytesExpiring {
                 key,
                 value,
                 expires_at: deadline.get(),
             })?,
-            None => sink.record(Mutation::SetBytes { key, value })?,
+            None => log.record(Mutation::SetBytes { key, value })?,
         }
 
-        drop(sink);
         entries.insert(
             key.to_vec(),
             HotEntry {
@@ -485,7 +434,12 @@ where
         Ok((true, previous))
     }
 
-    fn del(&self, now: UnixMillis, key: &[u8]) -> Result<bool, Self::Error> {
+    fn del<L: MutationSink>(
+        &self,
+        log: &mut L,
+        now: UnixMillis,
+        key: &[u8],
+    ) -> Result<bool, L::Error> {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some(entry) = entries.get(key)
@@ -500,12 +454,9 @@ where
             return Ok(false);
         }
 
-        let owned = std::borrow::Cow::Owned(key.to_vec());
-
-        self.sink
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .record(Mutation::Delete { keys: &[owned] })?;
+        log.record(Mutation::Delete {
+            keys: &[Cow::Borrowed(key)],
+        })?;
 
         take_hot(&mut entries, key);
         Ok(true)
@@ -597,7 +548,10 @@ mod tests {
         assert_eq!(
             dispatch(
                 &lock,
-                &Command::ListPush(Bytes::from(&b"lock:foo"[..]), vec![Bytes::from(&b"x"[..])])
+                &Command::ListPush(
+                    Bytes::from(&b"lock:foo"[..]),
+                    vec![Bytes::from(&b"x"[..])].into()
+                )
             ),
             HotDispatch::RejectUnsupported
         );
@@ -616,7 +570,13 @@ mod tests {
         assert_eq!(store.get(now, b"lock:a").unwrap(), None);
         assert!(
             store
-                .set(now, b"lock:a", b"held", SetOptions::default())
+                .set(
+                    &mut NoopMutationSink,
+                    now,
+                    b"lock:a",
+                    b"held",
+                    SetOptions::default()
+                )
                 .unwrap()
                 .0
         );
@@ -624,9 +584,9 @@ mod tests {
             store.get(now, b"lock:a").unwrap().as_deref(),
             Some(&b"held"[..])
         );
-        assert!(store.del(now, b"lock:a").unwrap());
+        assert!(store.del(&mut NoopMutationSink, now, b"lock:a").unwrap());
         assert_eq!(store.get(now, b"lock:a").unwrap(), None);
-        assert!(!store.del(now, b"lock:a").unwrap());
+        assert!(!store.del(&mut NoopMutationSink, now, b"lock:a").unwrap());
     }
 
     #[test]
@@ -643,14 +603,34 @@ mod tests {
             ..SetOptions::default()
         };
 
-        assert!(store.set(now, b"lock:a", b"first", nx).unwrap().0);
-        assert!(!store.set(now, b"lock:a", b"second", nx).unwrap().0);
+        assert!(
+            store
+                .set(&mut NoopMutationSink, now, b"lock:a", b"first", nx)
+                .unwrap()
+                .0
+        );
+        assert!(
+            !store
+                .set(&mut NoopMutationSink, now, b"lock:a", b"second", nx)
+                .unwrap()
+                .0
+        );
         assert_eq!(
             store.get(now, b"lock:a").unwrap().as_deref(),
             Some(&b"first"[..])
         );
-        assert!(!store.set(now, b"missing", b"x", xx).unwrap().0);
-        assert!(store.set(now, b"lock:a", b"replaced", xx).unwrap().0);
+        assert!(
+            !store
+                .set(&mut NoopMutationSink, now, b"missing", b"x", xx)
+                .unwrap()
+                .0
+        );
+        assert!(
+            store
+                .set(&mut NoopMutationSink, now, b"lock:a", b"replaced", xx)
+                .unwrap()
+                .0
+        );
         assert_eq!(
             store.get(now, b"lock:a").unwrap().as_deref(),
             Some(&b"replaced"[..])
@@ -666,7 +646,12 @@ mod tests {
             ..SetOptions::default()
         };
 
-        assert!(store.set(start, b"lock:ttl", b"1", options).unwrap().0);
+        assert!(
+            store
+                .set(&mut NoopMutationSink, start, b"lock:ttl", b"1", options)
+                .unwrap()
+                .0
+        );
         assert_eq!(
             store.get(start, b"lock:ttl").unwrap().as_deref(),
             Some(&b"1"[..])
@@ -729,15 +714,49 @@ mod tests {
     }
 
     #[test]
-    fn sink_failure_does_not_apply_set() {
-        let store = ConcurrentMapStore::new(FailingSink);
+    fn sink_failure_does_not_apply_set_or_del() {
+        let store = ConcurrentMapStore::memory();
         let now = UnixMillis::new(1);
 
         assert_eq!(
-            store.set(now, b"lock:a", b"x", SetOptions::default()),
+            store.set(
+                &mut FailingSink,
+                now,
+                b"lock:a",
+                b"x",
+                SetOptions::default()
+            ),
             Err("persistence unavailable")
         );
         assert_eq!(store.get(now, b"lock:a").unwrap(), None);
+
+        store
+            .set(
+                &mut NoopMutationSink,
+                now,
+                b"lock:a",
+                b"old",
+                SetOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.set(
+                &mut FailingSink,
+                now,
+                b"lock:a",
+                b"new",
+                SetOptions::default()
+            ),
+            Err("persistence unavailable")
+        );
+        assert_eq!(
+            store.del(&mut FailingSink, now, b"lock:a"),
+            Err("persistence unavailable")
+        );
+        assert_eq!(
+            store.get(now, b"lock:a").unwrap().as_deref(),
+            Some(&b"old"[..])
+        );
     }
 
     #[derive(Default)]
@@ -756,17 +775,17 @@ mod tests {
 
     #[test]
     fn records_set_before_visible_get() {
-        let store = ConcurrentMapStore::new(RecordingSink::default());
+        let store = ConcurrentMapStore::memory();
+        let mut sink = RecordingSink::default();
         let now = UnixMillis::new(1);
 
         store
-            .set(now, b"lock:a", b"v", SetOptions::default())
+            .set(&mut sink, now, b"lock:a", b"v", SetOptions::default())
             .unwrap();
         assert_eq!(
             store.get(now, b"lock:a").unwrap().as_deref(),
             Some(&b"v"[..])
         );
-        let sink = store.sink.lock().unwrap_or_else(|e| e.into_inner());
 
         assert!(
             sink.mutations.iter().any(|line| line.contains("SetBytes")),
@@ -792,7 +811,13 @@ mod tests {
                 thread::spawn(move || {
                     barrier.wait();
                     store
-                        .set(now, b"lock:global", format!("t{i}").as_bytes(), nx)
+                        .set(
+                            &mut NoopMutationSink,
+                            now,
+                            b"lock:global",
+                            format!("t{i}").as_bytes(),
+                            nx,
+                        )
                         .unwrap()
                         .0
                 })
@@ -874,18 +899,21 @@ mod tests {
             execute(
                 &store,
                 now,
-                &Command::ListPush(Bytes::from(&b"lock:foo"[..]), vec![Bytes::from(&b"x"[..])])
+                &Command::ListPush(
+                    Bytes::from(&b"lock:foo"[..]),
+                    vec![Bytes::from(&b"x"[..])].into()
+                )
             )
             .unwrap(),
             unsupported(&Command::ListPush(
                 Bytes::from(&b"lock:foo"[..]),
-                vec![Bytes::from(&b"x"[..])]
+                vec![Bytes::from(&b"x"[..])].into()
             ))
         );
         assert_eq!(
             unsupported(&Command::ListPush(
                 Bytes::from(&b"lock:foo"[..]),
-                vec![Bytes::from(&b"x"[..])]
+                vec![Bytes::from(&b"x"[..])].into()
             )),
             Response::OwnedError(b"ERR hot key does not support lpush".to_vec())
         );
@@ -898,7 +926,13 @@ mod tests {
 
         assert!(
             store
-                .set(start, b"lock:a", b"held", SetOptions::default())
+                .set(
+                    &mut NoopMutationSink,
+                    start,
+                    b"lock:a",
+                    b"held",
+                    SetOptions::default()
+                )
                 .unwrap()
                 .0
         );
@@ -907,7 +941,12 @@ mod tests {
             ..SetOptions::default()
         };
 
-        assert!(store.set(start, b"lock:ttl", b"1", ttl).unwrap().0);
+        assert!(
+            store
+                .set(&mut NoopMutationSink, start, b"lock:ttl", b"1", ttl)
+                .unwrap()
+                .0
+        );
         let later = UnixMillis::new(10_050);
         let checkpoint = store.checkpoint(later, 2, 7);
 
@@ -938,7 +977,13 @@ mod tests {
 
             assert!(
                 store
-                    .set(now, key.as_bytes(), b"v", SetOptions::default())
+                    .set(
+                        &mut NoopMutationSink,
+                        now,
+                        key.as_bytes(),
+                        b"v",
+                        SetOptions::default()
+                    )
                     .unwrap()
                     .0
             );
@@ -949,7 +994,11 @@ mod tests {
         for index in 0..removed {
             let key = format!("lock:{index:04}");
 
-            assert!(store.del(now, key.as_bytes()).unwrap());
+            assert!(
+                store
+                    .del(&mut NoopMutationSink, now, key.as_bytes())
+                    .unwrap()
+            );
         }
 
         let shrunk = store.entries.lock().expect("lock").capacity();

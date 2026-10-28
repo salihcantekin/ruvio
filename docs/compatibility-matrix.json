@@ -40,7 +40,7 @@
       "family": "connection",
       "status": "supported",
       "same_slot": false,
-      "limitations": "No arguments replies PONG is taken. OWNER names the shard rule. Any other argument is an error.",
+      "limitations": "No arguments replies PONG is taken. OWNER names the shard rule. RUVIO TOPOLOGY VERSION returns the cluster map version the node serves (0 without cluster_topology); RUVIO TOPOLOGY SET map installs a newer map (sent by ruvio coordinator; @admin @dangerous; a slot may join the node's group only once RUVIO MIGRATE prepared its data there). RUVIO MIGRATE IMPORT, EXPORT, COPY, PREPARE, CANCEL and STATUS move a slot range between groups for ruvio coordinator (COORDINATOR MOVE; @admin @dangerous; AUTH arguments redacted in SLOWLOG); see docs/COMPATIBILITY.md. RUVIO LEASE BEGIN and RUVIO LEASE GRANT token coordinator voters epoch lease_ms renew the primary lease for ruvio coordinator (primary-lease; @admin @dangerous). Any other argument is an error.",
       "coverage": [
         "src/protocol/",
         "src/engine/"
@@ -196,6 +196,28 @@
       ]
     },
     {
+      "name": "TRANSFER",
+      "family": "strings",
+      "status": "supported",
+      "same_slot": true,
+      "limitations": "TRANSFER source destination amount [MAX cap] subtracts a positive amount from the integer at source when it holds at least that much and adds it to destination, creating destination at amount when it is missing. Returns [source after, destination after]. A missing or short source, an addition that overflows, or a destination that would pass MAX returns a null bulk and writes nothing. Source and destination must differ and share a slot. Both keys are written as one WAL record. A non-integer is an error and a key of another type is WRONGTYPE.",
+      "coverage": [
+        "src/protocol/",
+        "src/engine/"
+      ]
+    },
+    {
+      "name": "HTRANSFER",
+      "family": "hashes",
+      "status": "supported",
+      "same_slot": false,
+      "limitations": "HTRANSFER key from to amount [MAX cap] is TRANSFER between two fields of one hash. Returns [from after, to after], or a null bulk when the key or the from field is missing or short, the addition overflows, or to would pass MAX; nothing is written then. A missing to field is created at amount. Field TTLs stay. Both fields are written as one WAL record. A field that is not an integer is an error.",
+      "coverage": [
+        "src/protocol/",
+        "src/engine/"
+      ]
+    },
+    {
       "name": "DELEX",
       "family": "strings",
       "status": "supported",
@@ -221,7 +243,7 @@
       "family": "keys",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Fixed window on one key. Returns the remaining allowance after this call, or a null bulk when the window is full. The counter is not incremented on rejection. The window is the key deadline, so an unused window disappears. A plain key does not store a limit. The accepted call is a WAL record. GET of a limit is WRONGTYPE.",
+      "limitations": "Fixed window on one key. Returns the remaining allowance after this call, or a null bulk when the window is full. The counter is not incremented on rejection. SLIDING keeps a weighted count of the current and previous window (maximum up to 2147483647), TOKENS a token bucket of `max` tokens that refills over the window (capacity up to 1000000, refill up to 4294967295 ms, COST n takes n tokens); a refused call writes nothing. WITHRETRY returns [remaining, retry_after_ms] with remaining -1 when refused. A key keeps the mode it was created with: another mode on it is an error. The window is the key deadline, so an unused window disappears. A plain key does not store a limit. The accepted call is a WAL record. GET of a limit is WRONGTYPE.",
       "coverage": [
         "src/protocol/",
         "src/engine/"
@@ -232,7 +254,7 @@
       "family": "keys",
       "status": "supported",
       "same_slot": false,
-      "limitations": "IDEM key BEGIN fingerprint owner ttl_ms atomically reserves a missing key or returns pending, conflict, or completed with the binary result. IDEM key COMPLETE fingerprint owner result publishes only for the matching live owner. Identical completion is acknowledged without rewriting; changed results are refused. Neither retries nor completion renew the original TTL. Tokens are 1-128 bytes, retention is 1 ms-7 days, and result is at most 4 MiB (also subject to protocol limits including the packed metadata). Uses the existing string layout with an internal packed record; do not modify it with string/expiry commands. Each state transition and its deadline is one WAL record. Not exactly-once for external effects.",
+      "limitations": "IDEM key BEGIN fingerprint owner ttl_ms atomically reserves a missing key or returns pending, conflict, or completed with the binary result. IDEM key COMPLETE fingerprint owner result publishes only for the matching live owner. IDEM key ABORT fingerprint owner removes a pending record of the matching owner and fingerprint (never a completed one) and is recorded as a delete. Identical completion is acknowledged without rewriting; changed results are refused. Neither retries nor completion renew the original TTL. Tokens are 1-128 bytes, retention is 1 ms-7 days, and result is at most 4 MiB (also subject to protocol limits including the packed metadata). Uses the existing string layout with an internal packed record; do not modify it with string/expiry commands. Each state transition and its deadline is one WAL record. Not exactly-once for external effects.",
       "coverage": [
         "src/protocol/",
         "src/engine/idempotency.rs"
@@ -254,7 +276,7 @@
       "family": "keys",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Acquires a shard-owned lease. Returns a new fencing token, or a null bulk when the lease is still held. Expiry and RELEASE keep the token so the next LEASE continues the sequence. DEL starts a new key at token 1. The grant is a WAL record. GET of a lease is WRONGTYPE. Unused keys do not store a lease.",
+      "limitations": "Acquires a shard-owned lease. Returns a new fencing token, or a null bulk when the lease is still held. Tokens only grow: after expiry, RELEASE, DEL, a restart, a failover or a slot move, the next grant is larger (generation in the top bits, then a counter with a clock floor). The grant is a WAL record. The key has the lease deadline as its TTL (PTTL shows the time left) and goes away when the lease expires or is released. GET of a lease is WRONGTYPE. Unused keys do not store a lease.",
       "coverage": [
         "src/protocol/",
         "src/engine/"
@@ -276,7 +298,18 @@
       "family": "keys",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Releases a lease when the token matches the current holder. Returns 1 or 0. A mismatch leaves the holder in place. The key keeps the token so the next LEASE continues the sequence. The release is a WAL record.",
+      "limitations": "Releases a lease when the token matches the current holder. Returns 1 or 0. A mismatch leaves the holder in place. A released lease removes its key. The next LEASE gets a larger token. The release is a WAL delete record.",
+      "coverage": [
+        "src/protocol/",
+        "src/engine/"
+      ]
+    },
+    {
+      "name": "RENEW",
+      "family": "keys",
+      "status": "supported",
+      "same_slot": false,
+      "limitations": "RENEW key token ttl_ms moves the deadline of a live LEASE holder or SEMAPHORE slot to now + ttl_ms (the new TTL replaces the remaining time). Returns 1, or 0 when the token is expired, released or not the holder. It never creates a holder and never changes the token sequence. A lease renew is a LeasePut record and a semaphore renew a SemaphoreAcquire record with the same token, so no new WAL record type exists. Any other key type is WRONGTYPE.",
       "coverage": [
         "src/protocol/",
         "src/engine/"
@@ -298,7 +331,7 @@
       "family": "strings",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Supports EX, PX, EXAT, PXAT, KEEPTTL, NX, XX, and GET. GET returns the previous string and refuses a non-string. `SET key value IFEQ expected [EX|PX|EXAT|PXAT|KEEPTTL]` (Ruvio extension) writes only when the string equals `expected` and answers nil otherwise; it does not combine with NX, XX or GET.",
+      "limitations": "Supports EX, PX, EXAT, PXAT, KEEPTTL, NX, XX, and GET. GET returns the previous string and refuses a non-string. `SET key value IFEQ expected [EX|PX|EXAT|PXAT|KEEPTTL]` (Ruvio extension) writes only when the string equals `expected` and answers nil otherwise; it does not combine with NX, XX or GET. `SET key value IFGT|IFLT [EX|PX|EXAT|PXAT|KEEPTTL]` (Ruvio extension) writes when the key is missing or `value` is greater (`IFGT`) or smaller (`IFLT`) than the stored signed 64-bit integer, and answers nil otherwise; a `value` or stored string that is not an integer is an error and writes nothing; it does not combine with NX, XX, GET or IFEQ.",
       "coverage": [
         "scripts/resp_conformance.py",
         "scripts/redis_differential.py",
@@ -365,7 +398,7 @@
       "family": "strings",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Signed 64-bit decimal integers.",
+      "limitations": "Signed 64-bit decimal integers. `EX seconds` or `PX milliseconds` sets a deadline only when the call creates the key; an existing key keeps its deadline. The write and the deadline are one WAL record.",
       "coverage": [
         "scripts/resp_conformance.py",
         "scripts/redis_differential.py"
@@ -376,7 +409,7 @@
       "family": "strings",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Signed 64-bit decimal integers.",
+      "limitations": "Signed 64-bit decimal integers. `EX seconds` or `PX milliseconds` sets a deadline only when the call creates the key; an existing key keeps its deadline. The write and the deadline are one WAL record.",
       "coverage": [
         "scripts/resp_conformance.py",
         "scripts/redis_differential.py"
@@ -387,7 +420,7 @@
       "family": "strings",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Signed 64-bit decimal integers. INCRBY key n MAX limit returns a null bulk and writes nothing when the result would pass limit.",
+      "limitations": "Signed 64-bit decimal integers. INCRBY key n MAX limit returns a null bulk and writes nothing when the result would pass limit. `EX seconds` or `PX milliseconds` sets a deadline only when the call creates the key; an existing key keeps its deadline. The write and the deadline are one WAL record. Order with `MAX`: `[EX|PX] [MAX]`.",
       "coverage": [
         "scripts/resp_conformance.py",
         "scripts/redis_differential.py"
@@ -398,7 +431,7 @@
       "family": "strings",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Signed 64-bit decimal integers.",
+      "limitations": "Signed 64-bit decimal integers. `EX seconds` or `PX milliseconds` sets a deadline only when the call creates the key; an existing key keeps its deadline. The write and the deadline are one WAL record.",
       "coverage": [
         "scripts/resp_conformance.py",
         "scripts/redis_differential.py"
@@ -464,7 +497,7 @@
       "family": "keys",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Shard-local. Cursors walk sorted live keys, not Redis dict cursors.",
+      "limitations": "Shard-local. Cursors walk sorted live keys, not Redis dict cursors. Ruvio adds SLOT n (0-16383): only keys of that hash slot, run on the shard that owns it from any port; COUNT still bounds the work, so pages may be short or empty until the cursor returns 0. No CLUSTER COUNTKEYSINSLOT or GETKEYSINSLOT.",
       "coverage": [
         "scripts/resp_conformance.py"
       ]
@@ -541,7 +574,7 @@
       "family": "keys",
       "status": "supported",
       "same_slot": false,
-      "limitations": "A relative expire of zero or less deletes the key and returns 1, as Redis does.",
+      "limitations": "A relative expire of zero or less deletes the key and returns 1, as Redis does. Accepts one of `NX`, `XX`, `GT`, `LT` (a key without a deadline counts as infinite). A condition that does not hold replies 0.",
       "coverage": [
         "scripts/resp_conformance.py"
       ]
@@ -551,7 +584,7 @@
       "family": "keys",
       "status": "supported",
       "same_slot": false,
-      "limitations": "A relative expire of zero or less deletes the key and returns 1, as Redis does.",
+      "limitations": "A relative expire of zero or less deletes the key and returns 1, as Redis does. Accepts one of `NX`, `XX`, `GT`, `LT` (a key without a deadline counts as infinite). A condition that does not hold replies 0.",
       "coverage": [
         "scripts/resp_conformance.py"
       ]
@@ -561,7 +594,7 @@
       "family": "keys",
       "status": "supported",
       "same_slot": false,
-      "limitations": "A deadline in the past leaves the key absent and still replies OK.",
+      "limitations": "A deadline in the past leaves the key absent and still replies OK. Accepts one of `NX`, `XX`, `GT`, `LT` (a key without a deadline counts as infinite). A condition that does not hold replies 0.",
       "coverage": [
         "scripts/resp_conformance.py"
       ]
@@ -571,7 +604,7 @@
       "family": "keys",
       "status": "supported",
       "same_slot": false,
-      "limitations": "A deadline in the past leaves the key absent and still replies OK.",
+      "limitations": "A deadline in the past leaves the key absent and still replies OK. Accepts one of `NX`, `XX`, `GT`, `LT` (a key without a deadline counts as infinite). A condition that does not hold replies 0.",
       "coverage": [
         "scripts/resp_conformance.py"
       ]
@@ -894,6 +927,17 @@
       ]
     },
     {
+      "name": "HMSET",
+      "family": "hashes",
+      "status": "supported",
+      "same_slot": false,
+      "limitations": "Same as multi-field HSET (Redis marks HMSET deprecated); replies OK instead of the count of new fields.",
+      "coverage": [
+        "scripts/resp_conformance.py",
+        "scripts/redis_differential.py"
+      ]
+    },
+    {
       "name": "HGET",
       "family": "hashes",
       "status": "supported",
@@ -986,7 +1030,7 @@
       "family": "hashes",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Stores the decimal result. Non-integers and overflow are rejected without a write.",
+      "limitations": "Stores the decimal result. Non-integers and overflow are rejected without a write. `EX seconds` or `PX milliseconds` sets a deadline only when the call creates the key; an existing key keeps its deadline. The write and the deadline are one WAL record. The deadline is the key's.",
       "coverage": [
         "scripts/resp_conformance.py",
         "scripts/redis_differential.py"
@@ -1128,7 +1172,7 @@
       "family": "zsets",
       "status": "supported",
       "same_slot": false,
-      "limitations": "NX, XX, GT, LT, CH, and INCR. Without CH the reply counts new members. INCR returns the new score or nil. GT and LT still add a missing member.",
+      "limitations": "NX, XX, GT, LT, CH, and INCR. Without CH the reply counts new members. INCR returns the new score or nil. GT and LT still add a missing member. `EX seconds` or `PX milliseconds` sets a deadline only when the call creates the key; an existing key keeps its deadline. The write and the deadline are one WAL record. Placed with the other options before the first score.",
       "coverage": [
         "scripts/resp_conformance.py",
         "scripts/redis_differential.py"
@@ -1205,7 +1249,7 @@
       "family": "zsets",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Records the resulting score.",
+      "limitations": "Records the resulting score. `EX seconds` or `PX milliseconds` sets a deadline only when the call creates the key; an existing key keeps its deadline. The write and the deadline are one WAL record.",
       "coverage": [
         "scripts/resp_conformance.py",
         "scripts/redis_differential.py"
@@ -1278,6 +1322,26 @@
       ]
     },
     {
+      "name": "ZPOPBYSCORE",
+      "family": "zsets",
+      "status": "supported",
+      "same_slot": false,
+      "limitations": "Ruvio extension. `ZPOPBYSCORE key max [MIN min] [COUNT n] [WITHSCORES]` removes and returns up to `n` (default 1, at most 10000) members with `min <= score <= max`, lowest score first. Bounds take `-inf`, `+inf` and `(` exclusive forms. Empty array when nothing is due. Recorded as one ZREM of the popped members.",
+      "coverage": [
+        "src/engine/tests/due.rs"
+      ]
+    },
+    {
+      "name": "ZMOVEDUE",
+      "family": "zsets",
+      "status": "supported",
+      "same_slot": true,
+      "limitations": "Ruvio extension. `ZMOVEDUE source destination max [COUNT n]` moves up to `n` (default 1, at most 10000) members with `score <= max`, lowest first, from a sorted set to the tail of a list, and returns how many moved. Source and destination must hash to the same slot. Clients blocked on the destination list are served first. Recorded as one transaction.",
+      "coverage": [
+        "src/engine/tests/due.rs"
+      ]
+    },
+    {
       "name": "BZPOPMIN",
       "family": "zsets",
       "status": "supported",
@@ -1335,7 +1399,7 @@
       "family": "geo",
       "status": "supported",
       "same_slot": false,
-      "limitations": "One sorted set. Score is the 52-bit geohash. NX, XX, and CH.",
+      "limitations": "One sorted set. Score is the 52-bit geohash. NX, XX, and CH. `EX seconds` or `PX milliseconds` sets a deadline only when the call creates the key; an existing key keeps its deadline. The write and the deadline are one WAL record. Placed with the other options before the first longitude.",
       "coverage": [
         "src/protocol/"
       ]
@@ -1447,7 +1511,7 @@
       "family": "bloom",
       "status": "supported",
       "same_slot": false,
-      "limitations": "RedisBloom wire shape: `CAPACITY`, `ERROR`, `EXPANSION`, `NOCREATE`, `NONSCALING`, `ITEMS`. The creation options apply only when the key is new. `NOCREATE` on a missing key answers `ERR not found`.",
+      "limitations": "RedisBloom wire shape: `CAPACITY`, `ERROR`, `EXPANSION`, `NOCREATE`, `NONSCALING`, `ITEMS`. The creation options apply only when the key is new. `NOCREATE` on a missing key answers `ERR not found`. `EX seconds` or `PX milliseconds` sets a deadline only when the call creates the key; an existing key keeps its deadline. The write and the deadline are one WAL record. Placed with the creation options before `ITEMS`.",
       "coverage": [
         "src/engine/tests/bloom.rs"
       ]
@@ -1538,7 +1602,7 @@
       "family": "json",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Whole-document updates; only existing intermediate nodes; maximum resulting document 16 MiB. `NX` / `XX` as a fourth argument write only when the path is missing / present, and answer null otherwise.",
+      "limitations": "Whole-document updates; only existing intermediate nodes; maximum resulting document 16 MiB. `NX` / `XX` as a fourth argument write only when the path is missing / present, and answer null otherwise. `EX seconds` or `PX milliseconds` sets a deadline only when the call creates the key; an existing key keeps its deadline. The write and the deadline are one WAL record. After the optional `NX` or `XX`.",
       "coverage": [
         "src/protocol/tests.rs",
         "src/engine/tests/json_ops_more.rs"
@@ -1559,7 +1623,7 @@
       "family": "streams",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Auto id is * or ms-*. Explicit ids are ms-seq. DELAY holds the new entry from XREADGROUP until that many milliseconds pass. The hold is a WAL record and a snapshot trailer, written only when a delay is set. A millisecond behind the top id is rejected. MAXLEN and MINID, including ~ and =, both trim exactly. They cannot be combined. NOMKSTREAM returns a null bulk and does not create a missing key. The assigned id is the WAL record. The approximate trim option LIMIT is not accepted.",
+      "limitations": "Auto id is * or ms-*. Explicit ids are ms-seq. DELAY holds the new entry from XREADGROUP until that many milliseconds pass. The hold is a WAL record and a snapshot trailer, written only when a delay is set. A millisecond behind the top id is rejected. MAXLEN and MINID, including ~ and =, both trim exactly. They cannot be combined. NOMKSTREAM returns a null bulk and does not create a missing key. The assigned id is the WAL record. The approximate trim option LIMIT is not accepted. `EX seconds` or `PX milliseconds` sets a deadline only when the call creates the key; an existing key keeps its deadline. The write and the deadline are one WAL record. Placed with the other options before the id.",
       "coverage": [
         "src/engine/"
       ]
@@ -1792,14 +1856,55 @@
       ]
     },
     {
+      "name": "REPLICAOF",
+      "family": "replication",
+      "status": "supported",
+      "same_slot": false,
+      "limitations": "REPLICAOF host port makes every shard follow host:port (shard i dials port + i) without a restart; writes answer READONLY at once. A shard resumes from its own log when the new primary continues its history up to where it forked, otherwise it takes a full copy. REPLICAOF NO ONE promotes in place: queued frames are applied, a new history forks one epoch up, and the shard ships to replicas when replication.listen is set. It is refused while any shard has a catch-up marker unless FORCE is given; a shard still copying answers LOADING to every command, so an incomplete single-shard replica is promoted with a restart and --force-promote-incomplete. Durability memory and snapshot refuse it. Lasts until restart (the file's role applies again); not logged or replicated; refused inside MULTI and scripts. No SLAVEOF alias.",
+      "coverage": [
+        "src/runtime/evented/tests/role_change.rs"
+      ]
+    },
+    {
+      "name": "ROLE",
+      "family": "replication",
+      "status": "supported",
+      "same_slot": false,
+      "limitations": "Per shard (each shard is a node): a primary, or a server that does not replicate, answers master, its WAL sequence and its replicas that announced an address and finished copying ([host, port, acknowledged sequence], as strings); a replica answers slave, the address it dials, connect or connected, and its synced sequence.",
+      "coverage": [
+        "src/runtime/evented/tests/role_change.rs"
+      ]
+    },
+    {
       "name": "CONFIG GET",
       "family": "introspection",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Lists Ruvio settings with requirepass redacted. CONFIG SET is not supported.",
+      "limitations": "Lists Ruvio settings with requirepass redacted; shows the live value of a setting CONFIG SET changed.",
       "coverage": [
         "scripts/resp_conformance.py",
         "src/protocol/tests.rs"
+      ]
+    },
+    {
+      "name": "CONFIG SET",
+      "family": "introspection",
+      "status": "supported",
+      "same_slot": false,
+      "limitations": "Live memory, observability, connection, script and security settings only (docs/CONFIGURATION.md, Live column); restart-only names such as shards, data_dir or TLS files are refused by name. Names as CONFIG GET shows them; values follow the config file's rules (plain byte counts, no 100mb units). All pairs apply or none. Every shard applies it before OK. Connection settings apply to new connections. Not written to the WAL, not replicated, not allowed in MULTI or scripts.",
+      "coverage": [
+        "src/config/tests.rs",
+        "src/runtime/evented/tests/config_set.rs"
+      ]
+    },
+    {
+      "name": "CONFIG REWRITE",
+      "family": "introspection",
+      "status": "supported",
+      "same_slot": false,
+      "limitations": "Writes the live settings into the config file the server started from; restart-only settings keep what the file says. The file is rewritten as --write-config does (keys kept, comments dropped).",
+      "coverage": [
+        "src/runtime/evented/tests/config_set.rs"
       ]
     },
     {
@@ -1827,7 +1932,7 @@
       "family": "transactions",
       "status": "supported",
       "same_slot": true,
-      "limitations": "Same-slot, shard-local only. At most 1,024 queued commands.",
+      "limitations": "Same-slot, shard-local only. At most 1,024 queued commands. EVAL, EVALSHA and FCALL queue and run in their place at EXEC, their writes in the transaction's one WAL record; a queued PUBLISH is sent after EXEC is recorded (DISCARD sends nothing). Not queueable: blocking commands, SELECT, SPUBLISH, SUBSCRIBE and the other subscribe commands, SCRIPT and FUNCTION management, AUTH, HELLO, ACL, CONFIG SET/REWRITE, SAVE/BGSAVE, REPLICAOF/ROLE and cluster discovery.",
       "coverage": [
         "scripts/resp_conformance.py",
         "scripts/redis_differential.py"
@@ -1982,7 +2087,7 @@
       "family": "cluster",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Static topology of the shards in one process. Hosts and ports come from advertised_host and advertised_port.",
+      "limitations": "Topology of the shards in one process, including ranges moved with RUVIO MOVESLOTS, and with cluster_topology the other groups of a multi-node cluster (by their primary). Hosts and ports come from advertised_host and advertised_port. Each range lists the primary shard, then its replicas that announced an address and finished copying; a replica lists the primary it follows first and itself second. Node ids are the SHA-1 of the announced host:port.",
       "coverage": [
         "scripts/cluster_smoke.py"
       ]
@@ -1992,7 +2097,7 @@
       "family": "cluster",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Static topology of the shards in one process. Hosts and ports come from advertised_host and advertised_port.",
+      "limitations": "Static topology of the shards in one process. Hosts and ports come from advertised_host and advertised_port. Replicas that announced an address and finished copying appear as slave lines naming their primary's id.",
       "coverage": [
         "scripts/cluster_smoke.py"
       ]
@@ -2002,7 +2107,7 @@
       "family": "cluster",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Static topology of the shards in one process. Every shard is a primary.",
+      "limitations": "Static topology of the shards in one process. Each shard lists its primary, then its replicas (role replica, replication-offset = acknowledged sequence).",
       "coverage": [
         "scripts/cluster_smoke.py"
       ]
@@ -2038,11 +2143,21 @@
       ]
     },
     {
+      "name": "RUVIO MOVESLOTS",
+      "family": "cluster",
+      "status": "supported",
+      "same_slot": false,
+      "limitations": "Ruvio only. RUVIO MOVESLOTS first-last shard (or one slot) moves a slot range to another shard of the same server while it keeps serving it, and answers OK once the move has started; RUVIO MOVESLOTS STATUS reports the running or last move as a map of strings (state none, copying, cleaning, cancelling, done or cancelled, and first, last, from, to, keys, rounds, elapsed_ms, freeze_ms, error). One move at a time; every slot of the range must be on one shard. Refused while replication is on and inside MULTI and scripts. No MOVED: clients that still route to the old shard are forwarded. A client blocked on a moved key gets UNBLOCKED, an EXEC whose watched keys moved runs nothing, and a pipelined command routed to the old shard at the hand-over may get TRYAGAIN.",
+      "coverage": [
+        "src/runtime/evented/tests/slot_moves.rs"
+      ]
+    },
+    {
       "name": "READONLY",
       "family": "cluster",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Returns OK in cluster mode. There are no replicas to read from.",
+      "limitations": "Returns OK in cluster mode. Replicas serve reads with or without it; clients send it to replica connections for Redis compatibility.",
       "coverage": [
         "scripts/cluster_smoke.py"
       ]
@@ -2052,7 +2167,7 @@
       "family": "cluster",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Returns OK in cluster mode.",
+      "limitations": "Returns OK in cluster mode; replicas refuse writes either way.",
       "coverage": [
         "scripts/cluster_smoke.py"
       ]
@@ -2155,6 +2270,17 @@
       "limitations": "An empty name clears it. The name is not durable.",
       "coverage": [
         "src/runtime/session.rs"
+      ]
+    },
+    {
+      "name": "CLIENT DURABILITY",
+      "family": "connection",
+      "status": "supported",
+      "same_slot": false,
+      "limitations": "Ruvio extension. CLIENT DURABILITY REPLICAS n [TIMEOUT ms] (default 5000 ms; n 0 turns it off): this connection's replies leave once n replicas hold on disk every record its shard wrote before them, checked once per batch of replies. On timeout every reply of the batch is -NOREPLICAS; the writes are applied and stay, as with WAIT. Refused inside MULTI and on a server without replication.",
+      "coverage": [
+        "src/runtime/session.rs",
+        "src/runtime/evented/durable.rs"
       ]
     },
     {
@@ -2382,7 +2508,7 @@
       "family": "bitmap",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Bitmap limited to 16 MiB (offset < 134,217,728); each call rewrites the value, O(value size). Keeps an existing TTL.",
+      "limitations": "Bitmap limited to 16 MiB (offset < 134,217,728); each call rewrites the value, O(value size). Keeps an existing TTL. `EX seconds` or `PX milliseconds` sets a deadline only when the call creates the key; an existing key keeps its deadline. The write and the deadline are one WAL record.",
       "coverage": [
         "scripts/redis_differential.py"
       ]
@@ -2552,7 +2678,7 @@
       "family": "strings",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Computed in double precision and printed with 15 significant digits; Redis uses long double, so results with more digits can differ in the last places (Redis prints 153.10000000000000001 where Ruvio prints 153.1). Keeps the TTL.",
+      "limitations": "Computed in double precision and printed with 16 significant digits and stored as that rounded text, so later increments start from the rounded value (use integers for money); Redis uses long double, so results with more digits can differ in the last places (Redis prints 153.10000000000000001 where Ruvio prints 153.1). Keeps the TTL. `EX seconds` or `PX milliseconds` sets a deadline only when the call creates the key; an existing key keeps its deadline. The write and the deadline are one WAL record.",
       "coverage": [
         "scripts/redis_differential.py"
       ]
@@ -2722,7 +2848,7 @@
       "family": "hashes",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Computed in double precision and printed with 15 significant digits (Redis uses long double). Keeps a field TTL.",
+      "limitations": "Computed in double precision and printed with 16 significant digits and stored as that rounded text, so later increments start from the rounded value (use integers for money; Redis uses long double). Keeps a field TTL.",
       "coverage": [
         "scripts/redis_differential.py"
       ]
@@ -2982,7 +3108,7 @@
       "family": "connection",
       "status": "supported",
       "same_slot": false,
-      "limitations": "`GET`, `LEN`, `RESET`. Only commands that take the generic dispatcher are timed (not GET, SET, INCR, PING on the fast path) and blocking commands are skipped. An entry holds the command name and its first key (128 bytes), not every argument. Per shard; set `slowlog_threshold_micros` and `slowlog_max_len` in the config file or environment, not with CONFIG SET.",
+      "limitations": "`GET`, `LEN`, `RESET`. Only commands that take the generic dispatcher are timed (not GET, SET, INCR, PING on the fast path) and blocking commands are skipped. An entry holds the command name and its first key (128 bytes), not every argument. Per shard; `slowlog_threshold_micros` and `slowlog_max_len` come from the config file or environment and CONFIG SET changes them live.",
       "coverage": [
         "src/runtime/evented/clients.rs"
       ]
@@ -3018,12 +3144,7 @@
       ]
     }
   ],
-  "unsupported": [
-    {
-      "name": "CONFIG SET",
-      "reason": "Runtime mutation of process settings is not supported."
-    }
-  ],
+  "unsupported": [],
   "clients": [
     {
       "id": "ruvio-client",
@@ -3039,7 +3160,7 @@
       "language": "C#",
       "library": "Ruvio.Client",
       "package": "Ruvio.Client",
-      "version": "0.3.4",
+      "version": "0.4.0",
       "protocol": "RESP2",
       "suite": "clients/csharp/Ruvio.Client/Commands/Commands.cs"
     }

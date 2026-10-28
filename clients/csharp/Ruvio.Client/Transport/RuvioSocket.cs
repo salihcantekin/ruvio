@@ -1,6 +1,9 @@
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
+using System.Globalization;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
 
 namespace Ruvio.Client;
 
@@ -11,6 +14,8 @@ internal sealed class RuvioSocket : IDisposable
     private static readonly Meter Meter = new("Ruvio.Client");
     private static readonly Histogram<double> SocketPhaseDuration = Meter.CreateHistogram<double>(
         "ruvio_client_socket_phase_duration_milliseconds", "ms");
+    private static readonly Histogram<double> CommandDuration = Meter.CreateHistogram<double>(
+        "ruvio_client_command_duration_milliseconds", "ms");
     private static readonly Counter<long> SocketWrites = Meter.CreateCounter<long>(
         "ruvio_client_socket_write_calls");
     private static readonly Counter<long> SocketWrittenBytes = Meter.CreateCounter<long>(
@@ -24,17 +29,19 @@ internal sealed class RuvioSocket : IDisposable
     private bool _independentIo;
     private readonly object _multiplexerGate = new();
     private readonly int _maxInFlight;
+    private readonly TimeSpan _commandTimeout;
     private CommandMultiplexer? _multiplexer;
     private bool _initialized;
 
     private volatile bool _broken;
     private volatile bool _disposed;
 
-    private RuvioSocket(TcpClient tcp, string host, int port, int maxInFlight, bool dedicatedReader)
+    private RuvioSocket(TcpClient tcp, Stream? secure, string host, int port, int maxInFlight, bool dedicatedReader, TimeSpan commandTimeout)
     {
+        _commandTimeout = commandTimeout;
         _tcp = tcp;
         _dedicatedReader = dedicatedReader;
-        _stream = dedicatedReader ? new BlockingSocketStream(tcp.Client) : tcp.GetStream();
+        _stream = secure ?? (dedicatedReader ? new BlockingSocketStream(tcp.Client) : tcp.GetStream());
         _reader = new RespReader(_stream);
         Host = host;
         Port = port;
@@ -47,7 +54,7 @@ internal sealed class RuvioSocket : IDisposable
 
     public bool IsBroken => _broken || _disposed || _multiplexer?.IsBroken == true;
 
-    /// <summary>Connects, then sends <c>AUTH</c> when the options ask for it. <c>SELECT</c> is left to the caller.</summary>
+    /// <summary>Connects, then sends <c>AUTH</c> and <c>CLIENT DURABILITY</c> when the options ask for them. <c>SELECT</c> is left to the caller.</summary>
     // subscriber: a Pub/Sub socket, which keeps async I/O whatever the options say.
     public static async Task<RuvioSocket> OpenAsync(
         string host,
@@ -59,9 +66,11 @@ internal sealed class RuvioSocket : IDisposable
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(options.MaxInFlightRequests);
         
         var tcp = new TcpClient { NoDelay = true };
-        bool dedicatedReader = options.DedicatedReaderThread && !subscriber;
+        bool dedicatedReader = options.DedicatedReaderThread && !subscriber && options.Tls is null;
         using var connect = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         connect.CancelAfter(options.ConnectTimeout);
+
+        Stream? secure = null;
 
         try
         {
@@ -77,6 +86,11 @@ internal sealed class RuvioSocket : IDisposable
             {
                 await tcp.ConnectAsync(host, port, connect.Token);
             }
+
+            if (options.Tls is { } tls)
+            {
+                secure = await AuthenticateAsync(tcp, host, tls, connect.Token);
+            }
         }
         catch (Exception error) when (dedicatedReader && connect.Token.IsCancellationRequested && error is not OperationCanceledException)
         {
@@ -85,13 +99,14 @@ internal sealed class RuvioSocket : IDisposable
         }
         catch
         {
+            secure?.Dispose();
             tcp.Dispose();
             throw;
         }
 
-        var connection = new RuvioSocket(tcp, host, port, options.MaxInFlightRequests, dedicatedReader);
+        var connection = new RuvioSocket(tcp, secure, host, port, options.MaxInFlightRequests, dedicatedReader, options.CommandTimeout);
 
-        if (options.Password is null)
+        if (options.Password is null && options.DurabilityReplicas <= 0)
         {
             connection._initialized = true;
 
@@ -100,21 +115,18 @@ internal sealed class RuvioSocket : IDisposable
 
         try
         {
-            IReadOnlyList<string> auth = options.Username is null
-                ? ["AUTH", options.Password]
-                : ["AUTH", options.Username, options.Password];
+            if (options.Password is not null)
+            {
+                IReadOnlyList<string> auth = options.Username is null
+                    ? ["AUTH", options.Password]
+                    : ["AUTH", options.Username, options.Password];
 
-            if (dedicatedReader)
-            {
-                // The blocking stream ignores tokens: run AUTH off the caller's thread, and let the
-                // token close the socket so a server that never answers cannot hang the connect.
-                using CancellationTokenRegistration abort = cancellationToken.Register(connection.Dispose);
-                ThrowOnError(await Task.Run(() => connection.SendAsync(auth, CancellationToken.None).AsTask(), CancellationToken.None).ConfigureAwait(false));
-                cancellationToken.ThrowIfCancellationRequested();
+                await HandshakeAsync(connection, auth, dedicatedReader, cancellationToken);
             }
-            else
+
+            if (options.DurabilityReplicas > 0)
             {
-                ThrowOnError(await connection.SendAsync(auth, cancellationToken));
+                await HandshakeAsync(connection, DurabilityCommand(options), dedicatedReader, cancellationToken);
             }
         }
         catch (Exception) when (dedicatedReader && cancellationToken.IsCancellationRequested)
@@ -131,6 +143,78 @@ internal sealed class RuvioSocket : IDisposable
         connection._initialized = true;
 
         return connection;
+    }
+
+    /// <summary>Wraps the connected socket in TLS and finishes the handshake, so a refused certificate fails the connect.</summary>
+    private static async Task<SslStream> AuthenticateAsync(TcpClient tcp, string host, RuvioTlsOptions tls, CancellationToken cancellationToken)
+    {
+        var secure = new SslStream(tcp.GetStream(), leaveInnerStreamOpen: false);
+        var authentication = new SslClientAuthenticationOptions
+        {
+            TargetHost = tls.ServerName ?? host,
+            ClientCertificates = tls.ClientCertificates,
+        };
+
+        if (tls.InsecureSkipVerify)
+        {
+            authentication.RemoteCertificateValidationCallback = static (_, _, _, _) => true;
+        }
+        else if (tls.TrustedCertificates is { Count: > 0 } roots)
+        {
+            var policy = new X509ChainPolicy
+            {
+                TrustMode = X509ChainTrustMode.CustomRootTrust,
+                RevocationMode = X509RevocationMode.NoCheck,
+            };
+
+            policy.CustomTrustStore.AddRange(roots);
+            authentication.CertificateChainPolicy = policy;
+        }
+
+        try
+        {
+            await secure.AuthenticateAsClientAsync(authentication, cancellationToken);
+        }
+        catch
+        {
+            secure.Dispose();
+            throw;
+        }
+
+        return secure;
+    }
+
+    /// <summary>The <c>CLIENT DURABILITY</c> command the options ask for, with <c>TIMEOUT</c> only when one is set.</summary>
+    private static IReadOnlyList<string> DurabilityCommand(RuvioClientOptions options)
+    {
+        string replicas = options.DurabilityReplicas.ToString(CultureInfo.InvariantCulture);
+
+        if (options.DurabilityTimeout is not { } timeout)
+        {
+            return ["CLIENT", "DURABILITY", "REPLICAS", replicas];
+        }
+
+        return ["CLIENT", "DURABILITY", "REPLICAS", replicas, "TIMEOUT", ((long)timeout.TotalMilliseconds).ToString(CultureInfo.InvariantCulture)];
+    }
+
+    private static async Task HandshakeAsync(
+        RuvioSocket connection,
+        IReadOnlyList<string> command,
+        bool dedicatedReader,
+        CancellationToken cancellationToken)
+    {
+        if (dedicatedReader)
+        {
+            // The blocking stream ignores tokens: run the command off the caller's thread, and let the
+            // token close the socket so a server that never answers cannot hang the connect.
+            using CancellationTokenRegistration abort = cancellationToken.Register(connection.Dispose);
+            ThrowOnError(await Task.Run(() => connection.SendAsync(command, CancellationToken.None).AsTask(), CancellationToken.None).ConfigureAwait(false));
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+        else
+        {
+            ThrowOnError(await connection.SendAsync(command, cancellationToken));
+        }
     }
 
     /// <summary>
@@ -380,7 +464,7 @@ internal sealed class RuvioSocket : IDisposable
                 if (existing is not null)
                     return existing;
 
-                existing = new CommandMultiplexer(_stream, _reader, _maxInFlight, coalesceWrites: true, dedicatedReader: _dedicatedReader);
+                existing = new CommandMultiplexer(_stream, _reader, _maxInFlight, coalesceWrites: true, dedicatedReader: _dedicatedReader, commandTimeout: _commandTimeout);
                 Volatile.Write(ref _multiplexer, existing);
 
                 return existing;
@@ -439,6 +523,45 @@ internal sealed class RuvioSocket : IDisposable
 
     internal static bool TracingEnabled => Activities.HasListeners();
     internal static bool PhaseMetricsEnabled => SocketPhaseDuration.Enabled;
+
+    /// <summary>True when a listener wants command spans or the command duration; otherwise commands skip both.</summary>
+    internal static bool CommandTelemetryEnabled => Activities.HasListeners() || CommandDuration.Enabled;
+
+    /// <summary>A client span for one command, named after it. Keys and values are never recorded.</summary>
+    internal static Activity? StartCommand(string? name, int database)
+    {
+        Activity? activity = Activities.StartActivity(name ?? "ruvio", ActivityKind.Client);
+
+        if (activity is { IsAllDataRequested: true })
+        {
+            activity.SetTag("db.system", "ruvio");
+            activity.SetTag("db.operation.name", name);
+            activity.SetTag("db.namespace", database.ToString(CultureInfo.InvariantCulture));
+        }
+
+        return activity;
+    }
+
+    internal static void EndCommand(Activity? activity, string? name, long started, Exception? failure)
+    {
+        if (failure is not null && activity is not null)
+        {
+            activity.SetStatus(ActivityStatusCode.Error, failure.Message);
+            activity.SetTag("error.type", failure.GetType().FullName);
+        }
+
+        if (!CommandDuration.Enabled)
+            return;
+
+        var tags = new TagList
+        {
+            { "db.system", "ruvio" },
+            { "db.operation.name", name },
+            { "outcome", failure is null ? "ok" : "error" },
+        };
+
+        CommandDuration.Record(Stopwatch.GetElapsedTime(started).TotalMilliseconds, tags);
+    }
 
     internal static void RecordSocketWrite(int bytes)
     {

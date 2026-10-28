@@ -88,6 +88,27 @@ pub(crate) fn encode_entry_with(
     written
 }
 
+/// One entry frame as [`encode_entry`] wrote it, carried by a slot move's copy record. The
+/// source already accepted the value, so the only bound is the frame itself.
+pub(crate) fn decode_entry_frame(bytes: &[u8]) -> Result<SnapshotEntry, PersistenceError> {
+    let limits = ProtocolLimits {
+        max_arguments: bytes.len(),
+        max_key_bytes: bytes.len(),
+        max_value_bytes: bytes.len(),
+        max_command_bytes: bytes.len(),
+        ..ProtocolLimits::default()
+    };
+    let (entry, used) = decode_entry(bytes, limits)?;
+
+    if used != bytes.len() {
+        return Err(PersistenceError::Corruption(
+            "slot copy entry has trailing bytes".into(),
+        ));
+    }
+
+    Ok(entry)
+}
+
 pub(super) fn decode_entry(
     bytes: &[u8],
     limits: ProtocolLimits,

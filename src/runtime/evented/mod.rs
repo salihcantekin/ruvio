@@ -64,16 +64,21 @@ mod cdc;
 mod checkpoint;
 mod clients;
 mod connection;
+mod durable;
 mod forward;
 mod hot;
 mod info;
 mod input;
+mod live;
 mod maintenance;
+mod migrate;
+mod moveslots;
 mod net;
 mod pubsub;
 mod replica;
 #[cfg(all(test, not(miri)))]
 mod tests;
+mod topology;
 mod wal_group;
 
 use checkpoint::*;
@@ -92,7 +97,9 @@ use wal_group::*;
 // Only the WAL sink (`persistence`) is locked, because it is shared. Never share a ShardState across threads.
 struct ShardState {
     store: RefCell<KvShard>,
+    /// Durations and WAL sync totals; the per-command counts live in `command_counts`.
     command_metrics: RefCell<CommandMetrics>,
+    command_counts: CommandCounts,
     latency: RefCell<crate::latency::LatencyTable>,
     key_stats: RefCell<crate::keystats::KeyStats>,
     persistence: Arc<Mutex<WalSink>>,
@@ -102,6 +109,25 @@ struct ShardState {
     /// Signalled by that thread for every delivery, and by a drain that ran out of budget.
     replica_wake: Arc<tokio::sync::Notify>,
     replica_resync_sequence: Arc<AtomicU64>,
+    /// Bytes of copied `PUBLISH` frames waiting in `replica_frames`; they are never logged, so
+    /// the reader thread bounds them here instead of by the log's applied sequence.
+    replica_publish_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    /// Slot ranges whose keys a background drop is still removing; a range arriving from
+    /// another node waits until its drop is done.
+    dropping: RefCell<Vec<(u16, u16)>>,
+    /// The shard's replication role now: the configured one until `REPLICAOF` changes it.
+    role: Cell<crate::config::ReplicationRole>,
+    /// The primary this replica shard dials (its own port), for `ROLE`.
+    followed: RefCell<Option<(String, u16)>>,
+    /// The thread that ships this shard's log to replicas, or follows a primary.
+    replication: RefCell<Option<crate::replication::ReplicationThread>>,
+    /// Whether this shard takes writes; read for every write.
+    write_gate: Cell<crate::replication::WriteGate>,
+    /// Epoch of the history this shard writes as a primary (0 otherwise).
+    epoch: Cell<u64>,
+    /// Highest epoch a refused replica followed, set by the replication thread; checked on
+    /// the maintenance tick, which fences the shard once it passes `epoch`.
+    newer_epoch: Arc<AtomicU64>,
     replica_link: Arc<crate::replication::LinkStatus>,
     /// When a replica last warned that its log refuses the primary's frames.
     replica_persist_warned: Cell<Option<Instant>>,
@@ -143,7 +169,12 @@ struct ShardState {
     subscribers: RefCell<HashMap<u64, Outbound>>,
     clients: RefCell<HashMap<u64, ClientEntry>>,
     slowlog: RefCell<crate::slowlog::SlowLog>,
+    /// Settings fixed at start: the restart-only ones are read here. The ones `CONFIG SET`
+    /// changes are read from `live`.
     published_config: AppConfig,
+    live: live::LiveConfig,
+    /// Admits this shard's own listener connections (per-shard mode).
+    limiter: ConnectionLimiter,
     next_conn_id: Cell<u64>,
     scripts: RefCell<crate::script::ScriptCache>,
     active_connections: Cell<u64>,
@@ -165,8 +196,14 @@ struct ShardState {
     /// `(generation, covered sequence)` of this shard's files whose round is not yet published.
     submitted_coverage: RefCell<std::collections::VecDeque<(u64, u64)>>,
     hot_store: Option<crate::hot_store::SharedMemoryStore>,
-    publish_fanout: Option<Arc<crate::replication::PublishFanout>>,
+    /// Copies of `PUBLISH` for replicas; fed only while the shard is a primary.
+    publish_fanout: Arc<crate::replication::PublishFanout>,
     durable_acks: Arc<crate::replication::DurableAcks>,
+    /// Committed sequence and waiting durable replies, shipped to replicas.
+    durable_replies: Arc<crate::replication::DurableReplies>,
+    /// The primary lease from the coordinators (`primary-lease`): shared by every shard of
+    /// the process, read on the maintenance tick only.
+    primary_lease: Arc<crate::primary_lease::LeaseTable>,
 }
 
 impl ShardState {
@@ -174,6 +211,15 @@ impl ShardState {
     /// or cluster nodes own some of the slots.
     fn enforces_slots(&self) -> bool {
         self.forwarding.is_some() || self.route.is_some()
+    }
+
+    /// Every shard's replicas or followed primary, for the cluster answers. Empty without
+    /// forwarding, where there are no cluster answers.
+    fn shard_peers(&self) -> Vec<crate::runtime::cluster::ShardPeers> {
+        self.forwarding
+            .as_ref()
+            .map(|forwarding| forwarding.fabric.shard_peers())
+            .unwrap_or_default()
     }
 
     /// The route as cluster clients see it: absent in single-port mode.
@@ -199,7 +245,30 @@ struct CommandMetrics {
     other_duration_nanos: u128,
     wal_sync_count: u64,
     wal_sync_duration_nanos: u128,
-    timing_tick: u32,
+}
+
+/// The counts every command bumps, in cells so the count costs no `RefCell` borrow.
+#[derive(Default)]
+struct CommandCounts {
+    tick: Cell<u32>,
+    commands: Cell<u64>,
+    /// Indexed by `CommandGroup`.
+    groups: [Cell<u64>; 4],
+}
+
+impl ShardState {
+    /// `command_metrics` with the counts filled in.
+    fn command_totals(&self) -> CommandMetrics {
+        let mut metrics = *self.command_metrics.borrow();
+        let counts = &self.command_counts;
+
+        metrics.commands = counts.commands.get();
+        metrics.gets = counts.groups[CommandGroup::Get as usize].get();
+        metrics.sets = counts.groups[CommandGroup::Set as usize].get();
+        metrics.increments = counts.groups[CommandGroup::Increment as usize].get();
+        metrics.other_commands = counts.groups[CommandGroup::Other as usize].get();
+        metrics
+    }
 }
 
 /// Command durations are measured on one command in this many and scaled up, so the
@@ -208,14 +277,14 @@ const COMMAND_TIMING_SAMPLE: u32 = 16;
 
 #[derive(Clone, Copy)]
 enum CommandGroup {
-    Get,
-    Set,
-    Increment,
-    Other,
+    Get = 0,
+    Set = 1,
+    Increment = 2,
+    Other = 3,
 }
 
-struct CommandTiming {
-    state: Rc<ShardState>,
+struct CommandTiming<'a> {
+    state: &'a ShardState,
     group: CommandGroup,
     started: Option<Instant>,
     /// Command-table index for the latency histogram; set only on sampled commands.
@@ -226,25 +295,19 @@ struct CommandTiming {
     discarded: bool,
 }
 
-impl CommandTiming {
+impl<'a> CommandTiming<'a> {
     fn new(
-        state: Rc<ShardState>,
+        state: &'a ShardState,
         group: CommandGroup,
         name: impl FnOnce() -> &'static str,
     ) -> Self {
-        let sampled = {
-            let mut metrics = state.command_metrics.borrow_mut();
-            let tick = metrics.timing_tick;
-            metrics.timing_tick = tick.wrapping_add(1);
-            (
-                tick.is_multiple_of(COMMAND_TIMING_SAMPLE),
-                tick.is_multiple_of(crate::keystats::HOT_KEY_SAMPLE),
-            )
-        };
-        let (sampled, hot_tick) = sampled;
-        let hot_sample = hot_tick && state.published_config.key_stats;
+        let tick = state.command_counts.tick.get();
+        state.command_counts.tick.set(tick.wrapping_add(1));
+        let sampled = tick.is_multiple_of(COMMAND_TIMING_SAMPLE);
+        let hot_tick = tick.is_multiple_of(crate::keystats::HOT_KEY_SAMPLE);
+        let hot_sample = hot_tick && state.live.key_stats.get();
 
-        let histogram = (sampled && state.published_config.latency_histograms)
+        let histogram = (sampled && state.live.latency_histograms.get())
             .then(|| {
                 crate::protocol::command_spec(name().as_bytes()).map(crate::protocol::command_index)
             })
@@ -263,13 +326,13 @@ impl CommandTiming {
 
 /// Counts a command this connection hands to other shards (or runs on all of them): the
 /// owner shards do not count what they are sent.
-fn forwarded_timing(state: &Rc<ShardState>, command: &Command<'_>) -> CommandTiming {
-    CommandTiming::new(state.clone(), command_group(command), || {
+fn forwarded_timing<'a>(state: &'a ShardState, command: &Command<'_>) -> CommandTiming<'a> {
+    CommandTiming::new(state, command_group(command), || {
         crate::acl::command_acl_name(command)
     })
 }
 
-impl CommandTiming {
+impl CommandTiming<'_> {
     /// Leaves the count to a later timing of the same command.
     fn discard(mut self) {
         self.discarded = true;
@@ -278,7 +341,7 @@ impl CommandTiming {
     /// Feed the sampled-key tables: one access in `HOT_KEY_SAMPLE` is counted as hot, and
     /// every string write of at least `BIG_KEY_BYTES` is remembered as big.
     fn observe_key(&self, key: impl Fn() -> Option<Vec<u8>>, write_bytes: Option<usize>) {
-        if !self.state.published_config.key_stats {
+        if !self.state.live.key_stats.get() {
             return;
         }
 
@@ -296,42 +359,46 @@ impl CommandTiming {
     }
 }
 
-impl Drop for CommandTiming {
+impl Drop for CommandTiming<'_> {
     fn drop(&mut self) {
         if self.discarded {
             return;
         }
-        let measured = self.started.map(|started| started.elapsed().as_nanos());
+        let counts = &self.state.command_counts;
+        let group = &counts.groups[self.group as usize];
 
-        if let (Some(index), Some(nanos)) = (self.histogram, measured) {
+        counts.commands.set(counts.commands.get().saturating_add(1));
+        group.set(group.get().saturating_add(1));
+
+        if let Some(started) = self.started {
+            self.record_duration(started);
+        }
+    }
+}
+
+impl CommandTiming<'_> {
+    /// The sampled command's time, for the latency histogram and the scaled-up totals.
+    #[inline(never)]
+    fn record_duration(&self, started: Instant) {
+        let nanos = started.elapsed().as_nanos();
+
+        if let Some(index) = self.histogram {
             self.state
                 .latency
                 .borrow_mut()
                 .record(index, u64::try_from(nanos).unwrap_or(u64::MAX));
         }
 
-        let elapsed = measured.map_or(0, |nanos| nanos * u128::from(COMMAND_TIMING_SAMPLE));
+        let elapsed = nanos * u128::from(COMMAND_TIMING_SAMPLE);
         let mut metrics = self.state.command_metrics.borrow_mut();
-        metrics.commands = metrics.commands.saturating_add(1);
-        match self.group {
-            CommandGroup::Get => {
-                metrics.gets = metrics.gets.saturating_add(1);
-                metrics.get_duration_nanos = metrics.get_duration_nanos.saturating_add(elapsed);
-            }
-            CommandGroup::Set => {
-                metrics.sets = metrics.sets.saturating_add(1);
-                metrics.set_duration_nanos = metrics.set_duration_nanos.saturating_add(elapsed);
-            }
-            CommandGroup::Increment => {
-                metrics.increments = metrics.increments.saturating_add(1);
-                metrics.increment_duration_nanos =
-                    metrics.increment_duration_nanos.saturating_add(elapsed);
-            }
-            CommandGroup::Other => {
-                metrics.other_commands = metrics.other_commands.saturating_add(1);
-                metrics.other_duration_nanos = metrics.other_duration_nanos.saturating_add(elapsed);
-            }
-        }
+        let total = match self.group {
+            CommandGroup::Get => &mut metrics.get_duration_nanos,
+            CommandGroup::Set => &mut metrics.set_duration_nanos,
+            CommandGroup::Increment => &mut metrics.increment_duration_nanos,
+            CommandGroup::Other => &mut metrics.other_duration_nanos,
+        };
+
+        *total = total.saturating_add(elapsed);
     }
 }
 
@@ -455,7 +522,9 @@ pub fn run_with_force(config: &AppConfig, shutdown: ShutdownToken, force: bool) 
     )
     .map_err(|error| io::Error::other(error.to_string()))?;
 
-    if config.shards <= 1 {
+    // A one-shard node of a multi-node cluster still routes (to answer `MOVED`) and
+    // answers the cluster commands, so it runs as a cluster of one shard.
+    if config.shards <= 1 && config.cluster_topology.is_none() {
         let bind: SocketAddr = config
             .address
             .parse()
@@ -545,12 +614,81 @@ fn run_cluster(config: &AppConfig, shutdown: ShutdownToken, force: bool) -> io::
     // to the owner directly and never sends `MOVED`.
     let fabric = Some(Fabric::new(config.shards));
 
+    // Before any shard serves: every route reads the table the moves left, and new moves
+    // are recorded next to the log.
+    if let Some(fabric) = &fabric {
+        // The cluster map places this group's slots on its shards first; moves between
+        // the shards apply on top of it.
+        let mut pushed = false;
+
+        if let Some(path) = &config.cluster_topology {
+            let (topology, saved) = crate::topology::Topology::load_newest(
+                path,
+                &config.persistence.data_dir,
+                &config.cluster_group,
+                config.shards,
+            )
+            .map_err(io::Error::other)?;
+
+            pushed = saved;
+            fabric.set_topology(topology);
+        }
+        let placement: Option<std::sync::Arc<[u16]>> = fabric
+            .topology()
+            .map(|shared| shared.get().placement(config.shards).into());
+        let moves = load_slot_moves(config, config.shards, placement.clone(), Some(pushed))?;
+        let mapped = placement.is_some();
+
+        if let Some(moves) = &moves {
+            moves.apply(&fabric.slot_table(), |slot| {
+                placement
+                    .as_ref()
+                    .map_or(0, |placement| usize::from(placement[usize::from(slot)]))
+            });
+        }
+        // A node of a multi-node cluster keeps its history even without a log: a range
+        // arriving from another node is tracked here until the map gives it the range.
+        if config.persistence.profile.uses_wal() || placement.is_some() {
+            fabric.mover.set_durable(
+                moves.unwrap_or_else(|| {
+                    let moves = crate::slot_moves::SlotMoves::new(config.shards);
+
+                    match placement {
+                        Some(base) => moves.with_base(base),
+                        None => moves,
+                    }
+                }),
+                config
+                    .persistence
+                    .profile
+                    .uses_wal()
+                    .then(|| config.persistence.data_dir.clone()),
+            );
+        }
+        if mapped {
+            migrate::restore(
+                fabric,
+                config
+                    .persistence
+                    .profile
+                    .uses_wal()
+                    .then(|| config.persistence.data_dir.clone()),
+                config.replication.role != crate::config::ReplicationRole::Replica,
+            );
+        }
+    }
+
     // One acceptor hands each std TcpStream to a shard. SO_REUSEPORT does not balance
     // connections on macOS and needs socket2.
     if single && let Some(fabric) = &fabric {
         let acceptor = bind_listener(base)?;
         let fabric = fabric.clone();
         let limiter = ConnectionLimiter::new(config.connections);
+        fabric
+            .config
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .register_acceptor(limiter.clone());
         let stop = shutdown.clone();
         let exit_guard = ShutdownOnExit(shutdown.clone());
 
@@ -582,6 +720,13 @@ fn run_cluster(config: &AppConfig, shutdown: ShutdownToken, force: bool) -> io::
             shard_count: config.shards,
             advertised_host: config.advertised_host.clone(),
             advertised_port,
+            slots: fabric.as_ref().map_or_else(
+                || crate::routing::SlotTable::from_formula(config.shards),
+                |fabric| fabric.slot_table(),
+            ),
+            topology: fabric
+                .as_ref()
+                .and_then(|fabric| fabric.topology().cloned()),
         };
 
         let cfg = config.clone();
@@ -706,6 +851,61 @@ pub fn serve(
     )
 }
 
+/// The slot moves saved in the data directory, checked against the cluster map
+/// (`placement`, this node's table by the map). Replicas follow ranges that move between
+/// nodes through the log and the map, but not moves between a node's own shards, so those
+/// are refused while replication is on. `pushed`: whether the map came from the
+/// coordinators, when the check's decision is to be saved; `None` reads what an earlier
+/// check saved.
+fn load_slot_moves(
+    config: &AppConfig,
+    shard_count: usize,
+    placement: Option<std::sync::Arc<[u16]>>,
+    pushed: Option<bool>,
+) -> io::Result<Option<crate::slot_moves::SlotMoves>> {
+    if config.persistence.profile == crate::DurabilityProfile::Memory {
+        return Ok(None);
+    }
+
+    let data_dir = &config.persistence.data_dir;
+    let Some(moves) = crate::slot_moves::SlotMoves::load(data_dir, shard_count)? else {
+        return Ok(None);
+    };
+    let local_moves = moves.has_local_moves();
+
+    if local_moves && config.replication.role != crate::config::ReplicationRole::Off {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "slot ranges were moved between shards (SLOTS file); replication is not supported \
+             with moved slots",
+        ));
+    }
+    let Some(placement) = placement else {
+        crate::slot_moves::SlotMoves::check_base(data_dir, shard_count, None)?;
+        return Ok(Some(moves));
+    };
+    // Moves are recorded against the table the node had at its first move: the saved one,
+    // or the formula for moves made before the node had a map.
+    let moves = match crate::slot_moves::SlotMoves::load_base(data_dir, shard_count)? {
+        Some(base) => moves.with_base(base),
+        None => {
+            crate::slot_moves::SlotMoves::check_base(data_dir, shard_count, Some(&placement))?;
+            moves.with_base(placement.clone())
+        }
+    };
+    let Some(pushed) = pushed else {
+        return Ok(Some(moves));
+    };
+    let (moves, changed) = moves
+        .reconcile(&placement, pushed)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+
+    if changed {
+        moves.save(data_dir)?;
+    }
+    Ok(Some(moves))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn serve_unlocked(
     std_listener: Option<std::net::TcpListener>,
@@ -820,6 +1020,29 @@ async fn serve_async(
         snapshot_sequence = plan.last_sequence(shard_id).unwrap_or(0);
     }
 
+    let slot_moves = match &route {
+        Some(route) => load_slot_moves(
+            &config,
+            route.shard_count,
+            route
+                .topology
+                .as_ref()
+                .map(|shared| shared.get().placement(route.shard_count).into()),
+            // Checked and saved before the shards started.
+            None,
+        )?,
+        None => None,
+    };
+    let mut slot_filter = slot_moves
+        .as_ref()
+        .and_then(|moves| moves.replay_filter(shard_id as usize, snapshot_sequence));
+    // A prepared range from another node is kept on its shard until the map decides.
+    let arriving = slot_moves
+        .as_ref()
+        .and_then(crate::slot_moves::SlotMoves::pending_gain)
+        .filter(|gain| usize::from(gain.to) == shard_id as usize)
+        .map(|gain| gain.first..=gain.last);
+
     let (mut sink, mutations, report) = WalSink::open_after(
         config.persistence.clone(),
         shard_id,
@@ -837,6 +1060,9 @@ async fn serve_async(
                 && snapshot == snapshot_sequence
                 && sink.last_sequence() >= through);
     let mut store = KvShard::with_clock(SystemClock::with_floor(created_at));
+
+    // Leases released or expired before the checkpoint left no key with their token.
+    store.raise_fence_floor(created_at);
     let replay_clock = store.pause_expiration_for_replay();
 
     // A replica removes a key only when the primary's delete arrives; restarted with
@@ -845,10 +1071,38 @@ async fn serve_async(
 
     store.apply_memory_limits(config.shard_memory_limits());
 
+    // With a cluster map, the lowest slot of another group a replay filter skipped: such
+    // keys refuse the start, as they do on a shard without a filter (below).
+    let other_group = |slot: u16| {
+        route.as_ref().is_some_and(|route| {
+            route.topology.is_some() && route.slots.owner(slot) >= route.shard_count
+        })
+    };
+    let mut skipped_foreign: Option<u16> = None;
+    let mut note_foreign = |key: &[u8]| {
+        let slot = crate::routing::hash_slot(key);
+
+        if other_group(slot)
+            && !slot_moves
+                .as_ref()
+                .is_some_and(|moves| moves.crossed_nodes(slot))
+        {
+            skipped_foreign = Some(skipped_foreign.map_or(slot, |known| known.min(slot)));
+        }
+    };
+
     // Entries go from the decoder straight into the store, so recovery holds one
     // shard's file and its store, not a second copy of the data.
     if let Some(plan) = &plan {
         plan.stream_shard(shard_id, |entry| {
+            if slot_filter
+                .as_mut()
+                .is_some_and(|filter| !filter.keeps_entry(&entry.key))
+            {
+                note_foreign(&entry.key);
+                return Ok(());
+            }
+
             store
                 .restore_snapshot_entry(entry)
                 .map_err(|error| crate::persistence::PersistenceError::Corruption(error.into()))
@@ -877,33 +1131,88 @@ async fn serve_async(
     // copy: a record that does not replay must not keep it from starting.
     let resync_pending = config.replication.role == crate::config::ReplicationRole::Replica
         && marker == Some(CatchupMarker::Preparing);
-    for (index, (database, mutation)) in mutations.iter().enumerate() {
-        if *database == 0
+    let replayed = mutations.len();
+    // Records are contiguous: the first replayed one follows the checkpoint.
+    let first_replayed = report.last_sequence + 1 - report.records_replayed;
+
+    // Each record is dropped once applied and the list with the loop, so after replay the
+    // shard holds its store only, not a second copy of everything since the checkpoint.
+    for (index, (database, mutation)) in mutations.into_iter().enumerate() {
+        if database == 0
             && hot_store.as_ref().is_some_and(|store| {
-                crate::hot_store::apply_owned(store, &config.hot_keys, mutation)
+                crate::hot_store::apply_owned(store, &config.hot_keys, &mutation)
             })
         {
             continue;
         }
 
-        if let Err(error) = apply_mutation(&mut store, *database, mutation) {
+        if let Some(filter) = slot_filter.as_mut()
+            && !filter.keeps_record(first_replayed + index as u64, &mutation, &mut |slots| {
+                store.drop_slots(slots);
+            })
+        {
+            mutation.for_each_write_key(&mut |key| note_foreign(key));
+            continue;
+        }
+
+        if let Err(error) = apply_mutation(&mut store, database, &mutation) {
             if !resync_pending {
                 return Err(io::Error::other(error.to_string()));
             }
             warn!(
                 shard_id,
                 %error,
-                skipped = mutations.len() - index,
+                skipped = replayed - index,
                 "replica log does not replay; leaving the rest to the pending full resync"
             );
             break;
         }
+    }
+    if replayed != 0 {
+        crate::memory::release_free_pages();
     }
     if proven_complete {
         sink.flush()
             .map_err(|error| io::Error::other(error.to_string()))?;
         replica_guard::clear(&config.persistence.data_dir, shard_id)?;
         incomplete = false;
+    }
+    if let Some(stale) = slot_filter.and_then(crate::slot_moves::ReplayFilter::stale_slots) {
+        let dropped = store.drop_slots(&stale);
+
+        info!(
+            shard_id,
+            dropped, "dropped keys of slots another shard owns"
+        );
+    }
+    // A node of a multi-node cluster must not hold keys the map serves elsewhere: they
+    // would be unreachable here and missing there. One walk, only with a map.
+    if let Some(slot) = skipped_foreign {
+        return Err(io::Error::other(format!(
+            "shard {shard_id} recorded keys in slots another group serves under \
+             cluster_topology (first: slot {slot}); start with a map that gives this group \
+             those slots, or with an empty data directory"
+        )));
+    }
+    if let Some(route) = route.as_ref().filter(|route| route.topology.is_some()) {
+        let foreign: Vec<bool> = (0..crate::routing::HASH_SLOT_COUNT as u16)
+            .map(|slot| {
+                let owner = route.slots.owner(slot);
+
+                // A frozen range (a prepared move to another node) is still held here.
+                owner != shard_id as usize
+                    && owner != crate::routing::FROZEN_BASE + shard_id as usize
+                    && !arriving.as_ref().is_some_and(|range| range.contains(&slot))
+            })
+            .collect();
+
+        if let (count @ 1.., Some(slot)) = store.count_in_slots(&foreign) {
+            return Err(io::Error::other(format!(
+                "shard {shard_id} holds {count} keys in slots it does not serve under \
+                 cluster_topology (first: slot {slot}; expired keys count too); start with a \
+                 map that gives this group those slots, or with an empty data directory"
+            )));
+        }
     }
     store.resume_expiration_after_replay(replay_clock);
     store.json_index_load_definitions();
@@ -934,14 +1243,28 @@ async fn serve_async(
     let state = Rc::new(ShardState {
         store: RefCell::new(store),
         command_metrics: RefCell::new(CommandMetrics::default()),
+        command_counts: CommandCounts::default(),
         latency: RefCell::new(crate::latency::LatencyTable::default()),
         key_stats: RefCell::new(crate::keystats::KeyStats::default()),
         persistence: Arc::new(Mutex::new(sink)),
         replica_frames: RefCell::new(None),
+        replica_publish_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         replica_reader: RefCell::new(None),
         replica_wake: Arc::new(tokio::sync::Notify::new()),
         replica_link: Arc::new(crate::replication::LinkStatus::default()),
         replica_persist_warned: Cell::new(None),
+        role: Cell::new(config.replication.role),
+        followed: RefCell::new(None),
+        replication: RefCell::new(None),
+        write_gate: Cell::new(match config.replication.role {
+            crate::config::ReplicationRole::Replica => crate::replication::WriteGate::Replica,
+            // Closed until a majority of the coordinators grant the lease.
+            _ if config.replication.primary_lease => crate::replication::WriteGate::NoLease,
+            _ => crate::replication::WriteGate::Open,
+        }),
+        epoch: Cell::new(0),
+        newer_epoch: Arc::new(AtomicU64::new(0)),
+        dropping: RefCell::new(Vec::new()),
         replica_resync_sequence: Arc::new(AtomicU64::new(if incomplete && !force {
             u64::MAX
         } else {
@@ -975,6 +1298,8 @@ async fn serve_async(
         clients: RefCell::new(HashMap::new()),
         slowlog: RefCell::new(crate::slowlog::SlowLog::default()),
         published_config: config.clone(),
+        live: live::LiveConfig::new(&config),
+        limiter: ConnectionLimiter::new(config.connections),
         next_conn_id: Cell::new(1),
         scripts: RefCell::new(crate::script::ScriptCache::with_payload_limits(
             config.protocol,
@@ -987,6 +1312,9 @@ async fn serve_async(
         peak_pubsub_queue_bytes: Rc::new(Cell::new(0)),
         tls,
         single_port: std_listener.is_none() && fabric.is_some(),
+        primary_lease: fabric
+            .as_ref()
+            .map_or_else(Arc::default, |fabric| Arc::clone(&fabric.lease)),
         forwarding: fabric.map(|fabric| Forwarding::new(fabric, shard_id as usize)),
         route,
         cluster,
@@ -994,10 +1322,15 @@ async fn serve_async(
         compacted_generation: Cell::new(0),
         submitted_coverage: RefCell::new(std::collections::VecDeque::new()),
         hot_store,
-        publish_fanout: (config.replication.role == crate::config::ReplicationRole::Primary)
-            .then(|| Arc::new(crate::replication::PublishFanout::new())),
+        publish_fanout: Arc::new(crate::replication::PublishFanout::new()),
         durable_acks: Arc::new(crate::replication::DurableAcks::new()),
+        durable_replies: Arc::default(),
     });
+
+    // A replica that starts with an unfinished copy acknowledges nothing until it has one.
+    state
+        .replica_link
+        .set_copying(state.replica_incomplete.get());
 
     if let Some(coordinator) = &state.cluster {
         coordinator.register_wal(shard_id, &state.persistence);
@@ -1024,8 +1357,10 @@ async fn serve_async(
             ShardDurability {
                 wal: Arc::clone(&state.persistence),
                 acks: Arc::clone(&state.durable_acks),
+                replies: Arc::clone(&state.durable_replies),
             },
         );
+        tokio::task::spawn_local(forward::run_doorbell(Arc::clone(&forwarding.fabric)));
         tokio::task::spawn_local(remote_loop(Rc::clone(&state), shutdown.clone()));
     }
 
@@ -1038,16 +1373,19 @@ async fn serve_async(
         recovered_records = state.recovery.records_replayed,
         "server listening"
     );
-    let limiter = ConnectionLimiter::new(config.connections);
-    let timeouts = config.timeouts;
     let limits = config.protocol;
-    let request_limits = config.requests;
     let shutdown_grace = config.shutdown_grace;
 
-    let replication = attach_replication(&state, shard_id)?;
-    *state.replica_reader.borrow_mut() = replication
+    *state.replication.borrow_mut() = attach_replication(&state, shard_id)?;
+    // A map installed just before a stop may have given ranges away before the loss was
+    // recorded: record it now, before this shard serves.
+    if state
+        .route
         .as_ref()
-        .and_then(crate::replication::ReplicationThread::reader);
+        .is_some_and(|route| route.topology.is_some())
+    {
+        migrate::settle(&state);
+    }
     let mut maintenance = tokio::time::interval(Duration::from_millis(100));
     maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     maintenance.tick().await;
@@ -1090,10 +1428,14 @@ async fn serve_async(
                         continue;
                     }
                 };
+                // Connection settings are read per accept: `CONFIG SET` changes them for new
+                // connections only.
+                let (timeouts, request_limits) =
+                    state.live.with(|live| (live.timeouts, live.requests));
                 let permit = match handed {
                     Some(permit) => permit,
                     None => {
-                        let Some(permit) = limiter.try_acquire(peer.ip()) else {
+                        let Some(permit) = state.limiter.try_acquire(peer.ip()) else {
                             let mut stream = stream;
                             let _ = timeout(
                                 timeouts.write,
@@ -1134,16 +1476,18 @@ async fn serve_async(
                 if state.replica_incomplete.get() {
                     continue;
                 }
+                let maintenance_keys =
+                    state.live.with(|live| live.memory.active_expire_maintenance_keys);
                 let mut store = state.store.borrow_mut();
                 let reaped = expire_maintenance(
                     &mut store,
-                    config.memory.active_expire_maintenance_keys,
+                    maintenance_keys,
                     EXPIRE_MAINTENANCE_TIME,
                     EXPIRE_MAINTENANCE_MAX_KEYS,
                 );
                 // A slice that ended on its time limit with work left comes back as soon as
                 // requests have had their turn, so a mass expiry clears in seconds.
-                let backlog = reaped >= config.memory.active_expire_maintenance_keys
+                let backlog = reaped >= maintenance_keys
                     && store.soonest_deadline_due();
                 // A write admitted before eviction made room for it left a debt: evict the
                 // rest in slices, so no single request stalls the shard.
@@ -1177,6 +1521,8 @@ async fn serve_async(
                 checkpoint_slice(&state);
             },
             _ = maintenance.tick() => {
+                fence_if_replaced(&state);
+                gate_on_replicas(&state);
                 let mut store = state.store.borrow_mut();
 
                 if !state.replica_incomplete.get() {
@@ -1316,6 +1662,6 @@ async fn serve_async(
         warn!(%error, "final checkpoint failed; the WAL keeps every acknowledged write");
     }
 
-    drop(replication);
+    drop(state.replication.borrow_mut().take());
     Ok(())
 }

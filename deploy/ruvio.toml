@@ -1,9 +1,8 @@
-# Example host config. Replace requirepass before use.
+# Example host config. It binds to loopback only; set requirepass before using another address.
 # Loopback needs no password. A public bind needs requirepass.
 
 address = "127.0.0.1:6379"
 shards = 1
-metrics_address = "127.0.0.1:9121"
 
 [connections]
 max_global = 10000
@@ -14,5 +13,5 @@ profile = "everysec"
 data_dir = "/var/lib/ruvio"
 
 [security]
-requirepass = "change-me"
+# requirepass = "..."   # required before binding to a non-loopback address
 protected_mode = true

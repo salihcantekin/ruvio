@@ -140,4 +140,29 @@ class JsonBloomLiveTest {
         assertEquals(Arrays.asList(true, false), c.seenBefore("seen", "u1", "u3"));
         assertEquals(Arrays.asList(true, false), c.mightContain("seen", "u2", "u9"));
     }
+
+    @Test
+    void ttlOnCreateJsonAndBloom() {
+        assertTrue(c.jsonSet("ttl:j", "$", "{\"a\":1}", LONG_TTL));
+        assertTrue(c.jsonSet("ttl:j", "$.a", "2", LONGER_TTL));
+        assertDeadlineKept("ttl:j");
+        assertTrue(c.jsonSetNx("ttl:jn", "$", "{}", LONG_TTL));
+        assertFalse(c.jsonSetNx("ttl:jn", "$", "{}", LONGER_TTL));
+        assertDeadlineKept("ttl:jn");
+        assertFalse(c.jsonSetXx("ttl:jx", "$", "{}", LONG_TTL));
+        assertEquals(0L, c.exists("ttl:jx"));
+
+        assertEquals(Arrays.asList(true), c.bfInsert("ttl:bf", BfInsertArgs.builder().ttl(LONG_TTL).capacity(100), "a"));
+        assertEquals(Arrays.asList(true), c.bfInsert("ttl:bf", BfInsertArgs.builder().ttl(LONGER_TTL), "b"));
+        assertDeadlineKept("ttl:bf");
+    }
+
+    private static final java.time.Duration LONG_TTL = java.time.Duration.ofSeconds(100);
+    private static final java.time.Duration LONGER_TTL = java.time.Duration.ofSeconds(1000);
+
+    /** The key got the first call's deadline (at most 100 s), not the second call's 1000 s. */
+    private void assertDeadlineKept(String key) {
+        long ms = c.pttl(key);
+        assertTrue(ms > 0 && ms <= 100_000, "pttl " + ms);
+    }
 }

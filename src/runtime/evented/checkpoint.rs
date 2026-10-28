@@ -422,6 +422,11 @@ fn complete_job(
         record_submission(state, coordinator, job.generation, covered);
         coordinator.persist_clock(state.store.borrow().now_unix_millis())?;
     } else {
+        // The clock goes to disk before the round, so a crash between the two cannot leave
+        // a checkpoint whose restart floor is below a token granted before it.
+        state
+            .checkpoints
+            .persist_clock(state.store.borrow().now_unix_millis())?;
         state.checkpoints.commit_round(job.generation, &[file])?;
         state.checkpoint_generation.set(job.generation);
         compact_after_checkpoint(state, covered);

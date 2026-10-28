@@ -60,6 +60,27 @@ func TestLiveConnectionAndServer(t *testing.T) {
 	if len(must[map[string]string](t)(c.ConfigGet(ctx, "*"))) == 0 {
 		t.Fatal("config get")
 	}
+	if err := c.ConfigSet(ctx, "slowlog-max-len", "128"); err != nil {
+		t.Fatal(err)
+	}
+	eq(t, must[map[string]string](t)(c.ConfigGet(ctx, "slowlog-max-len"))["slowlog-max-len"], "128")
+	if err := c.ConfigSet(ctx, "shards", "2"); err == nil {
+		t.Fatal("CONFIG SET shards should be refused")
+	}
+	if role, err := c.Role(ctx); err != nil || len(role.Array) == 0 || string(role.Array[0].Bytes) != "master" {
+		t.Fatalf("ROLE answered %+v, %v", role, err)
+	}
+	// The live server keeps no WAL, so it cannot replicate: both forms are refused unchanged.
+	if err := c.ReplicaOf(ctx, "127.0.0.1", 1); err == nil {
+		t.Fatal("REPLICAOF should be refused without a WAL")
+	}
+	if err := c.ReplicaOfNoOne(ctx, false); err == nil {
+		t.Fatal("REPLICAOF NO ONE should be refused without a WAL")
+	}
+	// Without replication the server refuses CLIENT DURABILITY.
+	if err := c.ClientDurability(ctx, 1, 0); err == nil || !strings.Contains(err.Error(), "needs replication") {
+		t.Fatalf("CLIENT DURABILITY answered %v, want the needs-replication error", err)
+	}
 	okOrServerErr(t, "SAVE", c.Save(ctx))
 	okOrServerErr(t, "BGSAVE", func() error { _, err := c.BgSave(ctx); return err }())
 	cmd := must[Value](t)(c.Command(ctx))
@@ -138,7 +159,7 @@ func TestLiveClusterCommands(t *testing.T) {
 
 func TestLiveScripting(t *testing.T) {
 	c, ctx := live(t)
-	// Ruvio's Lua API is ruvio.call (redis.call is not defined).
+	// Ruvio's Lua API is ruvio.call (redis.call is an alias).
 	v, err := c.Eval(ctx, "ruvio.call('SET', KEYS[1], ARGV[1]); return ruvio.call('GET', KEYS[1])", []string{"ek"}, "val")
 	noErr(t, err)
 	eq(t, v.Str(), "val")
@@ -151,6 +172,11 @@ func TestLiveScripting(t *testing.T) {
 	var se *Error
 	if _, err := c.EvalSHA(ctx, sha, nil); !errors.As(err, &se) || se.Prefix() != "NOSCRIPT" {
 		t.Fatalf("want NOSCRIPT, got %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		v, err = c.EvalCached(ctx, "return ARGV[1]", nil, "again")
+		noErr(t, err)
+		eq(t, v.Str(), "again")
 	}
 	if err := c.ScriptKill(ctx); !errors.As(err, &se) || se.Prefix() != "NOTBUSY" {
 		t.Fatalf("want NOTBUSY, got %v", err)
@@ -345,7 +371,10 @@ func TestLiveHelpers(t *testing.T) {
 	lh, ok, err := c.AcquireLease(ctx, "lease", time.Minute)
 	noErr(t, err)
 	eq(t, ok, true)
+	eq(t, must[bool](t)(lh.Renew(ctx, 2*time.Minute)), true)
+	eq(t, must[bool](t)(c.Renew(ctx, "lease", lh.Token+100, time.Minute)), false)
 	eq(t, must[bool](t)(lh.Release(ctx)), true)
+	eq(t, must[bool](t)(lh.Renew(ctx, time.Minute)), false)
 	noErr(t, c.WithLease(ctx, "lease", time.Minute, func(ctx context.Context, token int64) error {
 		if token <= lh.Token {
 			t.Errorf("fencing token did not grow: %d <= %d", token, lh.Token)
@@ -358,7 +387,9 @@ func TestLiveHelpers(t *testing.T) {
 	if err := c.WithPermit(ctx, "sem", 1, time.Minute, func(context.Context) error { return nil }); !errors.Is(err, ErrNotAcquired) {
 		t.Fatalf("permit: %v", err)
 	}
+	eq(t, must[bool](t)(p1.Renew(ctx, 2*time.Minute)), true)
 	eq(t, must[bool](t)(p1.Release(ctx)), true)
+	eq(t, must[bool](t)(p1.Renew(ctx, time.Minute)), false)
 	noErr(t, c.WithPermit(ctx, "sem", 1, time.Minute, func(context.Context) error { return nil }))
 
 	// rate limit

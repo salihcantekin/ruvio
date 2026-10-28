@@ -5,6 +5,11 @@ pub const HASH_SLOT_COUNT: usize = 16_384;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CrossSlot;
 
+/// Slot table entries from here on mark a range frozen while it moves to another node:
+/// `FROZEN_BASE + shard` is still held by `shard`, but its commands answer `TRYAGAIN`.
+/// Entries between the shard count and this value are the other groups of the cluster.
+pub const FROZEN_BASE: usize = 0x8000;
+
 pub fn hash_slot(key: &[u8]) -> u16 {
     crc16(hash_tag(key)) % HASH_SLOT_COUNT as u16
 }
@@ -13,6 +18,81 @@ pub fn shard_for_slot(slot: u16, shard_count: usize) -> usize {
     assert!(shard_count > 0, "shard count must be positive");
     usize::from(slot) * shard_count / HASH_SLOT_COUNT
 }
+
+/// Which shard owns each hash slot, read on every routed command instead of computing it.
+///
+/// Built from [`shard_for_slot`], so a data directory keeps the layout it was written with.
+/// Entries are atomics so a later change can move one slot in place without a lock; a
+/// `Relaxed` load is a plain load. Moved ranges (`SLOTS`) are applied at start. Cloning
+/// shares the table.
+#[derive(Clone)]
+pub struct SlotTable(std::sync::Arc<[std::sync::atomic::AtomicU16]>);
+
+impl SlotTable {
+    /// The table the formula gives for `shard_count` shards.
+    pub fn from_formula(shard_count: usize) -> Self {
+        assert!(
+            shard_count > 0 && shard_count <= usize::from(u16::MAX),
+            "shard count must fit a slot table entry"
+        );
+
+        Self(
+            (0..HASH_SLOT_COUNT)
+                .map(|slot| {
+                    std::sync::atomic::AtomicU16::new(
+                        shard_for_slot(slot as u16, shard_count) as u16
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// The shard that owns `slot`.
+    #[inline]
+    pub fn owner(&self, slot: u16) -> usize {
+        usize::from(self.0[usize::from(slot)].load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Gives `slot` to `owner`.
+    pub fn assign(&self, slot: u16, owner: usize) {
+        self.0[usize::from(slot)].store(owner as u16, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Consecutive slots of one owner as `(first, last, owner)`, in slot order.
+    pub fn ranges(&self) -> Vec<(u16, u16, usize)> {
+        let mut ranges: Vec<(u16, u16, usize)> = Vec::new();
+
+        for slot in 0..HASH_SLOT_COUNT as u16 {
+            let owner = self.owner(slot);
+
+            match ranges.last_mut() {
+                Some((_, last, previous)) if *previous == owner => *last = slot,
+                _ => ranges.push((slot, slot, owner)),
+            }
+        }
+
+        ranges
+    }
+}
+
+impl std::fmt::Debug for SlotTable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SlotTable")
+            .field("ranges", &self.ranges().len())
+            .finish()
+    }
+}
+
+/// Two tables are equal when they give every slot the same owner.
+impl PartialEq for SlotTable {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+            || (0..HASH_SLOT_COUNT as u16).all(|slot| self.owner(slot) == other.owner(slot))
+    }
+}
+
+impl Eq for SlotTable {}
 
 pub fn slot_range_for_shard(shard_id: usize, shard_count: usize) -> (u16, u16) {
     assert!(shard_count > 0, "shard count must be positive");
@@ -25,6 +105,11 @@ pub fn slot_range_for_shard(shard_id: usize, shard_count: usize) -> (u16, u16) {
 
 pub fn command_slot(command: &Command<'_>) -> Result<Option<u16>, CrossSlot> {
     match command {
+        // `SCAN … SLOT n` runs where slot `n` lives; a plain `SCAN` is keyless.
+        Command::Scan {
+            slot: Some(slot), ..
+        } => Ok(Some(*slot)),
+        Command::CreateTtl { inner, .. } => command_slot(inner),
         Command::ShardUnsubscribe(channels) if channels.is_empty() => Ok(None),
         Command::ShardPublish { channel, .. } => Ok(Some(hash_slot(channel))),
         Command::ShardSubscribe(channels) | Command::ShardUnsubscribe(channels) => {
@@ -41,6 +126,7 @@ pub fn command_slot(command: &Command<'_>) -> Result<Option<u16>, CrossSlot> {
         | Command::ClientGetName
         | Command::ClientSetName(_)
         | Command::ClientTracking(_)
+        | Command::ClientDurability { .. }
         | Command::ClusterSlots
         | Command::ClusterNodes
         | Command::ClusterInfo
@@ -52,12 +138,21 @@ pub fn command_slot(command: &Command<'_>) -> Result<Option<u16>, CrossSlot> {
         | Command::ConfigGet(_)
         | Command::Info(_)
         | Command::Save
+        | Command::ConfigSet(_)
+        | Command::ConfigRewrite
+        | Command::ReplicaOf { .. }
+        | Command::MoveSlots(_)
+        | Command::Topology(_)
+        | Command::PrimaryLease(_)
+        | Command::Migrate(_)
+        | Command::Role
         | Command::Bgsave
         | Command::Scan { .. }
         | Command::Keys(_)
         | Command::JsonIndex { .. }
         | Command::RandomKey
         | Command::ClientId
+        | Command::ClientSetInfo
         | Command::ClientList { .. }
         | Command::ClientInfo
         | Command::ClientKill { .. }
@@ -111,6 +206,11 @@ pub fn command_slot(command: &Command<'_>) -> Result<Option<u16>, CrossSlot> {
             source,
             destination,
             ..
+        }
+        | Command::SortedSetMoveDue {
+            source,
+            destination,
+            ..
         } => common_slot([source.as_ref(), destination.as_ref()].into_iter()).map(Some),
         Command::MGet(keys)
         | Command::JsonMGet { keys, .. }
@@ -161,7 +261,12 @@ pub fn command_slot(command: &Command<'_>) -> Result<Option<u16>, CrossSlot> {
         Command::MSet(pairs) | Command::MSetNx(pairs) => {
             common_slot(pairs.iter().map(|(key, _)| key.as_ref())).map(Some)
         }
-        Command::Rename {
+        Command::Transfer {
+            source,
+            destination,
+            ..
+        }
+        | Command::Rename {
             source,
             destination,
         }
@@ -178,12 +283,15 @@ pub fn command_slot(command: &Command<'_>) -> Result<Option<u16>, CrossSlot> {
         | Command::Semaphore { key, .. }
         | Command::IncrementCapped { key, .. }
         | Command::Release { key, .. }
+        | Command::Renew { key, .. }
         | Command::Limit { key, .. }
         | Command::Once { key, .. }
         | Command::IdempotencyBegin { key, .. }
         | Command::IdempotencyComplete { key, .. }
+        | Command::IdempotencyAbort { key, .. }
         | Command::Take { key, .. }
         | Command::SetIfEq { key, .. }
+        | Command::SetIfCmp { key, .. }
         | Command::DelIfEq { key, .. }
         | Command::ListPushCapped { key, .. }
         | Command::GetEx { key, .. }
@@ -230,8 +338,10 @@ pub fn command_slot(command: &Command<'_>) -> Result<Option<u16>, CrossSlot> {
         | Command::SetPop { key, .. }
         | Command::SetRandom { key, .. }
         | Command::HashSet { key, .. }
+        | Command::HashMSet { key, .. }
         | Command::HashSetNx { key, .. }
         | Command::HashIncrement { key, .. }
+        | Command::HashTransfer { key, .. }
         | Command::HashStrLen { key, .. }
         | Command::HashDelete { key, .. }
         | Command::HashGet { key, .. }
@@ -258,6 +368,7 @@ pub fn command_slot(command: &Command<'_>) -> Result<Option<u16>, CrossSlot> {
         | Command::SortedSetScore { key, .. }
         | Command::SortedSetRank { key, .. }
         | Command::SortedSetPop { key, .. }
+        | Command::SortedSetPopByScore { key, .. }
         | Command::SortedSetRemoveRange { key, .. }
         | Command::HashExpire { key, .. }
         | Command::HashTtl { key, .. }
@@ -316,6 +427,7 @@ pub fn command_slot(command: &Command<'_>) -> Result<Option<u16>, CrossSlot> {
 
 pub fn command_keys<'a>(command: &'a Command<'_>) -> Vec<&'a [u8]> {
     match command {
+        Command::CreateTtl { inner, .. } => command_keys(inner),
         Command::Ping(_)
         | Command::CommandMeta { .. }
         | Command::Wait { .. }
@@ -326,6 +438,7 @@ pub fn command_keys<'a>(command: &'a Command<'_>) -> Vec<&'a [u8]> {
         | Command::ClientGetName
         | Command::ClientSetName(_)
         | Command::ClientTracking(_)
+        | Command::ClientDurability { .. }
         | Command::ShardPublish { .. }
         | Command::ShardSubscribe(_)
         | Command::ShardUnsubscribe(_)
@@ -345,12 +458,21 @@ pub fn command_keys<'a>(command: &'a Command<'_>) -> Vec<&'a [u8]> {
         | Command::ConfigGet(_)
         | Command::Info(_)
         | Command::Save
+        | Command::ConfigSet(_)
+        | Command::ConfigRewrite
+        | Command::ReplicaOf { .. }
+        | Command::MoveSlots(_)
+        | Command::Topology(_)
+        | Command::PrimaryLease(_)
+        | Command::Migrate(_)
+        | Command::Role
         | Command::Bgsave
         | Command::Scan { .. }
         | Command::Keys(_)
         | Command::JsonIndex { .. }
         | Command::RandomKey
         | Command::ClientId
+        | Command::ClientSetInfo
         | Command::ClientList { .. }
         | Command::ClientInfo
         | Command::ClientKill { .. }
@@ -406,6 +528,11 @@ pub fn command_keys<'a>(command: &'a Command<'_>) -> Vec<&'a [u8]> {
             source,
             destination,
             ..
+        }
+        | Command::SortedSetMoveDue {
+            source,
+            destination,
+            ..
         } => vec![source.as_ref(), destination.as_ref()],
         Command::SetAlgebra {
             keys, destination, ..
@@ -435,6 +562,11 @@ pub fn command_keys<'a>(command: &'a Command<'_>) -> Vec<&'a [u8]> {
             destination,
             ..
         } => vec![source.as_ref(), destination.as_ref()],
+        Command::Transfer {
+            source,
+            destination,
+            ..
+        } => vec![source.as_ref(), destination.as_ref()],
         Command::GeoSearch {
             key,
             store: Some(store),
@@ -447,12 +579,15 @@ pub fn command_keys<'a>(command: &'a Command<'_>) -> Vec<&'a [u8]> {
         | Command::Semaphore { key, .. }
         | Command::IncrementCapped { key, .. }
         | Command::Release { key, .. }
+        | Command::Renew { key, .. }
         | Command::Limit { key, .. }
         | Command::Once { key, .. }
         | Command::IdempotencyBegin { key, .. }
         | Command::IdempotencyComplete { key, .. }
+        | Command::IdempotencyAbort { key, .. }
         | Command::Take { key, .. }
         | Command::SetIfEq { key, .. }
+        | Command::SetIfCmp { key, .. }
         | Command::DelIfEq { key, .. }
         | Command::ListPushCapped { key, .. }
         | Command::GetEx { key, .. }
@@ -499,8 +634,10 @@ pub fn command_keys<'a>(command: &'a Command<'_>) -> Vec<&'a [u8]> {
         | Command::SetPop { key, .. }
         | Command::SetRandom { key, .. }
         | Command::HashSet { key, .. }
+        | Command::HashMSet { key, .. }
         | Command::HashSetNx { key, .. }
         | Command::HashIncrement { key, .. }
+        | Command::HashTransfer { key, .. }
         | Command::HashStrLen { key, .. }
         | Command::HashDelete { key, .. }
         | Command::HashGet { key, .. }
@@ -527,6 +664,7 @@ pub fn command_keys<'a>(command: &'a Command<'_>) -> Vec<&'a [u8]> {
         | Command::SortedSetScore { key, .. }
         | Command::SortedSetRank { key, .. }
         | Command::SortedSetPop { key, .. }
+        | Command::SortedSetPopByScore { key, .. }
         | Command::SortedSetRemoveRange { key, .. }
         | Command::HashExpire { key, .. }
         | Command::HashTtl { key, .. }
@@ -615,19 +753,51 @@ fn hash_tag(key: &[u8]) -> &[u8] {
     if close == 0 { key } else { &tagged[..close] }
 }
 
-fn crc16(bytes: &[u8]) -> u16 {
-    let mut crc = 0u16;
-
-    for byte in bytes {
-        crc ^= u16::from(*byte) << 8;
-
-        for _ in 0..8 {
+/// CRC16-XMODEM tables for slice-by-4: `CRC16_TABLES[k][b]` is the CRC of byte `b` followed by
+/// `k` zero bytes, so four bytes fold in with four independent lookups.
+const CRC16_TABLES: [[u16; 256]; 4] = {
+    let mut tables = [[0u16; 256]; 4];
+    let mut byte = 0;
+    while byte < 256 {
+        let mut crc = (byte as u16) << 8;
+        let mut bit = 0;
+        while bit < 8 {
             crc = if crc & 0x8000 != 0 {
                 (crc << 1) ^ 0x1021
             } else {
                 crc << 1
             };
+            bit += 1;
         }
+        tables[0][byte] = crc;
+        byte += 1;
+    }
+    let mut k = 1;
+    while k < 4 {
+        let mut byte = 0;
+        while byte < 256 {
+            let prev = tables[k - 1][byte];
+            tables[k][byte] = (prev << 8) ^ tables[0][(prev >> 8) as usize];
+            byte += 1;
+        }
+        k += 1;
+    }
+    tables
+};
+
+fn crc16(bytes: &[u8]) -> u16 {
+    let [t0, t1, t2, t3] = &CRC16_TABLES;
+    let mut crc = 0u16;
+    let mut chunks = bytes.chunks_exact(4);
+
+    for chunk in &mut chunks {
+        let high = usize::from(chunk[0] ^ (crc >> 8) as u8);
+        let low = usize::from(chunk[1] ^ crc as u8);
+        crc = t3[high] ^ t2[low] ^ t1[usize::from(chunk[2])] ^ t0[usize::from(chunk[3])];
+    }
+
+    for byte in chunks.remainder() {
+        crc = (crc << 8) ^ t0[usize::from(*byte ^ (crc >> 8) as u8)];
     }
 
     crc
@@ -636,6 +806,81 @@ fn crc16(bytes: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bitwise_crc16(bytes: &[u8]) -> u16 {
+        let mut crc = 0u16;
+        for byte in bytes {
+            crc ^= u16::from(*byte) << 8;
+            for _ in 0..8 {
+                crc = if crc & 0x8000 != 0 {
+                    (crc << 1) ^ 0x1021
+                } else {
+                    crc << 1
+                };
+            }
+        }
+        crc
+    }
+
+    #[test]
+    fn crc16_matches_known_xmodem_values() {
+        for (input, expected) in [
+            (b"".as_slice(), 0x0000),
+            (b"A".as_slice(), 0x58E5),
+            (b"123456789".as_slice(), 0x31C3),
+            (b"user:1000".as_slice(), bitwise_crc16(b"user:1000")),
+            (
+                b"\xff\xff\xff\xff\xff".as_slice(),
+                bitwise_crc16(b"\xff\xff\xff\xff\xff"),
+            ),
+        ] {
+            assert_eq!(crc16(input), expected, "{input:?}");
+        }
+        assert_eq!(bitwise_crc16(b"A"), 0x58E5);
+        assert_eq!(bitwise_crc16(b"123456789"), 0x31C3);
+    }
+
+    #[test]
+    fn table_crc16_equals_bitwise_for_all_lengths() {
+        // Fixed-seed xorshift: the same bytes on every run.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut buffer = [0u8; 64];
+        for _ in 0..64 {
+            for byte in &mut buffer {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *byte = state as u8;
+            }
+            for len in 0..=buffer.len() {
+                let bytes = &buffer[..len];
+                assert_eq!(crc16(bytes), bitwise_crc16(bytes), "{bytes:?}");
+            }
+        }
+        for byte in 0..=255u8 {
+            assert_eq!(crc16(&[byte]), bitwise_crc16(&[byte]));
+            assert_eq!(crc16(&[byte; 7]), bitwise_crc16(&[byte; 7]));
+        }
+    }
+
+    #[test]
+    fn hash_tag_edge_cases_hash_like_redis() {
+        for (key, hashed) in [
+            (b"{}".as_slice(), b"{}".as_slice()),
+            (b"{a".as_slice(), b"{a".as_slice()),
+            (b"a}{b}".as_slice(), b"b".as_slice()),
+            (b"{a}{b}".as_slice(), b"a".as_slice()),
+            (b"{{a}}".as_slice(), b"{a".as_slice()),
+            (b"}{".as_slice(), b"}{".as_slice()),
+        ] {
+            assert_eq!(hash_tag(key), hashed, "{key:?}");
+            assert_eq!(
+                hash_slot(key),
+                bitwise_crc16(hashed) % HASH_SLOT_COUNT as u16,
+                "{key:?}"
+            );
+        }
+    }
 
     #[test]
     fn matches_known_redis_slot_and_hash_tags() {
@@ -846,6 +1091,8 @@ mod tests {
             (&["ZCARD", "z"], &["z"]),
             (&["ZINCRBY", "z", "1", "m"], &["z"]),
             (&["ZPOPMIN", "z"], &["z"]),
+            (&["ZPOPBYSCORE", "z", "10"], &["z"]),
+            (&["ZMOVEDUE", "z", "l", "10"], &["z", "l"]),
             (&["XADD", "x", "*", "f", "v"], &["x"]),
             (&["XLEN", "x"], &["x"]),
             (&["XRANGE", "x", "-", "+"], &["x"]),
@@ -924,6 +1171,26 @@ mod tests {
             let (command, _) = crate::protocol::parse_command(&frame).unwrap().unwrap();
 
             assert_eq!(command_slot(&command), Ok(Some(slot)), "{words:?}");
+        }
+    }
+
+    #[test]
+    fn slot_table_matches_the_formula_for_every_shard_count() {
+        for count in 1..=512 {
+            let table = SlotTable::from_formula(count);
+            let ranges = table.ranges();
+
+            for slot in 0..HASH_SLOT_COUNT as u16 {
+                assert_eq!(
+                    table.owner(slot),
+                    shard_for_slot(slot, count),
+                    "{count} shards"
+                );
+            }
+            assert_eq!(ranges.len(), count.min(HASH_SLOT_COUNT));
+            for (first, last, owner) in ranges {
+                assert_eq!((first, last), slot_range_for_shard(owner, count));
+            }
         }
     }
 }

@@ -11,7 +11,7 @@
 // encodes straight into the one connection, exactly like RuvioClient.
 
 import { Helpers, RuvioClient, type BinaryCommands, type ClientOptions } from './client.js';
-import type { Connection, BatchSink, MovedHandler } from './connection.js';
+import { parseSeeds, type Connection, type BatchSink, type MovedHandler } from './connection.js';
 import { COMMAND_KEY_RULES, KeyRule, type CommandKeyRule } from './command-keys.js';
 import { Encoder } from './encoder.js';
 import { ConnectionError, RuvioError } from './errors.js';
@@ -125,9 +125,15 @@ interface Spec {
   readonly c: number;
   readonly words: readonly string[];
   readonly flags: number;
+  /** A read that may go to a replica: flagged readonly and not blocking in the command table, and not sent on a blocking connection. */
+  readonly read: boolean;
   /** The one key is argument 1 (`kind` Range 1..1). */
   readonly first: boolean;
 }
+
+// Server flag bits in the command table (see scripts/gen_client_keys.py).
+const TABLE_READONLY = 2;
+const TABLE_BLOCKING = 16;
 
 // Key positions come from COMMAND_KEY_RULES; these lists only say how a command is sent.
 const FLAG_LISTS: [number, string][] = [
@@ -166,15 +172,17 @@ export const ROUTED_COMMANDS: ReadonlyMap<string, number> = (() => {
   const rules = new Map<string, CommandKeyRule>(COMMAND_KEY_RULES);
   for (const [name, rule] of CHANNEL_RULES) rules.set(name, rule);
   for (const name of flags.keys()) if (!rules.has(name)) rules.set(name, DEFAULT_RULE);
-  for (const [name, [kind, a, b, c, words]] of rules) {
+  for (const [name, [kind, a, b, c, words, tableFlags]] of rules) {
     const up = Buffer.from(name, 'latin1');
     const h = nameHash(up, 0, up.length);
     if (SPECS.has(h)) throw new Error('ruvio: command name hash collision: ' + name);
-    SPECS.set(h, { name, up, kind, a, b, c, words, flags: flags.get(name) ?? 0, first: kind === KeyRule.Range && a === 1 && b === 1 });
+    const routed = flags.get(name) ?? 0;
+    const read = (tableFlags & TABLE_READONLY) !== 0 && (tableFlags & TABLE_BLOCKING) === 0 && (routed & (F_BLOCK | F_BLOCKOPT)) === 0;
+    SPECS.set(h, { name, up, kind, a, b, c, words, flags: routed, read, first: kind === KeyRule.Range && a === 1 && b === 1 });
   }
   return flags;
 })();
-const DEFAULT_SPEC: Spec = { name: '', up: Buffer.alloc(0), kind: KeyRule.Range, a: 1, b: 1, c: 1, words: [], flags: 0, first: true };
+const DEFAULT_SPEC: Spec = { name: '', up: Buffer.alloc(0), kind: KeyRule.Range, a: 1, b: 1, c: 1, words: [], flags: 0, read: false, first: true };
 
 /** The routing rule of the command in the frame just scanned. */
 function specOfFrame(b: Uint8Array): Spec {
@@ -281,14 +289,30 @@ function noSlot(slot: number): RuvioError {
   return new RuvioError('CLUSTERDOWN Hash slot ' + slot + ' is not served by any known node');
 }
 
+function noReplica(slot: number): RuvioError {
+  return new RuvioError('NOREPLICA no replica is known for slot ' + slot + ' (readPolicy "replica")');
+}
+
 // Routing outcomes that are not a single node.
 const T_SPLIT = 1;
 const T_CROSS = 2;
 const T_FANOUT = 3;
 const T_NOSLOT = 4;
+const T_NOREPLICA = 5;
 
-/** MOVED redirects followed per command before the MOVED error is returned. */
+/** MOVED and ASK redirects followed per command (one shared budget) before the redirect error is returned. */
 const MAX_REDIRECTS = 3;
+/**
+ * TRYAGAIN retries per command; the wait before retry n (from 0) is `TRYAGAIN_WAIT_MS << n`, 635 ms in
+ * all: a slot range moving between nodes is frozen for a few hundred milliseconds.
+ */
+const MAX_TRYAGAIN = 7;
+const TRYAGAIN_WAIT_MS = 5;
+/** `ASKING`, written before the command a node was asked to serve for a slot it is handing over. */
+const ASKING_FRAME = Buffer.from('*1\r\n$6\r\nASKING\r\n');
+
+/** Error codes the router handles by sending the command again. */
+const isRedirect = (code: string): boolean => code === 'MOVED' || code === 'ASK' || code === 'TRYAGAIN';
 
 // ---- nodes ----------------------------------------------------------------------------------
 
@@ -303,6 +327,12 @@ export class ClusterNode {
   readonly idle: RuvioClient[] = [];
   /** The connection used for ordinary commands to this node. You may use it for node-specific calls such as `clusterMyid()`. */
   readonly client: RuvioClient;
+  /** @internal The replicas `CLUSTER SLOTS` lists for this node (only read while the read policy is not `'primary'`). */
+  replicas: { host: string; port: number }[] = [];
+  /** @internal The replica this node's reads go to until the next slot table load; null when it has none or it cannot be used. */
+  reader: ClusterNode | null = null;
+  /** @internal On a replica node: the node it serves reads for. */
+  primary: ClusterNode | null = null;
   constructor(
     readonly host: string,
     readonly port: number,
@@ -328,12 +358,25 @@ export class ClusterNode {
  */
 export interface ClusterOptions extends ClientOptions {
   /**
+   * Where reads go. `'primary'` (default): every command goes to the shard's primary. `'prefer-replica'`:
+   * reads (commands the server flags readonly and not blocking, with a key) go to one replica of the key's shard,
+   * picked at random when the slot table loads, and to the primary when that replica cannot be used. `'replica'`:
+   * the same, but a read fails when no replica can be used. Writes, transactions, Pub/Sub, blocking and keyless
+   * commands always use the primary. Replication is asynchronous, so a replica read may miss a recent write,
+   * including your own. A pipeline goes to replicas only when every command in it is a read. Ignored by a
+   * standalone server.
+   */
+  readPolicy?: ReadPolicy;
+  /**
    * `'auto'` (default): ask the seed for `CLUSTER SLOTS` and fall back to plain standalone mode when
    * the server answers `cluster mode is disabled` (a single-shard server). `true`: a standalone
    * seed is an error. `false`: treated like `'auto'`.
    */
   cluster?: 'auto' | boolean;
 }
+
+/** See {@link ClusterOptions.readPolicy}. */
+export type ReadPolicy = 'primary' | 'prefer-replica' | 'replica';
 
 /** MOVED / refresh bookkeeping and the routing logic, shared by a client and its `binary` view. */
 class Router {
@@ -352,15 +395,36 @@ class Router {
   refreshes = 0;
   /** Number of MOVED redirects followed. */
   redirects = 0;
+  /** Options of every node; the seeds are not part of them (a node is one address). */
   readonly base: ClientOptions;
   readonly strict: boolean;
+  readonly policy: ReadPolicy;
+  /** The read policy is not `'primary'`: the only thing the routing of a command checks for replicas. */
+  readonly reads: boolean;
+  /** The nodes reads go to, by address; empty with the `'primary'` policy. */
+  replicaNodes = new Map<string, ClusterNode>();
+  /** The configured seed addresses, asked for the slot table when no known node answers. */
+  private readonly seeds: { host: string; port: number }[] = [];
 
   constructor(options: ClusterOptions) {
-    const { cluster, ...rest } = options;
+    // A cluster client never follows a primary: it keeps its own MOVED/ASK rules.
+    const { cluster, seeds, readPolicy = 'primary', sentinelMaster: _coordinator, ...rest } = options;
+    rest.followPrimary = false;
+    if (readPolicy !== 'primary' && readPolicy !== 'prefer-replica' && readPolicy !== 'replica') {
+      throw new TypeError('ruvio: readPolicy must be "primary", "prefer-replica" or "replica"');
+    }
+    this.policy = readPolicy;
+    this.reads = readPolicy !== 'primary';
     this.strict = cluster === true;
     this.base = rest;
-    const host = rest.host ?? '127.0.0.1';
-    const port = rest.port ?? 6379;
+    let host = rest.host ?? '127.0.0.1';
+    let port = rest.port ?? 6379;
+    if (seeds !== undefined && seeds.length > 0) {
+      if (rest.path !== undefined) throw new TypeError('ruvio: seeds cannot be combined with path');
+      this.seeds = parseSeeds(seeds);
+      host = rest.host = this.seeds[0]!.host;
+      port = rest.port = this.seeds[0]!.port;
+    }
     this.home = this.track(new ClusterNode(host, port, rest));
     this.nodes.set(this.home.addr, this.home);
   }
@@ -388,7 +452,7 @@ class Router {
   send(tf: Tf | null, fl: number): Promise<any> {
     const e = this.enc;
     const b = e.buf;
-    const r = this.target(b, e.start);
+    const r = this.target(b, e.start, this.reads);
     if (typeof r !== 'number' && ((LAST_SPEC.flags & (F_BLOCK | F_BLOCKOPT)) === 0 || !this.blocking(b))) {
       const conn = r.conn;
       conn.writeRaw(b, e.start, e.pos);
@@ -428,28 +492,52 @@ class Router {
     ));
   }
 
+  /**
+   * Reads CLUSTER SLOTS. Nodes with an open socket are asked first, then the other known nodes
+   * (each one connect attempt), and when none of them answers every seed that is not a known
+   * node. A seed that cannot be opened is not kept in the node list.
+   */
   private async load(first: boolean): Promise<void> {
-    const tried: ClusterNode[] = [this.home];
-    for (const n of this.nodes.values()) if (n !== this.home) tried.push(n);
+    const queue: (ClusterNode | { host: string; port: number })[] = [];
+    for (const n of this.nodes.values()) if (n.conn.isConnected) queue.push(n);
+    if (!queue.includes(this.home)) queue.push(this.home);
+    for (const n of this.nodes.values()) if (!queue.includes(n)) queue.push(n);
+    for (const x of this.seeds) if (!this.nodes.has(x.host + ':' + x.port)) queue.push(x);
+    const spare = new Map<string, ClusterNode>();
     let last: unknown = null;
     let reply: unknown[] | null = null;
-    for (const n of tried) {
+    let answered: ClusterNode | null = null;
+    for (const item of queue) {
+      let n: ClusterNode;
+      if (item instanceof ClusterNode) n = item;
+      else {
+        n = this.makeNode(item.host, item.port);
+        spare.set(n.addr, n);
+      }
       try {
         reply = (await n.client.clusterSlots()) as unknown[];
+        answered = n;
         break;
       } catch (e) {
         if (e instanceof RuvioError && first && !this.strict) {
           // "cluster mode is disabled": plain standalone server.
-          this.standalone = true;
-          this.ready = true;
+          this.standaloneAt(n);
+          for (const x of spare.values()) if (x !== n) this.drop(x);
           return;
         }
         last = e;
+        if (spare.get(n.addr) === n) {
+          spare.delete(n.addr);
+          this.drop(n);
+        }
         if (e instanceof RuvioError) break;
       }
     }
-    if (reply === null) throw last;
-    const seedHost = this.base.host ?? '127.0.0.1';
+    if (reply === null || answered === null) {
+      for (const x of spare.values()) this.drop(x);
+      throw last ?? new ConnectionError('ruvio: no cluster topology source');
+    }
+    const seedHost = answered.host;
     const fresh = new Map<string, ClusterNode>();
     const slots: (ClusterNode | undefined)[] = new Array(SLOT_COUNT);
     for (const range of reply as unknown[][]) {
@@ -459,18 +547,117 @@ class Router {
       const host = typeof m[0] === 'string' && m[0] !== '' ? (m[0] as string) : seedHost;
       const port = Number(m[1]);
       const addr = host + ':' + port;
-      let node = fresh.get(addr) ?? this.nodes.get(addr);
+      let node = fresh.get(addr) ?? this.nodes.get(addr) ?? spare.get(addr);
       if (node === undefined) node = this.makeNode(host, port);
+      if (this.reads) {
+        if (!fresh.has(addr)) node.replicas = [];
+        for (let k = 3; k < range.length; k++) this.addReplica(node, range[k], seedHost);
+      }
       fresh.set(addr, node);
       for (let s = from; s <= to; s++) slots[s] = node;
     }
-    if (fresh.size === 0) throw new RuvioError('CLUSTERDOWN CLUSTER SLOTS returned no ranges');
+    if (fresh.size === 0) {
+      for (const x of spare.values()) this.drop(x);
+      throw new RuvioError('CLUSTERDOWN CLUSTER SLOTS returned no ranges');
+    }
     const old = this.nodes;
     this.slots = slots;
     this.nodes = fresh;
     if (!fresh.has(this.home.addr)) this.home = fresh.values().next().value!;
     this.ready = true;
     for (const [addr, n] of old) if (!fresh.has(addr)) this.drop(n);
+    for (const [addr, n] of spare) if (!fresh.has(addr)) this.drop(n);
+    if (this.reads) this.pickReplicas();
+  }
+
+  /** Records a replica entry of a `CLUSTER SLOTS` range for `node`; an entry that cannot be read is skipped. */
+  private addReplica(node: ClusterNode, entry: unknown, seedHost: string): void {
+    if (!Array.isArray(entry)) return;
+    const port = Number(entry[1]);
+    if (!Number.isInteger(port) || port < 0 || port > 65535) return;
+    const host = typeof entry[0] === 'string' ? (entry[0] === '' ? seedHost : entry[0]) : null;
+    if (host === null) return;
+    if (!node.replicas.some((r) => r.host === host && r.port === port)) node.replicas.push({ host, port });
+  }
+
+  /**
+   * Gives each node one of its replicas to read from, picked with one random number per load so many
+   * clients spread over a shard's replicas, and kept until the next load. Replica nodes of the last load
+   * that are not picked again are closed.
+   */
+  private pickReplicas(): void {
+    const pick = Math.floor(Math.random() * 0x100000000);
+    const old = this.replicaNodes;
+    const kept = new Map<string, ClusterNode>();
+    for (const n of this.nodes.values()) {
+      n.reader = null;
+      if (n.replicas.length === 0) continue;
+      const { host, port } = n.replicas[pick % n.replicas.length]!;
+      const addr = host + ':' + port;
+      let r = kept.get(addr) ?? old.get(addr);
+      if (r === undefined) r = this.makeReplica(host, port);
+      r.primary = n;
+      kept.set(addr, r);
+      n.reader = r;
+    }
+    for (const [addr, r] of old) if (!kept.has(addr)) this.drop(r);
+    this.replicaNodes = kept;
+  }
+
+  private makeReplica(host: string, port: number): ClusterNode {
+    const o: ClientOptions = { ...this.base, host, port };
+    delete o.path;
+    const n = new ClusterNode(host, port, o);
+    n.conn.replica = true;
+    const frame = (buf: Buffer, off: number, len: number) => Buffer.from(buf.subarray(off, off + len));
+    n.conn.keepFrames(
+      (e, buf, off, len, tf, fl, res, rej) => {
+        const f = frame(buf, off, len);
+        (isRedirect(e.code) ? this.moved(e, f, tf, fl) : this.replicaFailed(n, e, f, tf, fl)).then(res, rej);
+      },
+      (e, buf, off, len, tf, fl, res, rej) => {
+        this.replicaFailed(n, e, frame(buf, off, len), tf, fl).then(res, rej);
+      },
+    );
+    return n;
+  }
+
+  /**
+   * A read sent to replica `n` could not be answered: the replica could not be opened, or it answered
+   * `-LOADING` (still copying its primary). It is skipped until the next load, and the read goes to the
+   * node the routing now picks (the primary, under `'prefer-replica'`); under `'replica'` the error is returned.
+   */
+  replicaFailed(n: ClusterNode, e: unknown, frame: Buffer, tf: Tf | null, fl: number): Promise<any> {
+    const p = n.primary;
+    if (p !== null && p.reader === n) p.reader = null;
+    if (this.policy === 'replica') return Promise.reject(e);
+    return this.dispatch(frame, tf, fl);
+  }
+
+  /** The replica a read of `node`'s slots goes to, or `node` itself (a T_NOREPLICA under `'replica'`) when it has none to use. */
+  private readerOf(node: ClusterNode): ClusterNode | number {
+    const r = node.reader;
+    if (r !== null) return r;
+    return this.policy === 'replica' ? T_NOREPLICA : node;
+  }
+
+  /** The answering address is a plain server: `n` becomes the one connection, with the other seeds as fallbacks. */
+  private standaloneAt(n: ClusterNode): void {
+    this.standalone = true;
+    this.ready = true;
+    if (this.seeds.length < 2) return;
+    const start = this.seeds.findIndex((x) => x.host === n.host && x.port === n.port);
+    const rotated: string[] = [];
+    for (let k = 0; k < this.seeds.length; k++) {
+      const x = this.seeds[(Math.max(start, 0) + k) % this.seeds.length]!;
+      rotated.push((x.host.includes(':') ? '[' + x.host + ']' : x.host) + ':' + x.port);
+    }
+    const home = this.track(new ClusterNode(n.host, n.port, { ...this.base, host: n.host, port: n.port, seeds: rotated }));
+    const old = this.nodes;
+    this.nodes = new Map([[home.addr, home]]);
+    this.home = home;
+    for (const x of old.values()) this.drop(x);
+    if (!old.has(n.addr)) this.drop(n);
   }
 
   private makeNode(host: string, port: number): ClusterNode {
@@ -481,7 +668,9 @@ class Router {
 
   /** Lets the node's connection hand `-MOVED` replies of single commands back to the router. */
   private track(n: ClusterNode): ClusterNode {
-    n.conn.keepFrames(this.onMoved);
+    n.conn.keepFrames(this.onMoved, (e, buf, off, len, tf, fl, res, rej) => {
+      this.lost(n, e, Buffer.from(buf.subarray(off, off + len)), tf, fl).then(res, rej);
+    });
     return n;
   }
 
@@ -513,8 +702,11 @@ class Router {
 
   // ---- routing ----
 
-  /** Single owner node, or a T_* code. Leaves the scan in A_* and the rule in LAST_SPEC. */
-  target(b: Uint8Array, p: number): ClusterNode | number {
+  /**
+   * Single owner node, or a T_* code. Leaves the scan in A_* and the rule in LAST_SPEC. With `rd`, a read
+   * (see `Spec.read`) with a key goes to the replica of its slot's node.
+   */
+  target(b: Uint8Array, p: number, rd = false): ClusterNode | number {
     scanFrame(b, p);
     const spec = (LAST_SPEC = specOfFrame(b));
     LAST_SLOT = -1;
@@ -524,7 +716,8 @@ class Router {
       const o = A_OFF[1]!;
       const slot = (LAST_SLOT = slotRange(b, o, o + A_LEN[1]!));
       const node = this.slots[slot];
-      return node === undefined ? T_NOSLOT : node;
+      if (node === undefined) return T_NOSLOT;
+      return rd && spec.read ? this.readerOf(node) : node;
     }
     if (spec.kind === KeyRule.None) return (spec.flags & F_FANOUT) !== 0 ? T_FANOUT : this.home;
     const n = keyIndexes(spec, b);
@@ -538,7 +731,8 @@ class Router {
     }
     LAST_SLOT = slot;
     const node = this.slots[slot];
-    return node === undefined ? T_NOSLOT : node;
+    if (node === undefined) return T_NOSLOT;
+    return rd && spec.read ? this.readerOf(node) : node;
   }
 
   private blocking(b: Uint8Array): boolean {
@@ -549,16 +743,18 @@ class Router {
     return false;
   }
 
-  dispatch(frame: Buffer, tf: Tf | null, fl: number): Promise<any> {
-    const r = this.target(frame, 0);
+  dispatch(frame: Buffer, tf: Tf | null, fl: number, rd = this.reads): Promise<any> {
+    const r = this.target(frame, 0, rd);
     if (typeof r !== 'number') return this.sendTo(r, frame, tf, fl, this.blocking(frame));
     switch (r) {
       case T_SPLIT:
-        return this.split(frame, tf, fl);
+        return this.split(frame, tf, fl, rd);
       case T_FANOUT:
         return this.fanout(frame, tf, fl);
       case T_CROSS:
         return Promise.reject(crossSlot());
+      case T_NOREPLICA:
+        return Promise.reject(noReplica(LAST_SLOT));
       default:
         return Promise.reject(noSlot(LAST_SLOT));
     }
@@ -573,7 +769,9 @@ class Router {
       conn.trackCb(
         resolve,
         (e) => {
-          if (e instanceof RuvioError && e.code === 'MOVED') this.moved(e, frame, tf, fl).then(resolve, reject);
+          if (e instanceof RuvioError && isRedirect(e.code)) this.moved(e, frame, tf, fl).then(resolve, reject);
+          else if (node.primary !== null && replicaFault(e)) this.replicaFailed(node, e, frame, tf, fl).then(resolve, reject);
+          else if (e instanceof ConnectionError && e.unreachable) this.lost(node, e, frame, tf, fl).then(resolve, reject);
           else reject(e);
         },
         tf,
@@ -594,6 +792,7 @@ class Router {
       (e) => {
         if (e instanceof ConnectionError) c.disconnect();
         else this.release(node, c);
+        if (e instanceof ConnectionError && e.unreachable) return this.lost(node, e, frame, tf, fl);
         return this.onError(e, frame, tf, fl);
       },
     );
@@ -605,44 +804,123 @@ class Router {
   }
 
   onError(e: unknown, frame: Buffer, tf: Tf | null, fl: number): Promise<any> {
-    if (e instanceof RuvioError && e.code === 'MOVED') return this.moved(e, frame, tf, fl);
+    if (e instanceof RuvioError && isRedirect(e.code)) return this.moved(e, frame, tf, fl);
     return Promise.reject(e);
   }
 
   /**
-   * `MOVED slot host:port`: point that slot at the named node and send the command there. The
-   * whole table is reloaded only for an unknown node or a second MOVED for the same command; the
-   * MOVED after `MAX_REDIRECTS` redirects is returned as the error.
+   * `node` could not be opened. The slot table is reloaded (from the other nodes, then the seeds)
+   * and the command goes once to the owner the new table names; a command without a key goes to
+   * the first node of the new table that can be opened. When nothing better is found the
+   * original error is returned.
    */
-  async moved(e: RuvioError, frame: Buffer, tf: Tf | null, fl: number, hop = 1): Promise<any> {
-    const parts = e.message.split(' ');
-    const slot = Number(parts[1]);
-    const addr = parts[2];
-    if (hop > MAX_REDIRECTS || addr === undefined || !(slot >= 0 && slot < SLOT_COUNT)) throw e;
-    this.redirects++;
-    let node = this.nodes.get(addr);
-    if (node === undefined || hop > 1) {
-      try {
-        await this.refresh();
-      } catch {
-        /* keep the redirect target below */
-      }
-      node = this.nodeAt(addr);
+  async lost(node: ClusterNode, err: ConnectionError, frame: Buffer, tf: Tf | null, fl: number): Promise<any> {
+    if (this.standalone || !this.ready) throw err;
+    try {
+      await this.refresh();
+    } catch {
+      throw err;
     }
-    this.slots[slot] = node;
-    const conn = node.conn;
+    const r = this.target(frame, 0);
+    if (typeof r === 'number') throw err;
+    let owner: ClusterNode | null = null;
+    if (LAST_SLOT >= 0) {
+      if (r !== node || node.conn.isConnected) owner = r;
+    } else {
+      for (const n of [r, ...this.nodes.values()]) {
+        if (n === node && !n.conn.isConnected) continue;
+        try {
+          await n.conn.connect();
+        } catch {
+          continue;
+        }
+        this.home = owner = n;
+        break;
+      }
+    }
+    if (owner === null) throw err;
+    const conn = owner.conn;
     conn.writeFrames(frame);
     try {
       return await conn.track(tf, fl);
     } catch (e2) {
-      if (e2 instanceof RuvioError && e2.code === 'MOVED') return this.moved(e2, frame, tf, fl, hop + 1);
+      if (e2 instanceof RuvioError && isRedirect(e2.code)) return this.moved(e2, frame, tf, fl, 2, 0, true);
       throw e2;
     }
   }
 
+  /**
+   * Follows `MOVED`, `ASK` and `TRYAGAIN` for one command, re-sending from the caller's frame.
+   * `MOVED slot host:port` points that slot at the named node and sends the command there; the
+   * whole table is reloaded only for an unknown node or a second MOVED for the same command.
+   * `ASK slot host:port` sends `ASKING` and the command to the named node in one write and leaves
+   * the table alone. MOVED and ASK share `MAX_REDIRECTS`; the redirect after that is returned as
+   * the error. `TRYAGAIN` waits 5, 10, 20, ... 320 ms and routes the command again by the current
+   * table, at most `MAX_TRYAGAIN` times; the TRYAGAIN after that is returned.
+   */
+  async moved(e: RuvioError, frame: Buffer, tf: Tf | null, fl: number, hop = 1, tries = 0, movedBefore = false): Promise<any> {
+    for (;;) {
+      let conn: Connection;
+      let asking = false;
+      if (e.code === 'TRYAGAIN') {
+        if (tries >= MAX_TRYAGAIN) throw e;
+        await new Promise((r) => setTimeout(r, TRYAGAIN_WAIT_MS << tries));
+        tries++;
+        const t = this.target(frame, 0);
+        if (typeof t === 'number') throw e;
+        conn = t.conn;
+      } else {
+        const parts = e.message.split(' ');
+        const slot = Number(parts[1]);
+        const addr = parts[2];
+        if (hop > MAX_REDIRECTS || addr === undefined || !(slot >= 0 && slot < SLOT_COUNT)) throw e;
+        hop++;
+        this.redirects++;
+        let node = this.nodes.get(addr);
+        if (e.code === 'ASK') {
+          node ??= this.nodeAt(addr);
+          asking = true;
+        } else {
+          if (node === undefined || movedBefore) {
+            try {
+              await this.refresh();
+            } catch {
+              /* keep the redirect target below */
+            }
+            node = this.nodeAt(addr);
+          }
+          movedBefore = true;
+          this.slots[slot] = node;
+        }
+        conn = node.conn;
+      }
+      try {
+        if (!asking) {
+          conn.writeFrames(frame);
+          return await conn.track(tf, fl);
+        }
+        conn.writeFrames(ASKING_FRAME);
+        const pa = conn.track(null, 0);
+        conn.writeFrames(frame);
+        const pc = conn.track(tf, fl);
+        try {
+          await pa;
+        } catch (x) {
+          pc.catch(() => undefined);
+          throw x;
+        }
+        return await pc;
+      } catch (e2) {
+        if (!(e2 instanceof RuvioError && isRedirect(e2.code))) throw e2;
+        e = e2;
+      }
+    }
+  }
+
   /** MGET / MSET / DEL / UNLINK / EXISTS / TOUCH across slots: one sub-command per node, merged in caller order. */
-  private split(b: Buffer, tf: Tf | null, fl: number): Promise<any> {
+  private split(b: Buffer, tf: Tf | null, fl: number, rd: boolean): Promise<any> {
     const spec = LAST_SPEC;
+    rd &&= spec.read;
     const step = spec.c; // MSET: key value pairs
     // The server demands one slot per command (CROSSSLOT even inside one shard): group by slot.
     const groups = new Map<number, number[]>();
@@ -658,7 +936,9 @@ class Router {
     const jobs: [ClusterNode, Buffer][] = [];
     const order: number[][] = [];
     for (const [slot, idx] of groups) {
-      const node = this.slots[slot]!;
+      const owner = this.slots[slot]!;
+      const node = rd ? this.readerOf(owner) : owner;
+      if (typeof node === 'number') return Promise.reject(noReplica(slot));
       const parts: Buffer[] = [Buffer.from('*' + (1 + idx.length * step) + '\r\n', 'latin1'), nameBulk];
       for (const i of idx) {
         for (let k = 0; k < step; k++) parts.push(b.subarray(A_H[i + k], A_OFF[i + k]! + A_LEN[i + k]! + 2));
@@ -727,12 +1007,25 @@ class Router {
     }
     const nodes = B_NODE;
     const offs = B_OFF;
+    // Replicas serve a pipeline only when every command in it is a read, so it never reads its own
+    // writes from a replica that has not received them.
+    let rd = this.reads;
+    if (rd) {
+      for (let i = 0, q = 0; i < n; i++) {
+        scanFrame(bytes, q);
+        if (!specOfFrame(bytes).read) {
+          rd = false;
+          break;
+        }
+        q = A_END;
+      }
+    }
     let p = 0;
     let first: ClusterNode | null = null;
     let same = true;
     for (let i = 0; i < n; i++) {
       offs[i] = p;
-      const r = this.target(bytes, p);
+      const r = this.target(bytes, p, rd);
       p = A_END;
       if (typeof r === 'number') {
         nodes[i] = null;
@@ -744,7 +1037,7 @@ class Router {
       }
     }
     offs[n] = p;
-    const sink = new ClusterSink(this, bytes, n, fls, out);
+    const sink = new ClusterSink(this, bytes, n, fls, out, rd ? nodes.slice(0, n) : null);
     if (same) {
       const conn = first!.conn;
       conn.writeFrames(bytes);
@@ -755,12 +1048,12 @@ class Router {
       const node = nodes[i];
       if (node === null || node === undefined) {
         const frame = bytes.subarray(offs[i], offs[i + 1]);
-        const r = this.target(frame, 0);
+        const r = this.target(frame, 0, rd);
         if (typeof r === 'number' && r === T_CROSS) out.set(i, crossSlot());
         else if (typeof r === 'number' && r === T_NOSLOT) out.set(i, noSlot(-1));
         else {
           const k = i;
-          this.dispatch(frame, null, fls[i]!).then(
+          this.dispatch(frame, null, fls[i]!, rd).then(
             (v) => out.set(k, v),
             (e) => out.set(k, e),
           );
@@ -811,6 +1104,11 @@ class Router {
 let B_NODE: (ClusterNode | null)[] = new Array(256).fill(null);
 let B_OFF = new Int32Array(257);
 
+/** A reply or error that makes a read sent to a replica go elsewhere: the replica could not be opened, or answered `-LOADING`. */
+function replicaFault(v: unknown): boolean {
+  return (v instanceof ConnectionError && v.unreachable) || (v instanceof RuvioError && (v.code === 'LOADING' || v.code === 'MASTERDOWN'));
+}
+
 /** Receives a pipeline's replies at the caller's indexes and follows MOVED per command. */
 class ClusterSink implements BatchSink {
   private offs: Int32Array | null = null;
@@ -820,9 +1118,21 @@ class ClusterSink implements BatchSink {
     private readonly n: number,
     private readonly fls: number[],
     private readonly out: PipelineSink,
+    /** The node each command was sent to; only for a pipeline routed to replicas. */
+    private readonly via: (ClusterNode | null)[] | null,
   ) {}
   set(i: number, v: unknown): void {
-    if (v instanceof RuvioError && v.code === 'MOVED') {
+    if (this.via !== null) {
+      const n = this.via[i];
+      if (n !== null && n !== undefined && n.primary !== null && replicaFault(v)) {
+        this.r.replicaFailed(n, v, this.frame(i), null, this.fls[i]!).then(
+          (x) => this.out.set(i, x),
+          (e) => this.out.set(i, e),
+        );
+        return;
+      }
+    }
+    if (v instanceof RuvioError && isRedirect(v.code)) {
       this.r.moved(v, this.frame(i), null, this.fls[i]!).then(
         (x) => this.out.set(i, x),
         (e) => this.out.set(i, e),
@@ -926,8 +1236,9 @@ class ClusterTransactionImpl extends TransactionImpl {
  *   rejects with {@link RuvioError} code `CROSSSLOT` before anything is sent. Use `{tag}` in key names to colocate keys.
  *   Inside a pipeline the error sits in that command's slot and the rest still runs.
  * - A transaction (`multi()`) must stay in one slot.
- * - On `-MOVED` the slot is re-pointed and the command re-sent, at most 3 times; the 4th `MOVED` is returned as an error.
- *   Ruvio normally forwards a misrouted key instead of answering `MOVED`, so redirects are rare. `-ASK` is not followed.
+ * - On `-MOVED` the slot is re-pointed and the command re-sent; on `-ASK` the command is sent to the named node after `ASKING` and the
+ *   slot is left alone. Both share one budget of 3 redirects; the 4th is returned as an error. `-TRYAGAIN` is retried up to 7 times
+ *   after waits doubling from 5 ms to 320 ms (635 ms in all), then returned. Ruvio normally forwards a misrouted key instead of answering `MOVED`, so redirects are rare.
  * - Blocking commands run on a dedicated connection to the owning node so they do not stall the shared one.
  * - `SCAN` and the `CLIENT *`/`SLOWLOG`/`INFO` family reach one node only; use {@link scanIterator} to walk every node.
  *
@@ -1024,6 +1335,7 @@ export class ClusterClient extends Helpers {
       out.push(n.client);
       for (const c of n.idle) out.push(c);
     }
+    for (const n of this.r.replicaNodes.values()) out.push(n.client);
     return out;
   }
 
@@ -1141,11 +1453,13 @@ export class ClusterClient extends Helpers {
    * Creates a {@link Subscriber} on the seed node. Any node serves `SUBSCRIBE`/`PSUBSCRIBE`, and `PUBLISH` reaches subscribers on every shard.
    * For sharded channels use {@link subscriberFor}.
    *
-   * @param opts {@link SubscriberOptions} (host, port and path are fixed by the cluster client).
+   * @param opts {@link SubscriberOptions} (host, port and path are fixed by the cluster client; with `seeds` on a standalone server the subscriber starts at the seed the commands use).
    */
   subscriber(opts: Omit<SubscriberOptions, 'host' | 'port' | 'path'> = {}): Subscriber {
     const h = this.r.home;
-    return new Subscriber({ ...this.r.base, host: h.host, port: h.port, ...opts });
+    // A standalone fallback with several seeds starts the subscriber at the seed the commands use.
+    const seeds = this.r.standalone ? h.conn.seedsFromCurrent() : undefined;
+    return new Subscriber(seeds === undefined ? { ...this.r.base, host: h.host, port: h.port, ...opts } : { ...this.r.base, seeds, ...opts });
   }
   /**
    * Creates a {@link Subscriber} on the node that owns `channel`'s slot, which is where `SSUBSCRIBE` and `SPUBLISH` for that channel work.

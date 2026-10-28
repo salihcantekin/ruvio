@@ -4,6 +4,9 @@ package ruvio
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
+	"errors"
 	"time"
 )
 
@@ -224,8 +227,8 @@ func (c *cmds) Move(ctx context.Context, key string, db int) (bool, error) {
 
 // Expire sets a TTL on key (EXPIRE). The duration is truncated to whole seconds. It
 // returns true when the TTL was set and false when the key does not exist. A TTL of zero
-// or less deletes the key and returns true. Use PExpire for sub-second precision. There
-// are no NX/XX/GT/LT options.
+// or less deletes the key and returns true. Use PExpire for sub-second precision. For the
+// NX/XX/GT/LT conditions use ExpireIf.
 func (c *cmds) Expire(ctx context.Context, key string, ttl time.Duration) (bool, error) {
 	return c.boolR(ctx, newCmd(3, cEXPIRE).s(key).i(int64(ttl/time.Second)))
 }
@@ -248,6 +251,32 @@ func (c *cmds) ExpireAt(ctx context.Context, key string, at time.Time) (bool, er
 // when set and false when the key does not exist. A time in the past deletes the key.
 func (c *cmds) PExpireAt(ctx context.Context, key string, at time.Time) (bool, error) {
 	return c.boolR(ctx, newCmd(3, cPEXPIREAT).s(key).i(at.UnixMilli()))
+}
+
+// ExpireIf is Expire with a condition (EXPIRE key seconds NX|XX|GT|LT). A key without a
+// deadline counts as having an infinite one, so GT never applies to it and LT always
+// does. It returns false when the key does not exist or the condition is not met, and
+// nothing changes. An empty cond sends a plain EXPIRE.
+func (c *cmds) ExpireIf(ctx context.Context, key string, ttl time.Duration, cond ExpireCondition) (bool, error) {
+	return c.boolR(ctx, cond.append(newCmd(3+cond.n(), cEXPIRE).s(key).i(int64(ttl/time.Second))))
+}
+
+// PExpireIf is PExpire with a condition (PEXPIRE key ms NX|XX|GT|LT); the condition rules
+// are those of ExpireIf.
+func (c *cmds) PExpireIf(ctx context.Context, key string, ttl time.Duration, cond ExpireCondition) (bool, error) {
+	return c.boolR(ctx, cond.append(newCmd(3+cond.n(), cPEXPIRE).s(key).i(ms(ttl))))
+}
+
+// ExpireAtIf is ExpireAt with a condition (EXPIREAT key unix-seconds NX|XX|GT|LT); the
+// condition rules are those of ExpireIf.
+func (c *cmds) ExpireAtIf(ctx context.Context, key string, at time.Time, cond ExpireCondition) (bool, error) {
+	return c.boolR(ctx, cond.append(newCmd(3+cond.n(), cEXPIREAT).s(key).i(at.Unix())))
+}
+
+// PExpireAtIf is PExpireAt with a condition (PEXPIREAT key unix-ms NX|XX|GT|LT); the
+// condition rules are those of ExpireIf.
+func (c *cmds) PExpireAtIf(ctx context.Context, key string, at time.Time, cond ExpireCondition) (bool, error) {
+	return c.boolR(ctx, cond.append(newCmd(3+cond.n(), cPEXPIREAT).s(key).i(at.UnixMilli())))
 }
 
 // TTL returns the remaining life of key in seconds (TTL): -1 when the key exists without
@@ -523,6 +552,20 @@ func (c *cmds) ClientTracking(ctx context.Context, on bool) error {
 	return c.ok(ctx, newCmd(3, cCLIENT).t(tTRACKING).t(tOFF))
 }
 
+// ClientDurability holds this connection's replies until replicas replicas have on disk
+// every record written before them (CLIENT DURABILITY REPLICAS n [TIMEOUT ms]). It is
+// checked once per batch of replies. When timeout is not met, every reply of that batch
+// is the error NOREPLICAS and the writes stay applied. A timeout of 0 or less sends no
+// TIMEOUT (the server default, 5 seconds); replicas 0 turns it off. It applies to one
+// connection only and is refused inside MULTI and on a server without replication;
+// Options.DurabilityReplicas sets it on every connection the client opens.
+func (c *cmds) ClientDurability(ctx context.Context, replicas int, timeout time.Duration) error {
+	if timeout > 0 {
+		return c.ok(ctx, newCmd(6, cCLIENT).t(tDURABILITY).t(tREPLICAS).i(int64(replicas)).t(tTIMEOUT).i(ms(timeout)))
+	}
+	return c.ok(ctx, newCmd(4, cCLIENT).t(tDURABILITY).t(tREPLICAS).i(int64(replicas)))
+}
+
 // ---- server ------------------------------------------------------------------
 
 // Info returns the INFO text (INFO [section ...]) as "name:value" lines. With no
@@ -557,10 +600,49 @@ func (c *cmds) Wait(ctx context.Context, replicas int64, timeout time.Duration) 
 }
 
 // ConfigGet returns the settings whose names match the glob pattern (CONFIG GET pattern)
-// as a name-to-value map. requirepass is redacted. CONFIG SET is not supported by the
-// server, so there is no setter.
+// as a name-to-value map. requirepass is redacted.
 func (c *cmds) ConfigGet(ctx context.Context, pattern string) (map[string]string, error) {
 	return c.strMap(ctx, newCmd(3, cCONFIG).t(tGET).s(pattern))
+}
+
+// ConfigSet changes live settings (CONFIG SET name value ...): nameValues is name1, value1,
+// name2, value2 ..., with the names CONFIG GET shows. Every shard of the server applies
+// the change before it answers. All pairs apply or none: an unknown or restart-only name,
+// or an invalid value, returns an error and changes nothing. The change is not written to
+// the config file (see ConfigRewrite) and not replicated.
+func (c *cmds) ConfigSet(ctx context.Context, nameValues ...string) error {
+	return c.ok(ctx, newCmd(2+len(nameValues), cCONFIG).s("SET").ss(nameValues))
+}
+
+// ConfigRewrite writes the live settings into the config file the server started from
+// (CONFIG REWRITE).
+func (c *cmds) ConfigRewrite(ctx context.Context) error {
+	return c.ok(ctx, newCmd(2, cCONFIG).s("REWRITE"))
+}
+
+// ReplicaOf makes every shard of the server follow the primary at host:port (REPLICAOF host
+// port); shard i dials port + i. Writes are refused at once. A shard continues from its own
+// log when the new primary's history allows it, otherwise it takes a full copy. Lasts until
+// the server restarts.
+func (c *cmds) ReplicaOf(ctx context.Context, host string, port int) error {
+	return c.ok(ctx, newCmd(3, cREPLICAOF).s(host).i(int64(port)))
+}
+
+// ReplicaOfNoOne promotes a replica in place (REPLICAOF NO ONE), one epoch above its old
+// primary. force adds FORCE: promote even when a shard has not finished copying its
+// primary, which may lose writes.
+func (c *cmds) ReplicaOfNoOne(ctx context.Context, force bool) error {
+	if force {
+		return c.ok(ctx, newCmd(4, cREPLICAOF).s("NO").s("ONE").s("FORCE"))
+	}
+	return c.ok(ctx, newCmd(3, cREPLICAOF).s("NO").s("ONE"))
+}
+
+// Role returns the raw ROLE reply of the shard this connection is on: a primary answers
+// ["master", sequence, []]; a replica ["slave", host, port, "connect"|"connected",
+// sequence].
+func (c *cmds) Role(ctx context.Context) (Value, error) {
+	return c.value(ctx, newCmd(1, cROLE))
 }
 
 // Save runs a checkpoint in the server process and returns when it is written (SAVE). It
@@ -705,8 +787,8 @@ func (c *cmds) ClusterKeySlot(ctx context.Context, key string) (int64, error) {
 	return c.intR(ctx, newCmd(3, cCLUSTER).t(tKEYSLOT).s(key))
 }
 
-// ReadOnly sends READONLY. Every Ruvio shard is a primary with no replicas, so it only
-// returns OK and has no effect.
+// ReadOnly sends READONLY. A Ruvio server answers OK and serves reads on any connection, so
+// it has no effect; a cluster client with Options.ReadPolicy sends it to replicas by itself.
 func (c *cmds) ReadOnly(ctx context.Context) error { return c.ok(ctx, newCmd(1, cREADONLY)) }
 
 // ReadWrite sends READWRITE. It only returns OK; there are no replicas to read from.
@@ -756,6 +838,23 @@ func (c *cmds) EvalSHA(ctx context.Context, sha string, keys []string, args ...a
 		return Value{}, err
 	}
 	return c.value(ctx, r)
+}
+
+// EvalCached runs a script by its SHA1 and sends the whole script only when the shard
+// does not have it: EVALSHA, then EVAL once on NOSCRIPT. The SHA1 is computed here, and
+// EVAL also caches the script on that shard. The retry is safe because NOSCRIPT is
+// answered before any command of the script ran, so a script never runs twice.
+//
+//	v, err := c.EvalCached(ctx, "return ARGV[1]", nil, "x")
+func (c *cmds) EvalCached(ctx context.Context, script string, keys []string, args ...any) (Value, error) {
+	sum := sha1.Sum([]byte(script))
+	v, err := c.EvalSHA(ctx, hex.EncodeToString(sum[:]), keys, args...)
+
+	var se *Error
+	if errors.As(err, &se) && se.Prefix() == "NOSCRIPT" {
+		return c.Eval(ctx, script, keys, args...)
+	}
+	return v, err
 }
 
 // ScriptLoad caches a script and returns its SHA1 (SCRIPT LOAD) without running it. In

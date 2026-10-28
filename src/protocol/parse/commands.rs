@@ -30,10 +30,110 @@ pub(in crate::protocol) fn cmd_wait<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
 }
 
 pub(in crate::protocol) fn cmd_ruvio<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
+    if args.len() >= 1 && args.bytes(0).eq_ignore_ascii_case(b"MOVESLOTS") {
+        return parse_moveslots(args);
+    }
+    if args.len() >= 1 && args.bytes(0).eq_ignore_ascii_case(b"TOPOLOGY") {
+        let is = |word: &[u8]| args.bytes(1).eq_ignore_ascii_case(word);
+
+        return match args.len() {
+            2 if is(b"VERSION") => Ok(Command::Topology(None)),
+            3 if is(b"SET") => Ok(Command::Topology(Some(args.arg(2)))),
+            _ => Err(ProtocolError::Invalid(
+                "RUVIO TOPOLOGY expects VERSION, or SET map",
+            )),
+        };
+    }
+
+    if args.len() >= 1 && args.bytes(0).eq_ignore_ascii_case(b"LEASE") {
+        return parse_lease(args);
+    }
+
+    if args.len() >= 2 && args.bytes(0).eq_ignore_ascii_case(b"MIGRATE") {
+        return Ok(Command::Migrate(
+            (1..args.len()).map(|at| args.arg(at)).collect(),
+        ));
+    }
+
     match args.len() {
         0 => Ok(Command::Ruvio(None)),
         1 => Ok(Command::Ruvio(Some(args.arg(0)))),
         _ => Err(ProtocolError::Invalid("RUVIO expects zero or one argument")),
+    }
+}
+
+/// `RUVIO LEASE BEGIN` or `RUVIO LEASE GRANT token coordinator voters epoch lease_ms`.
+fn parse_lease<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
+    const USAGE: &str =
+        "RUVIO LEASE expects BEGIN, or GRANT token coordinator voters epoch lease_ms";
+    let is = |word: &[u8]| args.len() >= 2 && args.bytes(1).eq_ignore_ascii_case(word);
+    let number = |at: usize| {
+        std::str::from_utf8(args.bytes(at))
+            .ok()
+            .and_then(|text| text.parse::<u64>().ok())
+            .ok_or(ProtocolError::Invalid(USAGE))
+    };
+
+    match args.len() {
+        2 if is(b"BEGIN") => Ok(Command::PrimaryLease(None)),
+        7 if is(b"GRANT") => Ok(Command::PrimaryLease(Some(Box::new(
+            crate::protocol::LeaseGrant {
+                token: number(2)?,
+                coordinator: number(3)?,
+                voters: u32::try_from(number(4)?).map_err(|_| ProtocolError::Invalid(USAGE))?,
+                epoch: number(5)?,
+                lease_ms: number(6)?,
+            },
+        )))),
+        _ => Err(ProtocolError::Invalid(USAGE)),
+    }
+}
+
+/// `RUVIO MOVESLOTS first-last shard`, `RUVIO MOVESLOTS slot shard` or `RUVIO MOVESLOTS STATUS`.
+fn parse_moveslots<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
+    const USAGE: &str = "RUVIO MOVESLOTS expects first-last shard, or STATUS";
+    let slot = |bytes: &[u8]| {
+        std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|text| text.parse::<u16>().ok())
+            .filter(|slot| usize::from(*slot) < crate::routing::HASH_SLOT_COUNT)
+            .ok_or(ProtocolError::Invalid(
+                "RUVIO MOVESLOTS slot is not between 0 and 16383",
+            ))
+    };
+
+    match args.len() {
+        2 if args.bytes(1).eq_ignore_ascii_case(b"STATUS") => Ok(Command::MoveSlots(None)),
+        3 => {
+            let range = args.bytes(1);
+            let (first, last) = match range.iter().position(|byte| *byte == b'-') {
+                Some(dash) => (slot(&range[..dash])?, slot(&range[dash + 1..])?),
+                None => {
+                    let only = slot(range)?;
+
+                    (only, only)
+                }
+            };
+            let shard = std::str::from_utf8(args.bytes(2))
+                .ok()
+                .and_then(|text| text.parse::<u16>().ok())
+                .ok_or(ProtocolError::Invalid(
+                    "RUVIO MOVESLOTS shard is not a shard index",
+                ))?;
+
+            if first > last {
+                return Err(ProtocolError::Invalid(
+                    "RUVIO MOVESLOTS range ends before it starts",
+                ));
+            }
+
+            Ok(Command::MoveSlots(Some(crate::protocol::SlotRangeMove {
+                first,
+                last,
+                shard,
+            })))
+        }
+        _ => Err(ProtocolError::Invalid(USAGE)),
     }
 }
 
@@ -68,11 +168,87 @@ pub(in crate::protocol) fn cmd_readonly<'a>(name: &[u8], args: &Args<'a, '_>) ->
 }
 
 pub(in crate::protocol) fn cmd_config<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
-    if args.len() == 2 && args.bytes(0).eq_ignore_ascii_case(b"GET") {
+    if args.len() == 0 {
+        return Err(ProtocolError::Invalid(
+            "wrong number of arguments for 'config' command",
+        ));
+    }
+
+    let subcommand = args.bytes(0);
+
+    if args.len() == 2 && subcommand.eq_ignore_ascii_case(b"GET") {
         return Ok(Command::ConfigGet(args.arg(1)));
     }
 
-    Err(ProtocolError::Invalid("only CONFIG GET is supported"))
+    if subcommand.eq_ignore_ascii_case(b"SET") {
+        if args.len() < 3 || args.len().is_multiple_of(2) {
+            return Err(ProtocolError::Invalid(
+                "wrong number of arguments for 'config|set' command",
+            ));
+        }
+
+        let pairs = (1..args.len())
+            .step_by(2)
+            .map(|index| (args.arg(index), args.arg(index + 1)))
+            .collect();
+
+        return Ok(Command::ConfigSet(pairs));
+    }
+
+    if subcommand.eq_ignore_ascii_case(b"REWRITE") {
+        if args.len() != 1 {
+            return Err(ProtocolError::Invalid(
+                "wrong number of arguments for 'config|rewrite' command",
+            ));
+        }
+
+        return Ok(Command::ConfigRewrite);
+    }
+
+    Err(ProtocolError::Invalid(
+        "only CONFIG GET, SET and REWRITE are supported",
+    ))
+}
+
+/// `REPLICAOF host port` or `REPLICAOF NO ONE`; `REPLICAOF NO ONE FORCE` promotes a replica
+/// that has not finished copying its primary, and `REPLICAOF host port YIELD` follows the
+/// primary without claiming a newer epoch to it.
+pub(in crate::protocol) fn cmd_replicaof<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
+    let no_one = args.len() >= 2
+        && args.bytes(0).eq_ignore_ascii_case(b"NO")
+        && args.bytes(1).eq_ignore_ascii_case(b"ONE");
+
+    match args.len() {
+        2 if no_one => Ok(Command::ReplicaOf {
+            primary: None,
+            force: false,
+        }),
+        3 if no_one && args.bytes(2).eq_ignore_ascii_case(b"FORCE") => Ok(Command::ReplicaOf {
+            primary: None,
+            force: true,
+        }),
+        2 => Ok(Command::ReplicaOf {
+            primary: Some((args.arg(0), args.arg(1))),
+            force: false,
+        }),
+        3 if !no_one && args.bytes(2).eq_ignore_ascii_case(b"YIELD") => Ok(Command::ReplicaOf {
+            primary: Some((args.arg(0), args.arg(1))),
+            force: true,
+        }),
+        _ => Err(ProtocolError::Invalid(
+            "wrong number of arguments for 'replicaof' command",
+        )),
+    }
+}
+
+pub(in crate::protocol) fn cmd_role<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
+    if args.len() != 0 {
+        return Err(ProtocolError::Invalid(
+            "wrong number of arguments for 'role' command",
+        ));
+    }
+
+    Ok(Command::Role)
 }
 
 pub(in crate::protocol) fn cmd_info<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
@@ -236,7 +412,16 @@ pub(in crate::protocol) fn cmd_json_mget<'a>(args: &Args<'a, '_>) -> Parsed<'a> 
 }
 
 pub(in crate::protocol) fn cmd_json_set<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
-    match args.len() {
+    // `JSON.SET key path value [NX|XX] [EX s | PX ms]`: the deadline is for a key it creates.
+    let (length, ttl) = match args.len() {
+        length @ (5 | 6) => match create_ttl_option(args, length - 2)? {
+            Some(ttl) => (length - 2, Some(ttl)),
+            None => return Err(ProtocolError::Invalid("syntax error")),
+        },
+        length => (length, None),
+    };
+
+    let command = match length {
         3 => Ok(Command::JsonSet {
             key: args.arg(0),
             path: json_path(args.arg(1)),
@@ -260,9 +445,11 @@ pub(in crate::protocol) fn cmd_json_set<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
             })
         }
         _ => Err(ProtocolError::Invalid(
-            "JSON.SET expects key, path, JSON value and an optional NX or XX",
+            "JSON.SET expects key, path, JSON value, an optional NX or XX and an optional EX or PX",
         )),
-    }
+    }?;
+
+    Ok(with_create_ttl(ttl, command))
 }
 
 /// `JSON.MERGE` and its `JMERGE` alias.
@@ -327,7 +514,7 @@ pub(in crate::protocol) fn cmd_semaphore<'a>(args: &Args<'a, '_>) -> Parsed<'a> 
 }
 
 pub(in crate::protocol) fn cmd_limit<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
-    if args.len() != 3 {
+    if args.len() < 3 {
         return Err(ProtocolError::Invalid(
             "LIMIT expects a key, a maximum, and a window in milliseconds",
         ));
@@ -344,17 +531,104 @@ pub(in crate::protocol) fn cmd_limit<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
         ));
     }
 
+    let mode = if args.len() == 3 {
+        LimitMode::Fixed
+    } else {
+        parse_limit_mode(args, max, window_ms)?
+    };
+
     Ok(Command::Limit {
         key: args.arg(0),
         max,
         window_ms,
+        mode,
+    })
+}
+
+/// The trailing `SLIDING | TOKENS [COST n] [WITHRETRY]` of `LIMIT`. Only reached with more
+/// than three arguments, so the plain form never pays for it.
+fn parse_limit_mode(
+    args: &Args<'_, '_>,
+    max: u64,
+    window_ms: u64,
+) -> Result<LimitMode, ProtocolError> {
+    use crate::store::{LIMIT_SLIDING_MAX, LIMIT_TOKENS_MAX_CAPACITY, LIMIT_TOKENS_MAX_REFILL_MS};
+
+    let tokens = if args.bytes(3).eq_ignore_ascii_case(b"SLIDING") {
+        false
+    } else if args.bytes(3).eq_ignore_ascii_case(b"TOKENS") {
+        true
+    } else {
+        return Err(ProtocolError::Invalid(
+            "LIMIT mode must be SLIDING or TOKENS",
+        ));
+    };
+    let mut cost = None;
+    let mut with_retry = false;
+    let mut index = 4;
+
+    while index < args.len() {
+        let option = args.bytes(index);
+
+        if option.eq_ignore_ascii_case(b"WITHRETRY") && !with_retry {
+            with_retry = true;
+            index += 1;
+        } else if tokens && option.eq_ignore_ascii_case(b"COST") && cost.is_none() {
+            if index + 1 >= args.len() {
+                return Err(ProtocolError::Invalid("LIMIT COST expects a token count"));
+            }
+
+            cost =
+                Some(parse_u64(args.bytes(index + 1)).map_err(|_| {
+                    ProtocolError::Invalid("LIMIT COST must be a positive integer")
+                })?);
+            index += 2;
+        } else {
+            return Err(ProtocolError::Invalid("syntax error"));
+        }
+    }
+
+    if !tokens {
+        if max > LIMIT_SLIDING_MAX {
+            return Err(ProtocolError::Invalid(
+                "LIMIT SLIDING maximum must be at most 2147483647",
+            ));
+        }
+
+        return Ok(LimitMode::Sliding { with_retry });
+    }
+
+    if max > LIMIT_TOKENS_MAX_CAPACITY {
+        return Err(ProtocolError::Invalid(
+            "LIMIT TOKENS capacity must be at most 1000000",
+        ));
+    }
+
+    if window_ms > LIMIT_TOKENS_MAX_REFILL_MS {
+        return Err(ProtocolError::Invalid(
+            "LIMIT TOKENS refill must be at most 4294967295 milliseconds",
+        ));
+    }
+
+    let cost = cost.unwrap_or(1);
+
+    if cost == 0 || cost > max {
+        return Err(ProtocolError::Invalid(
+            "LIMIT COST must be between 1 and the capacity",
+        ));
+    }
+
+    Ok(LimitMode::Tokens {
+        cost: cost as u32,
+        with_retry,
     })
 }
 
 pub(in crate::protocol) fn cmd_idem<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
-    if args.len() != 5 {
+    let abort = args.len() == 4 && args.bytes(1).eq_ignore_ascii_case(b"ABORT");
+    if args.len() != 5 && !abort {
         return Err(ProtocolError::Invalid(
-            "IDEM expects key BEGIN fingerprint owner ttl_ms or key COMPLETE fingerprint owner result",
+            "IDEM expects key BEGIN fingerprint owner ttl_ms, key COMPLETE fingerprint owner result or key ABORT fingerprint owner",
         ));
     }
     let action = args.bytes(1);
@@ -364,6 +638,13 @@ pub(in crate::protocol) fn cmd_idem<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
         return Err(ProtocolError::Invalid(
             "IDEM fingerprint and owner must contain 1-128 bytes",
         ));
+    }
+    if abort {
+        return Ok(Command::IdempotencyAbort {
+            key: args.arg(0),
+            fingerprint: args.arg(2),
+            owner: args.arg(3),
+        });
     }
     let value = args.bytes(4);
     if action.eq_ignore_ascii_case(b"BEGIN") {
@@ -392,7 +673,7 @@ pub(in crate::protocol) fn cmd_idem<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
         });
     }
     Err(ProtocolError::Invalid(
-        "IDEM action must be BEGIN or COMPLETE",
+        "IDEM action must be BEGIN, COMPLETE or ABORT",
     ))
 }
 
@@ -440,6 +721,69 @@ pub(in crate::protocol) fn cmd_take<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
     })
 }
 
+/// Trailing `[MAX cap]` of `TRANSFER` and `HTRANSFER`, from argument `at`.
+fn transfer_max(args: &Args<'_, '_>, at: usize) -> Result<Option<i64>, ProtocolError> {
+    if args.len() == at {
+        return Ok(None);
+    }
+
+    if args.len() != at + 2 || !args.bytes(at).eq_ignore_ascii_case(b"MAX") {
+        return Err(ProtocolError::Invalid("syntax error"));
+    }
+
+    parse_i64(args.bytes(at + 1)).map(Some)
+}
+
+fn transfer_amount(args: &Args<'_, '_>, at: usize) -> Result<i64, ProtocolError> {
+    match parse_i64(args.bytes(at)) {
+        Ok(amount) if amount > 0 => Ok(amount),
+        _ => Err(ProtocolError::Invalid(
+            "transfer amount must be a positive integer",
+        )),
+    }
+}
+
+pub(in crate::protocol) fn cmd_transfer<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
+    if args.len() < 3 {
+        return Err(ProtocolError::Invalid(
+            "TRANSFER expects a source, a destination and an amount",
+        ));
+    }
+
+    if args.bytes(0) == args.bytes(1) {
+        return Err(ProtocolError::Invalid(
+            "TRANSFER source and destination must differ",
+        ));
+    }
+
+    Ok(Command::Transfer {
+        source: args.arg(0),
+        destination: args.arg(1),
+        amount: transfer_amount(args, 2)?,
+        max: transfer_max(args, 3)?,
+    })
+}
+
+pub(in crate::protocol) fn cmd_htransfer<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
+    if args.len() < 4 {
+        return Err(ProtocolError::Invalid(
+            "HTRANSFER expects a key, two fields and an amount",
+        ));
+    }
+
+    if args.bytes(1) == args.bytes(2) {
+        return Err(ProtocolError::Invalid("HTRANSFER fields must differ"));
+    }
+
+    Ok(Command::HashTransfer {
+        key: args.arg(0),
+        from: args.arg(1),
+        to: args.arg(2),
+        amount: transfer_amount(args, 3)?,
+        max: transfer_max(args, 4)?,
+    })
+}
+
 pub(in crate::protocol) fn cmd_getex<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
     if args.len() != 2 {
         return Err(ProtocolError::Invalid(
@@ -473,6 +817,31 @@ pub(in crate::protocol) fn cmd_release<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
     Ok(Command::Release {
         key: args.arg(0),
         token,
+    })
+}
+
+pub(in crate::protocol) fn cmd_renew<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
+    if args.len() != 3 {
+        return Err(ProtocolError::Invalid(
+            "RENEW expects a key, a token, and a TTL in milliseconds",
+        ));
+    }
+
+    let token = parse_u64(args.bytes(1))
+        .map_err(|_| ProtocolError::Invalid("RENEW token must be an integer"))?;
+    let ttl_ms = parse_u64(args.bytes(2))
+        .map_err(|_| ProtocolError::Invalid("RENEW TTL must be a positive integer"))?;
+
+    if ttl_ms == 0 {
+        return Err(ProtocolError::Invalid(
+            "RENEW TTL must be a positive integer",
+        ));
+    }
+
+    Ok(Command::Renew {
+        key: args.arg(0),
+        token,
+        ttl_ms,
     })
 }
 
@@ -702,6 +1071,14 @@ pub(in crate::protocol) fn cmd_zpopmin<'a>(name: &[u8], args: &Args<'a, '_>) -> 
     parse_sorted_set_pop(args, name.eq_ignore_ascii_case(b"ZPOPMAX"))
 }
 
+pub(in crate::protocol) fn cmd_zpopbyscore<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
+    parse_sorted_set_pop_by_score(args)
+}
+
+pub(in crate::protocol) fn cmd_zmovedue<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
+    parse_sorted_set_move_due(args)
+}
+
 pub(in crate::protocol) fn cmd_bzpopmin<'a>(name: &[u8], args: &Args<'a, '_>) -> Parsed<'a> {
     let max = name.eq_ignore_ascii_case(b"BZPOPMAX");
 
@@ -864,6 +1241,7 @@ pub(in crate::protocol) fn cmd_bf_insert<'a>(args: &Args<'a, '_>) -> Parsed<'a> 
     let mut no_create = false;
     let mut index = 1;
     let mut items_at = None;
+    let mut ttl = None;
 
     while index < args.len() {
         let name = args.bytes(index);
@@ -871,6 +1249,15 @@ pub(in crate::protocol) fn cmd_bf_insert<'a>(args: &Args<'a, '_>) -> Parsed<'a> 
         if name.eq_ignore_ascii_case(b"ITEMS") {
             items_at = Some(index + 1);
             break;
+        }
+
+        if ttl.is_none()
+            && let Some(found) = create_ttl_option(args, index)?
+        {
+            ttl = Some(found);
+            index += 2;
+
+            continue;
         }
 
         if name.eq_ignore_ascii_case(b"NOCREATE") {
@@ -907,14 +1294,17 @@ pub(in crate::protocol) fn cmd_bf_insert<'a>(args: &Args<'a, '_>) -> Parsed<'a> 
         ));
     };
 
-    Ok(Command::BloomInsert {
-        key: args.arg(0),
-        error_rate,
-        capacity,
-        expansion: expansion.unwrap_or(crate::store::BLOOM_DEFAULT_EXPANSION),
-        no_create,
-        items: args.rest(items_at),
-    })
+    Ok(with_create_ttl(
+        ttl,
+        Command::BloomInsert {
+            key: args.arg(0),
+            error_rate,
+            capacity,
+            expansion: expansion.unwrap_or(crate::store::BLOOM_DEFAULT_EXPANSION),
+            no_create,
+            items: args.rest(items_at),
+        },
+    ))
 }
 
 pub(in crate::protocol) fn cmd_bf_info<'a>(name: &[u8], args: &Args<'a, '_>) -> Parsed<'a> {

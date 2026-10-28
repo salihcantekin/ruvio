@@ -131,6 +131,15 @@ func sleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
+type idemOptions struct{ abortOnError bool }
+
+// IdemOption tunes Idempotent.
+type IdemOption func(*idemOptions)
+
+// WithAbortOnError makes Idempotent release the reservation with IDEM ABORT when fn
+// returns an error. Off by default: a failed fn leaves the record pending until ttl.
+func WithAbortOnError() IdemOption { return func(o *idemOptions) { o.abortOnError = true } }
+
 // Idempotent runs fn at most once for key (IDEM). fingerprint should identify the
 // request body (for example a hash); ttl is how long the record lives.
 //
@@ -140,9 +149,18 @@ func sleep(ctx context.Context, d time.Duration) error {
 // ErrIdemPending. If saving the result fails, the result is returned together with that
 // error.
 //
+// With WithAbortOnError a failing fn also sends IDEM ABORT, so a retry runs fn again at
+// once instead of getting ErrIdemPending; fn's error is still the one returned, and a
+// failed abort is ignored (the record then stays pending until ttl). Use it only when a
+// failed fn did not take effect or is safe to run again.
+//
 //	out, err := c.Idempotent(ctx, "pay:"+reqID, hash, time.Hour,
 //	    func(ctx context.Context) ([]byte, error) { return charge(ctx) })
-func (c *cmds) Idempotent(ctx context.Context, key, fingerprint string, ttl time.Duration, fn func(ctx context.Context) ([]byte, error)) ([]byte, error) {
+func (c *cmds) Idempotent(ctx context.Context, key, fingerprint string, ttl time.Duration, fn func(ctx context.Context) ([]byte, error), opts ...IdemOption) ([]byte, error) {
+	var o idemOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	owner := randomToken()
 	res, err := c.IdemBegin(ctx, key, fingerprint, owner, ttl)
 	if err != nil {
@@ -158,6 +176,10 @@ func (c *cmds) Idempotent(ctx context.Context, key, fingerprint string, ttl time
 	}
 	out, err := fn(ctx)
 	if err != nil {
+		if o.abortOnError {
+			// The caller's context may be what failed, so the abort gets its own.
+			_, _ = c.IdemAbort(context.WithoutCancel(ctx), key, fingerprint, owner)
+		}
 		return nil, err
 	}
 	if _, err := c.IdemComplete(ctx, key, fingerprint, owner, out); err != nil {

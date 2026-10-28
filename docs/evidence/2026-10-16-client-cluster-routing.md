@@ -4,7 +4,7 @@ Client CPU per request on the cluster path against the plain single-connection p
 
 ## Conditions (read before quoting any number)
 
-- Host: Apple M4 Pro, 12 cores, macOS, loopback. One `release-fast` Ruvio server, four shards, `port_mode = "per-shard"`, `memory` durability. Every client ran alone, one after another, on the same server.
+- Host: Apple silicon Mac, 12 cores, macOS, loopback. One `release-fast` Ruvio server, four shards, `port_mode = "per-shard"`, `memory` durability. Every client ran alone, one after another, on the same server.
 - Each client's own tool: `ruvio-client/examples/cluster_cost.rs`, `csharp/Ruvio.Client.Benchmarks --cluster-cost` (with `DOTNET_ThreadPool_UnfairSemaphoreSpinLimit=0`; without it thread-pool spinning dominates the CPU numbers), `java/.../RoutingCostBench` (thread CPU of the client's threads), `node npm run bench:cluster-cost`, `python benchmarks/bench.py --cluster-cost`, Go `RUVIO_COST_ADDR=... go test -run TestClusterCost -v`. Eight workers with a connection each (Python: one), keys `key:0`..`key:4095`, 32-byte values, 3-4 s per row after a warmup, one run.
 - Rows: **plain** connects to one port without discovery (the server forwards keys it does not own); **cluster** routes keys spread over the four shards; **one node** is the cluster client with every key in one hash tag. *One node* against *plain* is the routing code's own cost. *Cluster* adds the extra writes, reads and wakeups of four sockets instead of one, which no routing code removes.
 - "Before" is the parent commit with the same measuring tool. Numbers are user CPU nanoseconds per request; compare rows with each other only.

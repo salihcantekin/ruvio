@@ -14,16 +14,24 @@ import (
 // are still added); LT only when it is lower; CH makes the reply count changed members
 // (added plus updated) instead of added members only. NX cannot be combined with XX, GT
 // or LT, and GT cannot be combined with LT; the server answers "syntax error".
+//
+// TTL, when positive, sets a deadline on the key only if this call creates it (EX
+// seconds for whole seconds, otherwise PX milliseconds); an existing key keeps its
+// deadline. A negative TTL makes the call return ErrInvalidTTL.
 type ZAddOptions struct {
-	NX bool // only add new members
-	XX bool // only update existing members
-	GT bool // update only when the new score is greater
-	LT bool // update only when the new score is lower
-	CH bool // count changed members, not only added ones
+	TTL time.Duration // deadline to set when the call creates the key
+	NX  bool          // only add new members
+	XX  bool          // only update existing members
+	GT  bool          // update only when the new score is greater
+	LT  bool          // update only when the new score is lower
+	CH  bool          // count changed members, not only added ones
 }
 
 func (o *ZAddOptions) n() int {
 	n := 0
+	if o.TTL != 0 {
+		n += 2
+	}
 	for _, b := range [...]bool{o.NX, o.XX, o.GT, o.LT, o.CH} {
 		if b {
 			n++
@@ -33,6 +41,9 @@ func (o *ZAddOptions) n() int {
 }
 
 func (o *ZAddOptions) append(r *request) {
+	if tok, v, _ := optTTL(o.TTL); tok != nil {
+		r.t(tok).i(v)
+	}
 	if o.NX {
 		r.t(tNX)
 	}
@@ -65,6 +76,9 @@ func (c *cmds) ZAdd(ctx context.Context, key string, members ...Z) (int64, error
 // with o.CH the number of members added or whose score changed. With NX or XX or GT or
 // LT it can be 0 because nothing qualified.
 func (c *cmds) ZAddArgs(ctx context.Context, key string, o ZAddOptions, members ...Z) (int64, error) {
+	if _, _, err := optTTL(o.TTL); err != nil {
+		return 0, err
+	}
 	r := newCmd(2+o.n()+2*len(members), cZADD).s(key)
 	o.append(r)
 	for _, m := range members {
@@ -77,6 +91,9 @@ func (c *cmds) ZAddArgs(ctx context.Context, key string, o ZAddOptions, members 
 // missing member starts at 0) and returns the new score. ok is false when a condition in
 // o (NX, XX, GT, LT) stopped the update. Only one member is allowed.
 func (c *cmds) ZAddIncr(ctx context.Context, key string, o ZAddOptions, member Z) (float64, bool, error) {
+	if _, _, err := optTTL(o.TTL); err != nil {
+		return 0, false, err
+	}
 	r := newCmd(5+o.n(), cZADD).s(key)
 	o.append(r)
 	r.t(tINCR).f(member.Score).s(member.Member)
@@ -93,6 +110,17 @@ func (c *cmds) ZRem(ctx context.Context, key string, members ...string) (int64, 
 // missing member is added with score delta; a missing key is created.
 func (c *cmds) ZIncrBy(ctx context.Context, key string, delta float64, member string) (float64, error) {
 	return c.floatR(ctx, newCmd(4, cZINCRBY).s(key).f(delta).s(member))
+}
+
+// ZIncrByWithTTL is ZIncrBy that also sets a deadline when it creates the key (ZINCRBY
+// key delta member EX|PX). An existing key keeps its deadline. A ttl of zero or less
+// returns ErrInvalidTTL.
+func (c *cmds) ZIncrByWithTTL(ctx context.Context, key string, delta float64, member string, ttl time.Duration) (float64, error) {
+	tok, v, err := ttlArg(ttl)
+	if err != nil {
+		return 0, err
+	}
+	return c.floatR(ctx, newCmd(6, cZINCRBY).s(key).f(delta).s(member).t(tok).i(v))
 }
 
 // ZCard returns the number of members (ZCARD), 0 for a missing key.
@@ -317,6 +345,22 @@ func (c *cmds) ZPopMax(ctx context.Context, key string, count int64) ([]Z, error
 	return c.zs(ctx, newCmd(3, cZPOPMAX).s(key).i(count))
 }
 
+// ZPopByScore removes and returns up to count members (1 to 10000) whose score is between
+// min and max, lowest score first (ZPOPBYSCORE ... WITHSCORES). With scores set to due times
+// this takes the jobs that are ready. Bounds use the ZCount syntax: -inf, +inf, and a ( prefix
+// for exclusive. The result is empty when nothing is due.
+func (c *cmds) ZPopByScore(ctx context.Context, key, min, max string, count int64) ([]Z, error) {
+	return c.zs(ctx, newCmd(8, cZPOPBYSCORE).s(key).s(max).s("MIN").s(min).t(tCOUNT).i(count).t(tWITHSCORES))
+}
+
+// ZMoveDue moves up to count members (1 to 10000) whose score is at most max from the sorted
+// set source to the tail of the list destination, lowest score first, and returns how many
+// moved (ZMOVEDUE). Clients blocked on destination are served first. In cluster mode both
+// keys must share a slot.
+func (c *cmds) ZMoveDue(ctx context.Context, source, destination, max string, count int64) (int64, error) {
+	return c.intR(ctx, newCmd(6, cZMOVEDUE).s(source).s(destination).s(max).t(tCOUNT).i(count))
+}
+
 // KeyZ is the reply of BZPopMin and BZPopMax: the sorted set the member came from, with
 // the member and its score (the embedded Z).
 type KeyZ struct {
@@ -504,11 +548,14 @@ type GeoLocation struct {
 
 // GeoAddOptions are the GEOADD modifiers. NX only adds new members, XX only updates
 // existing ones (NX and XX together are a server syntax error), CH makes the result
-// count changed members as well as new ones.
+// count changed members as well as new ones. TTL, when positive, sets a deadline on the
+// key only if this call creates it (EX for whole seconds, otherwise PX); an existing key
+// keeps its deadline, and a negative TTL returns ErrInvalidTTL.
 type GeoAddOptions struct {
-	NX bool // only add new members
-	XX bool // only update existing members
-	CH bool // count changed members as well as new ones
+	TTL time.Duration // deadline to set when the call creates the key
+	NX  bool          // only add new members
+	XX  bool          // only update existing members
+	CH  bool          // count changed members as well as new ones
 }
 
 // GeoAdd adds members with coordinates to the geo index at key (GEOADD) and returns how
@@ -524,13 +571,23 @@ type GeoAddOptions struct {
 //	    ruvio.GeoLocation{Name: "central", Longitude: 13.361389, Latitude: 38.115556},
 //	    ruvio.GeoLocation{Name: "harbour", Longitude: 15.087269, Latitude: 37.502669})
 func (c *cmds) GeoAdd(ctx context.Context, key string, o GeoAddOptions, locs ...GeoLocation) (int64, error) {
+	ttok, tv, err := optTTL(o.TTL)
+	if err != nil {
+		return 0, err
+	}
 	n := 2 + 3*len(locs)
+	if ttok != nil {
+		n += 2
+	}
 	for _, b := range [...]bool{o.NX, o.XX, o.CH} {
 		if b {
 			n++
 		}
 	}
 	r := newCmd(n, cGEOADD).s(key)
+	if ttok != nil {
+		r.t(ttok).i(tv)
+	}
 	if o.NX {
 		r.t(tNX)
 	}

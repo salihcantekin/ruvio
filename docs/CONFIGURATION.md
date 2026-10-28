@@ -8,7 +8,10 @@ Ruvio resolves settings in this order:
 4. explicit command-line options.
 
 All merged settings and cross-field relationships are validated before a
-listener is opened. Unknown TOML fields are rejected.
+listener is opened. Unknown TOML fields are rejected. Which settings also
+change while the server runs, and under which `CONFIG SET` name, is listed in
+[Changing settings at runtime](#changing-settings-at-runtime) and in the
+`CONFIG SET` column of the [environment table](#environment-variables).
 
 ```toml
 address = "127.0.0.1:6379"
@@ -18,7 +21,6 @@ advertised_host = "127.0.0.1"  # host in CLUSTER SLOTS/SHARDS/NODES
 # advertised_port = 6379       # shard 0's announced port; omitted = bind port
 hot_keys = []          # Redis globs; empty keeps every key on its shard
 shutdown_grace_ms = 30000
-metrics_address = "127.0.0.1:9121"  # empty/omitted disables HTTP scrape
 
 # key_stats = true            # RUVIO HOTKEYS (1/1024 sampled, 128 entries) and RUVIO BIGKEYS (SET values >= 1 MiB, last 64)
 # slowlog_threshold_micros = 10000  # SLOWLOG: commands slower than this (negative = off, 0 = all); only the generic dispatcher is timed
@@ -65,6 +67,12 @@ replica_retain_max_bytes = 1073741824
 role = "off"                  # off, primary, or replica
 listen = "127.0.0.1:26379"    # primary base address; shard i uses port + i
 primary = "127.0.0.1:26379"   # replica dials this base address; a hostname is allowed
+min_replicas_to_write = 0     # a primary refuses writes with fewer good replicas; 0 = off
+min_replicas_max_lag = 10     # seconds since a replica's last acknowledgement
+primary_lease = false         # take writes only under a lease from ruvio coordinator
+primary_lease_coordinators = [] # ids of the coordinators whose grants are taken; required with primary_lease
+announced = true              # a replica tells its primary where clients reach it
+tls = false                   # encrypt the replication link; see Replication TLS
 
 [security]
 requirepass = ""
@@ -106,88 +114,200 @@ CLI flags still win. The file is left as it is unless you pass `--write-config`,
 which writes the effective values back into it at startup, so a process started
 with `--shards 3` never changes what the next process reads. The file is not
 watched: an edit applies only on the next start.
-Shard count, bind address, and durability cannot change under a live process.
+Shard count, bind address, and durability cannot change under a live process;
+the settings listed under *Changing settings at runtime* can.
+
+## Changing settings at runtime
+
+`CONFIG SET name value [name value ...]` changes the settings in the table
+below while the server runs. Names are the ones `CONFIG GET` shows
+(`maxmemory`, `slowlog-log-slower-than`, `max-connections`, `script-max-time-ms`,
+`requirepass`, and so on); values follow the same rules as the file and the
+environment, so byte counts are plain numbers and booleans are `yes`/`no`.
+
+```text
+CONFIG SET maxmemory 1073741824 maxmemory-policy allkeys-lru
+CONFIG GET maxmemory*
+CONFIG REWRITE
+```
+
+These are all the settings that change while the server runs; every other
+setting takes a restart.
+
+| `CONFIG SET` name | File setting | Takes effect |
+| --- | --- | --- |
+| `maxmemory` | `memory.max_process_bytes` | at once |
+| `max-shard-bytes` | `memory.max_shard_bytes` | at once |
+| `memory-headroom-bytes` | `memory.reserved_headroom_bytes` | at once |
+| `maxmemory-policy` | `memory.maxmemory_policy` | at once |
+| `maxmemory-samples` | `memory.maxmemory_samples` | next eviction |
+| `active-expire-keys` | `memory.active_expire_keys` | next expiry cycle |
+| `active-expire-maintenance-keys` | `memory.active_expire_maintenance_keys` | next expiry cycle |
+| `hash-max-compact-entries` | `memory.hash_max_compact_entries` | when the collection next grows |
+| `hash-max-compact-value-bytes` | `memory.hash_max_compact_value_bytes` | when the collection next grows |
+| `set-max-intset-entries` | `memory.set_max_intset_entries` | when the collection next grows |
+| `list-max-compact-entries` | `memory.list_max_compact_entries` | when the collection next grows |
+| `list-max-compact-value-bytes` | `memory.list_max_compact_value_bytes` | when the collection next grows |
+| `notify-keyspace-events` | `notify_keyspace_events` | next write |
+| `slowlog-log-slower-than` | `slowlog_threshold_micros` | next command |
+| `slowlog-max-len` | `slowlog_max_len` | at once |
+| `key-stats` | `key_stats` | next command |
+| `latency-histograms` | `latency_histograms` | next command |
+| `idle-timeout-ms` | `timeouts.idle_ms` | new connections |
+| `read-timeout-ms` | `timeouts.read_ms` | new connections |
+| `write-timeout-ms` | `timeouts.write_ms` | new connections |
+| `max-connections` | `connections.max_global` | next accept |
+| `max-connections-per-ip` | `connections.max_per_ip` | next accept |
+| `max-connections-per-user` | `connections.max_per_user` | next login |
+| `max-commands-per-second` | `connections.max_commands_per_second` | new connections |
+| `max-output-buffer-bytes` | `requests.max_output_buffer_bytes` | new connections |
+| `script-max-bytes` | `scripts.max_bytes` | next script |
+| `script-max-cached` | `scripts.max_cached` | next script |
+| `script-max-calls` | `scripts.max_calls` | next script |
+| `script-max-instructions` | `scripts.max_instructions` | next script |
+| `script-max-time-ms` | `scripts.max_time_ms` | next script |
+| `requirepass` | `security.requirepass` | next login |
+| `min-replicas-to-write` | `replication.min_replicas_to_write` | next replica check (100 ms) |
+| `min-replicas-max-lag` | `replication.min_replicas_max_lag` | next replica check (100 ms) |
+| `primary-lease` | `replication.primary_lease` | next replica check (100 ms) |
+
+- One call changes all its pairs or none. An unknown name, a name given twice,
+  a restart-only name, or a value that does not parse or validate fails the
+  whole call and nothing changes. A restart-only name answers
+  `restart-only setting; change it in the config file and restart`.
+- The connection that receives the call checks it, applies it to its own shard
+  and sends it to every other shard; `OK` comes back once every shard runs the
+  new values. `CONFIG GET` then shows them on every shard.
+- Memory settings (`maxmemory`, `max-shard-bytes`, `memory-headroom-bytes`,
+  `maxmemory-policy`, `maxmemory-samples`, the active-expire and compact
+  thresholds, `notify-keyspace-events`) apply at once. A lower limit is reached
+  by eviction (or refused writes under `noeviction`) as new writes arrive.
+  Changing `maxmemory-policy` resets the access bits of every key on each shard
+  once, so a policy change on a large shard takes a moment. New compact
+  thresholds apply to collections as they next grow; existing ones keep their
+  encoding.
+- Slowlog, `key-stats` and `latency-histograms` apply to the next command.
+  A shorter `slowlog-max-len` drops the oldest entries.
+- Connection settings (timeouts, `max-connections*`,
+  `max-commands-per-second`, `max-output-buffer-bytes`)
+  apply to connections accepted afterwards; open connections keep theirs, as
+  they keep their ACL rules.
+- Script limits apply to the next `EVAL`, `EVALSHA` or `FCALL`.
+- `requirepass` sets the default user's password in the live ACL directory,
+  as `ACL SETUSER default resetpass >password` would; an empty value makes the
+  default user `nopass`. Clients already logged in stay logged in. When
+  `replication_password` is empty the replication port keeps the
+  `requirepass` it started with until a restart, so rotate a leaked password
+  there with a restart (or set `replication_password`).
+- A change is not written to the WAL and not replicated: each node, primary or
+  replica, is configured on its own. It is lost on restart unless written to
+  the file.
+- `CONFIG SET` and `CONFIG REWRITE` are refused inside `MULTI` and scripts and
+  need the `config` command in the caller's ACL rules (`@admin`,
+  `@dangerous`), as in Redis: a user granted `+config` may run all three.
+  `-config|set` or `-config|rewrite` denies only that subcommand; a user that
+  should only read settings gets `+config|get` or `+config -config|set
+  -config|rewrite`.
+
+`CONFIG REWRITE` writes the live settings into the config file the server
+started from, through the same code as `--write-config`: other keys stay,
+comments are dropped, and the file stays owner-only. Restart-only settings
+keep what the file says even when the process runs with an environment or
+command-line value for them. A live value that came from the environment is
+written, so a secret such as `requirepass` from `RUVIO_REQUIREPASS` lands in
+the file. `CONFIG SET` never writes the file by itself.
+
+Persistence timing (`snapshot_interval_ms`, `snapshot_min_mutations`,
+`wal_sync_interval_ms`, `replica_retain_max_bytes`) is restart-only for now.
 
 ## Environment variables
 
 Each variable overrides one file setting, and a command-line flag, where there is one, overrides the variable. Booleans accept `1`/`0`, `true`/`false`, `yes`/`no` and `on`/`off`; durations are milliseconds.
 
-| Variable | Flag | File setting | Notes |
-| --- | --- | --- | --- |
-| `RUVIO_ADDR` | `--address` | `address` | |
-| `RUVIO_SHARDS` | `--shards` | `shards` | |
-| `RUVIO_PORT_MODE` | | `port_mode` | |
-| `RUVIO_ADVERTISE_HOST` | `--advertised-host` | `advertised_host` | |
-| `RUVIO_ADVERTISE_PORT` | `--advertised-port` | `advertised_port` | |
-| `RUVIO_CPUSET` | `--cpu-set` | `cpu_set` | |
-| `RUVIO_CORE` | | `cpu_set` | Older name; read only when `RUVIO_CPUSET` is unset |
-| `RUVIO_SHUTDOWN_GRACE_MS` | `--shutdown-grace-ms` | `shutdown_grace_ms` | |
-| `RUVIO_SLOWLOG_THRESHOLD_MICROS` | | `slowlog_threshold_micros` | |
-| `RUVIO_SLOWLOG_MAX_LEN` | | `slowlog_max_len` | |
-| `RUVIO_LATENCY_HISTOGRAMS` | | `latency_histograms` | |
-| `RUVIO_KEY_STATS` | | `key_stats` | |
-| `RUVIO_MAX_ARGUMENTS` | | `protocol.max_arguments` | |
-| `RUVIO_MAX_KEY_BYTES` | | `protocol.max_key_bytes` | |
-| `RUVIO_MAX_VALUE_BYTES` | | `protocol.max_value_bytes` | |
-| `RUVIO_MAX_COMMAND_BYTES` | | `protocol.max_command_bytes` | |
-| `RUVIO_MAX_PIPELINE_COMMANDS` | | `protocol.max_pipeline_commands` | |
-| `RUVIO_MAX_CONNECTION_BUFFER_BYTES` | | `protocol.max_connection_buffer_bytes` | |
-| `RUVIO_DATABASES` | | `protocol.databases` | |
-| `RUVIO_IDLE_TIMEOUT_MS` | `--idle-timeout-ms` | `timeouts.idle_ms` | |
-| `RUVIO_READ_TIMEOUT_MS` | `--read-timeout-ms` | `timeouts.read_ms` | |
-| `RUVIO_WRITE_TIMEOUT_MS` | `--write-timeout-ms` | `timeouts.write_ms` | |
-| `RUVIO_MAX_CONNECTIONS` | `--max-connections` | `connections.max_global` | |
-| `RUVIO_MAX_CONNECTIONS_PER_IP` | `--max-connections-per-ip` | `connections.max_per_ip` | |
-| `RUVIO_MAX_CONNECTIONS_PER_USER` | `--max-connections-per-user` | `connections.max_per_user` | |
-| `RUVIO_MAX_COMMANDS_PER_SECOND` | `--max-commands-per-second` | `connections.max_commands_per_second` | |
-| `RUVIO_MAX_QUEUED_REQUESTS` | `--max-queued-requests` | `requests.max_queued_requests` | |
-| `RUVIO_MAX_OUTPUT_BUFFER_BYTES` | `--max-output-buffer-bytes` | `requests.max_output_buffer_bytes` | |
-| `RUVIO_DURABILITY` | `--durability` | `persistence.profile` | `memory`, `snapshot`, `everysec` or `always` |
-| `RUVIO_DATA_DIR` | `--data-dir` | `persistence.data_dir` | |
-| `RUVIO_WAL_SEGMENT_BYTES` | `--wal-segment-bytes` | `persistence.wal_segment_bytes` | |
-| `RUVIO_WAL_SYNC_INTERVAL_MS` | `--wal-sync-interval-ms` | `persistence.sync_interval_ms` | |
-| `RUVIO_EXPERIMENTAL_SYNC_WORKER` | | `persistence.sync_worker` | Older boolean form (`true` = `on`); `RUVIO_SYNC_WORKER` wins |
-| `RUVIO_SYNC_WORKER` | | `persistence.sync_worker` | |
-| `RUVIO_WAL_PREFILL` | | | `auto` (default), `on` or `off`. Linux only: zero-fill WAL segments ahead of the cursor on a helper thread. `auto` does it for `always` only; under `everysec` the zero-fill doubled the bytes a throughput-capped disk saw and halved SET throughput. `CONFIG GET wal-prefill` shows the mode |
-| `RUVIO_SNAPSHOT_MAX_BYTES` | `--snapshot-max-bytes` | `persistence.snapshot_max_bytes` | |
-| `RUVIO_SNAPSHOT_JOURNAL_BYTES` | `--snapshot-journal-bytes` | `persistence.snapshot_journal_bytes` | |
-| `RUVIO_SNAPSHOT_INTERVAL_MS` | `--snapshot-interval-ms` | `persistence.snapshot_interval_ms` | |
-| `RUVIO_SNAPSHOT_MIN_MUTATIONS` | `--snapshot-min-mutations` | `persistence.snapshot_min_mutations` | |
-| `RUVIO_CDC_RETAIN_BYTES` | | `persistence.cdc_retain_bytes` | |
-| `RUVIO_REPLICA_RETAIN_MAX_BYTES` | | `persistence.replica_retain_max_bytes` | |
-| `RUVIO_REQUIREPASS` | `--requirepass` | `security.requirepass` | |
-| `RUVIO_TLS_CERT` | `--tls-cert` | `security.tls_cert` | |
-| `RUVIO_TLS_KEY` | `--tls-key` | `security.tls_key` | |
-| `RUVIO_TLS_CLIENT_CA` | `--tls-client-ca` | `security.tls_client_ca` | |
-| `RUVIO_TLS_CLIENT_AUTH` | `--tls-client-auth` | `security.tls_client_auth` | |
-| `RUVIO_ACL_FILE` | | `security.acl_file` | |
-| `RUVIO_PROTECTED_MODE` | `--protected-mode` | `security.protected_mode` | |
-| `RUVIO_ALLOW_UNAUTHENTICATED` | | `security.allow_unauthenticated_public` | |
-| `RUVIO_METRICS_TOKEN` | | `security.metrics_token` | |
-| `RUVIO_REPLICATION_PASSWORD` | | `security.replication_password` | |
-| `RUVIO_MAXMEMORY` | `--maxmemory` | `memory.max_process_bytes` | |
-| `RUVIO_MAX_SHARD_BYTES` | `--max-shard-bytes` | `memory.max_shard_bytes` | |
-| `RUVIO_MEMORY_HEADROOM_BYTES` | `--memory-headroom-bytes` | `memory.reserved_headroom_bytes` | |
-| `RUVIO_MAXMEMORY_POLICY` | `--maxmemory-policy` | `memory.maxmemory_policy` | |
-| `RUVIO_MAXMEMORY_SAMPLES` | `--maxmemory-samples` | `memory.maxmemory_samples` | |
-| `RUVIO_ACTIVE_EXPIRE_KEYS` | `--active-expire-keys` | `memory.active_expire_keys` | |
-| `RUVIO_ACTIVE_EXPIRE_MAINTENANCE_KEYS` | `--active-expire-maintenance-keys` | `memory.active_expire_maintenance_keys` | |
-| `RUVIO_HASH_MAX_COMPACT_ENTRIES` | `--hash-max-compact-entries` | `memory.hash_max_compact_entries` | |
-| `RUVIO_HASH_MAX_COMPACT_VALUE_BYTES` | `--hash-max-compact-value-bytes` | `memory.hash_max_compact_value_bytes` | |
-| `RUVIO_SET_MAX_INTSET_ENTRIES` | `--set-max-intset-entries` | `memory.set_max_intset_entries` | |
-| `RUVIO_LIST_MAX_COMPACT_ENTRIES` | `--list-max-compact-entries` | `memory.list_max_compact_entries` | |
-| `RUVIO_LIST_MAX_COMPACT_VALUE_BYTES` | `--list-max-compact-value-bytes` | `memory.list_max_compact_value_bytes` | |
-| `RUVIO_NOTIFY_KEYSPACE_EVENTS` | | `notify_keyspace_events` | |
-| `RUVIO_METRICS_ADDR` | `--metrics-address` | `metrics_address` | |
-| `RUVIO_SCRIPT_MAX_BYTES` | | `scripts.max_bytes` | |
-| `RUVIO_SCRIPT_MAX_CACHED` | | `scripts.max_cached` | |
-| `RUVIO_SCRIPT_MAX_CALLS` | | `scripts.max_calls` | |
-| `RUVIO_SCRIPT_MAX_INSTRUCTIONS` | | `scripts.max_instructions` | |
-| `RUVIO_SCRIPT_MAX_TIME_MS` | | `scripts.max_time_ms` | |
-| `RUVIO_HOT_KEYS` | | `hot_keys` | Comma-separated globs |
-| `RUVIO_REPLICATION_ROLE` | | `replication.role` | |
-| `RUVIO_REPLICATION_LISTEN` | | `replication.listen` | |
-| `RUVIO_REPLICATION_PRIMARY` | | `replication.primary` | |
+| Variable | `CONFIG SET` | Flag | File setting | Notes |
+| --- | --- | --- | --- | --- |
+| `RUVIO_ADDR` | no | `--address` | `address` | |
+| `RUVIO_SHARDS` | no | `--shards` | `shards` | |
+| `RUVIO_PORT_MODE` | no | | `port_mode` | |
+| `RUVIO_ADVERTISE_HOST` | no | `--advertised-host` | `advertised_host` | |
+| `RUVIO_ADVERTISE_PORT` | no | `--advertised-port` | `advertised_port` | |
+| `RUVIO_CLUSTER_TOPOLOGY` | no | | `cluster_topology` | Path of the cluster map; empty = none |
+| `RUVIO_CLUSTER_GROUP` | no | | `cluster_group` | This node's group in the map |
+| `RUVIO_MIGRATION_MAX_BYTES_PER_SEC` | no | | `migration_max_bytes_per_sec` | Copy rate of a range moving to another node; 0 = no limit |
+| `RUVIO_CPUSET` | no | `--cpu-set` | `cpu_set` | |
+| `RUVIO_CORE` | no | | `cpu_set` | Older name; read only when `RUVIO_CPUSET` is unset |
+| `RUVIO_SHUTDOWN_GRACE_MS` | no | `--shutdown-grace-ms` | `shutdown_grace_ms` | |
+| `RUVIO_SLOWLOG_THRESHOLD_MICROS` | `slowlog-log-slower-than` | | `slowlog_threshold_micros` | |
+| `RUVIO_SLOWLOG_MAX_LEN` | `slowlog-max-len` | | `slowlog_max_len` | |
+| `RUVIO_LATENCY_HISTOGRAMS` | `latency-histograms` | | `latency_histograms` | |
+| `RUVIO_KEY_STATS` | `key-stats` | | `key_stats` | |
+| `RUVIO_MAX_ARGUMENTS` | no | | `protocol.max_arguments` | |
+| `RUVIO_MAX_KEY_BYTES` | no | | `protocol.max_key_bytes` | |
+| `RUVIO_MAX_VALUE_BYTES` | no | | `protocol.max_value_bytes` | |
+| `RUVIO_MAX_COMMAND_BYTES` | no | | `protocol.max_command_bytes` | |
+| `RUVIO_MAX_PIPELINE_COMMANDS` | no | | `protocol.max_pipeline_commands` | |
+| `RUVIO_MAX_CONNECTION_BUFFER_BYTES` | no | | `protocol.max_connection_buffer_bytes` | |
+| `RUVIO_DATABASES` | no | | `protocol.databases` | |
+| `RUVIO_IDLE_TIMEOUT_MS` | `idle-timeout-ms` | `--idle-timeout-ms` | `timeouts.idle_ms` | |
+| `RUVIO_READ_TIMEOUT_MS` | `read-timeout-ms` | `--read-timeout-ms` | `timeouts.read_ms` | |
+| `RUVIO_WRITE_TIMEOUT_MS` | `write-timeout-ms` | `--write-timeout-ms` | `timeouts.write_ms` | |
+| `RUVIO_MAX_CONNECTIONS` | `max-connections` | `--max-connections` | `connections.max_global` | |
+| `RUVIO_MAX_CONNECTIONS_PER_IP` | `max-connections-per-ip` | `--max-connections-per-ip` | `connections.max_per_ip` | |
+| `RUVIO_MAX_CONNECTIONS_PER_USER` | `max-connections-per-user` | `--max-connections-per-user` | `connections.max_per_user` | |
+| `RUVIO_MAX_COMMANDS_PER_SECOND` | `max-commands-per-second` | `--max-commands-per-second` | `connections.max_commands_per_second` | |
+| `RUVIO_MAX_QUEUED_REQUESTS` | no | `--max-queued-requests` | `requests.max_queued_requests` | |
+| `RUVIO_MAX_OUTPUT_BUFFER_BYTES` | `max-output-buffer-bytes` | `--max-output-buffer-bytes` | `requests.max_output_buffer_bytes` | |
+| `RUVIO_DURABILITY` | no | `--durability` | `persistence.profile` | `memory`, `snapshot`, `everysec` or `always` |
+| `RUVIO_DATA_DIR` | no | `--data-dir` | `persistence.data_dir` | |
+| `RUVIO_WAL_SEGMENT_BYTES` | no | `--wal-segment-bytes` | `persistence.wal_segment_bytes` | |
+| `RUVIO_WAL_SYNC_INTERVAL_MS` | no | `--wal-sync-interval-ms` | `persistence.sync_interval_ms` | |
+| `RUVIO_EXPERIMENTAL_SYNC_WORKER` | no | | `persistence.sync_worker` | Older boolean form (`true` = `on`); `RUVIO_SYNC_WORKER` wins |
+| `RUVIO_SYNC_WORKER` | no | | `persistence.sync_worker` | |
+| `RUVIO_WAL_PREFILL` | no | | | `auto` (default), `on` or `off`. Linux only: zero-fill WAL segments ahead of the cursor on a helper thread. `auto` does it for `always` only; under `everysec` the zero-fill doubled the bytes a throughput-capped disk saw and halved SET throughput. `CONFIG GET wal-prefill` shows the mode |
+| `RUVIO_SNAPSHOT_MAX_BYTES` | no | `--snapshot-max-bytes` | `persistence.snapshot_max_bytes` | |
+| `RUVIO_SNAPSHOT_JOURNAL_BYTES` | no | `--snapshot-journal-bytes` | `persistence.snapshot_journal_bytes` | |
+| `RUVIO_SNAPSHOT_INTERVAL_MS` | no | `--snapshot-interval-ms` | `persistence.snapshot_interval_ms` | |
+| `RUVIO_SNAPSHOT_MIN_MUTATIONS` | no | `--snapshot-min-mutations` | `persistence.snapshot_min_mutations` | |
+| `RUVIO_CDC_RETAIN_BYTES` | no | | `persistence.cdc_retain_bytes` | |
+| `RUVIO_REPLICA_RETAIN_MAX_BYTES` | no | | `persistence.replica_retain_max_bytes` | |
+| `RUVIO_REQUIREPASS` | `requirepass` | `--requirepass` | `security.requirepass` | |
+| `RUVIO_TLS_CERT` | no | `--tls-cert` | `security.tls_cert` | |
+| `RUVIO_TLS_KEY` | no | `--tls-key` | `security.tls_key` | |
+| `RUVIO_TLS_CLIENT_CA` | no | `--tls-client-ca` | `security.tls_client_ca` | |
+| `RUVIO_TLS_CLIENT_AUTH` | no | `--tls-client-auth` | `security.tls_client_auth` | |
+| `RUVIO_ACL_FILE` | no | | `security.acl_file` | |
+| `RUVIO_PROTECTED_MODE` | no | `--protected-mode` | `security.protected_mode` | |
+| `RUVIO_ALLOW_UNAUTHENTICATED` | no | | `security.allow_unauthenticated_public` | |
+| `RUVIO_METRICS_TOKEN` | no | | `security.metrics_token` | |
+| `RUVIO_REPLICATION_PASSWORD` | no | | `security.replication_password` | |
+| `RUVIO_MAXMEMORY` | `maxmemory` | `--maxmemory` | `memory.max_process_bytes` | |
+| `RUVIO_MAX_SHARD_BYTES` | `max-shard-bytes` | `--max-shard-bytes` | `memory.max_shard_bytes` | |
+| `RUVIO_MEMORY_HEADROOM_BYTES` | `memory-headroom-bytes` | `--memory-headroom-bytes` | `memory.reserved_headroom_bytes` | |
+| `RUVIO_MAXMEMORY_POLICY` | `maxmemory-policy` | `--maxmemory-policy` | `memory.maxmemory_policy` | |
+| `RUVIO_MAXMEMORY_SAMPLES` | `maxmemory-samples` | `--maxmemory-samples` | `memory.maxmemory_samples` | |
+| `RUVIO_ACTIVE_EXPIRE_KEYS` | `active-expire-keys` | `--active-expire-keys` | `memory.active_expire_keys` | |
+| `RUVIO_ACTIVE_EXPIRE_MAINTENANCE_KEYS` | `active-expire-maintenance-keys` | `--active-expire-maintenance-keys` | `memory.active_expire_maintenance_keys` | |
+| `RUVIO_HASH_MAX_COMPACT_ENTRIES` | `hash-max-compact-entries` | `--hash-max-compact-entries` | `memory.hash_max_compact_entries` | |
+| `RUVIO_HASH_MAX_COMPACT_VALUE_BYTES` | `hash-max-compact-value-bytes` | `--hash-max-compact-value-bytes` | `memory.hash_max_compact_value_bytes` | |
+| `RUVIO_SET_MAX_INTSET_ENTRIES` | `set-max-intset-entries` | `--set-max-intset-entries` | `memory.set_max_intset_entries` | |
+| `RUVIO_LIST_MAX_COMPACT_ENTRIES` | `list-max-compact-entries` | `--list-max-compact-entries` | `memory.list_max_compact_entries` | |
+| `RUVIO_LIST_MAX_COMPACT_VALUE_BYTES` | `list-max-compact-value-bytes` | `--list-max-compact-value-bytes` | `memory.list_max_compact_value_bytes` | |
+| `RUVIO_NOTIFY_KEYSPACE_EVENTS` | `notify-keyspace-events` | | `notify_keyspace_events` | |
+| `RUVIO_METRICS_ADDR` | no | `--metrics-address` | `metrics_address` | |
+| `RUVIO_SCRIPT_MAX_BYTES` | `script-max-bytes` | | `scripts.max_bytes` | |
+| `RUVIO_SCRIPT_MAX_CACHED` | `script-max-cached` | | `scripts.max_cached` | |
+| `RUVIO_SCRIPT_MAX_CALLS` | `script-max-calls` | | `scripts.max_calls` | |
+| `RUVIO_SCRIPT_MAX_INSTRUCTIONS` | `script-max-instructions` | | `scripts.max_instructions` | |
+| `RUVIO_SCRIPT_MAX_TIME_MS` | `script-max-time-ms` | | `scripts.max_time_ms` | |
+| `RUVIO_HOT_KEYS` | no | | `hot_keys` | Comma-separated globs |
+| `RUVIO_REPLICATION_ROLE` | no | | `replication.role` | |
+| `RUVIO_REPLICATION_LISTEN` | no | | `replication.listen` | |
+| `RUVIO_REPLICATION_PRIMARY` | no | | `replication.primary` | |
+| `RUVIO_MIN_REPLICAS_TO_WRITE` | `min-replicas-to-write` | | `replication.min_replicas_to_write` | |
+| `RUVIO_MIN_REPLICAS_MAX_LAG` | `min-replicas-max-lag` | | `replication.min_replicas_max_lag` | Seconds, as in Redis |
+| `RUVIO_PRIMARY_LEASE` | `primary-lease` | | `replication.primary_lease` | `yes`/`no`; see [COORDINATOR.md](COORDINATOR.md#primary-lease) |
+| `RUVIO_PRIMARY_LEASE_COORDINATORS` | no | | `replication.primary_lease_coordinators` | Comma-separated coordinator ids, for example `1,2,3`; restart to change |
+| `RUVIO_REPLICA_ANNOUNCED` | no | | `replication.announced` | `CONFIG GET replica-announced` |
 
 Flags with no variable:
 
@@ -229,6 +349,10 @@ script's writes whose record is larger than `wal_segment_bytes` is refused with
 the shard stays healthy (this is not a `MISCONF` state), and the refusal is
 logged at most once a minute. Raise `wal_segment_bytes` or split the write.
 
+`wal_segment_bytes` can be lowered between restarts: older, longer segments are still
+read (with a warning) and new records go to segments of the new size. `ruvio-ctl` reads
+segments of any length.
+
 ### Sequence-barrier sync worker
 
 `persistence.sync_worker = "auto" | "on" | "off"` (env `RUVIO_SYNC_WORKER`) moves
@@ -240,6 +364,15 @@ returns to the shard-thread sync. The old `experimental_sync_worker` /
 `RUVIO_EXPERIMENTAL_SYNC_WORKER` keys still work and map to `on` / `off`.
 `CONFIG GET sync-worker` shows the mode and `CONFIG GET sync-worker-active`
 the resolved value.
+
+**When to use it.** With `always` durability and the worker off, every write batch runs
+`fdatasync` on the shard thread before the reply, so every client of that shard waits for the
+disk (about 1 to 2 ms on ext4 with preallocated segments, more on network disks). On Linux with
+`always` and one shard the default `auto` already turns the worker on. With several shards `auto`
+keeps it off, because the multi-shard case is not measured; if you run `always` on several
+shards, set `sync_worker = "on"` and compare the p99 write latency with and without it on your
+disk. Watch `wal_unsynced_bytes` in `INFO` (see `docs/OBSERVABILITY.md`): a value that keeps
+growing means the disk cannot keep up.
 
 Each shard has one long-lived sync worker, one active sync and one coalescing
 pending slot. The shard retains WAL encoding, append and mutation ownership;
@@ -307,9 +440,9 @@ the ladder. `SAVE` walks in one go and is not affected.
 
 ### Change stream
 
-`CHANGES SUBSCRIBE [FROM <shard>:<seq>|NOW] [MATCH glob] [TYPES a,b] [VALUES]` turns this
-shard's WAL into a push stream (RESP3 `>`; RESP2 clients get plain arrays). The reply is the
-cursor the stream starts after. Each event is
+`CHANGES SUBSCRIBE [FROM <generation>:<shard>:<seq>|NOW] [MATCH glob] [TYPES a,b] [VALUES]
+[COMMITTED]` turns this shard's WAL into a push stream (RESP3 `>`; RESP2 clients get plain
+arrays). The reply is the cursor the stream starts after. Each event is
 `["change", cursor, db, type, key|nil, value|nil]`; `type` is one of `put`, `json`, `del`,
 `expire`, `rename`, `list`, `set`, `hash`, `zset`, `stream`, `flush`, `other`. `value` is filled
 only with `VALUES`, and only for string and JSON writes. A record with several keys produces one
@@ -318,6 +451,36 @@ event it processed and passes it as `FROM` after a disconnect or restart: no eve
 repeated. Filtered-out records still move the cursor (`["cursor", c]` about once a second).
 Only durable records are streamed. A shard is its own sequence, so a cluster client subscribes on
 each shard it needs; the cursor names its shard and a wrong one is refused.
+
+A cursor is `<generation>:<shard>:<seq>`. The generation is the replication epoch the shard's log
+was written under (`replication_epoch` in `INFO`; 0 on a server that never replicated), so it
+changes only when a replica is promoted. A promoted replica continues its old primary's sequence
+numbers only up to the fork, the last record it had received; after that the same numbers name
+other records. On the promoted shard, a cursor of the old primary's generation at or before the
+fork resumes as usual. One past the fork names records the new primary never had: the stream
+first sends `["rewound", cursor]`, where `cursor` is the fork in the new generation, then
+continues from the fork. The client must undo or reload whatever it applied after that cursor.
+A cursor of a newer generation is refused with `ERR change cursor generation is newer than this
+server`, and one of a generation older than the one the shard forked from (it missed more than
+one failover) with `ERR change cursor generation is unknown to this server`: reload fully, then
+`FROM NOW`. The older two-part form `<shard>:<seq>` is still accepted and read as the shard's
+current generation, which is how it behaved before; it cannot detect a rewind. Two replicas
+promoted at once from the same primary (split brain without a coordinator) get the same
+generation, and a cursor cannot tell their logs apart. A primary told to follow another one
+(`REPLICAOF host port`, also by a coordinator) ends its streams with `["resync", "the shard
+follows another primary; resume on it"]` before its log takes the new primary's records; here the
+client does not reload: it subscribes on the new primary with its last cursor, where the rewind
+rule above applies.
+
+`COMMITTED` streams only records at or below the shard's committed sequence
+(`replication_committed_sequence`, the highest record a `CLIENT DURABILITY` reply was released
+for), so the consumer never sees a record a failover could take back; later records wait until a
+durable write commits past them. Only `CLIENT DURABILITY` writes advance it: on a primary whose
+clients never use it, a `COMMITTED` stream delivers nothing new. A newly promoted primary starts
+with nothing committed, so its stream waits for the first durable write there. `COMMITTED` is
+refused on a shard that does not replicate (`ERR CHANGES SUBSCRIBE COMMITTED needs replication
+on this server`), where nothing is ever committed. A subscriber without `COMMITTED` pays nothing
+for it.
 
 `cdc_retain_bytes` (environment `RUVIO_CDC_RETAIN_BYTES`, default `0`) is how much WAL a
 checkpoint keeps for subscribers, rounded to whole segments, whether or not anyone is
@@ -340,10 +503,9 @@ and copies `CURRENT`, `CLOCK`, `checkpoints/`, `wal/`, and any per-shard
 already has those files or markers unless `--force` is set. Integrity checks
 do not certify replica catch-up completeness. See [RECOVERY.md](RECOVERY.md).
 
-`INFO prometheus` returns Prometheus text for the receiving shard. When
-`metrics_address` is set, that shard also serves `GET /metrics` on a separate
-listener. Multi-shard layouts use consecutive metrics ports starting at the
-configured address. The metrics range must not overlap the RESP port range.
+`INFO prometheus` returns Prometheus text for the receiving shard. There is no
+HTTP metrics endpoint yet: `metrics_address` / `--metrics-address` is accepted but nothing listens on it
+(the server warns at startup if it is set).
 
 `hot_keys` / `RUVIO_HOT_KEYS` is a list of Redis-style `*` / `?` globs
 (`hot_keys = ["lock:*", "session:*"]` or `RUVIO_HOT_KEYS=lock:*,session:*`).
@@ -364,6 +526,15 @@ before publishing `CURRENT`. `SAVE` on a primary with `hot_keys` writes the hot
 partition into the same checkpoint. A replica behind a deleted WAL prefix
 receives that checkpoint.
 
+A hot `SET`, `DEL` or a `FLUSHDB` / `FLUSHALL` that removes hot keys keeps the
+usual order: checked, logged, then applied. Its record is taken in the shard's
+log before the shared store changes, so a refused record (a failed log, or a
+record larger than `wal_segment_bytes`) leaves the key as it was for every
+client. As for a batch of shard writes, the record is written to the file (and
+synced under `always`) just after the store's lock is released. If that write
+fails (a disk error), the writer gets `MISCONF`, the value stays readable, and
+the log keeps the record and writes it first when it resumes.
+
 `replication.role` / `RUVIO_REPLICATION_ROLE` is `off` (default), `primary`, or
 `replica`. `replication.listen` / `RUVIO_REPLICATION_LISTEN` is the primary's
 base address. `replication.primary` / `RUVIO_REPLICATION_PRIMARY` is the
@@ -374,6 +545,95 @@ Shard `i` uses that base port plus `i`. Role `off` opens no replication port
 and dials nobody. A primary binds `replication.listen` (loopback in the sample
 above). A replica dials `replication.primary` and does not listen. A primary keeps
 each replica on its own stream, up to 16.
+
+`replication.min_replicas_to_write` / `min-replicas-to-write` (default `0`, off)
+and `replication.min_replicas_max_lag` / `min-replicas-max-lag` (seconds, default
+`10`) work as in Redis. A primary shard refuses writes with `NOREPLICAS Not enough
+good replicas to write.` while fewer connected replicas than the first value
+acknowledged within the second; reads go on. A replica acknowledges each synced
+sequence and repeats its last acknowledgement every second while idle. The shard
+checks this every 100 ms, so a lost replica is noticed up to that much after the
+lag runs out, and writes resume on the next check after enough replicas
+acknowledge. It bounds how long a primary cut off from its replicas keeps taking
+writes another primary will not have; it is not a synchronous write. A replica
+that installs a full copy acknowledges nothing until it has caught up, so with a
+single replica and `min-replicas-to-write 1` the primary refuses writes while that
+replica resyncs, as in Redis. Both change
+with `CONFIG SET`. Only role `primary` applies them.
+
+For a synchronous write per connection, `CLIENT DURABILITY REPLICAS n [TIMEOUT ms]`
+holds the connection's replies until `n` replicas hold the records written before
+them on disk (default timeout 5000 ms); on timeout the batch's replies become
+`NOREPLICAS` and the writes stay applied. After a timeout, the connection's next
+batch waits only if the shard logged a new record in between, so a read sent right
+after can return a write no replica holds yet. See
+[COORDINATOR.md](COORDINATOR.md#what-can-be-lost-and-split-brain).
+
+`replication.primary_lease` / `primary-lease` (default `false`) makes a primary
+(or a node with no replication role) take writes only while a majority of the
+`ruvio coordinator`s that manage it renewed its lease (their `primary_lease_ms`)
+for more than 300 ms more; otherwise writes get
+`NOREPLICAS Primary lease expired: too few coordinators renewed it.`. A primary
+starts, and a promoted replica begins, refusing writes until the first grants
+arrive. It is checked on the same 100 ms tick and changes with `CONFIG SET`.
+A script (`EVAL`, `EVALSHA`, `FCALL`, or one inside `MULTI`) is checked when it
+starts, and its `script-max-time-ms` is cut to what the lease still holds past
+those 300 ms, so it cannot keep writing after the gate would close; a script
+that runs out of that time stops with the usual script timeout error and its
+writes stay. See [COORDINATOR.md](COORDINATOR.md#primary-lease) for the guarantee and the
+order to turn it on or off.
+
+`replication.primary_lease_coordinators` (default empty, restart to change) lists the ids
+(`id` in `coordinator.toml`) of the coordinators whose grants this node takes. It is required
+while `primary_lease` is on. A `RUVIO LEASE GRANT` from any other id, or from a coordinator
+that counts a different number of coordinators than the list holds, is refused, so a client that
+merely has the `ruvio|lease` right cannot invent a majority (the right is still part of `+@all`
+and `@admin`; leave it out of application users).
+
+**Replicas in the topology.** A replica sends its primary the address clients
+reach it on: `advertised_host`, and `advertised_port` (else the bind port) plus
+the shard index in `per-shard` mode. A replica that announces a loopback host
+but connects from another machine is listed at the address it connected from,
+so the default `advertised_host` works on a flat network; set `advertised_host`
+behind NAT, a proxy or in containers. A host is announced only when it is a
+host name or an IP address of at most 255 characters (letters, digits and
+`. - _ : % [ ]`); anything else is not announced. A replica sends no
+acknowledgement while it installs a full copy and catches up, so it is not
+listed, and not counted by `WAIT` or `min-replicas-to-write`, until its copy is
+complete. Once it acknowledges, the primary lists it after its own shard in
+`CLUSTER SLOTS`, `CLUSTER SHARDS` and `CLUSTER NODES`, in `ROLE`, and as
+`slave0:ip=…,port=…,state=online,offset=…,lag=…` lines in `INFO replication`;
+a replica that disconnects, or sends no acknowledgement for 10 seconds (it
+repeats one every second), leaves the list. The same loopback rule applies to the
+primary's own address as its replicas see it. A replica answers the cluster
+commands with the primary it follows first and itself second, so a client that
+knows only a replica's address still sends writes to the primary.
+`replication.announced = false` (`RUVIO_REPLICA_ANNOUNCED=no`,
+`CONFIG GET replica-announced`, Redis's `replica-announced`) keeps a replica out
+of these answers; it still replicates. Node ids are the SHA-1 of the announced
+`host:port`, so they differ between processes and stay the same across restarts
+on the same address. Clients choose whether to read from replicas; see
+[CLIENT_BEHAVIOR.md](CLIENT_BEHAVIOR.md#reads-from-replicas).
+Replication TLS (`replication.tls`, default `false`, restart-only, TOML only)
+wraps each replication connection in TLS. A primary presents the certificate in
+`tls_cert`/`tls_key` (required; the same files and reload as client TLS), so
+the certificate must cover the name or address replicas dial. A replica verifies
+it against `replication.tls_ca` (PEM issuer, required on a replica) and, when
+the primary asks for one (`tls_client_ca`/`tls_client_auth` apply to replicas
+too), presents `replication.tls_client_cert` and `replication.tls_client_key`
+(both or neither). `ruvio coordinator` has its own TLS settings (`tls_cert`,
+`tls_key`, `tls_ca`, `node_tls`; see "Security" in [COORDINATOR.md](COORDINATOR.md)).
+Both ends of a link must agree: a TLS replica cannot follow a
+cleartext primary or the reverse. Off, nothing is loaded and the stream is
+exactly as before.
+
+```toml
+[replication]
+tls = true
+tls_ca = "/etc/ruvio/ca.pem"                 # replica: issuer of the primary's certificate
+tls_client_cert = "/etc/ruvio/replica.pem"   # replica, optional
+tls_client_key = "/etc/ruvio/replica.key"
+```
 
 `INFO` reports `replication_role`, `wal_last_sequence`, and
 `wal_durable_sequence` on every shard. A primary also reports
@@ -395,8 +655,8 @@ whose clock runs ahead can drop a key early; if the primary then extends that
 key's TTL, the replica no longer has it and requests a full copy of the shard.
 A TTL change whose new deadline has already passed is applied without a resync.
 
-Changing `replication.role` from `replica` to `off` or `primary` is a **manual
-promotion**, not an automatic failover. If any shard still has a catch-up
+Changing `replication.role` from `replica` to `off` or `primary` (or `REPLICAOF NO ONE`) is a
+**manual promotion**; for automatic failover run `ruvio coordinator` ([COORDINATOR.md](COORDINATOR.md)). If any shard still has a catch-up
 marker, normal writer startup refuses it. `ruvio --config ./ruvio.toml
 --force-promote-incomplete` allows a recoverable but possibly incomplete
 replica to start as a writer **only for that invocation**; it is a CLI flag,
@@ -436,8 +696,7 @@ refuses to start. Container images set `RUVIO_PROTECTED_MODE=false` because
 published ports are not loopback inside the namespace, so they need
 `RUVIO_REQUIREPASS` or an ACL password. `RUVIO_ALLOW_UNAUTHENTICATED=true`
 is the explicit exception for a network that is already private.
-`RUVIO_METRICS_TOKEN` is required when `metrics_address` is not loopback;
-scrape requests then send `Authorization: Bearer`. `RUVIO_REPLICATION_PASSWORD`
+`RUVIO_REPLICATION_PASSWORD`
 is the replication handshake secret (Garnet's cluster password). When it is
 empty the handshake uses `requirepass`. A public replication listen needs one
 of those secrets. See [THREAT_MODEL.md](THREAT_MODEL.md). `AUTH` uses
@@ -445,7 +704,8 @@ constant-time comparison and never logs the secret. `requirepass`,
 `metrics-token`, and `replication-password` are redacted in `CONFIG GET`.
 `CONFIG GET *` lists the effective settings for the process; `CONFIG GET max-*`
 uses the same glob rules as `SCAN`. Redis compatibility keys `save` (empty)
-and `appendonly` (`no`) remain present. `CONFIG SET` is not supported.
+and `appendonly` (`no`) remain present. `CONFIG SET` changes the live
+settings; see *Changing settings at runtime*.
 
 TLS is supported on portable and evented. Set `tls_cert` / `tls_key`, `RUVIO_TLS_CERT` /
 `RUVIO_TLS_KEY`, or `--tls-cert` / `--tls-key` to PEM files. Both paths must
@@ -459,6 +719,14 @@ the configured certificate. `tls_client_ca` / `RUVIO_TLS_CLIENT_CA` /
 to it. `tls_client_auth` / `RUVIO_TLS_CLIENT_AUTH` / `--tls-client-auth`
 rejects a handshake that does not present one. Neither setting is consulted
 on a plaintext connection.
+
+All six first-party clients can connect over TLS (Rust with the `tls` cargo feature, the Operator UI with `RUVIO_UI_TLS`), checking the certificate chain and host name; each has a private CA option, a client certificate option for `tls_client_auth` and, for throwaway tests only, an option that skips the check. The options and a snippet per client are in [clients/README.md](../clients/README.md#tls) and each client's README.
+
+`tls_cert` covers client connections only. The replication port (WAL and snapshot
+stream, and the replication password in its handshake) is encrypted only when
+`replication.tls = true` (see below); otherwise keep it on a private network, a
+VPN or a tunnel. With TLS on and a replication listener or primary on another
+machine and `replication.tls` off, the server logs a warning at startup.
 
 ACL users are configured in `[[security.users]]` with Redis-style rule tokens:
 `on`/`off`, `>password`, `nopass`, `~pattern`, `+@category`, `-@category`,
@@ -609,6 +877,56 @@ port they name for shard 0; shard `i` is that port plus `i`. Leave it unset
 when clients reach the bind ports directly. Set both when a container or load
 balancer publishes the shards elsewhere, for example `-p 7000-7003:6379-6382`
 with `RUVIO_ADVERTISE_HOST=<host clients use>` and `RUVIO_ADVERTISE_PORT=7000`.
+
+`cluster_topology` (`RUVIO_CLUSTER_TOPOLOGY`) makes this node one of a multi-node
+cluster: the path of a map that gives every hash slot to one group, where a group
+is a primary and its replicas. `cluster_group` (`RUVIO_CLUSTER_GROUP`) names this
+node's group in it. Both are read at startup only; without a map the node owns
+every slot, as before.
+
+```toml
+version = 1                    # increases with every change; CLUSTER INFO cluster_current_epoch
+
+[[groups]]
+name = "a"
+address = "10.0.0.1:7000"      # client address of the group primary's shard 0
+shards = 2                     # must equal `shards` on that group's nodes
+slots = ["0-8191"]
+
+[[groups]]
+name = "b"
+address = "10.0.0.2:7000"
+shards = 4                     # groups may differ in shard count
+slots = ["8192-16383"]
+```
+
+Every slot must belong to exactly one group, and the node's own group must list its
+`shards`. A group's slots, in order, are split into equal runs over its shards (shard
+`i` of group `b` above listens on port 7000 + `i`); a group that owns every slot
+places them exactly as a node without a map does. A command whose key belongs to
+another group is answered `-MOVED slot host:port` with the address of the shard
+that holds it (inside `MULTI` the transaction is then aborted), so cluster-aware
+clients reach the owner directly; local keys are forwarded between this node's
+shards as before. `CLUSTER SLOTS`, `CLUSTER SHARDS` and `CLUSTER NODES` describe
+the whole map, other groups by their primary only. Keyless commands (`DBSIZE`,
+`KEYS`, `SCAN`, `FLUSHALL`), `WAIT` and classic `PUBLISH`/`SUBSCRIBE` stay on the
+node that receives them; use `SPUBLISH`/`SSUBSCRIBE` for channels the whole
+cluster shares. Start a group with its slots empty, or as the only group of a
+node that already holds data; `ruvio coordinator` moves ranges between groups
+later (`COORDINATOR MOVE`, see `docs/COORDINATOR.md`), and a node refuses a map
+that gives its group a slot whose data is not there. `migration_max_bytes_per_sec`
+(`RUVIO_MIGRATION_MAX_BYTES_PER_SEC`, default 0: no cap) caps how fast a node copies
+a range it sends to another group. A node that holds keys in slots the map serves elsewhere (or on another of its
+own shards) refuses to start and names the first such slot; the check walks the
+keys once at startup, only when a map is set. With `ruvio coordinator` managing the
+groups, the coordinators send each node a newer map after every failover (`RUVIO
+TOPOLOGY SET`, see `docs/COORDINATOR.md`); the node keeps it in `TOPOLOGY` in its data
+directory and starts from the newer of that file and `cluster_topology`. A one-shard
+node with a map answers the `CLUSTER` commands too. A map needs `port_mode = "per-shard"` and cannot be combined with `hot_keys`.
+`RUVIO MOVESLOTS` still moves this group's slots between the node's own shards, starting
+from the map's placement; another group's range cannot be moved. The layout the moves
+started from is kept next to them (`SLOTS_BASE`), and a node whose moves were made with
+another layout (no map, or a map with other slots for this group) refuses to start.
 `cpu_set` (`RUVIO_CPUSET`, `--cpu-set`) pins shard threads on Linux. It takes a
 CPU list such as `2`, `0-3` or `0,2,4-5`; shard `i` runs on the `i`th listed
 core and the list wraps when there are more shards than cores. Unset means no

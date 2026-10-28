@@ -329,10 +329,15 @@ public sealed class RuvioConnection : IRuvioConnection
     {
         Host = options.Host,
         Port = options.Port,
+        Seeds = options.Seeds is { Count: > 0 } ? [.. options.Seeds] : [],
         Username = options.Username,
         Password = options.Password,
         Database = database,
+        DurabilityReplicas = options.DurabilityReplicas,
+        DurabilityTimeout = options.DurabilityTimeout,
+        Tls = options.Tls,
         ConnectTimeout = options.ConnectTimeout,
+        CommandTimeout = options.CommandTimeout,
         MaxInFlightRequests = options.MaxInFlightRequests,
         DedicatedReaderThread = options.DedicatedReaderThread,
         DiscoverCluster = options.DiscoverCluster,
@@ -341,6 +346,9 @@ public sealed class RuvioConnection : IRuvioConnection
         ReconnectBaseDelay = options.ReconnectBaseDelay,
         ReconnectMaxDelay = options.ReconnectMaxDelay,
         ReconnectDelay = options.ReconnectDelay,
+        ReadPolicy = options.ReadPolicy,
+        FollowPrimary = options.FollowPrimary,
+        SentinelMaster = options.SentinelMaster,
         JsonSerializerOptions = options.JsonSerializerOptions,
     };
 }

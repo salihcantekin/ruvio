@@ -30,7 +30,7 @@ npm install ruvio-client
 ```ts
 import { createClient } from 'ruvio-client';
 
-const c = createClient('redis://127.0.0.1:6379/0');   // or { host, port, db, username, password, tls }
+const c = createClient('redis://127.0.0.1:6379/0');   // or { host, port, db, username, password, tls, durability }
 await c.set('k', 'v', { px: 5000 });
 console.log(await c.get('k'));                          // 'v'
 console.log(await c.binary.get('k'));                   // Buffer
@@ -55,10 +55,10 @@ await c.quit();
 
 ## API
 
-Typed methods for every command in `docs/compatibility-matrix.json` (287/287, enforced by `test/coverage.test.ts`),
-including the Ruvio options: `set(k, v, { ifEq })`, `incrbyMax`, `fillget`/`fillset` (`WAIT`, `SWR`), `getex(k, ms)`,
-`delex(k, ifEq)`, `lpushcap`/`rpushcap`, `bf*`, `json*` (incl. `jsonIndexCreate`, `jsonFind`), `idemBegin`/`idemComplete`,
-`lease`/`semaphore`/`release`, `once`, `take`, `setv`, `changes*`, `limit`. Anything else: `c.call('CMD', ...args)`.
+Typed methods for every command in `docs/compatibility-matrix.json` (299/299, enforced by `test/coverage.test.ts`),
+including the Ruvio options: `set(k, v, { ifEq })`, `set(k, n, { ifGt })` / `{ ifLt }`, `incrbyMax`, `fillget`/`fillset` (`WAIT`, `SWR`), `getex(k, ms)`,
+`delex(k, ifEq)`, `lpushcap`/`rpushcap`, `bf*`, `json*` (incl. `jsonIndexCreate`, `jsonFind`), `idemBegin`/`idemComplete`/`idemAbort`,
+`lease`/`semaphore`/`release`, `once`, `take`, `transfer`, `htransfer`, `setv`, `changes*`, `limit`. Anything else: `c.call('CMD', ...args)`.
 
 - **Pipeline:** `await c.pipeline().set('a', 1).get('a').exec()` (one write; per-command errors stay in their slot, `execStrict()` rejects).
 - **Transaction:** `await c.multi().incr('{k}a').incr('{k}b').exec()`: `MULTI`..`EXEC` in one contiguous write; `null` if a WATCH failed.
@@ -66,6 +66,9 @@ including the Ruvio options: `set(k, v, { ifEq })`, `incrbyMax`, `fillget`/`fill
 - **Pub/Sub:** `const s = c.subscriber(); s.on('message', m => ...)` or `for await (const m of s)`; a dedicated socket,
   re-subscribes after a drop. Supports `psubscribe`, `ssubscribe`, `binary: true` payloads.
 - **Blocking commands** (`blpop`, `xread block`, `fillget ... WAIT`, `wait`) park the shared socket: use `c.duplicate()`.
+- **Durable replies:** `createClient({ durability: { replicas: 1, timeoutMs: 5000 } })` sends `CLIENT DURABILITY REPLICAS 1 TIMEOUT 5000` on every
+  (re)connect, so each reply waits until that many replicas have the data on disk (otherwise `NOREPLICAS`; the write stays applied).
+  `c.clientDurability(n, timeoutMs?)` sets it on one connection; `0` turns it off. Needs a server with replication.
 - **Errors:** server errors reject with `RuvioError` (`.code` = `ERR`, `WRONGTYPE`...); a lost connection rejects pending calls with `ConnectionError`,
   and the next call reconnects (database and name are re-applied). Nil replies are `null`.
 
@@ -77,8 +80,11 @@ including the Ruvio options: `set(k, v, { ifEq })`, `incrbyMax`, `fillget`/`fill
 | `c.acquireLease(key, ttl)` (`lease.token` is the fencing token) | `LEASE` / `RELEASE` |
 | `c.acquireSemaphore(key, max, ttl)` | `SEMAPHORE` / `RELEASE` |
 | `c.rateLimit(key, max, windowMs)` -> `{ allowed, remaining }` | `LIMIT` |
+| `c.limitSliding(key, max, windowMs)`, `c.limitTokens(key, capacity, refillMs, cost?)` -> remaining or `null` | `LIMIT ... SLIDING`, `LIMIT ... TOKENS` |
+| `c.limitSlidingWithRetry(...)`, `c.limitTokensWithRetry(...)` -> `{ allowed, remaining, retryAfterMs }` | `LIMIT ... WITHRETRY` |
 | `c.getOrCreate(key, ttlMs, factory, { staleMs })` | `FILLGET`/`FILLSET`; waiters poll plain `FILLGET` with backoff (never `WAIT`) |
-| `c.idempotent(key, fingerprint, ttlMs, fn)` | `IDEM BEGIN/COMPLETE` |
+| `c.idempotent(key, fingerprint, ttlMs, fn, opts)` | `IDEM BEGIN/COMPLETE`. If `fn` throws the record stays pending until `ttlMs`; with `opts.abortOnError` (default `false`) it sends `IDEM ABORT` first, so a retry runs `fn` again at once, and the original error is still thrown (a failed abort is ignored). Use it only when a failed `fn` did not take effect or is safe to run again |
+| `c.idemAbort(key, fingerprint, owner)` | `IDEM ABORT`: `true` when the pending record of that owner and fingerprint was removed; `false` for a missing key, a completed record (its result is never removed) or another owner. Abort only when the work did not take effect or is safe to run again; a retry after an abort runs it again |
 | `c.scanIterator()`, `hscanIterator`, `sscanIterator`, `zscanIterator` | cursor-driven async generators |
 | `GeoUnit`, `GeoOrder`, `ListSide`, `InsertPosition`, `BitOp`, `BitUnit`, `Aggregate`, `ScanType`, `BitfieldOp` | named keyword constants and `BITFIELD` builders, e.g. `c.geodist('g', 'a', 'b', GeoUnit.Km)`, `c.scan(0, { type: ScanType.Hash })`, `c.bitfield(k, ...BitfieldOp.get('u8', 0))`; plain string literals still work, and the keywords are sent pre-encoded |
 | `StreamTrim`, `TrimMode`, `InfoSection`, `ClientType`, `StreamId`, `ScoreBound`, `LexBound` | one typed trim rule for `XADD` and `XTRIM`, `INFO` and `CLIENT LIST TYPE` names, stream id markers and range bound builders, e.g. `c.xtrim('s', StreamTrim.maxLen(1000, TrimMode.Approximate))`, `c.xadd('s', StreamId.New, f, { trim: StreamTrim.minId(id) })`, `c.info(InfoSection.Memory)`, `c.zrangebyscore(k, ScoreBound.NegativeInfinity, ScoreBound.exclusive(100))`, `c.zrangebylex(k, LexBound.inclusive('a'), LexBound.Max)` |
@@ -87,6 +93,24 @@ including the Ruvio options: `set(k, v, { ifEq })`, `incrbyMax`, `fillget`/`fill
 | `c.seenBefore(key, ...items)`, `c.mightContain` | `BF.MADD` / `BF.MEXISTS` |
 
 `Symbol.asyncDispose` is polyfilled for Node 18/20. The `await using` syntax itself is not available in plain JavaScript on Node 22 (it failed in a `.mjs` file on Node 22.22): use it from TypeScript 5.2+ (the compiler lowers it), or call `lock.release()` / `c.withLock(...)` instead.
+
+### TTL on create
+
+Counters, bitmaps and other write commands can set a deadline in the same call that creates the key. Pass `ttl` in seconds
+(a whole number is sent as `EX`, a fraction as `PX`); the deadline is set only when the call creates the key, and an existing
+key keeps the deadline it already has. A `ttl` that is not positive and finite rejects with `RangeError` before anything is sent.
+
+```ts
+await c.incr('hits:today', { ttl: 86_400 });                 // INCR hits:today EX 86400
+await c.incrbyMax('seats', 1, 100, { ttl: 3600 });           // INCRBY seats 1 EX 3600 MAX 100
+await c.zadd('board', 10, 'ada', { ttl: 600 });              // ZADD board EX 600 10 ada
+await c.jsonSet('user:1', '$', '{"a":1}', 'NX', { ttl: 60 }); // JSON.SET user:1 $ {...} NX EX 60
+```
+
+Supported on `incr`, `decr`, `incrby`, `decrby`, `incrbyMax`, `incrbyfloat`, `hincrby`, `zincrby`, `setbit`, `jsonSet`,
+`jsonSetAs` (as a trailing `{ ttl }` argument) and through the `ttl` field of the options of `zadd`/`zaddIncr`, `geoadd`,
+`xadd` and `bfInsert`. `expire`, `pexpire`, `expireat` and `pexpireat` take an optional last argument, an `ExpireCondition`
+(`NX`, `XX`, `GT`, `LT`); a key without a deadline counts as infinite, and a failed condition returns `false`.
 
 ## Cluster
 
@@ -118,12 +142,15 @@ only for a possible `MOVED` retry.
 
 - **`-MOVED`**: the slot is repointed to the named node and the command is sent there; up to **3** redirects are followed per command, a fourth `MOVED` is returned as the error.
   The whole table is re-read with `CLUSTER SLOTS` only when the named node is unknown or on the second `MOVED` for the same command (one request is shared by all callers).
+- **`-ASK`**: `ASKING` and the command are written together to the named node (opened if unknown) and its reply is returned; the slot table is not changed, so the next command for that slot still goes to the owner.
+  `ASK` and `MOVED` share the limit of **3** redirects per command.
+- **`-TRYAGAIN`**: the command is sent again, routed by the current table, up to **7** times after waits of 5, 10, 20, 40, 80, 160 and 320 ms (635 ms in all); the eighth `TRYAGAIN` is returned as the error.
   Transport failures are never replayed: the affected calls reject with `ConnectionError`, only that node reconnects (lazily), other nodes are untouched.
 - **Pipelines** are grouped per node: frames are written to each node's connection in call order (one coalesced write per node), replies come back in call order.
-  A cross-slot `MGET`-style command inside a pipeline is split, an unsplittable cross-slot one leaves a `CROSSSLOT` error in its own slot, and `MOVED` is followed per command.
+  A cross-slot `MGET`-style command inside a pipeline is split, an unsplittable cross-slot one leaves a `CROSSSLOT` error in its own slot, and `MOVED`, `ASK` and `TRYAGAIN` are followed per command.
   A lost connection rejects `exec()`, as for a single connection.
-- **Transactions** (`c.multi()`): all keys must hash to one slot, otherwise `exec()` rejects with `CROSSSLOT` and sends nothing; keyless ones run on the seed. `MOVED` inside a
-  transaction is not retried (it surfaces as the `EXECABORT`/command error; the next call fixes the table). `WATCH` needs the owner's own connection: `c.isolated(key, async iso => {...})`.
+- **Transactions** (`c.multi()`): all keys must hash to one slot, otherwise `exec()` rejects with `CROSSSLOT` and sends nothing; keyless ones run on the seed. `MOVED`, `ASK` and `TRYAGAIN` inside a
+  transaction are not retried (it surfaces as the `EXECABORT`/command error; the next call fixes the table). `WATCH` needs the owner's own connection: `c.isolated(key, async iso => {...})`.
 - **Blocking commands** (`BLPOP`, `BRPOP`, `BZPOP*`, `BLMOVE`, `BLMPOP`, `XREAD`/`XREADGROUP ... BLOCK`, `FILLGET ... WAIT`, `WAIT`) run on a pooled dedicated connection to the
   owning node, so they never park the shared one. (Inside a pipeline they use the shared connection.)
 - **Pub/Sub**: `c.subscriber()` connects to the seed node (`SUBSCRIBE`, `PSUBSCRIBE`); `await c.subscriberFor(channel)` connects to the node owning the channel's slot
@@ -131,6 +158,80 @@ only for a possible `MOVED` retry.
 - **Scan family**: `c.scanIterator()` walks `SCAN` on **every node, one after the other**; a plain `c.scan(cursor)` reaches only the seed node. `hscanIterator`/`sscanIterator`/`zscanIterator` route by key.
 - Introspection: `c.isCluster`, `c.nodes`, `c.nodeFor(key)` (a node with its own `RuvioClient`), `c.slotOf(key)`, `c.refreshSlots()`, `c.redirectCount`, `c.refreshCount`.
 - `hashSlot(key)` is exported and is checked against `CLUSTER KEYSLOT` in the live tests. Cluster mode has database 0 only (`SELECT` is not routed).
+
+## Reads from replicas
+
+`ClusterClient` takes `readPolicy: 'primary' | 'prefer-replica' | 'replica'` (type `ReadPolicy`). A standalone server ignores it.
+
+```ts
+const c = createClusterClient({ host: '127.0.0.1', port: 17340, readPolicy: 'prefer-replica' });
+```
+
+- `'primary'` (default): every command goes to the shard's primary, as before. No replica connection is opened and routing does one extra comparison.
+- `'prefer-replica'`: reads go to a replica of the key's shard; when no replica can be used they go to the primary.
+- `'replica'`: reads go to a replica and fail when none can be used (`RuvioError`, message `no replica is known for slot N`).
+- Replication is asynchronous: a read from a replica may miss a recent write, including your own.
+- A read is a command the server flags readonly and not blocking, with a key (`GET`, `MGET`, `HGETALL`, `EXISTS`, ...). Writes, keyless commands, transactions, Pub/Sub, blocking commands and `SCAN`/fan-out commands (`KEYS`, `DBSIZE`) always use the primary. Split multi-key commands apply the rule per slot (`MGET` and `EXISTS` parts read, `DEL` and `MSET` parts write).
+- A pipeline goes to replicas only when every command in it is a read; otherwise it is routed as for `'primary'`.
+- `CLUSTER SLOTS` lists each shard's replicas after its primary. On every slot table load the client picks one replica per shard at random and keeps it until the next load. A replica connection sends `READONLY` right after it is opened, and again after every reconnect.
+- A replica that cannot be opened, or answers `-LOADING` (still copying its primary), is skipped until the next slot table load: its read goes to the primary under `'prefer-replica'`, and fails under `'replica'` (the `LOADING` error is returned). A socket that drops after the command was sent still rejects the command; it is not sent again.
+
+## Seed addresses
+
+`seeds` lists addresses (`host:port`, IPv6 as `[::1]:6379`) in place of `host` and `port`. Without it nothing changes.
+
+```ts
+const client = createClient({ seeds: ['10.0.0.1:6379', '10.0.0.2:6379'] });
+const cluster = createClusterClient({ seeds: ['10.0.0.1:7000', '10.0.0.2:7000', '10.0.0.3:7000'] });
+```
+
+- Connecting tries the seeds in order, one connect attempt each, and keeps the first that answers. A seed that cannot be reached is skipped; a refused `AUTH` stops at once. When none answers, the last connect error is returned.
+- After a dropped connection the next connect starts with the seed after the one that dropped and goes round the whole list. The command that hit the drop still rejects, and a `subscriber()` starts at the seed the command connection is on.
+- `ClusterClient` reads the slot table from the first reachable seed. A reload asks the open node connections first; when none answers it opens the other known nodes and then the seeds, and a command whose node cannot be opened goes to the owner the new table names. Seeds that cannot be opened do not stay in `c.nodes`.
+- `seeds` cannot be combined with `path`; an empty host or an invalid port throws a `TypeError` when the client is created.
+
+## Retry policies of your own
+
+`isTransient` and `mayHaveRun` sort what a call throws, for a retry policy of your own (cockatiel, a loop).
+The client already follows `MOVED`/`ASK`, waits out `TRYAGAIN` during a slot move and finds a new primary after
+a failover; these judge what still reaches you.
+
+- `isTransient(err)`: trying again later can succeed. True for `ConnectionError` (including a command timeout)
+  and for `LOADING`, `MASTERDOWN`, `CLUSTERDOWN`, `TRYAGAIN`, `READONLY` and `NOREPLICAS`; false for `WRONGTYPE`,
+  `OOM`, syntax errors, `ReplyError` and an aborted signal.
+- `mayHaveRun(err)`: the failed call may have changed data. False only for a server error reply (the server
+  refused the command), except `NOREPLICAS`: the write was applied and only the replica confirmation timed out.
+  A failed connection or a timeout may have run.
+
+Repeat a write only when it is safe to repeat or did not run:
+
+```ts
+import { handleWhen, retry, ExponentialBackoff } from 'cockatiel';
+import { isTransient, mayHaveRun } from 'ruvio-client';
+
+// INCR is not safe to repeat: retry it only when it surely did not run.
+const policy = retry(handleWhen((e) => isTransient(e) && !mayHaveRun(e)), { maxAttempts: 3, backoff: new ExponentialBackoff() });
+const visits = await policy.execute(() => client.incr('visits'));
+```
+
+For a read, `isTransient` alone is enough.
+
+## Following a failover
+
+A standalone client with two or more `seeds`, or with `sentinelMaster`, finds the primary again after a failover instead of staying on a node that is now a replica. `followPrimary` (default `true`) turns it off; with one address and no coordinator name nothing changes. A `ClusterClient` does not follow.
+
+```ts
+const client = createClient({ seeds: ['10.0.0.1:6379', '10.0.0.2:6379'] });
+const viaCoordinator = createClient({ seeds: ['10.0.0.9:26379'], sentinelMaster: 'main' });
+```
+
+- A probe is a short-lived socket that sends `AUTH` as configured and one command (`ROLE`, or `SENTINEL get-master-addr-by-name <name>`), waits at most the smaller of `connectTimeoutMs` and `commandTimeoutMs`, and closes. A node that does not answer is skipped; a refused `AUTH` fails the operation. A replica's reported primary is probed too, once, when it is no seed.
+- After a dropped connection each reconnect runs one round first (starting at the seed after the one that dropped) and connects to the node that answered `master`; without one it falls back to the seed order. The command that hit the drop still rejects.
+- A reply `READONLY` (that word alone, or followed by a space) makes the client search for the primary, avoiding the node that answered while it still says `master` (once it says it is a replica, a later round takes it when it is promoted), in up to 8 rounds with waits of 100 ms doubling to 2 s (one round with `reconnect: false`). The waits are timers, so other work goes on. When a primary is found the socket is replaced and the refused command is sent once more; its reply, an error included, is the caller's. When none is found the `READONLY` error is returned and the connection stays. Commands still waiting for a reply on the old socket get a second to be answered, then reject with a `ConnectionError`.
+- Not sent again, though the connection still moves: a command after a `MULTI` you sent with `call` (until `EXEC` or `DISCARD`), a command of a `pipeline()` or `multi()` batch (its `READONLY` error is in its slot), any other error (`LOADING`, `MASTERDOWN`, `NOREPLICAS`), and a command that failed with a dropped socket.
+- With `sentinelMaster` the seeds are coordinators. The first connect asks them (one round) and fails with a `ConnectionError` naming the master when none names a primary. The same `username` and `password` go to coordinators and data nodes.
+- The `connect` event carries the address of the new socket, and `disconnect` the address that was lost as its second argument.
+- While the connection is healthy nothing is sent: the added work is looking at the text of an error reply, and a following client keeps the position of each pending command's frame so a refused one can be sent again.
 
 ## Tests and benchmark
 
@@ -174,7 +275,7 @@ and the 3-shard server shares this VM's CPUs with the benchmark, so the cluster 
 
 ## Not done / not verified
 
-- **Cluster, not done:** `ASK` redirects and replica reads (`READONLY`) are not handled (Ruvio's per-shard layout has no slot migration); a plain `scan()` call is single-node (use `scanIterator()`);
+- **Cluster, not done:** `ASK` redirects and `TRYAGAIN` retries are followed (see above), but `CLUSTERDOWN` is returned as an error; a plain `scan()` call is single-node (use `scanIterator()`);
   `MOVED` inside a transaction is not retried; split `MSET`/`DEL`... are not atomic; `SELECT` is not routed (database 0 only); `CLUSTER NODES/SHARDS/INFO/MYID` go to the seed node only.
   Cluster routing is verified only against Ruvio's 3-shard `per-shard` port layout on one machine, not against a Redis Cluster.
 - **Not verified live:** TLS and unix-socket connections; `ACL LOAD`/`ACL SAVE` success (server has no acl_file; the call round-trips an error); `WAIT` with real replicas;

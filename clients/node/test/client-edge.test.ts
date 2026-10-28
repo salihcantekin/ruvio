@@ -22,6 +22,8 @@ import {
   createClient,
   type ClientOptions,
 } from '../src/index.js';
+import { blockingWait, WAIT_FOREVER } from '../src/blocking.js';
+import { DEFAULT_COMMAND_TIMEOUT_MS } from '../src/connection.js';
 import { arr, bulk, err, fakeServer, int, ok, type FakeServer, type Handler } from './fake-server.js';
 import { rejects, sleep, until } from './helpers.js';
 
@@ -88,6 +90,29 @@ test('handshake: AUTH with username, RESP3 HELLO with AUTH, SELECT and SETNAME i
   await withClient(() => ok, { password: 'pw' }, async (c, s) => {
     await c.ping();
     assert.deepEqual(s.seen[0], ['AUTH', 'pw']);
+  });
+});
+
+test('durability: the method and the connect option send CLIENT DURABILITY', async () => {
+  await withClient(() => ok, {}, async (c, s) => {
+    assert.equal(await c.clientDurability(1), 'OK');
+    assert.equal(await c.clientDurability(2, 750), 'OK');
+    assert.deepEqual(s.seen, [['CLIENT', 'DURABILITY', 'REPLICAS', '1'], ['CLIENT', 'DURABILITY', 'REPLICAS', '2', 'TIMEOUT', '750']]);
+  });
+  await withClient(() => ok, { db: 2, name: 'nm', durability: { replicas: 1, timeoutMs: 5000 } }, async (c, s) => {
+    await c.ping();
+    assert.deepEqual(s.seen.slice(0, 4), [['SELECT', '2'], ['CLIENT', 'SETNAME', 'nm'], ['CLIENT', 'DURABILITY', 'REPLICAS', '1', 'TIMEOUT', '5000'], ['PING']]);
+  });
+  await withClient(() => ok, { durability: { replicas: 3 } }, async (c, s) => {
+    await c.ping();
+    assert.deepEqual(s.seen.slice(0, 2), [['CLIENT', 'DURABILITY', 'REPLICAS', '3'], ['PING']]);
+  });
+  await withClient(() => ok, {}, async (c, s) => {
+    await c.ping();
+    assert.deepEqual(s.seen, [['PING']], 'nothing is sent by default');
+  });
+  await withClient((a) => (a[0] === 'CLIENT' ? err('ERR CLIENT DURABILITY needs replication on this server') : ok), { durability: { replicas: 1 } }, async (c) => {
+    await assert.rejects(c.ping());
   });
 });
 
@@ -257,6 +282,103 @@ test('connect timeout destroys the socket and rejects the command', async () => 
   }
 });
 
+test('commandTimeoutMs fails the connection when a peer never answers, and the next command reconnects', async () => {
+  let silent = true;
+  await withClient(
+    () => (silent ? null : '+PONG\r\n'),
+    { commandTimeoutMs: 100 },
+    async (c) => {
+      const started = Date.now();
+      const e = await rejects(c.ping());
+      assert.ok(e instanceof ConnectionError && /command timeout/.test(String(e.cause ?? e.message)), String(e));
+      assert.ok(Date.now() - started < 3000);
+      silent = false;
+      assert.ok(await c.ping());
+      c.disconnect();
+    },
+  );
+});
+
+test('commandTimeoutMs defaults to 30 s, and 0 turns it off', () => {
+  assert.equal(DEFAULT_COMMAND_TIMEOUT_MS, 30_000);
+  const on = new RuvioClient({ host: '127.0.0.1', port: 9 });
+  const off = new RuvioClient({ host: '127.0.0.1', port: 9, commandTimeoutMs: 0 });
+  assert.notEqual(internals(on).conn.watchdog, null);
+  assert.equal(internals(off).conn.watchdog, null);
+  on.disconnect();
+  off.disconnect();
+});
+
+test('commandTimeoutMs: a blocking command waits its own timeout on top', async () => {
+  await withClient(
+    (args, sock) => {
+      if (args[0] !== 'BLPOP') return null; // anything else is never answered
+      setTimeout(() => sock.write('*-1\r\n'), 1000); // an empty list: nil when BLPOP's 1 s runs out
+      return null;
+    },
+    { commandTimeoutMs: 200 },
+    async (c) => {
+      const started = Date.now();
+      assert.equal(await c.blpop('k', 1), null);
+      const took = Date.now() - started;
+      assert.ok(took >= 900 && took < 3000, `took ${took} ms`);
+      // The plain limit is back for the next command.
+      const e = await rejects(c.ping());
+      assert.ok(e instanceof ConnectionError && /command timeout/.test(String(e.cause ?? e.message)), String(e));
+      c.disconnect();
+    },
+  );
+});
+
+test('blockingWait: the wait each blocking command adds to the command timeout', () => {
+  const enc = (...a: string[]): Buffer => Buffer.from(arr(...a.map(bulk)), 'latin1');
+  const cases: [string[], number][] = [
+    [['GET', 'k'], 0],
+    [['SET', 'k', 'v'], 0],
+    [['blpop', 'a', 'b', '1'], 1000],
+    [['BLPOP', 'k', '0'], WAIT_FOREVER],
+    [['BLPOP', 'k', '0.5'], 500],
+    [['BLPOP', 'k', 'soon'], WAIT_FOREVER],
+    [['BLPOP', 'k', '-1'], WAIT_FOREVER],
+    [['BRPOP', 'k', '2'], 2000],
+    [['BZPOPMIN', 'k', '1.5'], 1500],
+    [['BZPOPMAX', 'k', '3'], 3000],
+    [['BRPOPLPUSH', 'a', 'b', '4'], 4000],
+    [['BLMOVE', 'a', 'b', 'LEFT', 'RIGHT', '0.25'], 250],
+    [['BLMPOP', '2', '2', 'a', 'b', 'LEFT'], 2000],
+    [['BZMPOP', '0', '1', 'z', 'MIN'], WAIT_FOREVER],
+    [['XREAD', 'STREAMS', 's', '$'], 0],
+    [['XREAD', 'COUNT', '1', 'BLOCK', '700', 'STREAMS', 's', '$'], 700],
+    [['XREAD', 'BLOCK', '0', 'STREAMS', 's', '$'], WAIT_FOREVER],
+    [['XREADGROUP', 'GROUP', 'g', 'c', 'STREAMS', 's', '>'], 0],
+    [['XREADGROUP', 'GROUP', 'BLOCK', 'c', 'STREAMS', 's', '>'], 0],
+    [['XREADGROUP', 'GROUP', 'g', 'c', 'BLOCK', '50', 'STREAMS', 's', '>'], 50],
+    [['WAIT', '1', '100'], 100],
+    [['WAIT', '1', '0'], WAIT_FOREVER],
+    [['WAITAOF', '1', '0', '200'], 200],
+    [['FILLGET', 'k', '1000'], 0],
+    [['FILLGET', 'k', '1000', 'WAIT', '300'], 300],
+    [['FILLGET', 'k', '1000', 'WAIT', '0'], WAIT_FOREVER],
+    [['MONITOR'], WAIT_FOREVER],
+    [['SUBSCRIBE', 'news'], WAIT_FOREVER],
+    [['PSUBSCRIBE', 'n*'], WAIT_FOREVER],
+    [['SSUBSCRIBE', 'news'], WAIT_FOREVER],
+    [['PUBLISH', 'news', 'x'], 0],
+    [['BLPOP'], WAIT_FOREVER],
+  ];
+  for (const [a, want] of cases) {
+    const b = enc(...a);
+    assert.equal(blockingWait(b, 0, b.length), want, a.join(' '));
+  }
+  // A pipeline takes its widest wait; any wait-forever wins.
+  const pipe = Buffer.concat([enc('GET', 'k'), enc('BLPOP', 'k', '2'), enc('XREAD', 'BLOCK', '100', 'STREAMS', 's', '$')]);
+  assert.equal(blockingWait(pipe, 0, pipe.length), 2000);
+  const forever = Buffer.concat([enc('BLPOP', 'k', '2'), enc('BLPOP', 'k', '0')]);
+  assert.equal(blockingWait(forever, 0, forever.length), WAIT_FOREVER);
+  const junk = Buffer.from('garbage');
+  assert.equal(blockingWait(junk, 0, junk.length), 0);
+});
+
 test('TLS options: a server that does not speak TLS fails the connection', async () => {
   const open = new Set<net.Socket>();
   const srv = net.createServer((s) => {
@@ -354,6 +476,19 @@ test('RESP3 push frames arrive as "push" events and never as command replies', a
       c.on('push', (d: unknown) => pushes.push(d));
       assert.equal(await c.get('k'), 'v');
       assert.deepEqual(pushes, [['invalidate', ['k']]]);
+    },
+  );
+});
+
+test('set: IFGT and IFLT go before the expiry', async () => {
+  await withClient(
+    () => ok,
+    {},
+    async (c, s) => {
+      assert.equal(await c.set('wm', 5, { ifGt: true, px: 9 }), 'OK');
+      assert.deepEqual(s.seen.at(-1), ['SET', 'wm', '5', 'IFGT', 'PX', '9']);
+      assert.equal(await c.set('wm', -5, { ifLt: true }), 'OK');
+      assert.deepEqual(s.seen.at(-1), ['SET', 'wm', '-5', 'IFLT']);
     },
   );
 });
@@ -460,6 +595,36 @@ test('rateLimit maps LIMIT replies', async () => {
     next = '$-1\r\n';
     assert.deepEqual(await c.rateLimit('k', 5, 1000), { allowed: false, remaining: 0 });
   });
+});
+
+test('limit modes send their keywords and read their replies', async () => {
+  let next: string = int(3);
+  const sent: string[][] = [];
+  await withClient(
+    (a) => {
+      if (a[0] !== 'LIMIT') return ok;
+      sent.push(a);
+      return next;
+    },
+    {},
+    async (c) => {
+      assert.equal(await c.limitSliding('k', 5, 1000), 3);
+      assert.deepEqual(sent.pop(), ['LIMIT', 'k', '5', '1000', 'SLIDING']);
+      assert.equal(await c.limitTokens('k', 10, 2000, 2), 3);
+      assert.deepEqual(sent.pop(), ['LIMIT', 'k', '10', '2000', 'TOKENS', 'COST', '2']);
+      assert.equal(await c.limitTokens('k', 10, 2000), 3);
+      assert.deepEqual(sent.pop(), ['LIMIT', 'k', '10', '2000', 'TOKENS', 'COST', '1']);
+      next = '$-1\r\n';
+      assert.equal(await c.limitSliding('k', 5, 1000), null);
+
+      next = '*2\r\n:2\r\n:0\r\n';
+      assert.deepEqual(await c.limitSlidingWithRetry('k', 5, 1000), { allowed: true, remaining: 2, retryAfterMs: 0 });
+      assert.deepEqual(sent.pop(), ['LIMIT', 'k', '5', '1000', 'SLIDING', 'WITHRETRY']);
+      next = '*2\r\n:-1\r\n:250\r\n';
+      assert.deepEqual(await c.limitTokensWithRetry('k', 10, 2000), { allowed: false, remaining: 0, retryAfterMs: 250 });
+      assert.deepEqual(sent.pop(), ['LIMIT', 'k', '10', '2000', 'TOKENS', 'COST', '1', 'WITHRETRY']);
+    },
+  );
 });
 
 // ---- getOrCreate / idempotent ---------------------------------------------------------------

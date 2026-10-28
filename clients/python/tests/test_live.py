@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import uuid
 
@@ -108,6 +109,12 @@ async def test_strings(c):
     assert await c.set("s", "y", ifeq="nope") is False
     assert await c.set("s", "y", ifeq="x", px=50000) is True
     assert await c.get("s") == "y" and await c.pttl("s") > 0
+    # Ruvio: SET ... IFGT / IFLT
+    assert await c.set("wm", 10, ifgt=True) is True
+    assert await c.set("wm", 10, ifgt=True) is False
+    assert await c.set("wm", 11, ifgt=True, px=50000) is True and await c.pttl("wm") > 0
+    assert await c.set("wm", 12, iflt=True) is False
+    assert await c.set("wm", -1, iflt=True) is True and await c.get("wm") == "-1"
     # binary-safe through the raw view
     assert await c.set(b"bin", b"\x00\xff\x80") is True
     assert await c.raw.get(b"bin") == b"\x00\xff\x80"
@@ -167,6 +174,17 @@ async def test_versioned_take_once_limit(c):
     assert await c.take("stock", 2) == 3
     assert await c.take("stock", 4) is None
     assert await c.get("stock") == "3"
+    # TRANSFER / HTRANSFER
+    await c.set("{w}a", "10")
+    assert await c.transfer("{w}a", "{w}b", 4) == (6, 4)
+    assert await c.transfer("{w}a", "{w}b", 7) is None
+    assert await c.transfer("{w}a", "{w}b", 3, max=6) is None
+    assert await c.transfer("{w}a", "{w}b", 2, max=6) == (4, 6)
+    with pytest.raises(ruvio.ResponseError):
+        await c.transfer("{w}a", "{w}a", 1)
+    await c.hset("th", "f", "10")
+    assert await c.htransfer("th", "f", "g", 4) == (6, 4)
+    assert await c.htransfer("th", "f", "g", 3, max=5) is None
     # ONCE
     assert await c.once("o", 10000) is True
     assert await c.once("o", 10000) is False
@@ -176,6 +194,14 @@ async def test_versioned_take_once_limit(c):
     assert await c.limit("lim", 2, 10000) is None
     assert await c.rate_limit("rl", 1, 10000) == (True, 0)
     assert await c.rate_limit("rl", 1, 10000) == (False, 0)
+    assert await c.limit_sliding("sl", 2, 60000) == 1
+    assert await c.limit_sliding("sl", 2, 60000) == 0
+    refused = await c.limit_sliding_with_retry("sl", 2, 60000)
+    assert not refused.allowed and refused.remaining == 0 and refused.retry_after_ms > 0
+    assert await c.limit_tokens("tk", 5, 60000, 2) == 3
+    taken = await c.limit_tokens_with_retry("tk", 5, 60000, 3)
+    assert taken == (True, 0, 0)
+    assert await c.limit_tokens("tk", 5, 60000) is None
 
 
 async def test_lease_semaphore_release(c):
@@ -183,12 +209,17 @@ async def test_lease_semaphore_release(c):
     assert isinstance(t1, int)
     assert await c.lease("lease", 10000) is None
     assert await c.release("lease", t1 + 100) is False
+    assert await c.renew("lease", t1 + 100, 10000) is False
+    assert await c.renew("lease", t1, 20000) is True
     assert await c.release("lease", t1) is True
+    assert await c.renew("lease", t1, 20000) is False
     t2 = await c.lease("lease", 10000)
     assert t2 > t1  # fencing tokens continue the sequence
     s1 = await c.semaphore("sem", 2, 10000)
     s2 = await c.semaphore("sem", 2, 10000)
     assert s1 is not None and s2 is not None
+    assert await c.semaphore("sem", 2, 10000) is None
+    assert await c.renew("sem", s1, 20000) is True
     assert await c.semaphore("sem", 2, 10000) is None
     assert await c.release("sem", s1) is True
     assert await c.semaphore("sem", 2, 10000) is not None
@@ -201,6 +232,15 @@ async def test_idem_and_changes(c):
     assert await c.idem_complete("idem", "fp", "owner1", "result") == 1
     assert await c.idem_begin("idem", "fp", "owner2", 10000) == IdemResult("completed", "result")
     assert (await c.idem_begin("idem", "fp2", "owner2", 10000)).state == "conflict"
+    # abort frees a pending record, never a completed one, and only for its owner
+    assert (await c.idem_begin("idem-abort", "fp", "o1", 10000)).state == "acquired"
+    assert await c.idem_abort("idem-abort", "fp", "o2") is False
+    assert await c.idem_abort("idem-abort", "other", "o1") is False
+    assert await c.idem_abort("idem-abort", "fp", "o1") is True
+    assert (await c.idem_begin("idem-abort", "fp", "o2", 10000)).state == "acquired"
+    assert await c.idem_complete("idem-abort", "fp", "o2", "kept") == 1
+    assert await c.idem_abort("idem-abort", "fp", "o2") is False
+    assert await c.idem_begin("idem-abort", "fp", "o3", 10000) == IdemResult("completed", "kept")
     cursor = await c.changes_start()
     await c.set("chg", "1")
     notes = await c.changes(cursor)
@@ -397,6 +437,8 @@ async def test_hashes(c):
     assert await c.hincrbyfloat("h", "f3", 0.5) == 5.5
     assert await c.hsetnx("h", "f1", "x") is False
     assert await c.hsetnx("h", "f6", "x") is True
+    assert await c.hmset("hm", {"a": "1", "b": "2"}) is True
+    assert await c.hmget("hm", "a", "b") == ["1", "2"]
     assert await c.hstrlen("h", "f1") == 2
     assert await c.hdel("h", "f6", "nope") == 1
     cur, page = await c.hscan("h", 0, match="f*", count=100)
@@ -405,6 +447,9 @@ async def test_hashes(c):
     assert len(await c.hrandfield("h", 2)) == 2
     pairs = await c.hrandfield("h", 2, withvalues=True)
     assert len(pairs) == 2 and all(len(p) == 2 for p in pairs)
+    # A negative count may repeat a field; every pair is returned.
+    await c.hset("h1", "only", "v")
+    assert await c.hrandfield("h1", -3, withvalues=True) == [("only", "v")] * 3
     # field TTLs
     assert await c.hexpire("h", 100, "f1", "nope") == [1, -2]
     assert await c.hexpire("h", 50, "f1", gt=True) == [0]
@@ -462,6 +507,11 @@ async def test_sorted_sets(c):
     assert await c.zpopmax("z", 1) == [("d", 6.0)]
     await c.zadd("r", {"x": 1, "y": 2, "w": 3})
     assert await c.zremrangebyrank("r", 0, 0) == 1
+    await c.zadd("due", {"a": 1, "b": 2, "c": 3, "d": 9})
+    assert await c.zpopbyscore("due", 1) == [("a", 1.0)]
+    assert await c.zmovedue("due", "ready", 3, count=5) == 2
+    assert await c.lrange("ready", 0, -1) == ["b", "c"]
+    assert await c.zpopbyscore("due", 3, count=5) == []
     assert await c.zremrangebyscore("r", 3, 3) == 1
     assert await c.bzpopmin("r", 0.1) == ("r", "y", 2.0)
     await c.zadd("r", {"x": 1, "y": 2})
@@ -623,7 +673,7 @@ async def test_streams(c):
     assert await c.xadd("nost", {"a": "1"}, nomkstream=True) is None
     assert await c.xlen("st") == 2
     rows = await c.xrange("st")
-    assert rows[0] == StreamEntry(i1, {"a": "1"})
+    assert rows[0] == StreamEntry(i1, [("a", "1")])
     assert await c.xrange("st", count=1) == [rows[0]]
     assert (await c.xrevrange("st", count=1))[0].id == i2
     assert await c.xrevrange("st", "+", "-") == rows[::-1]
@@ -688,8 +738,20 @@ async def test_streams(c):
     while later in (None, [], [("ds", [])]) and time.monotonic() < deadline:
         await asyncio.sleep(0.05)
         later = await c.xreadgroup("g", "w", {"ds": ">"})
-    assert later[0][1][0].fields == {"job": "later"}
+    assert later[0][1][0].fields == [("job", "later")]
 
+
+
+async def test_stream_fields_keep_order_and_repeats(c):
+    await c.execute_command("XADD", "sd", "1-0", "f", "1", "g", "", "f", "3")
+    want = [("f", "1"), ("g", ""), ("f", "3")]
+    assert (await c.xrange("sd"))[0].fields == want
+    assert (await c.xrevrange("sd", "+", "-"))[0].fields == want
+    assert (await c.xread({"sd": "0"}))[0][1][0].fields == want
+    assert await c.xgroup_create("sd", "g", "0") is True
+    assert (await c.xreadgroup("g", "c", {"sd": ">"}))[0][1][0].fields == want
+    assert (await c.xclaim("sd", "g", "c2", 0, ["1-0"]))[0].fields == want
+    assert (await c.xinfo_stream("sd"))["first-entry"].fields == want
 
 async def test_server(c):
     text = await c.info()
@@ -700,6 +762,20 @@ async def test_server(c):
     assert await c.wait(0, 10) == 0
     cfg = await c.config_get("databases")
     assert cfg["databases"] == "16"
+    assert await c.config_set({"slowlog-max-len": 128}) is True
+    assert (await c.config_get("slowlog-max-len"))["slowlog-max-len"] == "128"
+    with pytest.raises(ruvio.ResponseError):
+        await c.config_set({"shards": 2})
+    # Only on a throwaway server: CONFIG REWRITE rewrites the server's config file.
+    if os.environ.get("RUVIO_TEST_CONFIG_REWRITE") == "1":
+        assert await c.config_rewrite() is True
+    role = await c.role()
+    assert role[0] in ("master", b"master")
+    # The live server keeps no WAL, so it cannot replicate: both forms are refused unchanged.
+    with pytest.raises(ruvio.ResponseError, match="WAL-backed"):
+        await c.replicaof("127.0.0.1", 1)
+    with pytest.raises(ruvio.ResponseError, match="WAL-backed"):
+        await c.replicaof_no_one()
     assert await c.save() is True
     assert "saving" in (await c.bgsave()).lower() or await c.bgsave()
 
@@ -740,6 +816,8 @@ async def test_scripts(c):
     assert await c.script_flush() is True
     with pytest.raises(ruvio.NoScriptError):
         await c.evalsha(sha)
+    for _ in range(2):
+        assert await c.eval_cached("return ARGV[1]", [], ["again"]) == "again"
     assert await c.function_load("pyfn", "return KEYS[1]") == "pyfn"
     assert "pyfn" in str(await c.function_list())
     assert await c.fcall("pyfn", ["k1"]) == "k1"
@@ -845,3 +923,73 @@ async def test_execute_escape_hatch(c):
     assert await c.execute_command("SET", "e", "1", "PX", 100000) == "OK"
     assert await c.execute_command("GET", "e") == "1"
     assert await c.execute_command(b"PING") == "PONG"
+
+
+async def test_ttl_on_create(c):
+    from datetime import timedelta
+
+    async def check(key, first, again):
+        """``first`` creates the key; ``again`` is a second call asking for a much longer TTL."""
+        await first()
+        pttl = await c.pttl(key)
+        assert 0 < pttl <= 100_000, (key, pttl)
+        await again()
+        pttl = await c.pttl(key)
+        assert 0 < pttl <= 100_000, (key, pttl)  # an existing key keeps its deadline
+
+    await check("t:incr", lambda: c.incr("t:incr", ttl=100), lambda: c.incr("t:incr", ttl=5000))
+    await check("t:decr", lambda: c.decr("t:decr", ttl=100), lambda: c.decr("t:decr", ttl=5000))
+    await check("t:incrby", lambda: c.incrby("t:incrby", 2, max=10, ttl=100), lambda: c.incrby("t:incrby", 2, ttl=5000))
+    await check("t:decrby", lambda: c.decrby("t:decrby", 2, ttl=100), lambda: c.decrby("t:decrby", 2, ttl=5000))
+    await check("t:float", lambda: c.incrbyfloat("t:float", 1.5, ttl=100), lambda: c.incrbyfloat("t:float", 1.5, ttl=5000))
+    await check("t:hash", lambda: c.hincrby("t:hash", "f", 1, ttl=100), lambda: c.hincrby("t:hash", "f", 1, ttl=5000))
+    await check("t:zset", lambda: c.zincrby("t:zset", 1, "m", ttl=100), lambda: c.zincrby("t:zset", 1, "m", ttl=5000))
+    await check("t:bit", lambda: c.setbit("t:bit", 3, 1, ttl=100), lambda: c.setbit("t:bit", 4, 1, ttl=5000))
+    await check("t:zadd", lambda: c.zadd("t:zadd", {"a": 1}, ttl=100), lambda: c.zadd("t:zadd", {"b": 1}, ttl=5000))
+    await check(
+        "t:geo",
+        lambda: c.geoadd("t:geo", [(13.36, 38.11, "p")], ttl=100),
+        lambda: c.geoadd("t:geo", [(15.08, 37.5, "q")], ttl=5000),
+    )
+    await check("t:xadd", lambda: c.xadd("t:xadd", {"f": "v"}, ttl=100), lambda: c.xadd("t:xadd", {"f": "w"}, ttl=5000))
+    await check("t:json", lambda: c.json_set("t:json", "$", '{"a":1}', ttl=100), lambda: c.json_set("t:json", "$", '{"a":2}', ttl=5000))
+    await check("t:bf", lambda: c.bf_insert("t:bf", ["x"], ttl=100), lambda: c.bf_insert("t:bf", ["y"], ttl=5000))
+    # Sub-second part and timedelta send PX.
+    await c.incr("t:px", ttl=timedelta(milliseconds=90_500))
+    assert 0 < await c.pttl("t:px") <= 90_500
+    await c.incr("t:px2", ttl=90.5)
+    assert 0 < await c.pttl("t:px2") <= 90_500
+    # Without ttl a created key has no deadline.
+    await c.incr("t:none")
+    assert await c.pttl("t:none") == -1
+    # A zero or negative ttl never reaches the server.
+    with pytest.raises(ValueError):
+        await c.incr("t:bad", ttl=0)
+    assert await c.exists("t:bad") == 0
+
+
+async def test_expire_conditions(c):
+    from ruvio import ExpireCondition
+
+    await c.set("x:k", "v")
+    # No deadline counts as infinite: NX sets, XX and GT refuse, LT sets.
+    assert await c.expire("x:k", 100, condition=ExpireCondition.XX) is False
+    assert await c.expire("x:k", 100, condition=ExpireCondition.GT) is False
+    assert await c.pttl("x:k") == -1
+    assert await c.expire("x:k", 100, condition=ExpireCondition.NX) is True
+    assert 0 < await c.pttl("x:k") <= 100_000
+    # Now it has a deadline: NX refuses, XX sets, GT needs a later one, LT an earlier one.
+    assert await c.expire("x:k", 200, condition="NX") is False
+    assert await c.expire("x:k", 50, condition=ExpireCondition.GT) is False
+    assert await c.expire("x:k", 200, condition=ExpireCondition.GT) is True
+    assert 100_000 < await c.pttl("x:k") <= 200_000
+    assert await c.expire("x:k", 300, condition=ExpireCondition.LT) is False
+    assert await c.expire("x:k", 100, condition=ExpireCondition.LT) is True
+    assert await c.expire("x:k", 150, condition=ExpireCondition.XX) is True
+    # The other three commands accept a condition too.
+    assert await c.pexpire("x:k", 400_000, condition=ExpireCondition.GT) is True
+    assert 150_000 < await c.pttl("x:k") <= 400_000
+    far = int(time.time()) + 100_000
+    assert await c.expireat("x:k", far, condition=ExpireCondition.GT) is True
+    assert await c.pexpireat("x:k", far * 1000 + 1000, condition=ExpireCondition.LT) is False
+    assert await c.expire("missing", 10, condition=ExpireCondition.NX) is False

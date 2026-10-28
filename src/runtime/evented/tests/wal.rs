@@ -17,6 +17,7 @@ fn evented_wal_group_policy_checks_execution_path_and_session() {
         key: b"k".as_slice().into(),
         max: 10,
         window_ms: 1000,
+        mode: crate::protocol::LimitMode::Fixed,
     };
     for command in &hot {
         assert!(wal_group_eligible(WalGroupCommand::Hot(command), &session));
@@ -27,7 +28,7 @@ fn evented_wal_group_policy_checks_execution_path_and_session() {
     ));
     for command in [
         Command::Get(b"k".as_slice().into()),
-        Command::ListPush(b"k".as_slice().into(), vec![b"v".as_slice().into()]),
+        Command::ListPush(b"k".as_slice().into(), vec![b"v".as_slice().into()].into()),
         Command::MSet(vec![(b"k".as_slice().into(), b"v".as_slice().into())]),
         Command::SetAdd(b"k".as_slice().into(), vec![b"v".as_slice().into()]),
     ] {
@@ -409,6 +410,19 @@ fn a_grouped_script_or_transaction_whose_write_fails_rolls_back() {
                 &[b"MGET", b"{t}k", b"{t}n"],
             ]),
             b"$3\r\nold\r\n+OK\r\n+QUEUED\r\n+QUEUED\r\n-MISCONF persistence error\r\n\
+              *2\r\n$3\r\nold\r\n$-1\r\n"
+                .as_slice(),
+        ),
+        // A script queued in MULTI is undone with the rest of the batch.
+        (
+            resp(&[
+                &[b"GET", b"{t}k"],
+                &[b"MULTI"],
+                &[b"EVAL", set.as_slice(), b"2", b"{t}k", b"{t}n", b"new"],
+                &[b"EXEC"],
+                &[b"MGET", b"{t}k", b"{t}n"],
+            ]),
+            b"$3\r\nold\r\n+OK\r\n+QUEUED\r\n-MISCONF persistence error\r\n\
               *2\r\n$3\r\nold\r\n$-1\r\n"
                 .as_slice(),
         ),

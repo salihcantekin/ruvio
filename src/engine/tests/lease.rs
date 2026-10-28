@@ -11,16 +11,18 @@ fn lease_setv_changes_and_delay_stay_off_the_unused_path() {
         Response::Simple(b"OK")
     );
     assert!(shard.changes_after(0).is_empty());
-    assert_eq!(
-        execute(
-            &mut shard,
-            Command::Lease {
-                key: owned(b"lock"),
-                ttl_ms: 500,
-            },
-        ),
-        Response::Integer(1)
-    );
+    let first = match execute(
+        &mut shard,
+        Command::Lease {
+            key: owned(b"lock"),
+            ttl_ms: 500,
+        },
+    ) {
+        Response::Integer(token) => token,
+        other => panic!("expected a token, got {other:?}"),
+    };
+
+    assert_eq!(first, 1_000 << 6);
     assert_eq!(
         execute(
             &mut shard,
@@ -36,21 +38,22 @@ fn lease_setv_changes_and_delay_stay_off_the_unused_path() {
             &mut shard,
             Command::Release {
                 key: owned(b"lock"),
-                token: 1,
+                token: first as u64,
             },
         ),
         Response::Integer(1)
     );
-    assert_eq!(
-        execute(
-            &mut shard,
-            Command::Lease {
-                key: owned(b"lock"),
-                ttl_ms: 500,
-            },
-        ),
-        Response::Integer(2)
-    );
+
+    match execute(
+        &mut shard,
+        Command::Lease {
+            key: owned(b"lock"),
+            ttl_ms: 500,
+        },
+    ) {
+        Response::Integer(token) => assert!(token > first, "a new lease never reuses a token"),
+        other => panic!("expected a token, got {other:?}"),
+    }
     assert_eq!(
         execute(
             &mut shard,
@@ -155,6 +158,10 @@ fn lease_setv_changes_and_delay_hold_their_own_contracts() {
     let clock = crate::time::TestClock::new(1_000);
     let mut shard = KvShard::with_clock(clock.clone());
     let mut sink = DatabaseLog::default();
+    let token = |response: Response<'_>| match response {
+        Response::Integer(token) => token as u64,
+        other => panic!("expected a token, got {other:?}"),
+    };
 
     assert_eq!(
         execute_with_sink(
@@ -177,18 +184,19 @@ fn lease_setv_changes_and_delay_hold_their_own_contracts() {
         .unwrap(),
         wrong_type()
     );
-    assert_eq!(
+    let first = token(
         execute_with_sink(
             &mut shard,
             Command::Lease {
                 key: owned(b"lock"),
                 ttl_ms: 500,
             },
-            &mut sink
+            &mut sink,
         )
         .unwrap(),
-        Response::Integer(1)
     );
+
+    assert_eq!(first, 1_000 << 6);
     assert_eq!(
         execute_with_sink(&mut shard, Command::Type(owned(b"lock")), &mut sink).unwrap(),
         Response::Simple(b"lease")
@@ -230,7 +238,7 @@ fn lease_setv_changes_and_delay_hold_their_own_contracts() {
             &mut shard,
             Command::Release {
                 key: owned(b"lock"),
-                token: 1,
+                token: first,
             },
             &mut sink
         )
@@ -238,34 +246,37 @@ fn lease_setv_changes_and_delay_hold_their_own_contracts() {
         Response::Integer(1)
     );
     clock.set(2_000);
+    // A released lease takes its key with it.
     assert_eq!(
         execute_with_sink(&mut shard, Command::PTtl(owned(b"lock")), &mut sink).unwrap(),
-        Response::Integer(-1)
+        Response::Integer(-2)
     );
-    assert_eq!(
+    let other = token(
         execute_with_sink(
             &mut shard,
             Command::Lease {
                 key: owned(b"other"),
                 ttl_ms: 500,
             },
-            &mut sink
+            &mut sink,
         )
         .unwrap(),
-        Response::Integer(1)
     );
-    assert_eq!(
+
+    let second = token(
         execute_with_sink(
             &mut shard,
             Command::Lease {
                 key: owned(b"lock"),
                 ttl_ms: 500,
             },
-            &mut sink
+            &mut sink,
         )
         .unwrap(),
-        Response::Integer(2)
     );
+
+    assert!(second > first, "an expired lease never reuses a token");
+    assert!(second > other);
     assert_eq!(
         execute_with_sink(
             &mut shard,
@@ -275,18 +286,19 @@ fn lease_setv_changes_and_delay_hold_their_own_contracts() {
         .unwrap(),
         Response::Integer(1)
     );
-    assert_eq!(
+    let third = token(
         execute_with_sink(
             &mut shard,
             Command::Lease {
                 key: owned(b"lock"),
                 ttl_ms: 500,
             },
-            &mut sink
+            &mut sink,
         )
         .unwrap(),
-        Response::Integer(1)
     );
+
+    assert!(third > second, "a deleted lease never restarts the token");
 
     assert_eq!(
         execute_with_sink(
@@ -354,7 +366,7 @@ fn lease_setv_changes_and_delay_hold_their_own_contracts() {
     );
     execute_with_sink(
         &mut shard,
-        Command::ListPush(owned(b"list"), vec![owned(b"a")]),
+        Command::ListPush(owned(b"list"), vec![owned(b"a")].into()),
         &mut sink,
     )
     .unwrap();
@@ -518,12 +530,21 @@ fn lease_setv_changes_and_delay_hold_their_own_contracts() {
         Response::Simple(b"none")
     );
 
-    let restored = replayed(&sink);
+    // On the wall clock the lease has long run out: replay keeps it while expiry is paused,
+    // like any key with a past deadline, and drops it once expiry resumes.
+    let mut restored = KvShard::new();
+    let previous = restored.pause_expiration_for_replay();
+
+    for (database, mutation) in &sink.records {
+        crate::persistence::apply_mutation(&mut restored, *database, mutation).unwrap();
+    }
 
     assert_eq!(
         restored.value_kind(b"other"),
         Some(crate::store::ValueKind::Lease)
     );
+    restored.resume_expiration_after_replay(previous);
+    assert_eq!(restored.value_kind(b"other"), None);
     assert_eq!(
         restored.value_kind(b"doc"),
         Some(crate::store::ValueKind::Versioned)
@@ -551,7 +572,7 @@ fn semaphore_admits_max_holders_and_frees_a_slot_on_release_or_expiry() {
     let first = token(execute_with_sink(&mut shard, sem(5_000), &mut sink).unwrap());
     let second = token(execute_with_sink(&mut shard, sem(1_000), &mut sink).unwrap());
 
-    assert_eq!(first, crate::store::first_semaphore_token(1_000));
+    assert_eq!(first, 1_000 << 6);
     assert_eq!(second, first + 1);
 
     let records = sink.records.len();
@@ -590,7 +611,7 @@ fn semaphore_admits_max_holders_and_frees_a_slot_on_release_or_expiry() {
 
     let third = token(execute_with_sink(&mut shard, sem(5_000), &mut sink).unwrap());
 
-    assert_eq!(third, second + 1, "the expired holder freed its slot");
+    assert!(third > second, "the expired holder freed its slot");
     assert_eq!(
         execute_with_sink(
             &mut shard,
@@ -748,6 +769,7 @@ fn limit_and_once_cost_only_the_keys_that_use_them() {
                 key: owned(b"durable"),
                 max: 3,
                 window_ms: 4_000_000_000_000,
+                mode: crate::protocol::LimitMode::Fixed,
             },
             &mut sink,
         )
@@ -773,6 +795,7 @@ fn limit_and_once_cost_only_the_keys_that_use_them() {
                 key: owned(b"plain"),
                 max: 5,
                 window_ms: 60_000,
+                mode: crate::protocol::LimitMode::Fixed,
             },
             &mut sink,
         )
@@ -788,6 +811,7 @@ fn limit_and_once_cost_only_the_keys_that_use_them() {
                     key: owned(b"login"),
                     max: 5,
                     window_ms: 60_000,
+                    mode: crate::protocol::LimitMode::Fixed,
                 },
                 &mut sink,
             )
@@ -803,6 +827,7 @@ fn limit_and_once_cost_only_the_keys_that_use_them() {
                 key: owned(b"login"),
                 max: 5,
                 window_ms: 60_000,
+                mode: crate::protocol::LimitMode::Fixed,
             },
             &mut sink,
         )
@@ -852,6 +877,7 @@ fn limit_and_once_cost_only_the_keys_that_use_them() {
                 key: owned(b"other"),
                 max: 1,
                 window_ms: 1_000,
+                mode: crate::protocol::LimitMode::Fixed,
             },
             &mut sink,
         )
@@ -866,6 +892,7 @@ fn limit_and_once_cost_only_the_keys_that_use_them() {
                 key: owned(b"login"),
                 max: 5,
                 window_ms: 60_000,
+                mode: crate::protocol::LimitMode::Fixed,
             },
             &mut sink,
         )
@@ -940,6 +967,7 @@ fn limit_and_once_cost_only_the_keys_that_use_them() {
                 key: owned(b"fresh"),
                 max: 2,
                 window_ms: 1_000,
+                mode: crate::protocol::LimitMode::Fixed,
             },
             &mut failed,
         )
@@ -972,16 +1000,15 @@ fn release_during_a_snapshot_keeps_held_leases_and_semaphores_in_the_snapshot() 
     let clock = crate::time::TestClock::new(1_000);
     let mut shard = KvShard::with_clock(clock.clone());
 
-    assert_eq!(
-        execute(
-            &mut shard,
-            Command::Lease {
-                key: owned(b"lock"),
-                ttl_ms: 60_000,
-            },
-        ),
-        Response::Integer(1)
-    );
+    let Response::Integer(lease) = execute(
+        &mut shard,
+        Command::Lease {
+            key: owned(b"lock"),
+            ttl_ms: 60_000,
+        },
+    ) else {
+        panic!("the lease was granted");
+    };
     let Response::Integer(holder) = execute(
         &mut shard,
         Command::Semaphore {
@@ -1011,11 +1038,309 @@ fn release_during_a_snapshot_keeps_held_leases_and_semaphores_in_the_snapshot() 
             &mut shard,
             Command::Release {
                 key: owned(b"lock"),
-                token: 1,
+                token: lease as u64,
             },
         ),
         Response::Integer(1)
     );
     assert_ne!(shard.snapshot_entries(), before);
     assert_eq!(shard.finish_snapshot(), before);
+}
+
+#[test]
+fn renew_moves_a_live_holders_deadline_and_never_creates_one() {
+    // RENEW
+    let clock = crate::time::TestClock::new(1_000);
+    let mut shard = KvShard::with_clock(clock.clone());
+    let mut sink = DatabaseLog::default();
+    let renew = |key: &[u8], token: u64, ttl_ms: u64| Command::Renew {
+        key: owned(key),
+        token,
+        ttl_ms,
+    };
+
+    assert_eq!(
+        execute_with_sink(&mut shard, renew(b"lock", 1, 5_000), &mut sink).unwrap(),
+        Response::Integer(0),
+        "a missing key has no holder"
+    );
+    assert!(sink.records.is_empty());
+    assert_eq!(shard.value_kind(b"lock"), None);
+
+    let Response::Integer(first) = execute_with_sink(
+        &mut shard,
+        Command::Lease {
+            key: owned(b"lock"),
+            ttl_ms: 1_000,
+        },
+        &mut sink,
+    )
+    .unwrap() else {
+        panic!("the lease was granted");
+    };
+    let first = first as u64;
+
+    assert_eq!(first, 1_000 << 6);
+
+    let records = sink.records.len();
+
+    assert_eq!(
+        execute_with_sink(&mut shard, renew(b"lock", first + 1, 5_000), &mut sink).unwrap(),
+        Response::Integer(0),
+        "another token is not the holder"
+    );
+    assert_eq!(
+        sink.records.len(),
+        records,
+        "a refused renew writes nothing"
+    );
+
+    clock.set(1_500);
+
+    assert_eq!(
+        execute_with_sink(&mut shard, renew(b"lock", first, 5_000), &mut sink).unwrap(),
+        Response::Integer(1)
+    );
+    assert_eq!(sink.records.len(), records + 1);
+
+    clock.set(3_000);
+
+    macro_rules! lease {
+        () => {
+            execute(
+                &mut shard,
+                Command::Lease {
+                    key: owned(b"lock"),
+                    ttl_ms: 1_000,
+                },
+            )
+        };
+    }
+
+    assert_eq!(
+        lease!(),
+        Response::Bulk(None),
+        "still held after the first TTL"
+    );
+
+    clock.set(6_500);
+
+    assert_eq!(
+        execute_with_sink(&mut shard, renew(b"lock", first, 5_000), &mut sink).unwrap(),
+        Response::Integer(0),
+        "an expired holder cannot renew"
+    );
+    match lease!() {
+        Response::Integer(token) => assert!(token as u64 > first, "the token sequence moved on"),
+        other => panic!("expected a token, got {other:?}"),
+    }
+}
+
+#[test]
+fn renew_extends_one_semaphore_holder_without_taking_a_new_slot() {
+    let clock = crate::time::TestClock::new(1_000);
+    let mut shard = KvShard::with_clock(clock.clone());
+    let sem = |ttl_ms| Command::Semaphore {
+        key: owned(b"jobs"),
+        max: 2,
+        ttl_ms,
+    };
+    let Response::Integer(first) = execute(&mut shard, sem(1_000)) else {
+        panic!("first holder");
+    };
+    let Response::Integer(second) = execute(&mut shard, sem(10_000)) else {
+        panic!("second holder");
+    };
+
+    assert_eq!(
+        execute(
+            &mut shard,
+            Command::Renew {
+                key: owned(b"jobs"),
+                token: first as u64,
+                ttl_ms: 10_000,
+            },
+        ),
+        Response::Integer(1)
+    );
+    assert_eq!(
+        execute(&mut shard, sem(1_000)),
+        Response::Bulk(None),
+        "renewing did not free or add a slot"
+    );
+
+    clock.set(5_000);
+
+    assert!(
+        matches!(execute(&mut shard, sem(1_000)), Response::Bulk(None)),
+        "the renewed holder outlived its first TTL"
+    );
+    assert_eq!(
+        execute(
+            &mut shard,
+            Command::Release {
+                key: owned(b"jobs"),
+                token: first as u64,
+            },
+        ),
+        Response::Integer(1)
+    );
+    assert_eq!(
+        execute(
+            &mut shard,
+            Command::Release {
+                key: owned(b"jobs"),
+                token: second as u64,
+            },
+        ),
+        Response::Integer(1)
+    );
+    assert_eq!(shard.value_kind(b"jobs"), None);
+}
+
+#[test]
+fn renew_on_another_type_is_a_wrong_type_error() {
+    let mut shard = KvShard::with_clock(crate::time::TestClock::new(1_000));
+
+    execute(&mut shard, Command::set(owned(b"plain"), owned(b"v")));
+
+    assert_eq!(
+        execute(
+            &mut shard,
+            Command::Renew {
+                key: owned(b"plain"),
+                token: 1,
+                ttl_ms: 1_000,
+            },
+        ),
+        wrong_type()
+    );
+}
+
+#[test]
+fn renew_during_a_snapshot_keeps_held_leases_and_semaphores_in_the_snapshot() {
+    let mut shard = KvShard::with_clock(crate::time::TestClock::new(1_000));
+
+    let Response::Integer(lease) = execute(
+        &mut shard,
+        Command::Lease {
+            key: owned(b"lock"),
+            ttl_ms: 60_000,
+        },
+    ) else {
+        panic!("the lease was granted");
+    };
+    let Response::Integer(holder) = execute(
+        &mut shard,
+        Command::Semaphore {
+            key: owned(b"sem"),
+            max: 2,
+            ttl_ms: 60_000,
+        },
+    ) else {
+        panic!("the semaphore was acquired");
+    };
+    let before = shard.snapshot_entries();
+    shard.begin_snapshot(1 << 20).unwrap();
+
+    for (key, token) in [(&b"sem"[..], holder as u64), (&b"lock"[..], lease as u64)] {
+        assert_eq!(
+            execute(
+                &mut shard,
+                Command::Renew {
+                    key: owned(key),
+                    token,
+                    ttl_ms: 120_000,
+                },
+            ),
+            Response::Integer(1)
+        );
+    }
+
+    assert_ne!(shard.snapshot_entries(), before);
+    assert_eq!(shard.finish_snapshot(), before);
+}
+
+#[test]
+fn a_released_or_expired_lease_takes_its_key_with_it() {
+    let clock = crate::time::TestClock::new(1_000);
+    let mut shard = KvShard::with_clock(clock.clone());
+    let mut sink = DatabaseLog::default();
+    let lease = |key: &'static [u8], ttl_ms| Command::Lease {
+        key: owned(key),
+        ttl_ms,
+    };
+    let token = |response: Response<'_>| match response {
+        Response::Integer(token) => token as u64,
+        other => panic!("expected a token, got {other:?}"),
+    };
+
+    let first = token(execute_with_sink(&mut shard, lease(b"lock", 5_000), &mut sink).unwrap());
+
+    assert_eq!(
+        execute_with_sink(&mut shard, Command::PTtl(owned(b"lock")), &mut sink).unwrap(),
+        Response::Integer(5_000)
+    );
+    assert_eq!(
+        execute_with_sink(
+            &mut shard,
+            Command::Release {
+                key: owned(b"lock"),
+                token: first,
+            },
+            &mut sink,
+        )
+        .unwrap(),
+        Response::Integer(1)
+    );
+    assert!(!shard.contains_key(b"lock"));
+    assert_eq!(
+        sink.records.last().map(|(_, mutation)| mutation),
+        Some(&OwnedMutation::Delete {
+            keys: vec![b"lock".to_vec()]
+        }),
+        "a release is recorded as a plain delete"
+    );
+
+    // The next holder still gets a larger token without the old key as a floor.
+    let second = token(execute_with_sink(&mut shard, lease(b"lock", 100), &mut sink).unwrap());
+
+    assert!(second > first);
+
+    clock.set(1_100);
+    assert!(!shard.contains_key(b"lock"));
+    assert_eq!(
+        execute_with_sink(&mut shard, Command::PTtl(owned(b"lock")), &mut sink).unwrap(),
+        Response::Integer(-2)
+    );
+    assert_eq!(
+        execute_with_sink(
+            &mut shard,
+            Command::SetNx(owned(b"lock"), owned(b"v")),
+            &mut sink,
+        )
+        .unwrap(),
+        Response::Integer(1),
+        "an expired lease leaves the name free for any type"
+    );
+}
+
+#[test]
+fn a_lease_in_an_older_log_expires_with_its_deadline() {
+    // Logs written before a release became a delete hold it as a lease ending at release time.
+    let clock = crate::time::TestClock::new(2_000);
+    let mut shard = KvShard::with_clock(clock);
+
+    shard.lease_put(b"held", 7, 5_000, "LEASE").unwrap();
+    shard.lease_put(b"released", 8, 1_500, "LEASE").unwrap();
+    assert!(shard.contains_key(b"held"));
+    assert!(!shard.contains_key(b"released"));
+    assert_eq!(shard.pttl(b"held"), 3_000);
+
+    shard.lease_put(b"held", 7, 2_000, "RELEASE").unwrap();
+    assert!(!shard.contains_key(b"held"));
+
+    let (token, _) = shard.lease_plan(b"held", 10).unwrap().unwrap();
+
+    assert!(token > 8, "replayed tokens still raise the floor");
 }

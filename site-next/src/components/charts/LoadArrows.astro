@@ -59,14 +59,15 @@ const ms = (v: number) => `${v < 1 ? v.toFixed(2) : v.toFixed(1)} ms`;
   .hdr em { font-style: normal; color: var(--mute); }
   h3 { margin: 18px 0 4px; font-size: 13px; font-weight: 600; color: var(--mute); }
   .row { padding: 8px 0; outline: none; border-radius: 4px; }
+  .row:hover, .row.is-on { background: var(--row-hover); }
   .row.is-on .lab { color: var(--ink); }
   .lab { font-size: 14px; color: var(--mute); }
   .trk { position: relative; height: 24px; margin-inline: 70px; }
   .arr { position: absolute; top: 50%; height: 2px; margin-top: -1px; background: var(--faint); }
   .good .arr { background: color-mix(in srgb, var(--c1) 70%, transparent); }
   .pt { position: absolute; top: 50%; width: 10px; height: 10px; margin: -5px 0 0 -5px; border-radius: 50%; }
-  .pt.redis { background: var(--surface); border: 2px solid var(--c2); }
-  .pt.ruvio { background: var(--c1); box-shadow: 0 0 0 2px var(--surface); }
+  .pt.redis { background: var(--surface); border: 2px solid var(--c2); z-index: 2; }
+  .pt.ruvio { background: var(--c1); z-index: 1; }
   .trk b.l { transform: translate(calc(-100% - 12px), -50%); }
   .trk b { position: absolute; top: 50%; transform: translate(12px, -50%); font-family: var(--f-mono); font-size: 12.5px; font-weight: 500; color: var(--ink); white-space: nowrap; }
   @media (max-width: 760px) {

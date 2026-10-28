@@ -66,6 +66,28 @@ public abstract class RuvioCommands<K, V> extends ScriptingCommands<K, V> {
     }
 
     /**
+     * Sends {@code RUVIO MOVESLOTS first-last shard}: moves the hash slots {@code first..last} to {@code shard} (counted from 0) of the same server, which keeps serving them meanwhile. Completes once the move has started; {@link #moveSlotsStatus()} follows it. One move runs at a time, and every slot of the range must be on one shard.
+     *
+     * @param first first hash slot of the range (0-16383)
+     * @param last last hash slot of the range, inclusive
+     * @param shard shard of the same server to move it to
+     * @return a future that completes with no value once the move has started
+     * @throws RuvioServerException when the range is already on that shard, spans shards, another move runs, the server has one shard, or replication is on
+     */
+    public CompletableFuture<Void> moveSlots(int first, int last, int shard) {
+        return send(args().w(Cmd.RUVIO).s("MOVESLOTS").s(first + "-" + last).s(Integer.toString(shard)), Reply.OK);
+    }
+
+    /**
+     * Sends {@code RUVIO MOVESLOTS STATUS}: the running or last slot move. {@code state} is {@code none}, {@code copying}, {@code cleaning}, {@code cancelling}, {@code done} or {@code cancelled}; the other names are {@code first}, {@code last}, {@code from}, {@code to}, {@code keys}, {@code rounds}, {@code elapsed_ms}, {@code freeze_ms} and {@code error}.
+     *
+     * @return name to value, as text
+     */
+    public CompletableFuture<Map<String, String>> moveSlotsStatus() {
+        return send(args().w(Cmd.RUVIO).s("MOVESLOTS").s("STATUS"), Reply.STRING_MAP);
+    }
+
+    /**
      * Sends {@code PING}: checks that the server answers.
      *
      * <pre>{@code
@@ -223,6 +245,29 @@ public abstract class RuvioCommands<K, V> extends ScriptingCommands<K, V> {
      */
     public CompletableFuture<Void> clientTracking(boolean on) {
         return send(args().w(Cmd.CLIENT).s("TRACKING").s(on ? "ON" : "OFF"), Reply.OK);
+    }
+
+    /**
+     * Sends {@code CLIENT DURABILITY REPLICAS n}. While set, the server holds this connection's replies until {@code replicas} replicas have every earlier write on disk. After the default 5000 ms the replies of the batch become {@code NOREPLICAS} errors and the writes stay applied. The options' {@code durability} sets it on every (re)connect.
+     *
+     * @param replicas the replicas that must hold each write; 0 turns it off
+     * @throws RuvioServerException {@code ERR} on a server without replication or inside {@code MULTI}
+     * @return a future that completes with no value once the server has acknowledged the command
+     */
+    public CompletableFuture<Void> clientDurability(long replicas) {
+        return send(args().w(Cmd.CLIENT).s("DURABILITY").s("REPLICAS").l(replicas), Reply.OK);
+    }
+
+    /**
+     * Sends {@code CLIENT DURABILITY REPLICAS n TIMEOUT ms}. Same as {@link #clientDurability(long)} with a longest wait.
+     *
+     * @param replicas the replicas that must hold each write; 0 turns it off
+     * @param timeoutMillis the longest wait in milliseconds
+     * @throws RuvioServerException {@code ERR} on a server without replication or inside {@code MULTI}
+     * @return a future that completes with no value once the server has acknowledged the command
+     */
+    public CompletableFuture<Void> clientDurability(long replicas, long timeoutMillis) {
+        return send(args().w(Cmd.CLIENT).s("DURABILITY").s("REPLICAS").l(replicas).s("TIMEOUT").l(timeoutMillis), Reply.OK);
     }
 
     /**
@@ -465,13 +510,76 @@ public abstract class RuvioCommands<K, V> extends ScriptingCommands<K, V> {
     }
 
     /**
-     * Sends {@code CONFIG GET pattern}: reads settings. {@code CONFIG SET} is not supported; change settings in the config file, environment or flags. The password ({@code requirepass}) is redacted.
+     * Sends {@code CONFIG GET pattern}: reads settings. The password ({@code requirepass}) is redacted.
      *
      * @param pattern a glob such as {@code max*} or {@code *}
      * @return setting name to value
      */
     public CompletableFuture<Map<String, String>> configGet(String pattern) {
         return send(args().w(Cmd.CONFIG).s("GET").s(pattern), Reply.STRING_MAP);
+    }
+
+    /**
+     * Sends {@code CONFIG SET name value ...}: changes live settings, named as {@code CONFIG GET} shows them. Every shard of the server applies the change before it answers. All pairs apply or none: an unknown or restart-only name, or an invalid value, fails the call and changes nothing. Not written to the config file (see {@link #configRewrite()}) and not replicated.
+     *
+     * <pre>{@code
+     * client.configSet(Map.of("maxmemory", "1073741824", "maxmemory-policy", "allkeys-lru"));
+     * }</pre>
+     *
+     * @param settings setting names and values; iteration order is the send order
+     * @throws RuvioServerException {@code ERR} for an unknown, restart-only or invalid setting
+     * @return a future that completes with no value once every shard has applied the change
+     */
+    public CompletableFuture<Void> configSet(Map<String, String> settings) {
+        Args a = args().w(Cmd.CONFIG).s("SET");
+        for (Map.Entry<String, String> e : settings.entrySet()) {
+            a.s(e.getKey()).s(e.getValue());
+        }
+        return send(a, Reply.OK);
+    }
+
+    /**
+     * Sends {@code CONFIG REWRITE}: writes the live settings into the config file the server started from.
+     *
+     * @throws RuvioServerException {@code ERR} when the server runs without a config file
+     * @return a future that completes with no value once the file is written
+     */
+    public CompletableFuture<Void> configRewrite() {
+        return send(args().w(Cmd.CONFIG).s("REWRITE"), Reply.OK);
+    }
+
+    /**
+     * Sends {@code REPLICAOF host port}: every shard of the server follows the primary at {@code host:port} (shard {@code i} dials {@code port + i}). Writes are refused at once. A shard continues from its own log when the new primary's history allows it, otherwise it takes a full copy. Lasts until the server restarts.
+     *
+     * @param host the primary's host
+     * @param port the primary's base replication port
+     * @return a future that completes with no value once every shard follows the primary
+     */
+    public CompletableFuture<Void> replicaOf(String host, int port) {
+        return send(args().w(Cmd.REPLICAOF).s(host).s(Integer.toString(port)), Reply.OK);
+    }
+
+    /**
+     * Sends {@code REPLICAOF NO ONE}: promotes a replica in place, one epoch above its old primary.
+     *
+     * @param force adds {@code FORCE}: promote even when a shard has not finished copying its primary, which may lose writes
+     * @return a future that completes with no value once every shard takes writes
+     */
+    public CompletableFuture<Void> replicaOfNoOne(boolean force) {
+        Args a = args().w(Cmd.REPLICAOF).s("NO").s("ONE");
+        if (force) {
+            a.s("FORCE");
+        }
+        return send(a, Reply.OK);
+    }
+
+    /**
+     * Sends {@code ROLE} for the shard this connection is on.
+     *
+     * @return {@code ["master", sequence, []]} on a primary; {@code ["slave", host, port, "connect"|"connected", sequence]} on a replica
+     */
+    public CompletableFuture<List<Object>> role() {
+        return send(args().w(Cmd.ROLE), TEXT_LIST);
     }
 
     /**

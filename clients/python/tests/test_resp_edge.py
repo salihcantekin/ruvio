@@ -253,6 +253,17 @@ def test_unknown_type_byte_raises_protocol_error(wire):
         p.gets()
 
 
+@pytest.mark.parametrize(
+    "wire",
+    [b"$67108865\r\n", b"*1048577\r\n", b"%1048577\r\n", b"=67108865\r\n", b"*1\r\n$67108865\r\n"],
+)
+def test_oversized_headers_raise_protocol_error(wire):
+    p = Parser()
+    p.feed(wire)
+    with pytest.raises(ProtocolError, match="over the limit"):
+        p.gets()
+
+
 @pytest.mark.parametrize("wire", [b"$abc\r\n", b":xyz\r\n", b"*x\r\n", b",nan-ish\r\n"])
 def test_garbage_numbers_raise_value_error(wire):
     p = Parser()

@@ -38,6 +38,8 @@ func TestHandshakeCommandsFollowTheOptions(t *testing.T) {
 		{"resp3 auth with user", Options{Protocol: 3, Username: "bob", Password: "pw"}, []string{"HELLO 3 AUTH bob pw", "PING"}},
 		{"database", Options{DB: 4}, []string{"SELECT 4", "PING"}},
 		{"client name", Options{ClientName: "svc"}, []string{"CLIENT SETNAME svc", "PING"}},
+		{"durability", Options{DurabilityReplicas: 2}, []string{"CLIENT DURABILITY REPLICAS 2", "PING"}},
+		{"durability with timeout", Options{DurabilityReplicas: 1, DurabilityTimeout: 1500 * time.Millisecond}, []string{"CLIENT DURABILITY REPLICAS 1 TIMEOUT 1500", "PING"}},
 		{"everything", Options{Password: "pw", DB: 2, ClientName: "svc"}, []string{"AUTH pw", "SELECT 2", "CLIENT SETNAME svc", "PING"}},
 	}
 	for _, c := range cases {
@@ -88,6 +90,16 @@ func TestConnectFailures(t *testing.T) {
 	})
 	if _, err := Connect(context.Background(), Options{Addr: badName.addr, ClientName: "x"}); err == nil {
 		t.Fatal("CLIENT SETNAME failure must fail Connect")
+	}
+
+	noReplication := newFakeNode(t, func(f *fakeNode, args []string) string {
+		if args[0] == "CLIENT" {
+			return "-ERR CLIENT DURABILITY needs replication on this server\r\n"
+		}
+		return "+OK\r\n"
+	})
+	if _, err := Connect(context.Background(), Options{Addr: noReplication.addr, DurabilityReplicas: 1}); err == nil {
+		t.Fatal("CLIENT DURABILITY failure must fail Connect")
 	}
 
 	badHello := newFakeNode(t, func(f *fakeNode, args []string) string { return "-ERR unknown command 'HELLO'\r\n" })
@@ -236,5 +248,79 @@ func TestCustomDialerIsUsed(t *testing.T) {
 	defer failing.Close()
 	if err := failing.Ping(context.Background()); err == nil || !strings.Contains(err.Error(), "no route") {
 		t.Fatalf("dial error must surface, got %v", err)
+	}
+}
+
+func TestLimitModesSendTheirKeywordsAndReadTheirReplies(t *testing.T) {
+	reply := ":3\r\n"
+	f := newFakeNode(t, func(f *fakeNode, args []string) string {
+		switch strings.ToUpper(args[0]) {
+		case "PING":
+			return "+PONG\r\n"
+		case "LIMIT":
+			return reply
+		}
+		return "+OK\r\n"
+	})
+	cl, err := Connect(context.Background(), Options{Addr: f.addr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	ctx := context.Background()
+	last := func() string {
+		got := f.commands()
+		return got[len(got)-1]
+	}
+
+	remaining, allowed, err := cl.LimitSliding(ctx, "k", 5, time.Second)
+	if err != nil || remaining != 3 || !allowed || last() != "LIMIT k 5 1000 SLIDING" {
+		t.Fatalf("sliding: %d %v %v %q", remaining, allowed, err, last())
+	}
+	remaining, allowed, err = cl.LimitTokens(ctx, "k", 10, 2*time.Second, 2)
+	if err != nil || remaining != 3 || !allowed || last() != "LIMIT k 10 2000 TOKENS COST 2" {
+		t.Fatalf("tokens: %d %v %v %q", remaining, allowed, err, last())
+	}
+	reply = "$-1\r\n"
+	if _, allowed, err = cl.LimitSliding(ctx, "k", 5, time.Second); err != nil || allowed {
+		t.Fatalf("refused sliding: %v %v", allowed, err)
+	}
+
+	reply = "*2\r\n:2\r\n:0\r\n"
+	out, err := cl.LimitSlidingWithRetry(ctx, "k", 5, time.Second)
+	if err != nil || out != (LimitOutcome{Allowed: true, Remaining: 2}) || last() != "LIMIT k 5 1000 SLIDING WITHRETRY" {
+		t.Fatalf("sliding retry: %+v %v %q", out, err, last())
+	}
+	reply = "*2\r\n:-1\r\n:250\r\n"
+	out, err = cl.LimitTokensWithRetry(ctx, "k", 10, 2*time.Second, 1)
+	if err != nil || out != (LimitOutcome{RetryAfter: 250 * time.Millisecond}) || last() != "LIMIT k 10 2000 TOKENS COST 1 WITHRETRY" {
+		t.Fatalf("tokens retry: %+v %v %q", out, err, last())
+	}
+	reply = "*1\r\n:1\r\n"
+	if _, err = cl.LimitTokensWithRetry(ctx, "k", 10, time.Second, 1); err == nil {
+		t.Fatal("a one-element reply must be an error")
+	}
+}
+
+func TestClientDurabilitySendsTheCommand(t *testing.T) {
+	f := okFake(t)
+	cl, err := Connect(context.Background(), Options{Addr: f.addr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	ctx := context.Background()
+	if err := cl.ClientDurability(ctx, 2, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.ClientDurability(ctx, 1, 250*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.ClientDurability(ctx, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	want := "PING|CLIENT DURABILITY REPLICAS 2|CLIENT DURABILITY REPLICAS 1 TIMEOUT 250|CLIENT DURABILITY REPLICAS 0"
+	if got := strings.Join(f.commands(), "|"); got != want {
+		t.Fatalf("got %v want %v", got, want)
 	}
 }

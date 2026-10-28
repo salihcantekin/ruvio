@@ -119,7 +119,7 @@ slows a command or raises RSS for the same data does not land.
     Measure prolonged slow-replica WAL retention and disk use, then define and
     test a bounded retention/backpressure/resync policy before promising a
     disk bound; never silently promote an incomplete replica.
-- [ ] **Selected JSON field indexes.** Each explicitly named index selects a
+- [ ] **Selected JSON field indexes.** (First version shipped on `dev`: `JSON.INDEX CREATE` and `JSON.FIND`, exact equality on one scalar path; see `docs/COMPATIBILITY.md`. The open part is below.) Each explicitly named index selects a
   binary key prefix and one simple JSON path. The first version supports exact
   equality of scalar JSON values only (no ranges, wildcard paths, or implicit
   indexing). Queries return bounded pages with a continuation cursor, not
@@ -302,7 +302,9 @@ slows a command or raises RSS for the same data does not land.
 - [ ] **P2 — Implement complete `CLUSTER SLOTS`/`NODES` semantics and a real
   cluster bus endpoint.**
 - [ ] **P2 — Add online slot migration with importing/migrating states and
-  bounded transfer queues.**
+  bounded transfer queues.** Between the shards of one process this is done:
+  `RUVIO MOVESLOTS` (#50). Between machines: `COORDINATOR MOVE` (#23), and
+  `COORDINATOR REBALANCE` to even out slot counts across groups.
 - [ ] **P2 — Add hot-key and skew observability before automated rebalancing.**
 - [ ] **P2 — Define cross-slot command behavior; do not hide distributed
   coordination behind local-looking semantics.**
@@ -317,8 +319,12 @@ slows a command or raises RSS for the same data does not land.
   remaining operational controls and failure evidence are not complete.
 - [ ] **P2 — Define consistency and acknowledgement policies for asynchronous
   and quorum-backed writes.**
-- [ ] **P2 — Add failure detection and leader/primary election with a documented
-  split-brain model.**
+- [x] **P2 — Add failure detection and leader/primary election with a documented
+  split-brain model.** `ruvio coordinator` (three or five, Raft): majority-confirmed
+  detection, failover with `REPLICAOF`, the old primary demoted on return; split
+  brain bounded by `min-replicas-to-write` (every replica, for a primary cut off together with
+  one of its replicas) and the epoch. See
+  [COORDINATOR.md](COORDINATOR.md).
 - [ ] **P2 — Prove failover with deterministic fault injection, partitions,
   delayed packets, process crashes, and disk loss.**
 - [ ] **P2 — Add rolling-upgrade and mixed-version compatibility tests.**
@@ -357,7 +363,7 @@ slows a command or raises RSS for the same data does not land.
 
 - [ ] All `P1` items selected for the release are complete.
 - [ ] Security review and operational failure drills are complete.
-  Unknown names, wrong arity, `CONFIG SET`, `SHUTDOWN`, `DEBUG`, and
+  Unknown names, wrong arity, `CONFIG RESETSTAT`, `SHUTDOWN`, `DEBUG`, and
   `CLUSTER MEET` reply with an error and keep the socket on the evented
   runtime. Process-kill, full-disk, and live permission drills stay
   blocked on a dedicated host.

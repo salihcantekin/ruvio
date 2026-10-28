@@ -80,16 +80,18 @@ pub(super) fn mset_nx<'a, C: Clock, I: StorageIndex, S: MutationSink>(
     Ok(Response::Integer(1))
 }
 
-/// Plain decimal text with at most 15 significant digits and no trailing zeros.
+/// Plain decimal text with at most 16 significant digits and no trailing zeros.
 ///
-/// Redis computes in `long double`; doubles carry ~16 digits, so rounding to 15 keeps sums like
-/// `0.1 + 0.2` printing `0.3` as Redis does. Larger precision is not preserved.
+/// Redis computes in `long double`; a double carries 15-17 digits, so rounding to 16 keeps sums like
+/// `0.1 + 0.2` printing `0.3` as Redis does while keeping more of the value than 15 would. The
+/// result is stored as this text, so digits beyond the 16th are lost and later increments start from
+/// the rounded value.
 pub(super) fn float_text(value: f64) -> String {
     if value == 0.0 {
         return "0".into();
     }
 
-    let scientific = format!("{value:.14e}");
+    let scientific = format!("{value:.15e}");
     let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
     let exponent: i32 = exponent.parse().unwrap_or(0);
     let negative = mantissa.starts_with('-');
@@ -242,6 +244,62 @@ pub(super) fn set_range<'a, C: Clock, I: StorageIndex, S: MutationSink>(
     Ok(Response::Integer(length as i64))
 }
 
+pub(super) fn transfer<'a, C: Clock, I: StorageIndex, S: MutationSink>(
+    shard: &'a mut KvShard<C, I>,
+    sink: &mut S,
+    source: crate::protocol::Bytes<'a>,
+    destination: crate::protocol::Bytes<'a>,
+    amount: i64,
+    max: Option<i64>,
+) -> Result<Response<'a>, S::Error> {
+    let (from, to) = match shard.preview_transfer(&source, &destination, amount, max) {
+        Ok(Some(balances)) => balances,
+        Ok(None) => return Ok(Response::Bulk(None)),
+        Err(error) => return Ok(increment_error(error)),
+    };
+
+    let extra = if shard.contains_key(&destination) {
+        0
+    } else {
+        destination.len() + ADMISSION_OVERHEAD_BYTES
+    };
+
+    if let Some(rejected) =
+        before_mutation(shard, sink, [source.as_ref(), destination.as_ref()], extra)?
+    {
+        return Ok(rejected);
+    }
+
+    // Both balances go out as one record: a torn WAL tail or a replica never sees one
+    // side without the other.
+    sink.record(Mutation::Transaction {
+        mutations: &[
+            Mutation::SetInteger {
+                key: &source,
+                value: from,
+            }
+            .to_owned(),
+            Mutation::SetInteger {
+                key: &destination,
+                value: to,
+            }
+            .to_owned(),
+        ],
+    })?;
+
+    shard
+        .set_integer(&source, from)
+        .expect("transfer type was validated before recording");
+    shard
+        .set_integer(&destination, to)
+        .expect("transfer type was validated before recording");
+
+    Ok(Response::Exec(vec![
+        Response::Integer(from),
+        Response::Integer(to),
+    ]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::float_text;
@@ -257,8 +315,21 @@ mod tests {
             (3.0e-5, "0.00003"),
             (5.0e3, "5000"),
             (0.0, "0"),
+            (1234567.891234568, "1234567.891234568"),
+            (12345678901234.51, "12345678901234.51"),
         ] {
             assert_eq!(float_text(value), text, "{value}");
         }
+    }
+
+    #[test]
+    fn small_increments_survive_sixteen_digits() {
+        let mut stored = 12345678901234.5_f64;
+
+        for _ in 0..3 {
+            stored = float_text(stored + 0.01).parse().unwrap();
+        }
+
+        assert_eq!(float_text(stored), "12345678901234.53");
     }
 }

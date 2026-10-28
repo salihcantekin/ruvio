@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import binascii
+import hashlib
 import socket
 import sys
 
@@ -86,7 +87,8 @@ def main(left: int = 6379, right: int = 6380) -> None:
     cluster_info = command(right, "CLUSTER", "INFO")  # CLUSTER INFO
     assert b"cluster_state:ok" in cluster_info
     assert b"cluster_known_nodes:2" in cluster_info
-    assert command(right, "CLUSTER", "MYID") == f"{2:040x}".encode()  # CLUSTER MYID
+    # A node id is the SHA-1 of the address the shard is announced on.
+    assert command(right, "CLUSTER", "MYID") == hashlib.sha1(f"127.0.0.1:{right}".encode()).hexdigest().encode()  # CLUSTER MYID
     assert command(left, "CLUSTER", "KEYSLOT", "{left}:value") == slot("{left}:value")  # CLUSTER KEYSLOT
     assert command(left, "READONLY") == b"OK"
     assert command(left, "READWRITE") == b"OK"

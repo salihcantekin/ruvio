@@ -10,6 +10,9 @@ pub(super) static DELAY_SERVED_POPS: std::sync::Mutex<Vec<std::path::PathBuf>> =
 const UNAUTHENTICATED_BUFFER_BYTES: usize = 16 * 1024;
 /// How long `SAVE` waits for the other shards to put their files in its round.
 const SAVE_ROUND_TIMEOUT: Duration = Duration::from_secs(120);
+/// A read wait whose timeout does not fit in an `Instant` waits this long, as tokio's own
+/// `timeout` does.
+const FAR_FUTURE: Duration = Duration::from_secs(86400 * 365 * 30);
 
 /// The reply to a write whose WAL record is larger than a whole segment. The write is
 /// refused before it is applied and nothing is logged; the log stays healthy.
@@ -325,8 +328,11 @@ pub(super) async fn handle_client(
         return Ok(());
     }
 
-    let mut rate =
-        CommandRateLimiter::new(state.published_config.connections.max_commands_per_second);
+    let mut rate = CommandRateLimiter::new(
+        state
+            .live
+            .with(|live| live.connections.max_commands_per_second),
+    );
     let mut session = TxSession::new(conn);
     let fwd_entry = state
         .forwarding
@@ -351,6 +357,11 @@ pub(super) async fn handle_client(
     // End of stream seen by the read that started a skip.
     let mut eof_pending = false;
     let mut output = BoundedOutput::with_capacity(0, request_limits.max_output_buffer_bytes);
+    // One timer serves every read wait. A `timeout` per wait would add and remove a timer
+    // wheel entry each round; this one moves only when it fires early or must fire sooner.
+    let read_deadline = tokio::time::sleep(timeouts.idle);
+
+    tokio::pin!(read_deadline);
 
     loop {
         if shutdown.is_requested() {
@@ -376,9 +387,7 @@ pub(super) async fn handle_client(
             if state.published_config.persistence.sync_worker_active {
                 OpenWalGroup::new(&state).commit().await?;
             }
-            timeout(timeouts.write, stream.write_all(&frame))
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))??;
+            write_timed(&mut stream, &frame, timeouts.write).await?;
 
             continue;
         }
@@ -395,9 +404,7 @@ pub(super) async fn handle_client(
             if state.published_config.persistence.sync_worker_active {
                 OpenWalGroup::new(&state).commit().await?;
             }
-            timeout(timeouts.write, stream.write_all(&frame))
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))??;
+            write_timed(&mut stream, &frame, timeouts.write).await?;
 
             continue;
         }
@@ -419,49 +426,66 @@ pub(super) async fn handle_client(
         let mut close_after_parse = std::mem::take(&mut eof_pending);
 
         if !std::mem::take(&mut skip_now) {
-            tokio::select! {
-                _ = &mut notified => continue,
+            let now = tokio::time::Instant::now();
+            let due = now.checked_add(read_timeout).unwrap_or(now + FAR_FUTURE);
 
-                ready = timeout(read_timeout, stream.wait_readable(&mut read_chunk)) => {
-                    match ready {
-                        Err(_) if !input.is_empty() => {
-                            crate::admission::note_protocol_error();
-                            let _ = timeout(
-                                timeouts.write,
-                                stream.write_all(b"-ERR protocol error\r\n"),
-                            )
-                            .await;
+            if read_deadline.deadline() > due {
+                read_deadline.as_mut().reset(due);
+            }
 
-                            return Ok(());
+            let ready = loop {
+                tokio::select! {
+                    _ = &mut notified => break None,
+
+                    ready = stream.wait_readable(&mut read_chunk) => break Some(Ok(ready)),
+
+                    () = &mut read_deadline => {
+                        // Armed for an earlier wait: wait out the rest of this one's.
+                        if read_deadline.deadline() >= due {
+                            break Some(Err(()));
                         }
 
-                        Err(_) => return Ok(()),
-                        Ok(Err(error)) => return Err(error),
-                        Ok(Ok(SocketWait::Plain)) => {
-                            let before = input.len();
-                            let eof =
-                                stream.read_ready(&mut input, buffer_limit.saturating_add(1))?;
-
-                            // A refused frame cut short still gets its reply.
-                            if eof && input.len() == before && skipping.is_none() {
-                                return Ok(());
-                            }
-
-                            if input.len() == before && !eof {
-                                continue;
-                            }
-
-                            close_after_parse = eof;
-                        }
-
-                        Ok(Ok(SocketWait::Bytes(0))) if skipping.is_none() => return Ok(()),
-                        Ok(Ok(SocketWait::Bytes(0))) => close_after_parse = true,
-                        Ok(Ok(SocketWait::Bytes(read))) => {
-                            input.extend_from_slice(&read_chunk[..read]);
-                        }
+                        read_deadline.as_mut().reset(due);
                     }
                 }
             };
+            let Some(ready) = ready else {
+                continue;
+            };
+
+            match ready {
+                Err(_) if !input.is_empty() => {
+                    crate::admission::note_protocol_error();
+                    let _ =
+                        write_timed(&mut stream, b"-ERR protocol error\r\n", timeouts.write).await;
+
+                    return Ok(());
+                }
+
+                Err(_) => return Ok(()),
+                Ok(Err(error)) => return Err(error),
+                Ok(Ok(SocketWait::Plain)) => {
+                    let before = input.len();
+                    let eof = stream.read_ready(&mut input, buffer_limit.saturating_add(1))?;
+
+                    // A refused frame cut short still gets its reply.
+                    if eof && input.len() == before && skipping.is_none() {
+                        return Ok(());
+                    }
+
+                    if input.len() == before && !eof {
+                        continue;
+                    }
+
+                    close_after_parse = eof;
+                }
+
+                Ok(Ok(SocketWait::Bytes(0))) if skipping.is_none() => return Ok(()),
+                Ok(Ok(SocketWait::Bytes(0))) => close_after_parse = true,
+                Ok(Ok(SocketWait::Bytes(read))) => {
+                    input.extend_from_slice(&read_chunk[..read]);
+                }
+            }
         }
 
         state
@@ -560,7 +584,7 @@ pub(super) async fn handle_client(
 
         let mut consumed = 0;
         let mut batch_commands = 0;
-        let mut flush_at = PIPELINE_FLUSH_BYTES;
+        let mut flush_at = flush_threshold(0, output.maximum());
         let mut wal_group = OpenWalGroup::new(&state);
 
         state.store.borrow().sample_time();
@@ -611,6 +635,15 @@ pub(super) async fn handle_client(
                     &mut output,
                 )
                 .await?;
+                if session.durability.is_some() {
+                    super::durable::hold_until_durable(
+                        &state,
+                        &mut session,
+                        &mut output,
+                        &shutdown,
+                    )
+                    .await?;
+                }
                 flush_output(&mut stream, &mut output, timeouts.write, &state).await?;
                 batch_commands = 0;
             } else if output.len() >= flush_at {
@@ -627,11 +660,18 @@ pub(super) async fn handle_client(
                     &mut output,
                 )
                 .await?;
+                if session.durability.is_some() {
+                    super::durable::hold_until_durable(
+                        &state,
+                        &mut session,
+                        &mut output,
+                        &shutdown,
+                    )
+                    .await?;
+                }
                 let unsent = flush_ready(&mut stream, &mut output, timeouts.write, &state).await?;
 
-                // A client that is not reading is retried at doubling sizes, so the unsent
-                // tail is not moved once per command on its way to the limit.
-                flush_at = PIPELINE_FLUSH_BYTES.max(unsent.saturating_mul(2));
+                flush_at = flush_threshold(unsent, output.maximum());
             }
 
             match if session.is_multi() || session.in_pubsub {
@@ -649,7 +689,7 @@ pub(super) async fn handle_client(
             } {
                 Ok(HotParse::Complete(command, frame_length)) => {
                     let command_timing =
-                        CommandTiming::new(state.clone(), hot_command_group(&command), || {
+                        CommandTiming::new(&state, hot_command_group(&command), || {
                             hot_command_name(&command)
                         });
                     command_timing.observe_key(
@@ -680,14 +720,12 @@ pub(super) async fn handle_client(
                         continue;
                     }
 
-                    if state.published_config.replication.role
-                        == crate::config::ReplicationRole::Replica
-                        && hot_command_mutates_store(&command)
+                    let mutates = hot_command_mutates_store(&command);
+
+                    if let Some(refusal) = state.write_gate.get().refusal()
+                        && mutates
                     {
-                        write_response(
-                            &mut output,
-                            Response::Error(crate::replication::READONLY_LINE),
-                        )?;
+                        write_response(&mut output, Response::Error(refusal))?;
                         continue;
                     }
 
@@ -707,18 +745,21 @@ pub(super) async fn handle_client(
                     }
 
                     if let Some(forwarding) = state.forwarding.as_ref()
-                        && let Some(owner) = hot_remote_owner(forwarding, &command)
+                        && let Some((owner, slot)) = hot_remote_owner(forwarding, &command)
                     {
+                        if redirect_to_node(forwarding, &mut output, slot, owner)? {
+                            continue;
+                        }
                         forwarder.push(
                             owner,
                             &input[consumed - frame_length..consumed],
                             output.len(),
-                            hot_command_mutates_store(&command),
+                            mutates,
                         );
                         continue;
                     }
 
-                    if hot_command_mutates_store(&command) {
+                    if mutates {
                         bump_mutations(&state);
                     }
 
@@ -791,6 +832,8 @@ pub(super) async fn handle_client(
                             // Every key in one slot (true without a fabric): the lean path
                             // may skip the `CROSSSLOT` check of the generic one.
                             let mut one_slot = true;
+                            // Routed, then awaited before it runs here (see the re-check below).
+                            let mut waited = false;
 
                             // A subscribed client may only run (local) pub/sub commands;
                             // `gate` refuses the rest, so nothing is forwarded.
@@ -827,19 +870,31 @@ pub(super) async fn handle_client(
                                         write_response(&mut output, refusal)?;
                                         continue;
                                     }
+
+                                    // Another node of the cluster owns the slot. Inside MULTI
+                                    // the transaction is aborted, as Redis Cluster does.
+                                    if let Owner::Node(slot) = owner {
+                                        consumed += frame_length;
+                                        batch_commands += 1;
+                                        session.mark_queue_error();
+                                        redirect_to_node(
+                                            forwarding,
+                                            &mut output,
+                                            slot,
+                                            forwarding.fabric.slot_owner(slot),
+                                        )?;
+                                        continue;
+                                    }
                                 }
 
                                 // SWAPDB would swap the home shard's databases only, and a
                                 // queued fan command would run on the other shards at once
-                                // and on this one at EXEC; a queued PUBLISH could only reach
-                                // the other shards at queue time, before DISCARD or a failed
-                                // EXEC, so it is refused too.
+                                // and on this one at EXEC. A queued PUBLISH is sent at EXEC,
+                                // after the batch is recorded.
                                 let unsupported: Option<&[u8]> =
                                     if matches!(command, Command::SwapDb(..)) {
                                         Some(SWAPDB_SHARDS_REPLY)
-                                    } else if (fan || matches!(command, Command::Publish { .. }))
-                                        && session.is_multi()
-                                    {
+                                    } else if fan && session.is_multi() {
                                         Some(FAN_IN_MULTI_REPLY)
                                     } else {
                                         None
@@ -871,7 +926,7 @@ pub(super) async fn handle_client(
                                             batch_commands += 1;
                                             continue;
                                         }
-                                        Owner::Split => {
+                                        Owner::Node(_) | Owner::Split => {
                                             consumed += frame_length;
                                             batch_commands += 1;
                                             output.write_all(SPLIT_REPLY)?;
@@ -879,6 +934,7 @@ pub(super) async fn handle_client(
                                         }
                                     }
                                 } else {
+                                    waited = true;
                                     // Neither a plain command nor this shard's alone: it
                                     // may wait on another shard (see `MAX_PENDING_FORWARDS`).
                                     if !wal_group.always {
@@ -948,6 +1004,15 @@ pub(super) async fn handle_client(
                                         && !output.is_empty()
                                     {
                                         wal_group.commit().await?;
+                                        if session.durability.is_some() {
+                                            super::durable::hold_until_durable(
+                                                &state,
+                                                &mut session,
+                                                &mut output,
+                                                &shutdown,
+                                            )
+                                            .await?;
+                                        }
                                         flush_output(
                                             &mut stream,
                                             &mut output,
@@ -1001,11 +1066,22 @@ pub(super) async fn handle_client(
                                 {
                                     wal_group.begin();
                                 } else {
+                                    waited = true;
                                     wal_group.commit().await?;
                                 }
                             }
+                            // A command that waited above may find its slot taken over by
+                            // another shard meanwhile: it goes through routing again.
+                            if waited
+                                && let Some(forwarding) = state.forwarding.as_ref()
+                                && forwarding.fabric.mover.moved()
+                                && !session.in_pubsub
+                                && super::moveslots::runs_elsewhere(&state, &session, &command)
+                            {
+                                continue;
+                            }
                             let command_timing =
-                                CommandTiming::new(state.clone(), command_group(&command), || {
+                                CommandTiming::new(&state, command_group(&command), || {
                                     crate::acl::command_acl_name(&command)
                                 });
                             command_timing.observe_key(
@@ -1110,6 +1186,15 @@ pub(super) async fn handle_client(
                                     .await?;
                                     // Forwarded replies may have added records.
                                     wal_group.commit().await?;
+                                    if session.durability.is_some() {
+                                        super::durable::hold_until_durable(
+                                            &state,
+                                            &mut session,
+                                            &mut output,
+                                            &shutdown,
+                                        )
+                                        .await?;
+                                    }
                                     flush_output(&mut stream, &mut output, timeouts.write, &state)
                                         .await?;
                                 }
@@ -1263,6 +1348,10 @@ pub(super) async fn handle_client(
             durability.wait(&state).await?;
         }
 
+        if session.durability.is_some() {
+            super::durable::hold_until_durable(&state, &mut session, &mut output, &shutdown)
+                .await?;
+        }
         flush_output(&mut stream, &mut output, timeouts.write, &state).await?;
         input.release_idle();
         output.release_oversized(IDLE_SHRINK_ABOVE_BYTES, IDLE_KEEP_BYTES);
@@ -1300,6 +1389,17 @@ pub(super) async fn wrap_stream(stream: TcpStream, state: &ShardState) -> io::Re
 /// Replies a pipeline holds before it sends what the socket accepts.
 const PIPELINE_FLUSH_BYTES: usize = 64 * 1024;
 
+/// Output size at which a pipeline next sends what the socket takes. A client that is not
+/// reading is retried at doubling sizes, so the unsent tail is not moved once per command
+/// on its way to the limit. The size stays at or below half the limit: replies are only
+/// checked between commands, so a higher one let a reader that was keeping up overrun the
+/// limit with the replies queued before the next send, which dropped them and cut it off.
+pub(super) fn flush_threshold(unsent: usize, maximum: usize) -> usize {
+    PIPELINE_FLUSH_BYTES
+        .max(unsent.saturating_mul(2))
+        .min(maximum / 2)
+}
+
 /// Answers a frame that cannot be parsed, ending the connection. The batch's group is
 /// committed first: a client that does not read would otherwise keep it open, and every
 /// record of the shard staged, for as long as the write waits.
@@ -1310,7 +1410,36 @@ async fn protocol_error(
 ) -> io::Result<()> {
     crate::admission::note_protocol_error();
     wal_group.commit().await?;
-    timeout(write_timeout, stream.write_all(b"-ERR protocol error\r\n"))
+    write_timed(stream, b"-ERR protocol error\r\n", write_timeout).await
+}
+
+/// Writes all of `buf`, failing once the socket has taken nothing for `write_timeout`.
+/// A plain socket that takes it at once, the usual case, never arms a timer.
+async fn write_timed(
+    stream: &mut ClientStream,
+    buf: &[u8],
+    write_timeout: Duration,
+) -> io::Result<()> {
+    let mut sent = 0;
+
+    if let ClientStream::Plain(socket) = stream {
+        while sent < buf.len() {
+            match socket.try_write(&buf[sent..]) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(written) => sent += written,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+
+        super::net::note_output(sent);
+
+        if sent == buf.len() {
+            return Ok(());
+        }
+    }
+
+    timeout(write_timeout, stream.write_all(&buf[sent..]))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))?
 }
@@ -1379,9 +1508,10 @@ pub(super) async fn flush_output(
         .peak_output_buffer_bytes
         .set(state.peak_output_buffer_bytes.get().max(output.len()));
     if output.exceeded() {
-        let _ = timeout(
+        let _ = write_timed(
+            stream,
+            b"-ERR output buffer limit exceeded\r\n",
             write_timeout,
-            stream.write_all(b"-ERR output buffer limit exceeded\r\n"),
         )
         .await;
 
@@ -1392,9 +1522,7 @@ pub(super) async fn flush_output(
         return Ok(());
     }
 
-    timeout(write_timeout, stream.write_all(&*output))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))??;
+    write_timed(stream, &*output, write_timeout).await?;
     output.clear();
     Ok(())
 }
@@ -1413,11 +1541,13 @@ fn plain_command(command: &Command<'_>) -> bool {
                 | Command::Acl(_)
                 | Command::ClientGetName
                 | Command::ClientId
+                | Command::ClientSetInfo
                 | Command::ClientList { .. }
                 | Command::ClientInfo
                 | Command::ClientKill { .. }
                 | Command::ClientSetName(_)
                 | Command::ClientTracking(_)
+                | Command::ClientDurability { .. }
                 | Command::Slowlog(_)
                 | Command::LatencyLatest
                 | Command::ShardPublish { .. }
@@ -1439,6 +1569,14 @@ fn plain_command(command: &Command<'_>) -> bool {
                 | Command::ConfigGet(_)
                 | Command::Info(_)
                 | Command::Save
+                | Command::ConfigSet(_)
+                | Command::ConfigRewrite
+                | Command::ReplicaOf { .. }
+                | Command::MoveSlots(_)
+                | Command::Topology(_)
+                | Command::PrimaryLease(_)
+                | Command::Migrate(_)
+                | Command::Role
                 | Command::Bgsave
                 | Command::ChangesSubscribe(_)
                 | Command::Multi
@@ -1481,7 +1619,7 @@ fn lean_session(
         && auth.authenticated
         && auth.rules.all_commands
         && auth.rules.all_keys
-        && state.published_config.replication.role == crate::config::ReplicationRole::Off
+        && state.role.get() == crate::config::ReplicationRole::Off
         && (state.hot_store.is_none() || state.published_config.hot_keys.is_empty())
         && state.tracker.borrow().is_empty()
 }
@@ -1498,7 +1636,7 @@ fn dispatch_plain(
     command: Command<'_>,
     frame: &[u8],
 ) -> io::Result<()> {
-    let threshold = state.published_config.slowlog_threshold_micros;
+    let threshold = state.live.slowlog_threshold_micros.get();
     let started = (threshold >= 0).then(crate::time::Stamp::now);
 
     if !rate.allow() {
@@ -1576,7 +1714,7 @@ pub(super) async fn dispatch_command<'s>(
     peer: Option<Peer<'_>>,
     deferred: Option<&mut Option<Parking<'s>>>,
 ) -> io::Result<()> {
-    let threshold = state.published_config.slowlog_threshold_micros;
+    let threshold = state.live.slowlog_threshold_micros.get();
     let sample = (threshold >= 0).then(|| clients::SlowSample::of(&command, frame));
     let identity = clients::is_identity_change(&command);
     let started = sample.as_ref().map(|_| crate::time::Stamp::now());
@@ -1626,10 +1764,8 @@ async fn dispatch_inner<'s>(
             rate,
             security: &state.security,
             cluster: state.cluster_view().is_some(),
-            replica: state.published_config.replication.role
-                == crate::config::ReplicationRole::Replica,
-            replication: state.published_config.replication.role
-                != crate::config::ReplicationRole::Off,
+            write_refusal: state.write_gate.get().refusal(),
+            replication: state.role.get() != crate::config::ReplicationRole::Off,
             databases: state.published_config.protocol.databases,
         },
         &command,
@@ -1660,8 +1796,7 @@ async fn dispatch_inner<'s>(
             } = &command
             {
                 if let Some(slot) = deferred.as_deref_mut()
-                    && state.published_config.replication.role
-                        == crate::config::ReplicationRole::Primary
+                    && state.role.get() == crate::config::ReplicationRole::Primary
                 {
                     *slot = Some(Parking::Wait(Wait::Replicas {
                         replicas: *replicas,
@@ -1718,25 +1853,25 @@ async fn dispatch_inner<'s>(
     if !session.is_multi() {
         match &command {
             Command::ClusterSlots => {
-                write_cluster_slots(output, state.cluster_view())?;
+                write_cluster_slots(output, state.cluster_view(), &state.shard_peers())?;
 
                 return Ok(());
             }
 
             Command::ClusterNodes => {
-                write_cluster_nodes(output, state.cluster_view())?;
+                write_cluster_nodes(output, state.cluster_view(), &state.shard_peers())?;
 
                 return Ok(());
             }
 
             Command::ClusterShards => {
-                write_cluster_shards(output, state.cluster_view())?;
+                write_cluster_shards(output, state.cluster_view(), &state.shard_peers())?;
 
                 return Ok(());
             }
 
             Command::ClusterInfo => {
-                write_cluster_info(output, state.cluster_view())?;
+                write_cluster_info(output, state.cluster_view(), &state.shard_peers())?;
 
                 return Ok(());
             }
@@ -1762,8 +1897,73 @@ async fn dispatch_inner<'s>(
             Command::ConfigGet(pattern) => {
                 write_response(
                     output,
-                    crate::engine::config_get_response(&state.published_config, pattern),
+                    crate::engine::config_get_response(&state.live.current(), pattern),
                 )?;
+
+                return Ok(());
+            }
+
+            Command::ConfigSet(pairs) => {
+                let pairs: Vec<(&[u8], &[u8])> = pairs
+                    .iter()
+                    .map(|(name, value)| (name.as_ref(), value.as_ref()))
+                    .collect();
+
+                write_response(output, super::live::config_set(state, &pairs).await)?;
+
+                return Ok(());
+            }
+
+            Command::ConfigRewrite => {
+                write_response(output, super::live::config_rewrite(state))?;
+
+                return Ok(());
+            }
+
+            Command::MoveSlots(target) => {
+                write_response(output, super::moveslots::command(state, *target))?;
+
+                return Ok(());
+            }
+
+            Command::Topology(map) => {
+                super::topology::command(state, map.as_deref(), output)?;
+
+                return Ok(());
+            }
+
+            Command::PrimaryLease(grant) => {
+                write_response(
+                    output,
+                    super::replica::lease_command(state, grant.as_deref()),
+                )?;
+
+                return Ok(());
+            }
+
+            Command::Migrate(args) => {
+                let args: Vec<&[u8]> = args.iter().map(AsRef::as_ref).collect();
+
+                write_response(output, super::migrate::command(state, &args))?;
+
+                return Ok(());
+            }
+
+            Command::ReplicaOf { primary, force } => {
+                let primary = primary
+                    .as_ref()
+                    .map(|(host, port)| (host.as_ref(), port.as_ref()));
+
+                write_response(
+                    output,
+                    super::replica::replicaof(state, primary, *force).await,
+                )?;
+
+                return Ok(());
+            }
+
+            Command::Role => {
+                write_response(output, super::replica::role_response(state))?;
 
                 return Ok(());
             }
@@ -2008,7 +2208,7 @@ async fn dispatch_inner<'s>(
                     &mut *persistence,
                     &mut *waiters,
                     &mut scripts,
-                    state.published_config.scripts,
+                    script_limits(state),
                     command,
                     session.database,
                 ) {
@@ -2256,7 +2456,14 @@ async fn dispatch_inner<'s>(
                         .store
                         .borrow_mut()
                         .watch(conn, session.database, &keys);
-                    session.accept_watch(slot, keys.len());
+                    session.accept_watch(
+                        slot,
+                        keys.len(),
+                        state
+                            .forwarding
+                            .as_ref()
+                            .map_or(0, |forwarding| forwarding.me),
+                    );
                     write_response(output, Response::Simple(b"OK"))?;
                 }
 
@@ -2315,12 +2522,25 @@ async fn dispatch_inner<'s>(
             let mut commands = session.take_exec_commands();
             // The engine does not see the running settings or the server's counters: these
             // are answered here, in their place among the replies.
+            // PUBLISH is set aside the same way and sent once the batch is recorded, so a
+            // subscriber never hears of a transaction that DISCARD or a refused write undid.
             let server_queries: Vec<(usize, Command<'static>)> = commands
                 .iter_mut()
                 .enumerate()
-                .filter(|(_, command)| matches!(command, Command::ConfigGet(_) | Command::Info(_)))
+                .filter(|(_, command)| {
+                    matches!(
+                        command,
+                        Command::ConfigGet(_) | Command::Info(_) | Command::Publish { .. }
+                    )
+                })
                 .map(|(index, command)| (index, std::mem::replace(command, Command::Ping(None))))
                 .collect();
+            let scripted = commands.iter().any(|command| {
+                matches!(
+                    command,
+                    Command::Eval { .. } | Command::EvalSha { .. } | Command::FCall { .. }
+                )
+            });
             let track_plan = crate::tracking::TrackPlan::batch(&commands, session.database);
             let flushes_hot = commands
                 .iter()
@@ -2336,6 +2556,18 @@ async fn dispatch_inner<'s>(
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
                 let mut waiters = state.waiters.borrow_mut();
+                let mut cache = scripted.then(|| state.scripts.borrow_mut());
+                let scripts = cache.as_deref_mut().map(|cache| {
+                    let rules = &auth.rules;
+
+                    crate::engine::TransactionScripts {
+                        cache,
+                        limits: script_limits(state),
+                        rules: (!(rules.all_commands && rules.all_keys))
+                            .then(|| std::sync::Arc::clone(rules)),
+                    }
+                });
+
                 crate::engine::execute_transaction_in(
                     &mut store,
                     &mut *persistence,
@@ -2344,6 +2576,7 @@ async fn dispatch_inner<'s>(
                     commands,
                     session.database,
                     state.enforces_slots(),
+                    scripts,
                 )
                 .unwrap_or_else(|error| Response::Error(refused_write(&error)))
             };
@@ -2352,12 +2585,22 @@ async fn dispatch_inner<'s>(
                     for (index, query) in server_queries {
                         let answer = match &query {
                             Command::ConfigGet(pattern) => {
-                                crate::engine::config_get_response(&state.published_config, pattern)
+                                crate::engine::config_get_response(&state.live.current(), pattern)
                             }
                             Command::Info(section) => Response::Bulk(Some(
                                 super::info::evented_info(state, section.as_deref())?.into(),
                             )),
-                            _ => unreachable!("only CONFIG GET and INFO are set aside"),
+                            Command::Publish { channel, message } => {
+                                let delivered = publish_classic(state, channel, message);
+
+                                if let Some(forwarding) = state.forwarding.as_ref() {
+                                    super::forward::publish_everywhere(
+                                        forwarding, channel, message,
+                                    );
+                                }
+                                Response::Integer(delivered)
+                            }
+                            _ => unreachable!("only CONFIG GET, INFO and PUBLISH are set aside"),
                         };
 
                         if let Some(reply) = replies.get_mut(index) {
@@ -2767,6 +3010,16 @@ async fn finish_retry(
 
         let timed_out = deadline.is_some_and(|deadline| Instant::now() >= deadline);
 
+        // The key's slot moved to another shard while the command waited here.
+        if state
+            .forwarding
+            .as_ref()
+            .is_some_and(|forwarding| forwarding.fabric.mover.moved())
+            && super::moveslots::runs_elsewhere(state, session, &command)
+        {
+            break Some(Response::Error(super::moveslots::UNBLOCKED_ERROR));
+        }
+
         // The batch that parked this command sampled the clock once; a retry must see time pass.
         state.store.borrow().sample_time();
 
@@ -2826,4 +3079,22 @@ async fn finish_retry(
 fn command_may_write(command: &Command<'_>) -> bool {
     crate::protocol::command_spec(crate::acl::command_acl_name(command).as_bytes())
         .is_none_or(|spec| spec.flags & crate::protocol::flags::WRITE != 0)
+}
+
+/// The script limits of this shard. With `primary-lease` a script may run only while the
+/// write gate stays open, so its time is cut to what the lease holds past the gate margin;
+/// with the lease off this is the configured limits.
+fn script_limits(state: &ShardState) -> crate::config::ScriptLimits {
+    let (limits, lease) = state
+        .live
+        .with(|live| (live.scripts, live.replication.primary_lease));
+
+    if !lease {
+        return limits;
+    }
+    let left = state
+        .primary_lease
+        .with(|leases| leases.remaining(crate::primary_lease::now()));
+
+    crate::primary_lease::limit_script_time(limits, left)
 }

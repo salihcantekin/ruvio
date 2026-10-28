@@ -19,6 +19,14 @@ pub(super) fn parse_set<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, Protocol
             return parse_set_ifeq(args);
         }
 
+        if args.bytes(2).eq_ignore_ascii_case(b"IFGT") {
+            return parse_set_ifcmp(args, true);
+        }
+
+        if args.bytes(2).eq_ignore_ascii_case(b"IFLT") {
+            return parse_set_ifcmp(args, false);
+        }
+
         let options = parse_set_options(&args.rest(2))?;
 
         return Ok(Command::Set(args.arg(0), args.arg(1), options));
@@ -50,6 +58,28 @@ pub(super) fn parse_set_ifeq<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, Pro
         key: args.arg(0),
         value: args.arg(1),
         expected: args.arg(3),
+        options,
+    })
+}
+
+/// `SET key value IFGT|IFLT [EX|PX|EXAT|PXAT|KEEPTTL]`: `value` must be a signed 64-bit integer.
+/// `NX`, `XX` and `GET` do not combine with it.
+pub(super) fn parse_set_ifcmp<'a>(
+    args: &Args<'a, '_>,
+    greater: bool,
+) -> Result<Command<'a>, ProtocolError> {
+    let number = parse_integer_argument(args.bytes(1))?;
+    let options = parse_set_options(&args.rest(3))?;
+
+    if options.get || options.condition != SetCondition::Always {
+        return Err(ProtocolError::Invalid("syntax error"));
+    }
+
+    Ok(Command::SetIfCmp {
+        key: args.arg(0),
+        value: args.arg(1),
+        number,
+        greater,
         options,
     })
 }
@@ -208,6 +238,13 @@ pub(super) fn parse_incrbyfloat<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, 
             args.arg(0),
             parse_increment_float(args.bytes(1))?,
         )),
+        4 => match create_ttl_option(args, 2)? {
+            Some(ttl) => Ok(with_create_ttl(
+                Some(ttl),
+                Command::IncrementFloat(args.arg(0), parse_increment_float(args.bytes(1))?),
+            )),
+            None => Err(ProtocolError::Invalid("syntax error")),
+        },
         _ => Err(ProtocolError::Invalid(
             "wrong number of arguments for 'incrbyfloat' command",
         )),
@@ -838,49 +875,96 @@ pub(super) fn parse_blmpop<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, Proto
     )
 }
 
-pub(super) fn parse_incr<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, ProtocolError> {
+/// `INCR` and `DECR`: a key and an optional `EX`/`PX` deadline for a key they create.
+fn counter_step<'a>(args: &Args<'a, '_>, delta: i64) -> Result<Command<'a>, ProtocolError> {
     match args.len() {
-        1 => Ok(Command::Increment(args.arg(0), 1)),
-        _ => Err(ProtocolError::Invalid("INCR and DECR expect one argument")),
+        1 => Ok(Command::Increment(args.arg(0), delta)),
+        3 => match create_ttl_option(args, 1)? {
+            Some(ttl) => Ok(with_create_ttl(
+                Some(ttl),
+                Command::Increment(args.arg(0), delta),
+            )),
+            None => Err(ProtocolError::Invalid("syntax error")),
+        },
+        _ => Err(ProtocolError::Invalid(
+            "INCR and DECR expect a key and an optional EX or PX",
+        )),
     }
+}
+
+/// `INCRBY key n [EX s | PX ms] [MAX limit]` (`DECRBY` takes no `MAX`).
+fn counter_by<'a>(
+    args: &Args<'a, '_>,
+    delta: i64,
+    allow_max: bool,
+) -> Result<Command<'a>, ProtocolError> {
+    const SYNTAX: ProtocolError = ProtocolError::Invalid(
+        "INCRBY and DECRBY expect a key, an integer and optional EX, PX or MAX",
+    );
+
+    if args.len() < 2 {
+        return Err(SYNTAX);
+    }
+
+    let mut ttl = None;
+    let mut limit = None;
+    let mut index = 2;
+
+    while index < args.len() {
+        if ttl.is_none()
+            && let Some(found) = create_ttl_option(args, index)?
+        {
+            ttl = Some(found);
+        } else if allow_max
+            && limit.is_none()
+            && index + 1 < args.len()
+            && args.bytes(index).eq_ignore_ascii_case(b"MAX")
+        {
+            limit = Some(parse_i64(args.bytes(index + 1))?);
+        } else {
+            return Err(SYNTAX);
+        }
+
+        index += 2;
+    }
+
+    let key = args.arg(0);
+    let command = match limit {
+        Some(limit) => Command::IncrementCapped { key, delta, limit },
+        None => Command::Increment(key, delta),
+    };
+
+    Ok(with_create_ttl(ttl, command))
+}
+
+pub(super) fn parse_incr<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, ProtocolError> {
+    counter_step(args, 1)
 }
 
 pub(super) fn parse_decr<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, ProtocolError> {
-    match args.len() {
-        1 => Ok(Command::Increment(args.arg(0), -1)),
-        _ => Err(ProtocolError::Invalid("INCR and DECR expect one argument")),
-    }
+    counter_step(args, -1)
 }
 
 pub(super) fn parse_incrby<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, ProtocolError> {
-    match args.len() {
-        2 => Ok(Command::Increment(args.arg(0), parse_i64(args.bytes(1))?)),
-        4 if args.bytes(2).eq_ignore_ascii_case(b"MAX") => Ok(Command::IncrementCapped {
-            key: args.arg(0),
-            delta: parse_i64(args.bytes(1))?,
-            limit: parse_i64(args.bytes(3))?,
-        }),
-        _ => Err(ProtocolError::Invalid(
-            "INCRBY and DECRBY expect a key and an integer",
-        )),
+    if args.len() < 2 {
+        return counter_by(args, 0, true);
     }
+
+    counter_by(args, parse_i64(args.bytes(1))?, true)
 }
 
 pub(super) fn parse_decrby<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, ProtocolError> {
-    match args.len() {
-        2 => {
-            let delta = parse_i64(args.bytes(1))?
-                .checked_neg()
-                .ok_or(ProtocolError::Invalid(
-                    "value is not an integer or out of range",
-                ))?;
-
-            Ok(Command::Increment(args.arg(0), delta))
-        }
-        _ => Err(ProtocolError::Invalid(
-            "INCRBY and DECRBY expect a key and an integer",
-        )),
+    if args.len() < 2 {
+        return counter_by(args, 0, false);
     }
+
+    let delta = parse_i64(args.bytes(1))?
+        .checked_neg()
+        .ok_or(ProtocolError::Invalid(
+            "value is not an integer or out of range",
+        ))?;
+
+    counter_by(args, delta, false)
 }
 
 pub(super) fn parse_mget<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, ProtocolError> {
@@ -941,16 +1025,24 @@ pub(super) fn parse_bit_unit(bytes: &[u8]) -> Result<bool, ProtocolError> {
 }
 
 pub(super) fn parse_setbit<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, ProtocolError> {
-    match args.len() {
-        3 => Ok(Command::SetBit {
+    let ttl = match args.len() {
+        3 => None,
+        5 => Some(create_ttl_option(args, 3)?.ok_or(ProtocolError::Invalid("syntax error"))?),
+        _ => {
+            return Err(ProtocolError::Invalid(
+                "SETBIT expects a key, an offset, a bit and an optional EX or PX",
+            ));
+        }
+    };
+
+    Ok(with_create_ttl(
+        ttl,
+        Command::SetBit {
             key: args.arg(0),
             offset: parse_bit_offset(args.bytes(1))?,
             value: parse_bit_value(args.bytes(2))?,
-        }),
-        _ => Err(ProtocolError::Invalid(
-            "SETBIT expects a key, an offset and a bit",
-        )),
-    }
+        },
+    ))
 }
 
 /// Largest bit offset a `BITFIELD` field may end at (16 MiB bitmap).
@@ -1586,6 +1678,19 @@ pub(super) fn parse_hset<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, Protoco
     })
 }
 
+pub(super) fn parse_hmset<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, ProtocolError> {
+    if args.len() < 3 || args.len().is_multiple_of(2) {
+        return Err(ProtocolError::Invalid(
+            "wrong number of arguments for 'hmset' command",
+        ));
+    }
+
+    match parse_hset(args)? {
+        Command::HashSet { key, pairs } => Ok(Command::HashMSet { key, pairs }),
+        _ => unreachable!("parse_hset returns HashSet"),
+    }
+}
+
 pub(super) fn parse_lpush<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, ProtocolError> {
     if args.len() < 2 {
         return Err(ProtocolError::Invalid(
@@ -1593,7 +1698,7 @@ pub(super) fn parse_lpush<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, Protoc
         ));
     }
 
-    Ok(Command::ListPush(args.arg(0), args.rest(1)))
+    Ok(Command::ListPush(args.arg(0), args.rest_one_or_many(1)))
 }
 
 pub(super) fn parse_rpush<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, ProtocolError> {
@@ -1603,7 +1708,7 @@ pub(super) fn parse_rpush<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, Protoc
         ));
     }
 
-    Ok(Command::ListPushBack(args.arg(0), args.rest(1)))
+    Ok(Command::ListPushBack(args.arg(0), args.rest_one_or_many(1)))
 }
 
 pub(super) fn parse_zadd<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, ProtocolError> {
@@ -1614,10 +1719,20 @@ pub(super) fn parse_zadd<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, Protoco
     }
 
     let mut options = SortedSetAddOptions::default();
+    let mut ttl = None;
     let mut index = 1;
 
     while index < args.len() {
         let option = args.bytes(index);
+
+        if ttl.is_none()
+            && let Some(found) = create_ttl_option(args, index)?
+        {
+            ttl = Some(found);
+            index += 2;
+
+            continue;
+        }
 
         if option.eq_ignore_ascii_case(b"NX") {
             if options.condition != SortedSetCondition::Always || options.greater || options.less {
@@ -1661,11 +1776,17 @@ pub(super) fn parse_zadd<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, Protoco
         ));
     }
 
-    let mut pairs = Vec::with_capacity(remaining / 2);
+    let pairs = if remaining == 2 {
+        OneOrMany::One((parse_f64(args.bytes(index))?, args.arg(index + 1)))
+    } else {
+        let mut pairs = Vec::with_capacity(remaining / 2);
 
-    for position in (index..args.len()).step_by(2) {
-        pairs.push((parse_f64(args.bytes(position))?, args.arg(position + 1)));
-    }
+        for position in (index..args.len()).step_by(2) {
+            pairs.push((parse_f64(args.bytes(position))?, args.arg(position + 1)));
+        }
+
+        OneOrMany::Many(pairs)
+    };
 
     if options.increment && pairs.len() != 1 {
         return Err(ProtocolError::Invalid(
@@ -1673,11 +1794,14 @@ pub(super) fn parse_zadd<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, Protoco
         ));
     }
 
-    Ok(Command::SortedSetAdd {
-        key: args.arg(0),
-        pairs,
-        options,
-    })
+    Ok(with_create_ttl(
+        ttl,
+        Command::SortedSetAdd {
+            key: args.arg(0),
+            pairs,
+            options,
+        },
+    ))
 }
 
 pub(super) fn parse_command_meta<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, ProtocolError> {
@@ -1917,6 +2041,14 @@ pub(super) fn parse_zrevrangebylex<'a>(args: &Args<'a, '_>) -> Result<Command<'a
 
 pub(super) fn parse_zpopmin<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, ProtocolError> {
     commands::cmd_zpopmin(b"ZPOPMIN", args)
+}
+
+pub(super) fn parse_zpopbyscore<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, ProtocolError> {
+    commands::cmd_zpopbyscore(args)
+}
+
+pub(super) fn parse_zmovedue<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, ProtocolError> {
+    commands::cmd_zmovedue(args)
 }
 
 pub(super) fn parse_zpopmax<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, ProtocolError> {

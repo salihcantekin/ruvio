@@ -25,11 +25,49 @@ internal sealed class CommandMultiplexer
     private int _scheduled;
     private TaskCompletionSource? _writerStopped;
     private Exception? _failure;
+    // RuvioClientOptions.CommandTimeout; zero means no limit.
+    private readonly TimeSpan _commandTimeout;
+    // The plain limit in Stopwatch ticks; 0 when there is none.
+    private readonly long _timeoutTicks;
+    // One timer per connection enforces every deadline. The writer records each sent request with a
+    // deadline in _sent; the timer fires at the earliest deadline, fails the overdue requests (their
+    // late replies are still drained) and re-arms for the next one. Nothing is allocated per command.
+    private readonly Timer? _timer;
+    private readonly object _timerGate = new();
+    // The deadline the timer is set for (long.MaxValue when it is idle). Written under _timerGate.
+    private long _armedFor = long.MaxValue;
+    // Requests sent with a deadline, in send order: written by the writer only, scanned by the timer.
+    // A slot is reused once its request completes; the ring grows (up to capacity) when it is full.
+    private Request?[]? _sent;
+    private long[]? _sentStamps;
+    private int _sentNext;
+    private readonly int _sentLimit;
+    // When the stream write in progress started (0 when none): a write that never finishes is a dead peer.
+    private long _writeStarted;
+    // The request whose caller is reading the socket itself, and the token that stops that read when
+    // the request expires (see LeadToken).
+    private Request? _leading;
+    private CancellationTokenSource? _leadCancel;
+    // A request whose replies a leader stopped reading at a reply boundary; the next reader goes on.
+    private Request? _carried;
+    private RespValue[]? _carriedValues;
+    private int _carriedIndex;
 
     // dedicatedReader: the stream blocks (BlockingSocketStream); replies are read by a thread of
     // this multiplexer's own, and writes complete in the caller.
-    internal CommandMultiplexer(Stream stream, RespReader reader, int capacity, bool coalesceWrites = true, bool dedicatedReader = false)
+    internal CommandMultiplexer(Stream stream, RespReader reader, int capacity, bool coalesceWrites = true, bool dedicatedReader = false, TimeSpan commandTimeout = default)
     {
+        _commandTimeout = commandTimeout;
+
+        if (commandTimeout > TimeSpan.Zero)
+        {
+            _timeoutTicks = Math.Max(1, (long)(commandTimeout.TotalSeconds * Stopwatch.Frequency));
+            _sentLimit = capacity;
+            _sent = new Request?[Math.Min(capacity, 16)];
+            _sentStamps = new long[_sent.Length];
+            _timer = new Timer(static state => ((CommandMultiplexer)state!).OnTimer(), this, Timeout.Infinite, Timeout.Infinite);
+        }
+
         _stream = stream;
         _coalesceWrites = coalesceWrites;
         _reader = reader;
@@ -73,6 +111,10 @@ internal sealed class CommandMultiplexer
             return ValueTask.FromException<IReadOnlyList<RespValue>>(error!);
 
         request.SetCommands(commands);
+
+        if (_timeoutTicks != 0)
+            request.Deadline = DeadlineFor(request.QueuedAt, BlockingWait.OfPipeline(commands));
+
         bool lead = CanLead(token);
 
         return LeadOrWait(lead, request, request.SubmitMany(this));
@@ -86,6 +128,10 @@ internal sealed class CommandMultiplexer
             return ValueTask.FromException<RespValue>(error!);
 
         request.SetCommand(command);
+
+        if (_timeoutTicks != 0)
+            request.Deadline = DeadlineFor(request.QueuedAt, BlockingWait.OfCommand(command));
+
         bool lead = CanLead(token);
 
         return LeadOrWait(lead, request, request.SubmitOne(this));
@@ -99,6 +145,10 @@ internal sealed class CommandMultiplexer
             return ValueTask.FromException<RespValue>(error!);
 
         request.SetArguments(arguments);
+
+        if (_timeoutTicks != 0)
+            request.Deadline = DeadlineFor(request.QueuedAt, BlockingWait.OfArguments(arguments));
+
         bool lead = CanLead(token);
 
         return LeadOrWait(lead, request, request.SubmitOne(this));
@@ -113,9 +163,193 @@ internal sealed class CommandMultiplexer
             return ValueTask.FromException<IReadOnlyList<RespValue>>(error!);
 
         request.SetPayload(payload);
+
+        if (_timeoutTicks != 0)
+            request.Deadline = DeadlineFor(request.QueuedAt, BlockingWait.OfPayload(payload.Span));
+
         bool lead = CanLead(token);
 
         return LeadOrWait(lead, request, request.SubmitMany(this));
+    }
+
+    /// <summary>
+    /// When a send must be answered, in <see cref="Stopwatch"/> ticks: <c>CommandTimeout</c> from
+    /// <paramref name="start"/>, plus a blocking command's own wait (see <see cref="BlockingWait"/>);
+    /// 0 when it may wait forever.
+    /// </summary>
+    private long DeadlineFor(long start, TimeSpan wait)
+    {
+        if (wait == TimeSpan.Zero)
+            return start + _timeoutTicks;
+
+        if (wait == BlockingWait.Forever)
+            return 0;
+
+        double total = _commandTimeout.TotalSeconds + wait.TotalSeconds;
+
+        // Past about 24 days the limit is no limit, as it was when this used CancelAfter.
+        return total * 1000 >= int.MaxValue - 1 ? 0 : start + (long)(total * Stopwatch.Frequency);
+    }
+
+    /// <summary>
+    /// Records a request that is about to enter the reply queue, so the timer can find it. The writer
+    /// calls it after the request is encoded: from then on, failing the caller cannot let the writer
+    /// read memory the caller has reused.
+    /// </summary>
+    private void Track(Request request)
+    {
+        Request?[] ring = _sent!;
+        long[] stamps = _sentStamps!;
+        int slot = _sentNext;
+        Request? previous = ring[slot];
+
+        // The slot's request still waits for its reply: make room rather than lose it.
+        if (previous is not null && (stamps[slot] & 1) == 0 && previous.Stamp == stamps[slot] && ring.Length < _sentLimit)
+        {
+            int size = (int)Math.Min((long)ring.Length * 2, _sentLimit);
+            var grown = new Request?[size];
+            var grownStamps = new long[size];
+
+            for (int index = 0; index < ring.Length; index++)
+            {
+                int from = (slot + index) % ring.Length;
+                grown[index] = ring[from];
+                grownStamps[index] = stamps[from];
+            }
+
+            slot = ring.Length;
+            ring = grown;
+            stamps = grownStamps;
+            _sentStamps = grownStamps;
+            Volatile.Write(ref _sent, grown);
+        }
+
+        long stamp = request.Stamp;
+
+        Volatile.Write(ref request.QueuedStamp, stamp);
+        stamps[slot] = stamp;
+        // A full fence: the timer sets _armedFor before it scans, this sets the slot before it reads
+        // _armedFor, so either the scan sees the request or this call arms the timer for it.
+        Interlocked.Exchange(ref ring[slot], request);
+        _sentNext = slot + 1 == ring.Length ? 0 : slot + 1;
+
+        if (request.Deadline < Volatile.Read(ref _armedFor))
+            Arm(request.Deadline);
+    }
+
+    private void Arm(long deadline)
+    {
+        lock (_timerGate)
+        {
+            if (deadline >= _armedFor || _timer is null || IsBroken)
+                return;
+
+            Volatile.Write(ref _armedFor, deadline);
+            long ticks = deadline - Stopwatch.GetTimestamp();
+            long due = ticks <= 0 ? 0 : (long)Math.Ceiling(ticks * 1000.0 / Stopwatch.Frequency);
+
+            _timer.Change(Math.Min(due, int.MaxValue - 1), Timeout.Infinite);
+        }
+    }
+
+    /// <summary>
+    /// The timer: fails each sent request whose deadline has passed with a <see cref="TimeoutException"/>.
+    /// Like a cancelled wait, the request's late reply is still read and dropped, so the connection stays
+    /// in use. A stream write that has not finished within the command timeout means the peer stopped
+    /// reading; then the connection is closed. Re-arms for the next deadline, if any.
+    /// </summary>
+    private void OnTimer()
+    {
+        lock (_timerGate)
+        {
+            if (IsBroken)
+                return;
+
+            Volatile.Write(ref _armedFor, long.MaxValue);
+        }
+
+        Interlocked.MemoryBarrier();
+        long now = Stopwatch.GetTimestamp();
+        long next = long.MaxValue;
+        Request?[] ring = Volatile.Read(ref _sent)!;
+
+        foreach (Request? request in ring)
+        {
+            if (request is null)
+                continue;
+
+            long stamp = Volatile.Read(ref request.QueuedStamp);
+
+            // Completed, or recycled for a command that is not sent yet.
+            if ((stamp & 1) != 0 || request.Stamp != stamp)
+                continue;
+
+            long deadline = Volatile.Read(ref request.Deadline);
+
+            if (deadline == 0)
+                continue;
+
+            if (deadline > now)
+            {
+                next = Math.Min(next, deadline);
+
+                continue;
+            }
+
+            TimeSpan limit = TimeSpan.FromSeconds((deadline - request.QueuedAt) / (double)Stopwatch.Frequency);
+
+            if (request.TryExpire(stamp, limit) && ReferenceEquals(request, Volatile.Read(ref _leading)))
+                Interlocked.Exchange(ref _leadCancel, null)?.Cancel();
+        }
+
+        long writing = Volatile.Read(ref _writeStarted);
+
+        if (writing != 0)
+        {
+            if (now - writing >= _timeoutTicks)
+            {
+                Fail(new TimeoutException($"ruvio: the socket took no data within the command timeout of {_commandTimeout}"));
+
+                return;
+            }
+
+            next = Math.Min(next, writing + _timeoutTicks);
+        }
+
+        if (next != long.MaxValue)
+            Arm(next);
+    }
+
+    private void StopTimer()
+    {
+        if (_timer is null)
+            return;
+
+        lock (_timerGate)
+            _timer.Dispose();
+    }
+
+    /// <summary>
+    /// The token a leader reads with: cancelled when <paramref name="mine"/> expires, so its caller is
+    /// not held by a read that may never finish. <c>default</c> when the request has no deadline.
+    /// </summary>
+    private CancellationToken LeadToken(Request mine)
+    {
+        if (mine.Deadline == 0)
+            return default;
+
+        // A full fence: the timer completes the request before it reads _leading.
+        Interlocked.Exchange(ref _leading, mine);
+        CancellationTokenSource? cancel = Volatile.Read(ref _leadCancel);
+
+        if (cancel is null)
+        {
+            var created = new CancellationTokenSource();
+
+            cancel = Interlocked.CompareExchange(ref _leadCancel, created, null) ?? created;
+        }
+
+        return cancel.Token;
     }
 
     /// <summary>
@@ -152,13 +386,15 @@ internal sealed class CommandMultiplexer
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private async ValueTask ReadUntilAsync(Request mine)
     {
+        CancellationToken lead = LeadToken(mine);
+
         try
         {
             while (!mine.IsCompleted)
             {
-                if (_pending.Reader.TryRead(out Request? request))
+                if (TryNextReply(out Request? request, out RespValue[]? values, out int index))
                 {
-                    if (!await ReadRepliesAsync(request).ConfigureAwait(false))
+                    if (await ReadRepliesAsync(request!, values, index, lead).ConfigureAwait(false) != ReplyRead.Done)
                         break;
 
                     continue;
@@ -172,9 +408,35 @@ internal sealed class CommandMultiplexer
         }
         finally
         {
+            if (lead.CanBeCanceled)
+                Volatile.Write(ref _leading, null);
+
             ReleaseReading();
         }
     }
+
+    /// <summary>The next request to read replies for: one a leader handed over, else the oldest queued.</summary>
+    private bool TryNextReply(out Request? request, out RespValue[]? values, out int index)
+    {
+        request = _carried;
+
+        if (request is not null)
+        {
+            values = _carriedValues;
+            index = _carriedIndex;
+            _carried = null;
+            _carriedValues = null;
+
+            return true;
+        }
+
+        values = null;
+        index = 0;
+
+        return _pending.Reader.TryRead(out request);
+    }
+
+    private bool HasReplies => Volatile.Read(ref _carried) is not null || _pending.Reader.TryPeek(out _);
 
     private bool TryTakeReading() => Interlocked.CompareExchange(ref _readingOwner, 1, 0) == 0;
 
@@ -183,7 +445,7 @@ internal sealed class CommandMultiplexer
     {
         Volatile.Write(ref _readingOwner, 0);
 
-        if (_pending.Reader.TryPeek(out _))
+        if (HasReplies)
             EnsureReader();
     }
 
@@ -270,7 +532,21 @@ internal sealed class CommandMultiplexer
         bool published = false;
         try
         {
-            await _capacity.WaitAsync(request.Token).ConfigureAwait(false);
+            if (request.Deadline == 0)
+                await _capacity.WaitAsync(request.Token).ConfigureAwait(false);
+            else
+            {
+                // The slow path only: a wait for a slot is bounded by the command's deadline as well.
+                long left = request.Deadline - Stopwatch.GetTimestamp();
+                int millis = left <= 0 ? 0 : (int)Math.Min(int.MaxValue - 1, Math.Ceiling(left * 1000.0 / Stopwatch.Frequency));
+
+                if (!await _capacity.WaitAsync(millis, request.Token).ConfigureAwait(false))
+                {
+                    TimeSpan limit = TimeSpan.FromSeconds((request.Deadline - request.QueuedAt) / (double)Stopwatch.Frequency);
+
+                    throw new TimeoutException($"ruvio: no reply within the command timeout of {limit}");
+                }
+            }
 
             if (!PublishAdmitted(request, out Exception? error))
             {
@@ -369,6 +645,10 @@ internal sealed class CommandMultiplexer
                 request.SentAt = Stopwatch.GetTimestamp();
                 // The reader may complete and recycle the request once it is pending.
                 Activity? parent = request.Parent;
+
+                if (request.Deadline != 0)
+                    Track(request);
+
                 await _pending.Writer.WriteAsync(request).ConfigureAwait(false);
                 pending = true;
                 EnsureReader();
@@ -376,6 +656,8 @@ internal sealed class CommandMultiplexer
 
                 using (var activity = RuvioSocket.StartPhase("write", parent))
                 {
+                    Volatile.Write(ref _writeStarted, started);
+
                     try
                     {
                         if (_coalesceWrites && frame.Length < 64 * 1024 && _outgoing.Reader.TryRead(out Request? next))
@@ -388,6 +670,7 @@ internal sealed class CommandMultiplexer
                     }
                     finally
                     {
+                        Volatile.Write(ref _writeStarted, 0);
                         RuvioSocket.RecordSocketPhase("write", started);
                     }
                 }
@@ -482,6 +765,10 @@ internal sealed class CommandMultiplexer
                         frame.Buffer.AsSpan(0, frame.Length).CopyTo(buffer.AsSpan(length));
                         request.SentAt = Stopwatch.GetTimestamp();
                         RuvioSocket.RecordSocketPhase("queue", request.QueuedAt);
+
+                        if (request.Deadline != 0)
+                            Track(request);
+
                         await _pending.Writer.WriteAsync(request).ConfigureAwait(false);
                         EnsureReader();
                         // Do not touch a published request: the reader can recycle it.
@@ -549,9 +836,9 @@ internal sealed class CommandMultiplexer
     {
         while (true)
         {
-            while (_pending.Reader.TryRead(out Request? request))
+            while (TryNextReply(out Request? request, out RespValue[]? values, out int index))
             {
-                if (!await ReadRepliesAsync(request).ConfigureAwait(false))
+                if (await ReadRepliesAsync(request!, values, index, CancellationToken.None).ConfigureAwait(false) == ReplyRead.Failed)
                 {
                     Volatile.Write(ref _readingOwner, 0);
 
@@ -562,19 +849,29 @@ internal sealed class CommandMultiplexer
             Volatile.Write(ref _readingOwner, 0);
 
             // A request queued after the last TryRead found the read side taken; take it back.
-            if (!_pending.Reader.TryPeek(out _) || !TryTakeReading())
+            if (!HasReplies || !TryTakeReading())
                 return;
         }
     }
 
+    private enum ReplyRead
+    {
+        Done,
+        Failed,
+        // A leader's read was stopped between two replies; the request waits in _carried.
+        HandedOver,
+    }
+
     /// <summary>
-    /// Reads one request's replies and completes it. False when the connection failed: then the
-    /// request and everything queued behind it have been failed.
+    /// Reads one request's replies, from reply <paramref name="index"/> on, and completes it. Failed
+    /// when the connection failed: then the request and everything queued behind it have been failed.
+    /// A leader passes <paramref name="lead"/>: when it is cancelled while no byte of the next reply has
+    /// been read, the request is handed to the next reader and the leader's caller is let go.
     /// </summary>
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-    private async ValueTask<bool> ReadRepliesAsync(Request request)
+    private async ValueTask<ReplyRead> ReadRepliesAsync(Request request, RespValue[]? values, int index, CancellationToken lead)
     {
-        bool replyStarted = false;
+        bool replyStarted = index > 0;
 
         try
         {
@@ -587,17 +884,23 @@ internal sealed class CommandMultiplexer
                 {
                     if (request.Replies == 1)
                     {
-                        RespValue value = await _reader.ReadAsync(CancellationToken.None).ConfigureAwait(false);
+                        if (lead.CanBeCanceled && !_reader.HasBuffered && !await WaitForReplyAsync(lead).ConfigureAwait(false))
+                            return HandOver(request, null, 0);
+
+                        RespValue value = await _reader.ReadAsync(lead).ConfigureAwait(false);
                         replyStarted = true;
                         request.TrySetResult(value);
                     }
                     else
                     {
-                        var values = new RespValue[request.Replies];
+                        values ??= new RespValue[request.Replies];
 
-                        for (int i = 0; i < values.Length; i++)
+                        for (int i = index; i < values.Length; i++)
                         {
-                            values[i] = await _reader.ReadAsync(CancellationToken.None).ConfigureAwait(false);
+                            if (lead.CanBeCanceled && !_reader.HasBuffered && !await WaitForReplyAsync(lead).ConfigureAwait(false))
+                                return HandOver(request, values, i);
+
+                            values[i] = await _reader.ReadAsync(lead).ConfigureAwait(false);
                             replyStarted = true;
                         }
 
@@ -612,10 +915,15 @@ internal sealed class CommandMultiplexer
 
             Finish(request);
 
-            return true;
+            return ReplyRead.Done;
         }
-        catch (Exception error)
+        catch (Exception exception)
         {
+            // Stopped in the middle of a reply: the parser cannot resume there, so the connection goes.
+            Exception error = exception is OperationCanceledException && lead.IsCancellationRequested
+                ? new TimeoutException($"ruvio: a reply stalled past the command timeout of {_commandTimeout}")
+                : exception;
+
             // ReplyStarted belongs to this request, never to another concurrent caller.
             bool closedBeforeReply = !replyStarted && !_reader.ReplyStarted;
             Fail(error);
@@ -628,8 +936,33 @@ internal sealed class CommandMultiplexer
                 Finish(queued);
             }
 
+            return ReplyRead.Failed;
+        }
+    }
+
+    /// <summary>Waits for the next reply's first byte; false when <paramref name="lead"/> stopped the wait first.</summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    private async ValueTask<bool> WaitForReplyAsync(CancellationToken lead)
+    {
+        try
+        {
+            await _reader.WaitForDataAsync(lead).ConfigureAwait(false);
+
+            return true;
+        }
+        catch (OperationCanceledException) when (lead.IsCancellationRequested)
+        {
             return false;
         }
+    }
+
+    private ReplyRead HandOver(Request request, RespValue[]? values, int index)
+    {
+        _carriedValues = values;
+        _carriedIndex = index;
+        Volatile.Write(ref _carried, request);
+
+        return ReplyRead.HandedOver;
     }
 
     private Task StartReaderThread()
@@ -772,6 +1105,7 @@ internal sealed class CommandMultiplexer
         _outgoing.Writer.TryComplete();
         _pending.Writer.TryComplete();
         _stream.Dispose();
+        StopTimer();
     }
 
     internal async Task StopAsync()
@@ -790,9 +1124,9 @@ internal sealed class CommandMultiplexer
             await Task.Delay(1).ConfigureAwait(false);
 
         // Requests that reached the reply queue after the last reader left.
-        while (_pending.Reader.TryRead(out Request? request))
+        while (TryNextReply(out Request? request, out _, out _))
         {
-            request.TryFail(Failure(closedBeforeReply: true));
+            request!.TryFail(Failure(closedBeforeReply: true));
             Finish(request);
         }
 
@@ -814,7 +1148,9 @@ internal sealed class CommandMultiplexer
         private CancellationTokenRegistration _registration;
         private RespValue? _single;
         private IReadOnlyList<RespValue>? _many;
-        private int _completed;
+        // The generation (bits 1 and up, bumped by Reset) and whether it completed (bit 0). The timer
+        // completes a request only for the generation it saw queued, never a recycled one.
+        private long _state = 2;
         private int _callerReleased;
         private int _references;
         private IReadOnlyList<IReadOnlyList<string>>? _commands;
@@ -828,6 +1164,10 @@ internal sealed class CommandMultiplexer
         internal CancellationToken Token;
         internal long QueuedAt;
         internal long SentAt;
+        // When the reply is due, in Stopwatch ticks; 0 for none.
+        internal long Deadline;
+        // The Stamp this request had when the writer recorded it for the timer.
+        internal long QueuedStamp;
         internal Activity? Parent;
         // Timeout, cancel and the reply can race; only the first Finish call completes the request and releases capacity.
         internal int Finished;
@@ -907,9 +1247,29 @@ internal sealed class CommandMultiplexer
             Release();
         }
 
+        internal long Stamp => Volatile.Read(ref _state);
+
+        private bool TryComplete()
+        {
+            long state = Volatile.Read(ref _state);
+
+            return (state & 1) == 0 && Interlocked.CompareExchange(ref _state, state | 1, state) == state;
+        }
+
+        /// <summary>Fails the request with a timeout if it is still generation <paramref name="stamp"/> and not completed.</summary>
+        internal bool TryExpire(long stamp, TimeSpan limit)
+        {
+            if ((stamp & 1) != 0 || Interlocked.CompareExchange(ref _state, stamp | 1, stamp) != stamp)
+                return false;
+
+            _core.SetException(new TimeoutException($"ruvio: no reply within the command timeout of {limit}"));
+
+            return true;
+        }
+
         internal bool TrySetResult(RespValue value)
         {
-            if (Interlocked.Exchange(ref _completed, 1) != 0)
+            if (!TryComplete())
                 return false;
 
             _single = value;
@@ -920,7 +1280,7 @@ internal sealed class CommandMultiplexer
 
         internal bool TrySetResult(IReadOnlyList<RespValue> values)
         {
-            if (Interlocked.Exchange(ref _completed, 1) != 0)
+            if (!TryComplete())
                 return false;
 
             _many = values;
@@ -931,7 +1291,7 @@ internal sealed class CommandMultiplexer
 
         internal bool TryFail(Exception error)
         {
-            if (Interlocked.Exchange(ref _completed, 1) != 0)
+            if (!TryComplete())
                 return false;
 
             _core.SetException(error);
@@ -941,7 +1301,7 @@ internal sealed class CommandMultiplexer
 
         internal bool TryCancel() => TryFail(new OperationCanceledException(Token));
 
-        internal bool IsCompleted => Volatile.Read(ref _completed) != 0;
+        internal bool IsCompleted => (Volatile.Read(ref _state) & 1) != 0;
 
         internal void Release()
         {
@@ -955,13 +1315,15 @@ internal sealed class CommandMultiplexer
             _registration = default;
             _single = null;
             _many = null;
-            _completed = 0;
             _callerReleased = 0;
             Finished = 0;
             Token = default;
             Parent = null;
             _owner = null;
             DisposePayload();
+            Deadline = 0;
+            // Last: a new generation, not completed. The timer reads Deadline only after the stamp.
+            Volatile.Write(ref _state, (_state | 1) + 1);
         }
 
         public ValueTaskSourceStatus GetStatus(short token) => _core.GetStatus(token);

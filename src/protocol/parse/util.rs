@@ -51,6 +51,10 @@ pub(in crate::protocol) fn parse_timeout_ms(bytes: &[u8]) -> Result<Option<u64>,
     Ok(Some((seconds * 1_000.0).ceil() as u64))
 }
 
+/// The most keys, members or fields one `SCAN`, `HSCAN`, `SSCAN` or `ZSCAN` call examines; a larger
+/// `COUNT` is lowered to it. One call runs on the shard's thread, so it must stay short.
+pub const MAX_SCAN_COUNT: usize = 10_000;
+
 pub(in crate::protocol) fn parse_scan<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
     if args.len() == 0 {
         return Err(ProtocolError::Invalid("SCAN expects a cursor"));
@@ -60,6 +64,7 @@ pub(in crate::protocol) fn parse_scan<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
     let mut pattern = None;
     let mut count = 10;
     let mut type_name = None;
+    let mut slot = None;
     let mut index = 1;
 
     while index < args.len() {
@@ -75,9 +80,18 @@ pub(in crate::protocol) fn parse_scan<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
             let parsed = parse_i64(args.bytes(index + 1))?;
 
             count = usize::try_from(parsed)
-                .map_err(|_| ProtocolError::Invalid("value is not an integer"))?;
+                .map_err(|_| ProtocolError::Invalid("value is not an integer"))?
+                .min(MAX_SCAN_COUNT);
         } else if name.eq_ignore_ascii_case(b"TYPE") {
             type_name = Some(args.arg(index + 1));
+        } else if name.eq_ignore_ascii_case(b"SLOT") {
+            slot = Some(
+                std::str::from_utf8(args.bytes(index + 1))
+                    .ok()
+                    .and_then(|value| value.parse::<u16>().ok())
+                    .filter(|&value| usize::from(value) < crate::routing::HASH_SLOT_COUNT)
+                    .ok_or(ProtocolError::Invalid("slot is out of range (0-16383)"))?,
+            );
         } else {
             return Err(ProtocolError::Invalid("syntax error"));
         }
@@ -90,6 +104,7 @@ pub(in crate::protocol) fn parse_scan<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
         pattern,
         count,
         type_name,
+        slot,
     })
 }
 

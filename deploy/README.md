@@ -7,6 +7,8 @@
 | `ruvio.toml` | Example configuration; every key is documented in [docs/CONFIGURATION.md](../docs/CONFIGURATION.md) |
 | `ruvio.service` | systemd unit that runs `/usr/local/bin/ruvio --config /etc/ruvio/ruvio.toml` as the `ruvio` user |
 | `kubernetes.yaml` | Example Kubernetes manifest |
+| `coordinator.toml`, `ruvio-coordinator.service` | A coordinator for a binary install: example config and systemd unit (`ruvio coordinator --config /etc/ruvio/coordinator.toml`) |
+| `compose.failover.yml`, `coordinator/` | Three data nodes and three `ruvio coordinator` processes with automatic failover ([docs/COORDINATOR.md](../docs/COORDINATOR.md)); needs an image built with the coordinator |
 
 The Docker image and its environment variables are described in the [main README](../README.md#start-the-server) and in [docs/SETUP.md](../docs/SETUP.md). 
 > [!NOTE]

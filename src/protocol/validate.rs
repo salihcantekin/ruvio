@@ -43,6 +43,7 @@ pub(super) fn validate_command_payloads(
     limits: ProtocolLimits,
 ) -> Result<(), ProtocolError> {
     match command {
+        Command::CreateTtl { inner, .. } => validate_command_payloads(inner, limits)?,
         Command::Ping(message) | Command::Ruvio(message) | Command::Info(message) => {
             if let Some(message) = message {
                 validate_value(message, limits)?;
@@ -65,10 +66,18 @@ pub(super) fn validate_command_payloads(
         | Command::ReadWrite
         | Command::Wait { .. }
         | Command::Save
+        | Command::ConfigRewrite
+        | Command::ReplicaOf { .. }
+        | Command::MoveSlots(_)
+        | Command::Topology(_)
+        | Command::PrimaryLease(_)
+        | Command::Migrate(_)
+        | Command::Role
         | Command::Bgsave
         | Command::DbSize
         | Command::RandomKey
         | Command::ClientId
+        | Command::ClientSetInfo
         | Command::ClientList { .. }
         | Command::ClientInfo
         | Command::Slowlog(_)
@@ -95,6 +104,11 @@ pub(super) fn validate_command_payloads(
             fingerprint,
             owner,
             ..
+        }
+        | Command::IdempotencyAbort {
+            key,
+            fingerprint,
+            owner,
         } => {
             validate_key(key, limits)?;
             validate_value(fingerprint, limits)?;
@@ -112,6 +126,12 @@ pub(super) fn validate_command_payloads(
         }
         Command::Move { key, .. } => validate_key(key, limits)?,
         Command::ConfigGet(pattern) => validate_value(pattern, limits)?,
+        Command::ConfigSet(pairs) => {
+            for (name, value) in pairs {
+                validate_value(name, limits)?;
+                validate_value(value, limits)?;
+            }
+        }
         Command::JsonGet { key, path } | Command::JsonDel { key, path } => {
             validate_key(key, limits)?;
             validate_value(path, limits)?;
@@ -144,6 +164,7 @@ pub(super) fn validate_command_payloads(
         | Command::Semaphore { key, .. }
         | Command::IncrementCapped { key, .. }
         | Command::Release { key, .. }
+        | Command::Renew { key, .. }
         | Command::Limit { key, .. }
         | Command::Once { key, .. }
         | Command::Take { key, .. }
@@ -373,7 +394,7 @@ pub(super) fn validate_command_payloads(
             }
         }
 
-        Command::HashSet { key, pairs } => {
+        Command::HashSet { key, pairs } | Command::HashMSet { key, pairs } => {
             validate_key(key, limits)?;
 
             for (field, value) in pairs {
@@ -464,6 +485,10 @@ pub(super) fn validate_command_payloads(
             validate_value(value, limits)?;
             validate_value(expected, limits)?;
         }
+        Command::SetIfCmp { key, value, .. } => {
+            validate_key(key, limits)?;
+            validate_value(value, limits)?;
+        }
         Command::BloomInsert { key, items, .. } => {
             validate_key(key, limits)?;
             validate_values(items, limits)?;
@@ -472,9 +497,11 @@ pub(super) fn validate_command_payloads(
             validate_key(key, limits)?;
             validate_values(values, limits)?;
         }
-        Command::ListPush(key, values)
-        | Command::ListPushBack(key, values)
-        | Command::BloomAddMany(key, values)
+        Command::ListPush(key, values) | Command::ListPushBack(key, values) => {
+            validate_key(key, limits)?;
+            validate_values(values, limits)?;
+        }
+        Command::BloomAddMany(key, values)
         | Command::BloomContainsMany(key, values)
         | Command::SetAdd(key, values)
         | Command::SetRemove(key, values)
@@ -518,6 +545,21 @@ pub(super) fn validate_command_payloads(
             validate_value(field, limits)?;
         }
 
+        Command::HashTransfer { key, from, to, .. } => {
+            validate_key(key, limits)?;
+            validate_value(from, limits)?;
+            validate_value(to, limits)?;
+        }
+
+        Command::Transfer {
+            source,
+            destination,
+            ..
+        } => {
+            validate_key(source, limits)?;
+            validate_key(destination, limits)?;
+        }
+
         Command::SortedSetAdd { key, pairs, .. } => {
             validate_key(key, limits)?;
 
@@ -538,7 +580,17 @@ pub(super) fn validate_command_payloads(
             validate_values(fields, limits)?;
         }
 
-        Command::SortedSetPop { key, .. } => validate_key(key, limits)?,
+        Command::SortedSetPop { key, .. } | Command::SortedSetPopByScore { key, .. } => {
+            validate_key(key, limits)?
+        }
+        Command::SortedSetMoveDue {
+            source,
+            destination,
+            ..
+        } => {
+            validate_key(source, limits)?;
+            validate_key(destination, limits)?;
+        }
         Command::SortedSetBlockPop { keys, .. } => validate_keys(keys, limits)?,
         Command::SortedSetRemoveRange { key, range } => {
             validate_key(key, limits)?;
@@ -622,7 +674,8 @@ pub(super) fn validate_command_payloads(
         | Command::ScriptKill
         | Command::FunctionList
         | Command::ClientGetName
-        | Command::ClientTracking(_) => {}
+        | Command::ClientTracking(_)
+        | Command::ClientDurability { .. } => {}
         Command::Hello {
             client_name, auth, ..
         } => {

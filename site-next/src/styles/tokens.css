@@ -11,6 +11,10 @@
   --surface-2: #151a2a;
   --line: #242b3e;
   --line-soft: rgba(160, 175, 215, 0.18);
+  /* Table and grid rules, stronger than --line so rows and columns read as a grid */
+  --grid: #2f384f;
+  --row-alt: rgba(160, 175, 215, 0.04);
+  --row-hover: rgba(180, 81, 42, 0.16);
 
   /* Text */
   --ink: #e9ecf3;
@@ -71,4 +75,61 @@
   --section-y: clamp(56px, 8vw, 96px);
 
   color-scheme: dark;
+}
+
+/*
+ * Light theme: a soft, neutral light ground; the warm rust of the logo lives in the components
+ * (cards, tables, menus, selected items, chips) instead of the page background.
+ * Applied when <html data-theme="light"> is set; the choice is shared with the docs through
+ * the "starlight-theme" localStorage key. Code boxes stay on a dark panel so Night Owl stays readable.
+ */
+:root[data-theme="light"] {
+  --bg: #eef0f3;
+  --bg-band: #e8eaee;
+  --surface: #f8f8f7;
+  --surface-2: #e8eaee;
+  --line: #d5d8de;
+  --line-soft: rgba(40, 30, 24, 0.15);
+  --grid: #bfc5cf;
+  --row-alt: rgba(40, 50, 70, 0.045);
+  --row-hover: rgba(164, 68, 30, 0.12);
+
+  --ink: #1d1b1f;
+  --mute: #55504b;
+  --faint: #615b55;
+
+  --paper: rgba(249, 249, 248, 0.92);
+  --paper-solid: #f9f9f8;
+  --paper-line: #d8dbe1;
+  --ink-body: #2b2723;
+
+  --accent: #a4441e;
+  --accent-hover: #913b19;
+  --accent-ink: #ffffff;
+
+  --c1: #a4501f;
+  --c2: #3b5780;
+  --c3: #56648a;
+  --redis: #5a6684;
+
+  --code-bg: #1b1e2e;
+  --code-ink: #e3e7f0;
+  --code-dim: rgba(220, 228, 240, 0.68);
+
+  --sky-0: #eef0f4;
+  --sky-1: #ebeef2;
+  --sky-2: #f0ebe7;
+  --sky-3: #f2e3d8;
+  --dusk: 200, 100, 50;
+
+  --ground-glow-a: rgba(59, 87, 128, 0.09);
+  --ground-glow-b: rgba(var(--dusk), 0.07);
+  --ground-dot: rgba(40, 50, 70, 0.14);
+  --ground:
+    radial-gradient(70vw 60vh at 8% -8%, var(--ground-glow-a), transparent 70%),
+    radial-gradient(60vw 55vh at 100% 105%, var(--ground-glow-b), transparent 70%),
+    radial-gradient(circle, var(--ground-dot) 1px, transparent 1.4px) 0 0 / 24px 24px,
+    var(--bg);
+
+  color-scheme: light;
 }

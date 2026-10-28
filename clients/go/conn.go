@@ -34,6 +34,12 @@ type request struct {
 	err    error
 	state  atomic.Uint32
 	done   chan struct{}
+	// deadline is when the call fails with context.DeadlineExceeded, in nanoseconds on the
+	// clock of mono(); 0 means none. Set by setDeadline, checked by the reader (see expire).
+	deadline int64
+	// skip > 0 marks a stand-in left in the FIFO for an expired request: it swallows that
+	// many late replies.
+	skip int
 }
 
 var reqPool = sync.Pool{New: func() any {
@@ -82,6 +88,9 @@ func (r *request) ss(v []string) *request {
 
 // complete is called by the reader (or on failure) exactly once per request.
 func (r *request) complete() {
+	if r.skip != 0 { // a stand-in for an expired request: nobody waits on it
+		return
+	}
 	if r.state.CompareAndSwap(stateWaiting, stateDone) {
 		r.done <- struct{}{}
 		return
@@ -136,7 +145,10 @@ type conn struct {
 	rwake     chan struct{}
 	quit      chan struct{}
 	onPush    func(Value)
+	addr      int32                     // index of the dialed address in Client.addrs
 	sink      atomic.Pointer[sinkFuncs] // Pub/Sub mode: every reply goes here
+	timeout   time.Duration             // Options.CommandTimeout; <= 0 means none
+	armed     int64                     // the socket read deadline (mono() clock, 0: none); guarded by mu
 
 	// read state, owned by the holder of the reading token
 	rbuf   []byte
@@ -193,6 +205,11 @@ func (c *conn) send(r *request, canLead bool) (lead bool, err error) {
 	}
 	c.wbuf = append(c.wbuf, r.buf...)
 	c.pend.push(r)
+	if r.deadline != 0 && (c.armed == 0 || r.deadline < c.armed || c.armed <= r.deadline-int64(c.timeout)/2) {
+		// Armed once per half timeout on a steady stream of calls, not once per call; an earlier
+		// wake-up than a request needs is harmless (expire re-arms).
+		c.arm(r.deadline)
+	}
 	if !c.reading {
 		c.reading = true
 		if canLead {
@@ -358,6 +375,10 @@ func (c *conn) readLoop() {
 		}
 		for {
 			if err := c.pump(); err != nil {
+				if errors.Is(err, os.ErrDeadlineExceeded) && !c.dead.Load() {
+					c.expire()
+					continue
+				}
 				c.fail(err)
 				return
 			}
@@ -376,35 +397,66 @@ func (c *conn) readLoop() {
 	}
 }
 
-// lead reads until r completes, honoring the context deadline through the socket
-// read deadline. ok=false means r was abandoned (deadline hit) and must not be used.
-func (c *conn) lead(ctx context.Context, r *request) (ok bool, err error) {
-	dl, hasDL := ctx.Deadline()
-	if hasDL {
-		c.nc.SetReadDeadline(dl)
-	}
+// lead reads until r completes. A request past its deadline is failed by expire, which the
+// socket read deadline wakes; the connection stays usable.
+func (c *conn) lead(r *request) {
 	for r.state.Load() == stateWaiting {
 		if err := c.pump(); err != nil {
-			if hasDL && errors.Is(err, os.ErrDeadlineExceeded) && !c.dead.Load() {
-				abandoned := r.state.CompareAndSwap(stateWaiting, stateAbandoned)
-				c.nc.SetReadDeadline(time.Time{})
-				c.releaseRead()
-				if abandoned {
-					return false, context.DeadlineExceeded
-				}
-				<-r.done
-				return true, nil
+			if errors.Is(err, os.ErrDeadlineExceeded) && !c.dead.Load() {
+				c.expire()
+				continue
 			}
 			c.fail(err)
 			break
 		}
 	}
-	if hasDL {
-		c.nc.SetReadDeadline(time.Time{})
-	}
 	c.releaseRead()
 	<-r.done
-	return true, nil
+}
+
+// arm sets the socket read deadline; the caller holds mu.
+func (c *conn) arm(deadline int64) {
+	c.armed = deadline
+	if deadline == 0 {
+		c.nc.SetReadDeadline(time.Time{})
+		return
+	}
+	c.nc.SetReadDeadline(epoch.Add(time.Duration(deadline)))
+}
+
+// expire runs when the socket read deadline passes: every pending request past its own
+// deadline completes with context.DeadlineExceeded, a stand-in takes its place in the FIFO
+// to swallow its late reply, and the read deadline moves to the earliest deadline left.
+func (c *conn) expire() {
+	now := mono()
+	next := int64(0)
+	c.mu.Lock()
+	q := &c.pend
+	for i := 0; i < q.size; i++ {
+		r := q.buf[(q.head+i)%len(q.buf)]
+		if r.deadline == 0 || r.skip != 0 {
+			continue
+		}
+		if r.deadline > now {
+			if next == 0 || r.deadline < next {
+				next = r.deadline
+			}
+			continue
+		}
+		r.deadline = 0
+		if r.state.Load() != stateWaiting {
+			continue // abandoned by its caller: the reader completes and recycles it as usual
+		}
+		left := 1
+		if r.vals != nil {
+			left = r.expect - len(r.vals)
+		}
+		q.buf[(q.head+i)%len(q.buf)] = &request{skip: left}
+		r.err = context.DeadlineExceeded
+		r.complete()
+	}
+	c.arm(next)
+	c.mu.Unlock()
 }
 
 type sinkFuncs struct {
@@ -428,6 +480,13 @@ func (c *conn) deliver(v Value) {
 	if r == nil {
 		c.mu.Unlock()
 		c.fail(ErrProtocol)
+		return
+	}
+	if r.skip != 0 { // the late reply of an expired request
+		if r.skip--; r.skip == 0 {
+			c.pend.pop()
+		}
+		c.mu.Unlock()
 		return
 	}
 	if r.vals == nil { // single command (a pipeline always has a non-nil reply slice, even for one command)
@@ -481,6 +540,7 @@ func (c *conn) roundTrip(ctx context.Context, r *request) (bool, error) {
 		putReq(r)
 		return false, err
 	}
+	c.setDeadline(ctx, r)
 	canLead := ctx.Done() == nil
 	if !canLead {
 		_, canLead = ctx.Deadline()
@@ -491,10 +551,40 @@ func (c *conn) roundTrip(ctx context.Context, r *request) (bool, error) {
 		return false, err
 	}
 	if lead {
-		return c.lead(ctx, r)
+		c.lead(r)
+		return true, nil
 	}
 	return r.wait(ctx)
 }
+
+// setDeadline gives r its deadline: the context's, or else Options.CommandTimeout plus the
+// wait of a blocking command (none when it may wait forever). No allocation, no timer: one
+// socket read deadline per connection covers every pending request.
+func (c *conn) setDeadline(ctx context.Context, r *request) {
+	r.deadline = 0
+	if dl, has := ctx.Deadline(); has {
+		if r.deadline = int64(dl.Sub(epoch)); r.deadline <= 0 {
+			r.deadline = 1
+		}
+		return
+	}
+	if c.timeout <= 0 {
+		return
+	}
+	limit := c.timeout
+	// A blocking command waits its own time on top; one that waits forever has none.
+	if w := requestWait(r.buf); w == waitForever {
+		return
+	} else {
+		limit += w
+	}
+	r.deadline = mono() + int64(limit)
+}
+
+// epoch anchors mono(), a monotonic clock in nanoseconds that starts above 0.
+var epoch = time.Now().Add(-time.Second)
+
+func mono() int64 { return int64(time.Since(epoch)) }
 
 // exec sends r and waits for its reply. It recycles r.
 func (c *conn) exec(ctx context.Context, r *request) (Value, error) {
@@ -508,6 +598,31 @@ func (c *conn) exec(ctx context.Context, r *request) (Value, error) {
 		err = &Error{Msg: b2s(v.Bytes)}
 	}
 	return v, err
+}
+
+// execKeep is exec for a caller that may send r again: it does not recycle r, which the
+// caller must putReq when kept is true. kept is false when the call was abandoned and the
+// reader owns r.
+func (c *conn) execKeep(ctx context.Context, r *request) (v Value, kept bool, err error) {
+	ok, err := c.roundTrip(ctx, r)
+	if !ok {
+		return Value{}, false, err
+	}
+	v, err = r.val, r.err
+	if err == nil && v.Kind == KindError {
+		err = &Error{Msg: b2s(v.Bytes)}
+	}
+	return v, true, err
+}
+
+// rearm readies a completed request to be sent again.
+func (r *request) rearm() {
+	r.val = Value{}
+	r.vals = nil
+	r.err = nil
+	r.skip = 0
+	r.expect = 1
+	r.state.Store(stateWaiting)
 }
 
 // execMany sends one frame holding n commands and returns n replies (errors in place).

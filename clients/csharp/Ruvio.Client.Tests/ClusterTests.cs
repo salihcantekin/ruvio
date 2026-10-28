@@ -332,6 +332,155 @@ public class ClusterTests
     }
 
     [Fact(Timeout = 15000)]
+    public async Task AskIsFollowedWithAskingAndTheSlotMapIsNotUpdated()
+    {
+        using var first = Listen();
+        using var second = Listen();
+        (RuvioConnection opened, NetworkStream seedStream, TcpClient seed) = await ConnectTwoShards(first, second);
+
+        await using RuvioConnection connection = opened;
+        using TcpClient seedClient = seed;
+        RuvioClient client = await connection.GetDefaultDatabaseAsync();
+
+        ValueTask<string?> get = client.GetStringAsync("somekey");
+        using TcpClient owner = await second.AcceptTcpClientAsync();
+        NetworkStream ownerStream = owner.GetStream();
+
+        await ExpectAsync(ownerStream, "GET", "somekey");
+        await ReplyAsync(ownerStream, $"-ASK 11058 127.0.0.1:{first.Port}\r\n");
+
+        // One write: ASKING and then the command, to the node the ASK named.
+        await ExpectAsync(seedStream, "ASKING");
+        await ExpectAsync(seedStream, "GET", "somekey");
+        await ReplyAsync(seedStream, "+OK\r\n$5\r\nasked\r\n");
+        Assert.Equal("asked", await get);
+
+        // The map was not changed: the next command for the slot goes to its owner again.
+        ValueTask<string?> next = client.GetStringAsync("somekey");
+
+        await ExpectAsync(ownerStream, "GET", "somekey");
+        await ReplyAsync(ownerStream, "$4\r\nhome\r\n");
+        Assert.Equal("home", await next);
+    }
+
+    [Fact(Timeout = 15000)]
+    public async Task AskToAnUnknownNodeOpensAConnectionToIt()
+    {
+        using var first = Listen();
+        using var second = Listen();
+        using var third = Listen();
+        (RuvioConnection opened, NetworkStream seedStream, TcpClient seed) = await ConnectTwoShards(first, second);
+
+        await using RuvioConnection connection = opened;
+        using TcpClient seedClient = seed;
+        RuvioClient client = await connection.GetDefaultDatabaseAsync();
+
+        ValueTask<string?> get = client.GetStringAsync("somekey");
+        using TcpClient owner = await second.AcceptTcpClientAsync();
+        NetworkStream ownerStream = owner.GetStream();
+
+        await ExpectAsync(ownerStream, "GET", "somekey");
+        await ReplyAsync(ownerStream, $"-ASK 11058 127.0.0.1:{third.Port}\r\n");
+
+        using TcpClient asked = await third.AcceptTcpClientAsync();
+        NetworkStream askedStream = asked.GetStream();
+
+        await ExpectAsync(askedStream, "ASKING");
+        await ExpectAsync(askedStream, "GET", "somekey");
+        await ReplyAsync(askedStream, "+OK\r\n$3\r\nnew\r\n");
+        Assert.Equal("new", await get);
+    }
+
+    [Fact(Timeout = 15000)]
+    public async Task TryAgainIsRetriedAfterAShortWait()
+    {
+        using var first = Listen();
+        using var second = Listen();
+        (RuvioConnection opened, NetworkStream seedStream, TcpClient seed) = await ConnectTwoShards(first, second);
+
+        await using RuvioConnection connection = opened;
+        using TcpClient seedClient = seed;
+        RuvioClient client = await connection.GetDefaultDatabaseAsync();
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+
+        ValueTask<string?> get = client.GetStringAsync("somekey");
+        using TcpClient owner = await second.AcceptTcpClientAsync();
+        NetworkStream ownerStream = owner.GetStream();
+
+        await ExpectAsync(ownerStream, "GET", "somekey");
+        await ReplyAsync(ownerStream, "-TRYAGAIN slot is being moved\r\n");
+        await ExpectAsync(ownerStream, "GET", "somekey");
+        await ReplyAsync(ownerStream, "$2\r\nok\r\n");
+        Assert.Equal("ok", await get);
+        Assert.True(clock.ElapsedMilliseconds >= 4, $"retried after {clock.ElapsedMilliseconds} ms");
+    }
+
+    [Fact(Timeout = 15000)]
+    public async Task TryAgainIsReturnedAfterSevenRetries()
+    {
+        using var first = Listen();
+        using var second = Listen();
+        (RuvioConnection opened, NetworkStream seedStream, TcpClient seed) = await ConnectTwoShards(first, second);
+
+        await using RuvioConnection connection = opened;
+        using TcpClient seedClient = seed;
+        RuvioClient client = await connection.GetDefaultDatabaseAsync();
+
+        ValueTask<string?> get = client.GetStringAsync("somekey");
+        using TcpClient owner = await second.AcceptTcpClientAsync();
+        NetworkStream ownerStream = owner.GetStream();
+
+        for (int send = 0; send < 8; send++)
+        {
+            await ExpectAsync(ownerStream, "GET", "somekey");
+            await ReplyAsync(ownerStream, "-TRYAGAIN slot is being moved\r\n");
+        }
+
+        RuvioException error = await Assert.ThrowsAsync<RuvioException>(async () => await get);
+
+        Assert.StartsWith("TRYAGAIN", error.Message);
+
+        // The command was sent eight times and not again.
+        ValueTask<string> ping = client.PingAsync();
+
+        await ExpectAsync(seedStream, "PING");
+        await ReplyAsync(seedStream, "+PONG\r\n");
+        Assert.Equal("PONG", await ping);
+    }
+
+    [Fact(Timeout = 15000)]
+    public async Task AskAndMovedShareOneRedirectBudget()
+    {
+        using var first = Listen();
+        using var second = Listen();
+        (RuvioConnection opened, NetworkStream seedStream, TcpClient seed) = await ConnectTwoShards(first, second);
+
+        await using RuvioConnection connection = opened;
+        using TcpClient seedClient = seed;
+        RuvioClient client = await connection.GetDefaultDatabaseAsync();
+        string ask = $"-ASK 11058 127.0.0.1:{first.Port}\r\n";
+
+        ValueTask<string?> get = client.GetStringAsync("somekey");
+        using TcpClient owner = await second.AcceptTcpClientAsync();
+        NetworkStream ownerStream = owner.GetStream();
+
+        await ExpectAsync(ownerStream, "GET", "somekey");
+        await ReplyAsync(ownerStream, ask);
+        await ExpectAsync(seedStream, "ASKING");
+        await ExpectAsync(seedStream, "GET", "somekey");
+        await ReplyAsync(seedStream, $"+OK\r\n-MOVED 11058 127.0.0.1:{second.Port}\r\n");
+        await ExpectAsync(ownerStream, "GET", "somekey");
+        await ReplyAsync(ownerStream, ask);
+        await ExpectAsync(seedStream, "ASKING");
+        await ExpectAsync(seedStream, "GET", "somekey");
+        await ReplyAsync(seedStream, $"+OK\r\n{ask}");
+
+        RuvioException error = await Assert.ThrowsAsync<RuvioException>(async () => await get);
+
+        Assert.StartsWith("ASK 11058", error.Message);
+    }
+
+    [Fact(Timeout = 15000)]
     public async Task CommandsWhoseKeysSpanSlotsAreRefusedBeforeSending()
     {
         using var first = Listen();

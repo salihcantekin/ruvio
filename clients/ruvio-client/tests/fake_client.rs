@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use ruvio_client::__bench::parse;
 use ruvio_client::{
     Aggregate, Client, ClientOptions, ConnectionNotice, Error, GeoFrom, GeoSearch, GeoUnit,
-    ListSide, RespValue, SortedSetCombine,
+    LimitOutcome, ListSide, RespValue, SortedSetCombine,
 };
 
 enum Reply {
@@ -847,4 +847,69 @@ fn hash_field_expiry_conditions_are_spelled_out() {
         expected.extend(words(&["FIELDS", "1", "f"]));
         assert_eq!(request, expected);
     }
+}
+
+#[test]
+fn limit_modes_send_their_keywords_and_read_their_replies() {
+    let (reply, request) = probe(":4\r\n", |c| c.limit_sliding("k", 5, 1_000));
+    assert_eq!(reply.unwrap(), Some(4));
+    assert_eq!(request, words(&["LIMIT", "k", "5", "1000", "SLIDING"]));
+
+    let (reply, _) = probe("$-1\r\n", |c| c.limit_sliding("k", 5, 1_000));
+    assert_eq!(reply.unwrap(), None);
+
+    let (reply, request) = probe(":3\r\n", |c| c.limit_tokens("k", 10, 2_000, 2));
+    assert_eq!(reply.unwrap(), Some(3));
+    assert_eq!(
+        request,
+        words(&["LIMIT", "k", "10", "2000", "TOKENS", "COST", "2"])
+    );
+
+    let (reply, request) = probe("*2\r\n:2\r\n:0\r\n", |c| {
+        c.limit_sliding_with_retry("k", 5, 1_000)
+    });
+    assert_eq!(
+        reply.unwrap(),
+        LimitOutcome {
+            allowed: true,
+            remaining: 2,
+            retry_after_ms: 0
+        }
+    );
+    assert_eq!(
+        request,
+        words(&["LIMIT", "k", "5", "1000", "SLIDING", "WITHRETRY"])
+    );
+
+    let (reply, request) = probe("*2\r\n:-1\r\n:250\r\n", |c| {
+        c.limit_tokens_with_retry("k", 10, 2_000, 1)
+    });
+    assert_eq!(
+        reply.unwrap(),
+        LimitOutcome {
+            allowed: false,
+            remaining: 0,
+            retry_after_ms: 250
+        }
+    );
+    assert_eq!(
+        request,
+        words(&[
+            "LIMIT",
+            "k",
+            "10",
+            "2000",
+            "TOKENS",
+            "COST",
+            "1",
+            "WITHRETRY"
+        ])
+    );
+
+    let (reply, _) = probe("*1\r\n:1\r\n", |c| {
+        c.limit_sliding_with_retry("k", 5, 1_000)
+    });
+    assert!(protocol(reply).contains("LIMIT"));
+    let (reply, _) = probe("+OK\r\n", |c| c.limit_tokens("k", 5, 1_000, 1));
+    assert!(protocol(reply).contains("LIMIT"));
 }

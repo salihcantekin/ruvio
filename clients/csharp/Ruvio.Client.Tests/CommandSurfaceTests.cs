@@ -123,6 +123,14 @@ public partial class CommandSurfaceTests
         await session.Expect("IDEM", "request", "BEGIN", "fp", "retry", "1000");
         await session.Reply("*2\r\n$9\r\ncompleted\r\n$0\r\n\r\n");
         Assert.Empty((await acquire).Items![1].Bytes!);
+        ValueTask<bool> abort = session.Client.AbortIdempotencyAsync("request", "fp", "owner");
+        await session.Expect("IDEM", "request", "ABORT", "fp", "owner");
+        await session.Reply(":0\r\n");
+        Assert.False(await abort);
+        abort = ((IRuvioClient)session.Client).AbortIdempotencyAsync("other", "fp", "owner");
+        await session.Expect("IDEM", "other", "ABORT", "fp", "owner");
+        await session.Reply(":1\r\n");
+        Assert.True(await abort);
     }
 
     [Fact(Timeout = 15000)]
@@ -604,6 +612,12 @@ public partial class CommandSurfaceTests
         await session.Reply(":2\r\n");
         Assert.Equal(2, await hset);
 
+        ValueTask hmset = session.Client.SetHashManyAsync("h", ("f", "1"));
+
+        await session.Expect("HMSET", "h", "f", "1");
+        await session.Reply("+OK\r\n");
+        await hmset;
+
         ValueTask<string?> hget = session.Client.GetHashFieldAsync("h", "f");
 
         await session.Expect("HGET", "h", "f");
@@ -714,6 +728,24 @@ public partial class CommandSurfaceTests
         await session.Reply(":4\r\n");
         Assert.Equal(4, await taken);
 
+        ValueTask<(long Source, long Destination)?> moved = session.Client.TransferAsync("a", "b", 4);
+
+        await session.Expect("TRANSFER", "a", "b", "4");
+        await session.Reply("*2\r\n:6\r\n:4\r\n");
+        Assert.Equal((6L, 4L), await moved);
+
+        ValueTask<(long Source, long Destination)?> capped = session.Client.TransferAsync("a", "b", 4, 9);
+
+        await session.Expect("TRANSFER", "a", "b", "4", "MAX", "9");
+        await session.Reply("$-1\r\n");
+        Assert.Null(await capped);
+
+        ValueTask<(long From, long To)?> fields = session.Client.TransferHashFieldAsync("h", "f", "g", 1, 5);
+
+        await session.Expect("HTRANSFER", "h", "f", "g", "1", "MAX", "5");
+        await session.Reply("*2\r\n:1\r\n:2\r\n");
+        Assert.Equal((1L, 2L), await fields);
+
         ValueTask<string?> slid = session.Client.GetExpireAsync("session", 5000);
 
         await session.Expect("GETEX", "session", "5000");
@@ -725,6 +757,30 @@ public partial class CommandSurfaceTests
         await session.Expect("LIMIT", "login", "5", "60000");
         await session.Reply(":4\r\n");
         Assert.Equal(4, await limited);
+
+        ValueTask<long?> sliding = session.Client.LimitSlidingAsync("login", 5, 60000);
+
+        await session.Expect("LIMIT", "login", "5", "60000", "SLIDING");
+        await session.Reply(":3\r\n");
+        Assert.Equal(3, await sliding);
+
+        ValueTask<long?> tokens = session.Client.LimitTokensAsync("api", 10, 2000, 2);
+
+        await session.Expect("LIMIT", "api", "10", "2000", "TOKENS", "COST", "2");
+        await session.Reply("$-1\r\n");
+        Assert.Null(await tokens);
+
+        ValueTask<LimitOutcome> slidingRetry = session.Client.LimitSlidingWithRetryAsync("login", 5, 60000);
+
+        await session.Expect("LIMIT", "login", "5", "60000", "SLIDING", "WITHRETRY");
+        await session.Reply("*2\r\n:2\r\n:0\r\n");
+        Assert.Equal(new LimitOutcome(true, 2, 0), await slidingRetry);
+
+        ValueTask<LimitOutcome> tokensRetry = session.Client.LimitTokensWithRetryAsync("api", 10, 2000);
+
+        await session.Expect("LIMIT", "api", "10", "2000", "TOKENS", "COST", "1", "WITHRETRY");
+        await session.Reply("*2\r\n:-1\r\n:250\r\n");
+        Assert.Equal(new LimitOutcome(false, 0, 250), await tokensRetry);
 
         ValueTask<long> once = session.Client.OnceAsync("pay", 60000);
 
@@ -1076,11 +1132,35 @@ public partial class CommandSurfaceTests
         await session.Reply("+OK\r\n");
         await tracking;
 
+        ValueTask durability = session.Client.SetDurabilityAsync(2);
+
+        await session.Expect("CLIENT", "DURABILITY", "REPLICAS", "2");
+        await session.Reply("+OK\r\n");
+        await durability;
+
+        ValueTask durabilityWithTimeout = session.Client.SetDurabilityAsync(1, TimeSpan.FromMilliseconds(250));
+
+        await session.Expect("CLIENT", "DURABILITY", "REPLICAS", "1", "TIMEOUT", "250");
+        await session.Reply("+OK\r\n");
+        await durabilityWithTimeout;
+
         ValueTask<RespValue> config = session.Client.GetConfigAsync("requirepass");
 
         await session.Expect("CONFIG", "GET", "requirepass");
         await session.Reply("*2\r\n$11\r\nrequirepass\r\n$0\r\n\r\n");
         Assert.Equal(RespKind.Array, (await config).Kind);
+
+        ValueTask setConfig = session.Client.SetConfigAsync([("maxmemory", "100"), ("slowlog-max-len", "5")]);
+
+        await session.Expect("CONFIG", "SET", "maxmemory", "100", "slowlog-max-len", "5");
+        await session.Reply("+OK\r\n");
+        await setConfig;
+
+        ValueTask rewrite = session.Client.RewriteConfigAsync();
+
+        await session.Expect("CONFIG", "REWRITE");
+        await session.Reply("+OK\r\n");
+        await rewrite;
     }
 
     [Fact(Timeout = 15000)]
@@ -1491,6 +1571,24 @@ public partial class CommandSurfaceTests
     }
 
     [Fact(Timeout = 15000)]
+    public async Task DueSortedSetCommandsSendTheirOptions()
+    {
+        await using ScriptedSession session = await ScriptedSession.Open();
+
+        ValueTask<IReadOnlyList<SortedSetEntry>> due = session.Client.PopSortedSetByScoreAsync("z", "-inf", "(5", 3);
+
+        await session.Expect("ZPOPBYSCORE", "z", "(5", "MIN", "-inf", "COUNT", "3", "WITHSCORES");
+        await session.Reply("*2\r\n$1\r\nm\r\n$1\r\n2\r\n");
+        Assert.Equal("m", (await due)[0].Member);
+
+        ValueTask<long> moved = session.Client.MoveDueSortedSetAsync("{t}z", "{t}l", "+inf", 4);
+
+        await session.Expect("ZMOVEDUE", "{t}z", "{t}l", "+inf", "COUNT", "4");
+        await session.Reply(":2\r\n");
+        Assert.Equal(2, await moved);
+    }
+
+    [Fact(Timeout = 15000)]
     public async Task SortedSetPopsAndRangeRemovalsSendTheirCommands()
     {
         await using ScriptedSession session = await ScriptedSession.Open();
@@ -1557,6 +1655,17 @@ public partial class CommandSurfaceTests
         ValueTask<long> pending = session.Client.ReleaseAsync("lock", 7);
 
         await session.Expect("RELEASE", "lock", "7");
+        await session.Reply(":1\r\n");
+        Assert.Equal(1, await pending);
+    }
+
+    [Fact(Timeout = 15000)]
+    public async Task RenewSendsRenewWithTheTokenAndTtl()
+    {
+        await using ScriptedSession session = await ScriptedSession.Open();
+        ValueTask<long> pending = session.Client.RenewAsync("lock", 7, 30000);
+
+        await session.Expect("RENEW", "lock", "7", "30000");
         await session.Reply(":1\r\n");
         Assert.Equal(1, await pending);
     }

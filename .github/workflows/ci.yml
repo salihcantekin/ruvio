@@ -33,12 +33,12 @@ jobs:
       # Debug info roughly doubles compile and link time (most on Windows) and the cache size.
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@f08ac54821369508305fcb9e0121ec6e30ae9ada # 1.97.0
         with:
           components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         with:
           tool: cargo-nextest
       # Lints do not depend on the OS, and Windows and macOS minutes cost more.
@@ -60,9 +60,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.97.0
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@f08ac54821369508305fcb9e0121ec6e30ae9ada # 1.97.0
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check
       - run: python3 scripts/test_supply_chain.py
@@ -74,7 +74,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - run: >-
           python3 -m py_compile
           scripts/cluster_smoke.py
@@ -98,14 +98,14 @@ jobs:
       - run: python3 scripts/check_compatibility_matrix.py
       - run: python3 scripts/test_compatibility_matrix.py
       - run: bash -n scripts/benchmark.sh scripts/profile_linux.sh scripts/run_sanitizers.sh scripts/test.sh
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       # Dockerfile and Dockerfile.linux build the same server, and the release
       # publishes Dockerfile.linux, so one image serves every check below. Its
       # dependency layer is cached, so a source change rebuilds only the crate.
       # The checks are behavioral, so the image skips fat LTO, which alone takes
       # minutes; the release workflow builds the published image with it.
       - name: Build the image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile.linux
@@ -168,35 +168,35 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.97.0
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@f08ac54821369508305fcb9e0121ec6e30ae9ada # 1.97.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
-      - uses: actions/setup-dotnet@v5
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
         with:
           dotnet-version: "8.0.x"
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: clients/go/go.mod
           # The module has no dependencies (no go.sum) to cache.
           cache: false
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: temurin
           java-version: 17
           cache: maven
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: clients/node/package-lock.json
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: |
             .
             clients/ruvio-client
-      - uses: actions/cache@v5
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ~/.nuget/packages
           key: nuget-${{ runner.os }}-${{ hashFiles('clients/csharp/**/*.csproj', 'integrations/dotnet/**/*.csproj') }}
@@ -208,6 +208,10 @@ jobs:
       - name: Rust client
         timeout-minutes: 15
         run: scripts/run_with_servers.sh "$PWD/target/debug/ruvio" 17400 -- cargo test --locked --manifest-path clients/ruvio-client/Cargo.toml
+      # The TLS tests need the `tls` feature and the TLS servers the script starts.
+      - name: Rust client over TLS
+        timeout-minutes: 15
+        run: scripts/run_with_servers.sh "$PWD/target/debug/ruvio" 17400 -- cargo test --locked --manifest-path clients/ruvio-client/Cargo.toml --features tls --test tls_live
       - name: C# client and .NET integrations
         timeout-minutes: 15
         run: |
@@ -219,7 +223,7 @@ jobs:
             done'
       - name: Go client
         timeout-minutes: 15
-        run: scripts/run_with_servers.sh "$PWD/target/debug/ruvio" 17440 -- bash -c 'cd clients/go && go test -race -count=1 ./...'
+        run: scripts/run_with_servers.sh "$PWD/target/debug/ruvio" 17440 -- bash -c 'cd clients/go && go test -race -count=1 -timeout 600s ./...'
       - name: Java client
         timeout-minutes: 15
         run: scripts/run_with_servers.sh "$PWD/target/debug/ruvio" 17460 -- mvn -B -f clients/java/pom.xml verify
@@ -239,15 +243,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.97.0
-      - uses: actions/setup-dotnet@v5
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@f08ac54821369508305fcb9e0121ec6e30ae9ada # 1.97.0
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
         with:
           dotnet-version: "8.0.x"
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: |
             .
@@ -297,10 +301,10 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: nightly
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
       # Also keeps the installed cargo-fuzz binary, so the install below is a no-op on a warm cache.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: fuzz
       - run: cargo install cargo-fuzz --locked
@@ -316,12 +320,12 @@ jobs:
       RUSTFLAGS: "-Zsanitizer=address"
       ASAN_OPTIONS: "detect_leaks=1:detect_stack_use_after_return=1"
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
         with:
           components: rust-src
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         with:
           tool: cargo-nextest
       # One process per test, so a leak report names the test that leaked.
@@ -338,12 +342,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.97.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@f08ac54821369508305fcb9e0121ec6e30ae9ada # 1.97.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: iai
-      - run: sudo apt-get update && sudo apt-get install -y valgrind
+      # A stalled mirror download is cut after 30 s and retried, instead of waiting for minutes.
+      - run: |
+          apt_opts="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+          sudo apt-get $apt_opts update && sudo apt-get $apt_opts install -y valgrind
+        timeout-minutes: 6
       - run: cargo install iai-callgrind-runner --version 0.16.1 --locked
       - name: Measure and print the new baseline
         run: |
@@ -369,14 +377,14 @@ jobs:
       MIRIFLAGS: "-Zmiri-strict-provenance -Zmiri-disable-isolation"
       PROPTEST_CASES: "2"
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
         with:
           components: miri
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - id: nightly
         run: echo "version=$(rustc +nightly -V | tr -cd '[:alnum:].-')" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v5
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ~/.cache/miri
           key: miri-sysroot-${{ steps.nightly.outputs.version }}

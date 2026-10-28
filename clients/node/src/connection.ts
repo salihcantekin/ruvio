@@ -8,6 +8,11 @@ import { Encoder, cmd, type Arg, type Cmd } from './encoder.js';
 import { Parser, NEED_MORE, PushMessage } from './parser.js';
 import { RuvioError, ConnectionError } from './errors.js';
 import type { Tf } from './transforms.js';
+import { blockingWait, FRAME_COUNT, WAIT_FOREVER } from './blocking.js';
+import { ProbeScope, findPrimary, addrText } from './follow.js';
+
+/** `commandTimeoutMs` when it is not set. */
+export const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 
 /**
  * Connection settings shared by {@link RuvioClient}, {@link ClusterClient} and {@link Subscriber}.
@@ -32,8 +37,20 @@ export interface ConnectionOptions {
   host?: string;
   /** Server port (default `6379`). */
   port?: number;
-  /** Unix socket path, used instead of host/port. Not combined with `tls`. */
+  /** Unix socket path, used instead of host/port. Not combined with `tls` or `seeds`. */
   path?: string;
+  /**
+   * Seed addresses as `host:port` strings (IPv6 as `[::1]:6379`). When not empty they replace
+   * `host` and `port`; with none, `host` and `port` are used as before. Connecting tries the
+   * seeds in order, one connect attempt each, and keeps the first that answers: a seed that
+   * cannot be reached (refused, timed out) is skipped, while a refused `AUTH` or `SELECT` stops
+   * at once. After a dropped connection the next connect starts with the seed after the one that
+   * dropped and goes round the whole list. The command that hit the drop still rejects. A
+   * {@link ClusterClient} asks the first reachable seed for the slot table, and asks the seeds
+   * again when no known node answers a slot table reload. Cannot be combined with `path`.
+   * An empty host or an invalid port throws a `TypeError` when the client is created.
+   */
+  seeds?: string[];
   /** Use TLS: `true` for defaults, or Node's `tls.ConnectionOptions` (CA, client certificate, `servername`, ...). Default: plain TCP. */
   tls?: boolean | tls.ConnectionOptions;
   /** ACL user name sent with the password on connect (default user when omitted). Needs `password`. */
@@ -44,10 +61,23 @@ export interface ConnectionOptions {
   db?: number;
   /** Connection name set with `CLIENT SETNAME` on every (re)connect. */
   name?: string;
+  /**
+   * Sends `CLIENT DURABILITY REPLICAS replicas [TIMEOUT timeoutMs]` on every (re)connect, so each reply waits until that
+   * many replicas have the data on disk. A server without replication refuses it and the connect fails. Default: not set, nothing is sent.
+   */
+  durability?: { replicas: number; timeoutMs?: number };
   /** RESP protocol version: 2 (default) or 3 (sends `HELLO 3` on connect; enables push messages such as client-side-cache invalidation). */
   protocol?: 2 | 3;
-  /** Abort a connection attempt after this many milliseconds with a {@link ConnectionError}. Default: no timeout. There is no per-command timeout. */
+  /** Abort a connection attempt after this many milliseconds with a {@link ConnectionError}. Default 5000; `0` for no limit. */
   connectTimeoutMs?: number;
+  /**
+   * Fail the connection with a {@link ConnectionError} when replies are outstanding and none has arrived for
+   * this many milliseconds (checked on a timer, so it fires up to a quarter of this later). Every pending call
+   * rejects and a later command reconnects. Default 30000; `0` for no limit, so a half-open peer blocks callers
+   * until the socket drops. A blocking command gets its own wait on top (`blpop(k, 5)` may take 5 s plus this),
+   * and one that waits forever (timeout `0`) has no limit while it is pending.
+   */
+  commandTimeoutMs?: number;
   /** Disable Nagle's algorithm (`TCP_NODELAY`). Default true. */
   noDelay?: boolean;
   /** Enable TCP keep-alive probes after 30 s idle. Default true. */
@@ -66,11 +96,42 @@ export interface ConnectionOptions {
   reconnect?: boolean;
   /** Size in bytes of the reused socket read buffer (default 65536). */
   readBufferSize?: number;
+  /**
+   * Find the primary again after a failover (default true). It applies to a standalone connection with
+   * at least two `seeds`, or with `sentinelMaster`; with one address nothing changes. After a dropped
+   * connection the reconnect asks `ROLE` on the seeds and connects to the node that answers `master`
+   * (the seed order is the fallback), and a reply `READONLY` to a command makes the client find the
+   * primary, move there and send that command once more. A command inside a `MULTI` you opened with
+   * `call`, or in a pipeline or `multi()` batch, is not sent again (its `READONLY` error is returned;
+   * the connection still moves). Nothing is sent while the connection is healthy. `false` keeps the
+   * plain seed behavior. A {@link ClusterClient} does not follow.
+   */
+  followPrimary?: boolean;
+  /**
+   * Coordinator mode: `host`/`port` or `seeds` name coordinators, and this is the master name asked with
+   * `SENTINEL get-master-addr-by-name`. The first connect asks the coordinators and fails with a
+   * {@link ConnectionError} when none names a primary; a reconnect or a `READONLY` reply asks them again
+   * (with `followPrimary`). The same `username` and `password` go to coordinators and data nodes.
+   * Cannot be combined with `path`. Default: not set.
+   */
+  sentinelMaster?: string;
 }
 
 /** Receives a `-MOVED` error for a kept frame `buf[off..off+len)` together with its pending reply slot. */
 export type MovedHandler = (
   e: RuvioError,
+  buf: Buffer,
+  off: number,
+  len: number,
+  tf: Tf | null,
+  fl: number,
+  res: (v: unknown) => void,
+  rej: (e: unknown) => void,
+) => void;
+
+/** Receives a kept frame whose node could not be opened, together with its pending reply slot. */
+export type UnreachableHandler = (
+  e: ConnectionError,
   buf: Buffer,
   off: number,
   len: number,
@@ -95,15 +156,124 @@ function EXEC(resolve: (v: unknown) => void, reject: (e: unknown) => void): void
   xConn!.enqueue(resolve, reject, xTf, xFl);
 }
 
+interface SeedAddr {
+  readonly host: string;
+  readonly port: number;
+}
+
+/** @internal Parses `host:port` / `[v6]:port` seed strings; throws `TypeError` on an empty host or a bad port. */
+export function parseSeeds(seeds: readonly string[]): SeedAddr[] {
+  return seeds.map((seed) => {
+    const bad = (why: string): never => {
+      throw new TypeError('ruvio: invalid seed ' + JSON.stringify(seed) + ': ' + why);
+    };
+    if (typeof seed !== 'string') return bad('expected "host:port"');
+    let host: string;
+    let portText: string;
+    if (seed.startsWith('[')) {
+      const close = seed.indexOf(']');
+      if (close < 0 || seed[close + 1] !== ':') return bad('expected "[host]:port"');
+      host = seed.slice(1, close);
+      portText = seed.slice(close + 2);
+    } else {
+      const colon = seed.lastIndexOf(':');
+      if (colon < 0) return bad('expected "host:port"');
+      host = seed.slice(0, colon);
+      portText = seed.slice(colon + 1);
+      if (host.includes(':')) return bad('write an IPv6 host as "[host]:port"');
+    }
+    if (host === '') return bad('host is empty');
+    const port = /^\d{1,5}$/.test(portText) ? Number(portText) : 0;
+    if (port < 1 || port > 65535) return bad('port must be 1 to 65535');
+    return { host, port };
+  });
+}
+
+/** Stand-in for the socket while the seeds are tried: keeps the bytes written so far for the seed that answers. */
+class Dial {
+  held: Buffer[] = [];
+  pending: net.Socket | null = null;
+  last: Error | null = null;
+  dead = false;
+  /** Probes of the search for the primary that runs while the seeds are not tried yet. */
+  readonly scope = new ProbeScope();
+  write(chunk: Buffer): void {
+    this.held.push(chunk);
+  }
+  destroy(err?: Error): void {
+    this.dead = true;
+    this.scope.cancel();
+    this.pending?.destroy(err);
+  }
+}
+
+// Flag bits of a reply slot beside F_BINARY, set only on a following connection.
+const F_MULTI = 2;
+const F_ENDTX = 4;
+const F_RETRY = 8;
+/** How long the socket of a refused command is kept for the replies still on their way, once the primary is found. */
+const DRAIN_MS = 1000;
+
+/** Encoder of a following connection: remembers where the last complete frame sits, so a refused command can be sent again. */
+class KeptEncoder extends Encoder {
+  kb: Buffer | null = null;
+  ks = 0;
+  ke = 0;
+  override endFrame(): void {
+    this.kb = this.partial ? null : this.buf;
+    this.ks = this.frameStart;
+    this.ke = this.pos;
+    super.endFrame();
+  }
+}
+
+/** The command of a kept frame that opens or ends a transaction: `F_MULTI`, `F_ENDTX` or 0. */
+function txFlag(b: Buffer, s: number, n: number): number {
+  if (n !== 15 && n !== 14 && n !== 17) return 0;
+  if (b[s] !== 0x2a || b[s + 1] !== 0x31) return 0;
+  const w = b.toString('latin1', s + 8, s + n - 2).toUpperCase();
+  return w === 'MULTI' ? F_MULTI : w === 'EXEC' || w === 'DISCARD' ? F_ENDTX : 0;
+}
+
+/** A command that a reply `READONLY` refused, waiting for the primary to be found. */
+interface Refused {
+  res: unknown;
+  rej: unknown;
+  tf: Tf | null;
+  fl: number;
+  /** The frame to send again; null when it must not be sent again (batch, transaction, partial frame). */
+  frame: Buffer | null;
+  err: RuvioError;
+}
+
 const C_AUTH = cmd('AUTH');
 const C_SELECT = cmd('SELECT');
 const C_SETNAME = cmd('CLIENT', 'SETNAME');
+const C_DURABILITY = cmd('CLIENT', 'DURABILITY');
 const C_HELLO = cmd('HELLO');
+const C_READONLY = cmd('READONLY');
 
 /** @internal The multiplexed transport behind a client. */
 export class Connection extends EventEmitter {
   readonly opts: ConnectionOptions;
   readonly enc: Encoder;
+  // Seed list (two or more addresses); null with a single address. `start` is where the next
+  // connect begins, `cur` the seed the socket is on.
+  private addrs: SeedAddr[] | null = null;
+  private start = 0;
+  private cur = 0;
+  // Following a failover (see `followPrimary`): `coords` are the coordinators with `sentinelMaster` (then `addrs`
+  // holds the one data node they named); `lost` is set from a dropped connection until the next connect;
+  // `everUp` from the first connect on. `refused` waits for the primary after a reply READONLY.
+  private readonly follow: boolean;
+  private coords: SeedAddr[] | null = null;
+  private lost = false;
+  private everUp = false;
+  private inTx = false;
+  private refused: Refused[] | null = null;
+  private refusedScope: ProbeScope | null = null;
+  // Receives the kept frames of commands that failed because the node could not be opened.
+  private onUnreachable: UnreachableHandler | null = null;
   private socket: net.Socket | null = null;
   private readonly parser = new Parser();
   private readonly readBuf: Buffer;
@@ -126,6 +296,8 @@ export class Connection extends EventEmitter {
   forceBinary = false;
   /** Database to restore on reconnect (tracks SELECT through the typed client). */
   db: number;
+  /** A cluster replica chosen for reads: `READONLY` is sent each time the socket is opened, and a `-LOADING` reply to a kept frame goes to the router. */
+  replica = false;
   // Cluster routing keeps, per pending single command, where its frame sits in the write slab
   // (not overwritten while the command waits for its reply), so a `-MOVED` reply can re-send it;
   // the router copies the frame before any wait, since a reconnect rewinds the slab.
@@ -133,21 +305,92 @@ export class Connection extends EventEmitter {
   private rFB: (Buffer | null)[] | null = null;
   private rFO: Int32Array | null = null;
   private rFN: Int32Array | null = null;
+  // Command timeout watchdog (only when `commandTimeoutMs` is set): `rx` counts socket reads, and a tick that
+  // finds replies pending and `rx` unchanged since `markAt` has seen a stall.
+  private watchdog: NodeJS.Timeout | null = null;
+  private rx = 0;
+  private markRx = -1;
+  private markAt = 0;
+  // Replies dispatched so far; a pending blocking command adds `extraMs` (Infinity: no limit) to the
+  // limit until reply number `extraUntil` has arrived.
+  private replies = 0;
+  private extraMs = 0;
+  private extraUntil = 0;
   private lastBuf: Buffer | null = null;
   private lastOff = 0;
   private lastLen = 0;
 
   constructor(opts: ConnectionOptions) {
     super();
+    let listed: SeedAddr[] | null = null;
+    if (opts.seeds !== undefined && opts.seeds.length > 0) {
+      if (opts.path !== undefined) throw new TypeError('ruvio: seeds cannot be combined with path');
+      listed = parseSeeds(opts.seeds);
+    }
+    if (opts.sentinelMaster !== undefined) {
+      if (opts.path !== undefined) throw new TypeError('ruvio: sentinelMaster cannot be combined with path');
+      if (typeof opts.sentinelMaster !== 'string' || opts.sentinelMaster === '') throw new TypeError('ruvio: sentinelMaster must be a master name');
+      // The addresses are coordinators; the data node is whatever they name.
+      this.coords = listed ?? [{ host: opts.host ?? '127.0.0.1', port: opts.port ?? 6379 }];
+      this.addrs = [];
+    } else if (listed !== null) {
+      if (listed.length === 1) opts = { ...opts, host: listed[0]!.host, port: listed[0]!.port };
+      else this.addrs = listed;
+    }
+    this.follow = opts.followPrimary !== false && (this.coords !== null || (this.addrs !== null && this.addrs.length > 1));
     this.opts = opts;
     this.db = opts.db ?? 0;
-    this.enc = new Encoder((chunk) => this.write(chunk));
+    const sink = (chunk: Buffer) => this.write(chunk);
+    this.enc = this.follow ? new KeptEncoder(sink) : new Encoder(sink);
+    if (this.follow) {
+      this.rFB = new Array(this.mask + 1).fill(null);
+      this.rFO = new Int32Array(this.mask + 1);
+      this.rFN = new Int32Array(this.mask + 1);
+    }
     this.readBuf = Buffer.allocUnsafe(opts.readBufferSize ?? 64 * 1024);
     this.immediate = opts.flush === 'immediate';
     this.flushCb = () => {
       this.scheduled = false;
       this.enc.flush();
     };
+    const limit = opts.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+    if (limit > 0) {
+      this.watchdog = setInterval(() => this.stallCheck(limit), Math.max(10, Math.min(250, limit / 4)));
+      this.watchdog.unref();
+      this.enc.onFrame = (b, s, e) => this.noteFrame(b, s, e);
+    }
+  }
+
+  /** Command timeout: remembers the wait of a blocking command (or pipeline) about to be tracked. */
+  private noteFrame(b: Uint8Array, s: number, e: number): void {
+    const w = blockingWait(b, s, e);
+    if (w === 0) return;
+    if (this.replies >= this.extraUntil) this.extraMs = 0;
+    this.extraMs = w === WAIT_FOREVER ? Infinity : Math.max(this.extraMs, w);
+    // Its replies come after every slot pending now; a pipeline frame may hold several, so the extra
+    // time lasts until the whole queue as it will stand after this frame has been answered.
+    this.extraUntil = this.replies + this.count + FRAME_COUNT;
+  }
+
+  private stallCheck(limit: number): void {
+    if (this.closed) {
+      if (this.watchdog !== null) clearInterval(this.watchdog);
+      this.watchdog = null;
+      return;
+    }
+    if (this.count === 0 || this.socket === null) {
+      this.markRx = -1;
+      return;
+    }
+    const now = Date.now();
+    const extra = this.replies < this.extraUntil ? this.extraMs : 0;
+    if (this.markRx !== this.rx) {
+      this.markRx = this.rx;
+      this.markAt = now;
+    } else if (now - this.markAt >= limit + extra) {
+      this.markRx = -1;
+      this.abort(new ConnectionError(`ruvio: command timeout after ${limit} ms`));
+    }
   }
 
   /** Pending replies. */
@@ -190,8 +433,20 @@ export class Connection extends EventEmitter {
     const p = new Promise(EXEC);
     xConn = null;
     xTf = null;
+    if (this.follow) this.keepLast();
     this.schedule();
     return p;
+  }
+
+  /** Following only: remembers the frame of the command just tracked, and whether it opens or ends a transaction. */
+  private keepLast(): void {
+    const e = this.enc as KeptEncoder;
+    const i = (this.head + this.count - 1) & this.mask;
+    const n = e.ke - e.ks;
+    this.rFB![i] = e.kb;
+    this.rFO![i] = e.ks;
+    this.rFN![i] = n;
+    if (e.kb !== null) this.rFl[i]! |= txFlag(e.kb, e.ks, n);
   }
 
   /** Like {@link track}, but with the caller's own resolve / reject functions (cluster routing). */
@@ -205,9 +460,13 @@ export class Connection extends EventEmitter {
     this.schedule();
   }
 
-  /** Turns on frame keeping for {@link trackKept}; `h` receives every `-MOVED` reply of such a command. */
-  keepFrames(h: MovedHandler): void {
+  /**
+   * Turns on frame keeping for {@link trackKept}; `h` receives every `-MOVED` reply of such a command.
+   * `unreachable` receives the kept commands that were waiting when opening the socket failed.
+   */
+  keepFrames(h: MovedHandler, unreachable: UnreachableHandler | null = null): void {
     this.onMoved = h;
+    this.onUnreachable = unreachable;
     this.rFB = new Array(this.mask + 1).fill(null);
     this.rFO = new Int32Array(this.mask + 1);
     this.rFN = new Int32Array(this.mask + 1);
@@ -261,7 +520,9 @@ export class Connection extends EventEmitter {
   }
 
   /** Copies pre-encoded frames into the outgoing buffer. */
-  writeFrames(bytes: Buffer): void {
+  writeFrames(bytes: Buffer, mayBlock = true): void {
+    // A batch that may hold a blocking command gets its wait noted before its slots are tracked.
+    if (mayBlock && this.watchdog !== null) this.noteFrame(bytes, 0, bytes.length);
     const e = this.encoder();
     e.ensure(bytes.length);
     bytes.copy(e.buf, e.pos);
@@ -280,6 +541,7 @@ export class Connection extends EventEmitter {
     enc.pos = p + n;
     enc.frameStart = enc.pos;
     enc.partial = false;
+    if (enc.onFrame !== null) enc.onFrame(enc.buf, p, p + n);
     this.lastBuf = enc.buf;
     this.lastOff = p;
     this.lastLen = n;
@@ -352,8 +614,7 @@ export class Connection extends EventEmitter {
     return this.track(null, 0).then(() => undefined);
   }
 
-  private open(): void {
-    if (this.closed) return;
+  private newSocket(host: string, port: number): net.Socket {
     const o = this.opts;
     const onread = {
       buffer: this.readBuf,
@@ -365,27 +626,46 @@ export class Connection extends EventEmitter {
     let socket: net.Socket;
     if (o.tls) {
       const topts: tls.ConnectionOptions = o.tls === true ? {} : { ...o.tls };
-      socket = tls.connect({ host: o.host ?? '127.0.0.1', port: o.port ?? 6379, servername: o.host, ...topts });
+      socket = tls.connect({ host, port, ...(net.isIP(host) === 0 ? { servername: host } : {}), ...topts });
       socket.on('data', (d: Buffer) => this.onData(d, d.length));
     } else if (o.path !== undefined) {
       socket = net.connect({ path: o.path, onread } as net.NetConnectOpts);
     } else {
-      socket = net.connect({ host: o.host ?? '127.0.0.1', port: o.port ?? 6379, onread } as net.NetConnectOpts);
+      socket = net.connect({ host, port, onread } as net.NetConnectOpts);
     }
-    this.socket = socket;
-    this.connected = false;
-    this.parser.reset();
     socket.setNoDelay(o.noDelay ?? true);
     if (o.keepAlive ?? true) socket.setKeepAlive(true, 30000);
+    return socket;
+  }
+
+  /** Opens the socket; `fixed` is the seed index to connect to first (the primary a READONLY reply led to). */
+  private open(fixed = -1): void {
+    if (this.closed) return;
+    const o = this.opts;
+    this.connected = false;
+    this.parser.reset();
+    if (this.addrs !== null) {
+      const dial = new Dial();
+      this.socket = dial as unknown as net.Socket;
+      this.handshake();
+      // The first connect keeps the seed order, except with a coordinator name; a reconnect asks for the primary first.
+      const strict = this.coords !== null && !this.everUp;
+      if (fixed >= 0) this.dialNext(dial, 0, fixed);
+      else if (strict || (this.follow && this.lost)) this.seek(dial, strict);
+      else this.dialNext(dial, 0);
+      return;
+    }
+    const socket = this.newSocket(o.host ?? '127.0.0.1', o.port ?? 6379);
+    this.socket = socket;
     let timer: NodeJS.Timeout | null = null;
-    if (o.connectTimeoutMs !== undefined && o.connectTimeoutMs > 0) {
-      timer = setTimeout(() => socket.destroy(new ConnectionError('ruvio: connect timeout')), o.connectTimeoutMs);
+    if ((o.connectTimeoutMs ?? 5000) > 0) {
+      timer = setTimeout(() => socket.destroy(new ConnectionError('ruvio: connect timeout')), o.connectTimeoutMs ?? 5000);
     }
     socket.once(o.tls ? 'secureConnect' : 'connect', () => {
       if (timer !== null) clearTimeout(timer);
       if (this.socket !== socket) return;
       this.connected = true;
-      this.emit('connect');
+      this.emit('connect', (o.path ?? (o.host ?? '127.0.0.1') + ':' + (o.port ?? 6379)));
     });
     socket.on('error', (err) => {
       if (this.socket === socket) this.lastError = err;
@@ -395,6 +675,120 @@ export class Connection extends EventEmitter {
       if (this.socket === socket) this.onClose();
     });
     this.handshake();
+  }
+
+  /**
+   * One round that asks for the primary before the seeds are tried, then connects to it. Without one (and not
+   * `strict`) the seed order applies; `strict` (first connect with a coordinator name) fails instead.
+   */
+  private seek(dial: Dial, strict: boolean): void {
+    const coords = this.coords;
+    const seeds = (coords ?? this.addrs!).slice();
+    const start = coords !== null ? 0 : this.start % seeds.length;
+    findPrimary(seeds, start, { addr: null }, this.opts, this.opts.sentinelMaster, dial.scope).then(
+      (found) => {
+        if (this.current() !== dial || dial.dead) return;
+        if (found !== null) this.dialNext(dial, 0, this.locate(found));
+        else if (!strict) this.dialNext(dial, 0);
+        else {
+          this.lastError = new ConnectionError('ruvio: no coordinator names a primary for "' + this.opts.sentinelMaster + '"');
+          dial.destroy();
+          this.onClose();
+        }
+      },
+      (e) => {
+        if (this.current() === dial) this.abort(e as Error);
+      },
+    );
+  }
+
+  /** The index of `a` in the connect list, which gains it when it is new (with a coordinator name the list is just the primary). */
+  private locate(a: SeedAddr): number {
+    if (this.coords !== null) {
+      this.addrs = [a];
+      return 0;
+    }
+    const list = this.addrs!;
+    const i = list.findIndex((x) => x.port === a.port && x.host === a.host);
+    if (i >= 0) return i;
+    list.push(a);
+    return list.length - 1;
+  }
+
+  /** The address the socket is on (or was last on). */
+  private here(): SeedAddr {
+    const a = this.addrs;
+    if (a !== null && a.length > 0) return a[this.cur % a.length]!;
+    return { host: this.opts.host ?? '127.0.0.1', port: this.opts.port ?? 6379 };
+  }
+
+  /**
+   * One connect attempt at the seed `step` places after `start`; a failed attempt moves on to the next seed.
+   * With `fixed` the first attempt is at that index, and a failure falls back to the seed order.
+   */
+  private dialNext(dial: Dial, step: number, fixed = -1): void {
+    const addrs = this.addrs!;
+    const o = this.opts;
+    const index = fixed >= 0 ? fixed : (this.start + step) % addrs.length;
+    const addr = addrs[index]!;
+    const socket = this.newSocket(addr.host, addr.port);
+    dial.pending = socket;
+    let timer: NodeJS.Timeout | null = null;
+    if ((o.connectTimeoutMs ?? 5000) > 0) {
+      timer = setTimeout(() => socket.destroy(new ConnectionError('ruvio: connect timeout')), o.connectTimeoutMs ?? 5000);
+    }
+    socket.once(o.tls ? 'secureConnect' : 'connect', () => {
+      if (timer !== null) clearTimeout(timer);
+      if (this.current() !== dial || dial.pending !== socket) return;
+      dial.pending = null;
+      this.socket = socket;
+      this.cur = index;
+      this.connected = true;
+      this.lost = false;
+      this.everUp = true;
+      for (const chunk of dial.held) socket.write(chunk);
+      dial.held = [];
+      this.emit('connect', addrText(addr));
+    });
+    socket.on('error', (err) => {
+      if (this.socket === socket) this.lastError = err;
+      else if (dial.pending === socket) dial.last = err;
+    });
+    socket.on('close', () => {
+      if (timer !== null) clearTimeout(timer);
+      if (this.socket === socket) {
+        this.onClose();
+        return;
+      }
+      if (this.current() !== dial || dial.pending !== socket) return;
+      dial.pending = null;
+      if (!dial.dead && fixed >= 0) {
+        this.dialNext(dial, 0);
+        return;
+      }
+      if (!dial.dead && step + 1 < addrs.length) {
+        this.dialNext(dial, step + 1);
+        return;
+      }
+      this.lastError = dial.last;
+      this.onClose();
+    });
+  }
+
+  private current(): unknown {
+    return this.socket;
+  }
+
+  /** The seeds as `host:port` strings starting with the one the socket is on; `undefined` with a single address. */
+  seedsFromCurrent(): string[] | undefined {
+    const a = this.addrs;
+    if (a === null || a.length === 0 || this.coords !== null) return undefined;
+    const out: string[] = [];
+    for (let i = 0; i < a.length; i++) {
+      const x = a[(this.cur + i) % a.length]!;
+      out.push((x.host.includes(':') ? '[' + x.host + ']' : x.host) + ':' + x.port);
+    }
+    return out;
   }
 
   private lastError: Error | null = null;
@@ -419,6 +813,16 @@ export class Connection extends EventEmitter {
     }
     if (this.db !== 0) send(C_SELECT, [this.db]);
     if (o.name !== undefined) send(C_SETNAME, [o.name]);
+    if (o.durability !== undefined) {
+      const d = o.durability;
+      send(C_DURABILITY, d.timeoutMs === undefined ? ['REPLICAS', d.replicas] : ['REPLICAS', d.replicas, 'TIMEOUT', d.timeoutMs]);
+    }
+    if (this.replica) {
+      // Redis replicas serve reads only after READONLY; Ruvio replicas serve them anyway and answer OK.
+      e.begin(C_READONLY, 0);
+      e.endFrame();
+      this.enqueue(noop, noop, null, 0);
+    }
     this.schedule();
   }
 
@@ -443,24 +847,43 @@ export class Connection extends EventEmitter {
     this.lastError = null;
     this.socket = null;
     const wasConnected = this.connected;
+    const where = wasConnected ? addrText(this.here()) : '';
     this.connected = false;
+    this.inTx = false;
+    if (this.refusedScope !== null) this.cancelRefused(null);
+    // The next connect starts with the seed after the one that dropped.
+    if (wasConnected && this.addrs !== null && this.addrs.length > 0) this.start = (this.cur + 1) % this.addrs.length;
+    if (wasConnected && this.follow) this.lost = true;
+    if (!wasConnected) (err as ConnectionError).unreachable = true;
     // Drop unsent bytes; their callers are rejected with everyone else.
     this.enc.pos = this.enc.start = this.enc.frameStart = 0;
     this.parser.reset();
-    this.rejectAll(err);
-    if (wasConnected) this.emit('disconnect', err);
+    this.rejectAll(err, !wasConnected);
+    if (wasConnected) this.emit('disconnect', err, where);
     else this.emit('connectError', err);
     if (this.listenerCount('error') > 0) this.emit('error', err);
     if (this.opts.reconnect === false) this.closed = true;
   }
 
-  private rejectAll(err: Error): void {
+  private rejectAll(err: Error, unreachable = false): void {
+    this.extraUntil = 0;
+    this.replies = 0;
     while (this.count > 0) {
       const i = this.head;
       const res = this.rRes[i];
       const rej = this.rRej[i];
+      const tf = this.rTf[i]!;
       this.rRes[i] = this.rRej[i] = this.rTf[i] = null;
-      if (this.rFB !== null) this.rFB[i] = null;
+      if (this.rFB !== null) {
+        const fb = this.rFB[i]!;
+        this.rFB[i] = null;
+        if (unreachable && fb !== null && this.onUnreachable !== null && typeof res === 'function') {
+          this.head = (i + 1) & this.mask;
+          this.count--;
+          this.onUnreachable(err as ConnectionError, fb, this.rFO![i]!, this.rFN![i]!, tf, this.rFl[i]!, res as (v: unknown) => void, rej as (e: unknown) => void);
+          continue;
+        }
+      }
       this.head = (i + 1) & this.mask;
       this.count--;
       if (typeof res === 'function') (rej as (e: unknown) => void)(err);
@@ -484,6 +907,9 @@ export class Connection extends EventEmitter {
   /** Closes now; pending calls reject. */
   disconnect(): void {
     this.closed = true;
+    if (this.refusedScope !== null) this.cancelRefused(new ConnectionError('ruvio: client is closed'));
+    if (this.watchdog !== null) clearInterval(this.watchdog);
+    this.watchdog = null;
     const s = this.socket;
     if (s !== null) {
       this.enc.flush();
@@ -496,9 +922,114 @@ export class Connection extends EventEmitter {
     this.socket?.destroy(err);
   }
 
+  // ---- following a failover ----------------------------------------------------------------
+
+  /**
+   * A command was answered `READONLY`: it is held (its frame copied for a second send when that is allowed)
+   * while the primary is searched for, in a timer, so other callers keep working.
+   */
+  private refuse(err: RuvioError, fb: Buffer | null, i: number, res: unknown, rej: unknown, tf: Tf | null, fl: number): void {
+    // The refusal means the command was not applied, so it may be sent once more; not a command of a
+    // transaction (its earlier commands are gone with the socket), of a batch, or a partly sent frame.
+    const again = fb !== null && typeof res === 'function' && !this.inTx;
+    const frame = again ? Buffer.from(fb.subarray(this.rFO![i]!, this.rFO![i]! + this.rFN![i]!)) : null;
+    (this.refused ??= []).push({ res, rej, tf, fl, frame, err });
+    if (this.refusedScope === null) this.followAfterReadonly();
+  }
+
+  /** Rounds to find the primary, avoiding the node that answered: up to 8, waiting 100 ms doubling to 2 s (one round with `reconnect: false`). */
+  private followAfterReadonly(): void {
+    const scope = (this.refusedScope = new ProbeScope());
+    const coords = this.coords;
+    const sentinel = this.opts.sentinelMaster;
+    const rounds = this.opts.reconnect === false ? 1 : 8;
+    // Kept across rounds: cleared once the refusing node says it is a replica, so its promotion a moment later is
+    // taken instead of waiting out every round.
+    const refusing: { addr: SeedAddr | null } = { addr: this.here() };
+    const run = async (): Promise<SeedAddr | null> => {
+      for (let attempt = 1; ; attempt++) {
+        const seeds = (coords ?? this.addrs!).slice();
+        const start = coords !== null ? 0 : (this.cur + 1) % seeds.length;
+        const found = await findPrimary(seeds, start, refusing, this.opts, sentinel, scope);
+        if (found !== null) {
+          // Commands already sent on this socket are about to be answered (the ones that are refused join the held
+          // ones); give them a moment before the socket is replaced.
+          for (const end = Date.now() + DRAIN_MS; this.count > 0 && Date.now() < end && !scope.dead; ) await scope.sleep(5);
+          return found;
+        }
+        if (scope.dead || attempt >= rounds) return null;
+        await scope.sleep(Math.min(100 * 2 ** (attempt - 1), 2000));
+        if (scope.dead) return null;
+      }
+    };
+    run().then(
+      (found) => this.moveToPrimary(scope, found, null),
+      (e) => this.moveToPrimary(scope, null, e),
+    );
+  }
+
+  private failRefused(w: Refused, e: unknown): void {
+    if (typeof w.res === 'function') (w.rej as (e: unknown) => void)(e);
+    else (w.res as BatchSink).set(w.rej as number, e);
+  }
+
+  /** Gives up on the search: every held command gets `err` (its own READONLY error when null). */
+  private cancelRefused(err: Error | null): void {
+    const scope = this.refusedScope;
+    if (scope === null) return;
+    this.refusedScope = null;
+    scope.cancel();
+    const list = this.refused ?? [];
+    this.refused = null;
+    for (const w of list) this.failRefused(w, err ?? w.err);
+  }
+
+  /**
+   * The search ended. With a primary: the socket is replaced by one to it (commands still waiting on the old
+   * socket for longer than a second fail like a dropped connection) and the held commands that may be sent again go out first; the
+   * others get their error. Without: every held command gets its READONLY error and the socket stays.
+   */
+  private moveToPrimary(scope: ProbeScope, found: SeedAddr | null, error: unknown): void {
+    if (this.refusedScope !== scope) return;
+    this.refusedScope = null;
+    scope.cancel();
+    const list = this.refused ?? [];
+    this.refused = null;
+    if (found === null || this.closed) {
+      for (const w of list) this.failRefused(w, error ?? w.err);
+      return;
+    }
+    const where = addrText(this.here());
+    const idx = this.locate(found);
+    const old = this.socket;
+    const err = new ConnectionError('ruvio: a READONLY reply moved the connection to the primary at ' + addrText(found));
+    this.gen++;
+    this.socket = null;
+    this.connected = false;
+    this.inTx = false;
+    this.enc.pos = this.enc.start = this.enc.frameStart = 0;
+    this.parser.reset();
+    this.rejectAll(err);
+    old?.destroy();
+    this.emit('disconnect', err, where);
+    // If the primary cannot be opened now, the seeds are tried from the one after the refusing node.
+    this.start = (this.cur + 1) % this.addrs!.length;
+    this.open(idx);
+    for (const w of list) {
+      if (w.frame === null) {
+        this.failRefused(w, w.err);
+        continue;
+      }
+      this.writeFrames(w.frame);
+      this.enqueue(w.res, w.rej, w.tf, w.fl | F_RETRY);
+    }
+    this.schedule();
+  }
+
   // ---- replies -------------------------------------------------------------------------
 
   private onData(chunk: Buffer, n: number): void {
+    this.rx++;
     const p = this.parser;
     const gen = this.gen;
     p.feed(chunk, n);
@@ -537,14 +1068,24 @@ export class Connection extends EventEmitter {
     this.rTf[i] = null;
     this.head = (i + 1) & this.mask;
     this.count--;
+    this.replies++;
     let fb: Buffer | null = null;
     if (this.rFB !== null) {
       fb = this.rFB[i]!;
       this.rFB[i] = null;
+      if (this.follow) {
+        const f = this.rFl[i]!;
+        if (v instanceof RuvioError) {
+          if (v.code === 'READONLY' && (f & F_RETRY) === 0) {
+            this.refuse(v, fb, i, res, rej, tf, f);
+            return;
+          }
+        } else if ((f & (F_MULTI | F_ENDTX)) !== 0) this.inTx = (f & F_MULTI) !== 0 && v === 'OK';
+      }
     }
     if (typeof res === 'function') {
       if (v instanceof RuvioError) {
-        if (fb !== null && v.code === 'MOVED') {
+        if (fb !== null && (v.code === 'MOVED' || v.code === 'ASK' || v.code === 'TRYAGAIN' || (this.replica && (v.code === 'LOADING' || v.code === 'MASTERDOWN')))) {
           this.onMoved!(v, fb, this.rFO![i]!, this.rFN![i]!, tf, this.rFl[i]!, res as (x: unknown) => void, rej as (e: unknown) => void);
           return;
         }

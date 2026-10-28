@@ -2,7 +2,10 @@
 
 package ruvio
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // first unwraps a single-element array reply (RedisJSON "$" paths) to its element.
 func first(v Value) Value {
@@ -67,6 +70,29 @@ func (c *cmds) JSONSet(ctx context.Context, key, path, json string) error {
 func (c *cmds) JSONSetMode(ctx context.Context, key, path, json, mode string) (bool, error) {
 	v, err := c.value(ctx, newCmd(5, cJSON_SET).s(key).s(path).s(json).s(mode))
 	return err == nil && v.Kind != KindNil, err
+}
+
+// JSONSetWithTTL is JSONSet that also sets a deadline when it creates the key
+// (JSON.SET key path json EX|PX). EX is sent for whole seconds, PX otherwise; an
+// existing key keeps its deadline. A ttl of zero or less returns ErrInvalidTTL.
+func (c *cmds) JSONSetWithTTL(ctx context.Context, key, path, json string, ttl time.Duration) error {
+	tok, v, err := ttlArg(ttl)
+	if err != nil {
+		return err
+	}
+	return c.ok(ctx, newCmd(6, cJSON_SET).s(key).s(path).s(json).t(tok).i(v))
+}
+
+// JSONSetModeWithTTL is JSONSetMode with a create-time deadline (JSON.SET key path json
+// NX|XX EX|PX). ok is false when the write was skipped. A ttl of zero or less returns
+// ErrInvalidTTL.
+func (c *cmds) JSONSetModeWithTTL(ctx context.Context, key, path, json, mode string, ttl time.Duration) (bool, error) {
+	tok, v, err := ttlArg(ttl)
+	if err != nil {
+		return false, err
+	}
+	r, err := c.value(ctx, newCmd(7, cJSON_SET).s(key).s(path).s(json).s(mode).t(tok).i(v))
+	return err == nil && r.Kind != KindNil, err
 }
 
 // JSONDel removes the value at path (JSON.DEL key [path]); an empty path removes the
@@ -318,20 +344,30 @@ func (c *cmds) BFMExists(ctx context.Context, key string, items ...string) ([]bo
 // does not exist yet. Zero values are omitted. Capacity and Error size the new filter
 // (server defaults 100 and 0.01), Expansion sets the growth factor, NonScaling keeps a
 // single layer, NoCreate makes a missing filter an error ("ERR not found") instead of
-// creating it.
+// creating it. TTL, when positive, sets a deadline on the filter when this call creates
+// it (EX for whole seconds, otherwise PX); an existing filter keeps its deadline, and a
+// negative TTL returns ErrInvalidTTL.
 type BFInsertOptions struct {
-	Capacity   int64   // items the new filter is sized for
-	Error      float64 // target false-positive probability, 0 < Error < 1
-	Expansion  int64   // growth factor of added layers
-	NoCreate   bool    // fail instead of creating a missing filter
-	NonScaling bool    // keep a single layer
+	TTL        time.Duration // deadline to set when the call creates the filter
+	Capacity   int64         // items the new filter is sized for
+	Error      float64       // target false-positive probability, 0 < Error < 1
+	Expansion  int64         // growth factor of added layers
+	NoCreate   bool          // fail instead of creating a missing filter
+	NonScaling bool          // keep a single layer
 }
 
 // BFInsert adds items (BF.INSERT key [options] ITEMS item ...), creating the filter from
 // o when it is missing, and returns per item whether it was new. At least one item is
 // required.
 func (c *cmds) BFInsert(ctx context.Context, key string, o BFInsertOptions, items ...string) ([]bool, error) {
+	ttok, tv, err := optTTL(o.TTL)
+	if err != nil {
+		return nil, err
+	}
 	n := 3 + len(items)
+	if ttok != nil {
+		n += 2
+	}
 	if o.Capacity > 0 {
 		n += 2
 	}
@@ -348,6 +384,9 @@ func (c *cmds) BFInsert(ctx context.Context, key string, o BFInsertOptions, item
 		n++
 	}
 	r := newCmd(n, cBF_INSERT).s(key)
+	if ttok != nil {
+		r.t(ttok).i(tv)
+	}
 	if o.Capacity > 0 {
 		r.t(tCAPACITY).i(o.Capacity)
 	}

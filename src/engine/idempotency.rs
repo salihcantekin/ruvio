@@ -1,5 +1,6 @@
 use super::*;
-use crate::protocol::{MAX_IDEMPOTENCY_RESULT_BYTES, MAX_IDEMPOTENCY_TTL_MS};
+use crate::protocol::{Bytes, LimitMode, MAX_IDEMPOTENCY_RESULT_BYTES, MAX_IDEMPOTENCY_TTL_MS};
+use crate::store::LimitError;
 
 // Native state machine rather than a Lua script: the record is replicated and recovered like
 // any other mutation, so no script runs during replay (docs/IDEM.md).
@@ -76,7 +77,11 @@ pub(super) fn begin<'a, C: Clock, I: StorageIndex, S: MutationSink>(
             state(b"pending")
         });
     }
-    let Some(deadline) = shard.now_unix_millis().get().checked_add(ttl_ms) else {
+    let Some(deadline) = shard
+        .now_unix_millis()
+        .checked_add(ttl_ms)
+        .map(crate::UnixMillis::get)
+    else {
         return Ok(Response::Error(INPUT));
     };
     publish(
@@ -133,6 +138,43 @@ pub(super) fn complete<'a, C: Clock, I: StorageIndex, S: MutationSink>(
     )
 }
 
+/// Removes a pending record when `fingerprint` and `owner` match, so a later `BEGIN` acquires
+/// it. A completed record, another owner's record or a missing key is left alone (0). Recorded
+/// as an ordinary delete.
+pub(super) fn abort<'a, C: Clock, I: StorageIndex, S: MutationSink>(
+    shard: &'a mut KvShard<C, I>,
+    sink: &mut S,
+    key: &Bytes<'_>,
+    fingerprint: &[u8],
+    owner: &[u8],
+) -> Result<Response<'a>, S::Error> {
+    if !tokens_valid(fingerprint, owner) {
+        return Ok(Response::Error(INPUT));
+    }
+    if !shard.contains_key(key) {
+        return Ok(Response::Integer(0));
+    }
+    if shard.expires_at(key).is_none() {
+        return Ok(Response::Error(INVALID));
+    }
+    let bytes = match shard.value_view(key) {
+        Ok(Some(ByteView::Borrowed(bytes))) => bytes,
+        _ => return Ok(wrong_type()),
+    };
+    let Some(record) = Record::decode(bytes) else {
+        return Ok(Response::Error(INVALID));
+    };
+    if record.result.is_some() || record.fingerprint != fingerprint || record.owner != owner {
+        return Ok(Response::Integer(0));
+    }
+    before_mutation_allow_oom(shard, sink, [key.as_ref()], 0)?;
+    sink.record(Mutation::Delete {
+        keys: std::slice::from_ref(key),
+    })?;
+    shard.delete(key);
+    Ok(Response::Integer(1))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn publish<'a, C: Clock, I: StorageIndex, S: MutationSink>(
     shard: &mut KvShard<C, I>,
@@ -179,6 +221,9 @@ fn state(value: &'static [u8]) -> Response<'static> {
     Response::Array(vec![Some(Cow::Borrowed(value))])
 }
 
+const LIMIT_MODE_ERROR: &[u8] = b"ERR LIMIT key was created in another mode";
+const LIMIT_RANGE_ERROR: &[u8] = b"ERR LIMIT values do not fit the stored state";
+
 #[inline(always)]
 pub(super) fn limit<'a, C: Clock, I: StorageIndex, S: MutationSink>(
     shard: &'a mut KvShard<C, I>,
@@ -186,22 +231,39 @@ pub(super) fn limit<'a, C: Clock, I: StorageIndex, S: MutationSink>(
     key: crate::protocol::Bytes<'a>,
     max: u64,
     window_ms: u64,
+    mode: LimitMode,
 ) -> Result<Response<'a>, S::Error> {
-    let planned = match shard.plan_limit(&key, max, window_ms) {
+    let (planned, with_retry) = match mode {
+        LimitMode::Fixed => (shard.plan_limit(&key, max, window_ms), false),
+        LimitMode::Sliding { with_retry } => {
+            (shard.plan_limit_sliding(&key, max, window_ms), with_retry)
+        }
+        LimitMode::Tokens { cost, with_retry } => (
+            shard.plan_limit_tokens(&key, max, window_ms, u64::from(cost)),
+            with_retry,
+        ),
+    };
+    let planned = match planned {
         Ok(planned) => planned,
-        Err(_) => return Ok(wrong_type()),
+        Err(LimitError::WrongType) => return Ok(wrong_type()),
+        Err(LimitError::Mode) => return Ok(Response::Error(LIMIT_MODE_ERROR)),
+        Err(LimitError::Range) => return Ok(Response::Error(LIMIT_RANGE_ERROR)),
     };
 
     let crate::store::LimitDecision::Allow {
         used,
         window_end,
         remaining,
+        fresh,
     } = planned
     else {
-        return Ok(Response::Bulk(None));
+        return Ok(match planned {
+            crate::store::LimitDecision::RejectRetry { retry_after_ms } if with_retry => {
+                retry_reply(-1, retry_after_ms)
+            }
+            _ => Response::Bulk(None),
+        });
     };
-
-    let fresh = used == 1;
 
     if let Some(rejected) = before_mutation(
         shard,
@@ -217,7 +279,7 @@ pub(super) fn limit<'a, C: Clock, I: StorageIndex, S: MutationSink>(
     }
 
     match window_end {
-        // A new window: the counter and its end in one record.
+        // A new window, or a moved deadline: the state and its end in one record.
         Some(expires_at) => sink.record(Mutation::Transaction {
             mutations: &[
                 OwnedMutation::LimitPut {
@@ -244,7 +306,21 @@ pub(super) fn limit<'a, C: Clock, I: StorageIndex, S: MutationSink>(
         shard.expire_at(&key, UnixMillis::new(expires_at));
     }
 
-    Ok(Response::Integer(remaining as i64))
+    if with_retry {
+        return Ok(retry_reply(i64::try_from(remaining).unwrap_or(i64::MAX), 0));
+    }
+
+    Ok(Response::Integer(
+        i64::try_from(remaining).unwrap_or(i64::MAX),
+    ))
+}
+
+/// `[remaining, retry_after_ms]`; `remaining` is -1 for a refused call.
+fn retry_reply(remaining: i64, retry_after_ms: u64) -> Response<'static> {
+    Response::Exec(vec![
+        Response::Integer(remaining),
+        Response::Integer(retry_after_ms as i64),
+    ])
 }
 
 #[cfg(test)]
@@ -342,6 +418,100 @@ mod tests {
             execute_with_sink(&mut shard, finish(b"owner", b"late"), &mut log).unwrap(),
             Response::Integer(0)
         );
+    }
+
+    fn give_up<'a>(fingerprint: &'a [u8], owner: &'a [u8]) -> Command<'a> {
+        Command::IdempotencyAbort {
+            key: Cow::Borrowed(b"request"),
+            fingerprint: Cow::Borrowed(fingerprint),
+            owner: Cow::Borrowed(owner),
+        }
+    }
+
+    #[test]
+    fn abort_removes_only_a_pending_record_of_the_same_owner_and_fingerprint() {
+        let clock = TestClock::new(1_000);
+        let mut shard = KvShard::with_clock(clock.clone());
+        let mut log = Log::default();
+
+        assert_eq!(
+            execute_with_sink(&mut shard, give_up(b"fp", b"owner"), &mut log).unwrap(),
+            Response::Integer(0)
+        );
+        execute_with_sink(&mut shard, reserve(b"owner"), &mut log).unwrap();
+        for (fingerprint, owner) in [(&b"fp"[..], &b"other"[..]), (b"other", b"owner")] {
+            assert_eq!(
+                execute_with_sink(&mut shard, give_up(fingerprint, owner), &mut log).unwrap(),
+                Response::Integer(0)
+            );
+        }
+        assert_eq!(log.records.len(), 1);
+        assert_eq!(
+            execute_with_sink(&mut shard, give_up(b"fp", b"owner"), &mut log).unwrap(),
+            Response::Integer(1)
+        );
+        assert!(!shard.contains_key(b"request"));
+        assert_eq!(
+            log.records.last(),
+            Some(&OwnedMutation::Delete {
+                keys: vec![b"request".to_vec()]
+            })
+        );
+        assert_eq!(
+            execute_with_sink(&mut shard, give_up(b"fp", b"owner"), &mut log).unwrap(),
+            Response::Integer(0)
+        );
+
+        // A retry acquires at once instead of waiting for the retention to end.
+        assert_eq!(
+            execute_with_sink(&mut shard, reserve(b"retry"), &mut log).unwrap(),
+            state(b"acquired")
+        );
+        execute_with_sink(&mut shard, finish(b"retry", b"done"), &mut log).unwrap();
+        let records = log.records.len();
+        assert_eq!(
+            execute_with_sink(&mut shard, give_up(b"fp", b"retry"), &mut log).unwrap(),
+            Response::Integer(0)
+        );
+        assert_eq!(log.records.len(), records);
+        assert_eq!(shard.pttl(b"request"), 1_000);
+
+        shard.set_bytes(b"plain", b"value");
+        assert_eq!(
+            abort(
+                &mut shard,
+                &mut log,
+                &Cow::Borrowed(&b"plain"[..]),
+                b"fp",
+                b"owner"
+            )
+            .unwrap(),
+            Response::Error(INVALID)
+        );
+        assert_eq!(
+            abort(
+                &mut shard,
+                &mut log,
+                &Cow::Borrowed(&b"request"[..]),
+                b"",
+                b"owner"
+            )
+            .unwrap(),
+            Response::Error(INPUT)
+        );
+    }
+
+    #[test]
+    fn abort_failing_to_reach_the_log_keeps_the_pending_record() {
+        let clock = TestClock::new(1_000);
+        let mut shard = KvShard::with_clock(clock);
+        let mut log = Log::default();
+
+        execute_with_sink(&mut shard, reserve(b"owner"), &mut log).unwrap();
+        log.fail = true;
+        assert!(execute_with_sink(&mut shard, give_up(b"fp", b"owner"), &mut log).is_err());
+        assert!(shard.contains_key(b"request"));
+        assert_eq!(shard.pttl(b"request"), 1_000);
     }
 
     #[test]
@@ -490,11 +660,21 @@ mod tests {
             ],
             vec![b"IDEM".as_slice(), b"k", b"BEGIN", b"", b"owner", b"1000"],
             vec![b"IDEM".as_slice(), b"k", b"STEAL", b"fp", b"owner", b"1000"],
+            vec![b"IDEM".as_slice(), b"k", b"ABORT", b"fp", b"owner", b"1000"],
+            vec![b"IDEM".as_slice(), b"k", b"ABORT", b"fp", b""],
+            vec![b"IDEM".as_slice(), b"k", b"BEGIN", b"fp", b"owner"],
         ] {
             assert!(crate::protocol::parse_command(&wire(&args)).is_err());
         }
         let args = wire(&[b"IDEM", b"{tag}k", b"COMPLETE", b"fp", b"owner", b"\0\xff"]);
         let (command, _) = crate::protocol::parse_command(&args).unwrap().unwrap();
+        assert_eq!(
+            crate::routing::command_keys(&command),
+            vec![b"{tag}k".as_slice()]
+        );
+        let abort = wire(&[b"IDEM", b"{tag}k", b"abort", b"fp", b"owner"]);
+        let (command, _) = crate::protocol::parse_command(&abort).unwrap().unwrap();
+        assert!(matches!(command, Command::IdempotencyAbort { .. }));
         assert_eq!(
             crate::routing::command_keys(&command),
             vec![b"{tag}k".as_slice()]

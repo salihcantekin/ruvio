@@ -36,23 +36,15 @@ pub fn execute_hot_into_with_sink<C: Clock, I: StorageIndex, S: MutationSink>(
         HotCommand::Ping(None) => output.write_all(b"+PONG\r\n")?,
         HotCommand::Ping(Some(message)) => write_bulk(output, message)?,
         HotCommand::Get(key) => {
-            note_read(shard, key);
+            if shard.eviction_policy().tracks_recency() {
+                // Any live key, not only strings: a read-hot hash must not age from its
+                // last write. The read is stamped through the record the lookup found.
+                let (view, mark) = shard.value_view_read(key);
 
-            match shard.value_view(key) {
-                Ok(Some(ByteView::Borrowed(value))) => write_bulk(output, value)?,
-                Ok(Some(ByteView::Integer(value))) => {
-                    let mut digits = [0u8; 20];
-                    let len = crate::store::format_integer(value, &mut digits);
-
-                    write_bulk(output, &digits[..len])?;
-                }
-
-                Ok(None) => output.write_all(null)?,
-                Err(_) => {
-                    output.write_all(
-                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                    )?;
-                }
+                write_get(output, view, null)?;
+                shard.mark_read(key, mark);
+            } else {
+                write_get(output, shard.value_view(key), null)?;
             }
         }
 
@@ -144,39 +136,56 @@ pub fn execute_hot_into_with_sink<C: Clock, I: StorageIndex, S: MutationSink>(
             output.write_all(if removed { b":1\r\n" } else { b":0\r\n" })?;
         }
 
-        HotCommand::Increment(key, delta) => match shard.preview_increment(key, delta) {
-            Ok(value) => {
-                if let Some(rejected) =
-                    before_mutation(shard, sink, [key], key.len() + ADMISSION_OVERHEAD_BYTES)
-                        .map_err(ExecuteError::Mutation)?
-                {
-                    write_response(output, rejected)?;
+        HotCommand::Increment(key, delta) => {
+            let hint = shard.key_hint(key);
 
-                    return Ok(());
+            match shard.preview_increment_hinted(key, delta, hint) {
+                Ok(value) => {
+                    if let Some(rejected) =
+                        before_mutation(shard, sink, [key], key.len() + ADMISSION_OVERHEAD_BYTES)
+                            .map_err(ExecuteError::Mutation)?
+                    {
+                        write_response(output, rejected)?;
+
+                        return Ok(());
+                    }
+
+                    sink.record(Mutation::SetInteger { key, value })
+                        .map_err(ExecuteError::Mutation)?;
+                    shard
+                        .set_integer_hinted(key, value, hint)
+                        .expect("increment type was validated before recording");
+                    output.write_all(b":")?;
+                    write_i64(output, value)?;
+                    output.write_all(b"\r\n")?;
                 }
 
-                sink.record(Mutation::SetInteger { key, value })
-                    .map_err(ExecuteError::Mutation)?;
-                shard
-                    .set_integer(key, value)
-                    .expect("increment type was validated before recording");
-                output.write_all(b":")?;
-                write_i64(output, value)?;
-                output.write_all(b"\r\n")?;
+                Err(error) => write_response(output, increment_error(error))?,
             }
-
-            Err(error) => write_response(output, increment_error(error))?,
-        },
+        }
     }
 
     Ok(())
 }
 
-pub(super) fn note_read<C: Clock, I: StorageIndex>(shard: &mut KvShard<C, I>, key: &[u8]) {
-    if !shard.eviction_policy().tracks_recency() {
-        return;
-    }
+// Always inlined: the default policy's GET must cost what it did before the split.
+#[inline(always)]
+fn write_get(
+    output: &mut impl Write,
+    view: Result<Option<ByteView<'_>>, crate::store::WrongType>,
+    null: &'static [u8],
+) -> io::Result<()> {
+    match view {
+        Ok(Some(ByteView::Borrowed(value))) => write_bulk(output, value),
+        Ok(Some(ByteView::Integer(value))) => {
+            let mut digits = [0u8; 20];
+            let len = crate::store::format_integer(value, &mut digits);
 
-    // Any live key, not only strings: a read-hot hash must not age from its last write.
-    shard.touch(key);
+            write_bulk(output, &digits[..len])
+        }
+
+        Ok(None) => output.write_all(null),
+        Err(_) => output
+            .write_all(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"),
+    }
 }

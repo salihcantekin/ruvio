@@ -271,7 +271,7 @@ impl<'f> SlowSample<'f> {
                     .unwrap_or_default(),
                 name: session.client_name.clone(),
             },
-            state.published_config.slowlog_max_len,
+            state.live.with(|live| live.slowlog_max_len),
         );
     }
 }

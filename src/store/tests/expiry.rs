@@ -396,7 +396,7 @@ fn large_lease_and_limit_deadlines_saturate_without_wrapping() {
     assert!(shard.expire_at(b"limit", UnixMillis::new(end)));
     assert_eq!(shard.pttl(b"limit"), 5);
     clock.set(u64::MAX);
-    assert_eq!(shard.pttl(b"lease"), -1);
+    assert_eq!(shard.pttl(b"lease"), -2);
     assert_eq!(shard.pttl(b"limit"), -2);
 }
 

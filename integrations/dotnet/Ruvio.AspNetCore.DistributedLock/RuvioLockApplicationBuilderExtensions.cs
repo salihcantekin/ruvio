@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Builder;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Ruvio.AspNetCore.DistributedLock;
 
@@ -13,6 +14,11 @@ public static class RuvioLockApplicationBuilderExtensions
     public static IApplicationBuilder UseRuvioLock(this IApplicationBuilder app)
     {
         ArgumentNullException.ThrowIfNull(app);
+
+        // Runs while the pipeline is set up, so a missing AddRuvioDistributedLock fails before the server takes a request.
+        if (app.ApplicationServices.GetService<IServiceProviderIsService>() is { } services
+            && !services.IsService(typeof(RuvioLockProvider)))
+            throw new InvalidOperationException("UseRuvioLock needs services.AddRuvioDistributedLock(...) first.");
 
         return app.UseMiddleware<RuvioLockMiddleware>();
     }

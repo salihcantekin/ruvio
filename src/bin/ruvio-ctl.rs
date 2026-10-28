@@ -41,10 +41,12 @@ enum Command {
     },
     /// Copy keys from a running Redis or Ruvio into another server with ordinary commands.
     Import {
-        /// Source, for example redis://user:password@host:6379/0.
+        /// Source, for example redis://user:@host:6379/0. The password comes from
+        /// RUVIO_IMPORT_SOURCE_PASSWORD (a password in the URL shows in the process list).
         #[arg(long)]
         from: String,
-        /// Target, for example ruvio://host:6379/0.
+        /// Target, for example ruvio://host:6379/0. The password comes from
+        /// RUVIO_IMPORT_TARGET_PASSWORD.
         #[arg(long)]
         to: String,
         /// Only keys matching this glob.
@@ -62,6 +64,15 @@ enum Command {
         /// Read every copied key back from the target and compare it with the source.
         #[arg(long, default_value_t = false)]
         verify: bool,
+    },
+    /// Exit 0 when a server answers on the address; the container health check runs it.
+    Ping {
+        /// Defaults to RUVIO_ADDR with an unspecified host replaced by 127.0.0.1, then 127.0.0.1:6379.
+        #[arg(long)]
+        address: Option<String>,
+        /// Only open the connection; for a server with TLS, which a plaintext PING cannot talk to.
+        #[arg(long, default_value_t = false)]
+        connect_only: bool,
     },
     /// Restore a previously checked backup into a data directory.
     Restore {
@@ -85,6 +96,10 @@ fn main() {
 
 fn run(cli: Cli) -> Result<(), PersistenceError> {
     match cli.command {
+        Command::Ping {
+            address,
+            connect_only,
+        } => ping(address, connect_only)?,
         Command::Check { data_dir } => {
             verify_backup_signature(&data_dir, &backup_key(None)?)?;
             print_report(&check_data_dir(data_dir)?, false);
@@ -237,5 +252,47 @@ fn print_report(report: &IntegrityReport, inspect: bool) {
 
     if inspect {
         println!("mode=read-only; torn WAL tails are reported and not truncated");
+    }
+}
+
+/// `NOAUTH` counts as alive: the server answered, it just wants a password.
+fn ping(address: Option<String>, connect_only: bool) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    let address = address.unwrap_or_else(|| {
+        let configured = std::env::var("RUVIO_ADDR").unwrap_or_default();
+        let port = configured.rsplit(':').next().unwrap_or("6379");
+
+        match configured.rsplit_once(':') {
+            Some((host, _)) if !matches!(host, "" | "0.0.0.0" | "[::]" | "::") => {
+                configured.clone()
+            }
+            _ => format!("127.0.0.1:{}", if port.is_empty() { "6379" } else { port }),
+        }
+    });
+    let timeout = Duration::from_secs(2);
+    let target = address
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| Error::new(ErrorKind::NotFound, "address did not resolve"))?;
+    let mut stream = TcpStream::connect_timeout(&target, timeout)?;
+
+    if connect_only {
+        return Ok(());
+    }
+
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    stream.write_all(b"*1\r\n$4\r\nPING\r\n")?;
+
+    let mut reply = [0u8; 16];
+    let read = stream.read(&mut reply)?;
+
+    if reply[..read].starts_with(b"+PONG") || reply[..read].starts_with(b"-NOAUTH") {
+        Ok(())
+    } else {
+        Err(Error::other("unexpected reply to PING"))
     }
 }

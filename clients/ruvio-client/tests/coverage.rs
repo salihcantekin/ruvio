@@ -171,6 +171,7 @@ fn methods_exist() {
     let _ = Client::client_list;
     let _ = Client::client_setname;
     let _ = Client::client_tracking;
+    let _ = Client::client_durability;
     let _ = Client::cluster_info;
     let _ = Client::cluster_keyslot;
     let _ = Client::cluster_myid;
@@ -182,6 +183,8 @@ fn methods_exist() {
     let _ = Client::command_info;
     let _ = Client::command_list;
     let _ = Client::config_get;
+    let _ = Client::config_rewrite;
+    let _ = Client::config_set;
     let _ = Client::copy;
     let _ = Client::dbsize;
     let _ = Client::decr;
@@ -243,6 +246,7 @@ fn methods_exist() {
     let _ = Client::hpexpire;
     let _ = Client::hpexpiretime;
     let _ = Client::hpttl;
+    let _ = Client::hmset;
     let _ = Client::hrandfield;
     let _ = Client::hrandfield_count;
     let _ = Client::hrandfield_with_values;
@@ -254,7 +258,9 @@ fn methods_exist() {
     let _ = Client::httl;
     let _ = Client::hvals;
     let _ = Client::idem_begin;
+    let _ = Client::idem_abort;
     let _ = Client::idem_complete;
+    let _ = Client::idempotency_abort;
     let _ = Client::idempotency_begin;
     let _ = Client::idempotency_complete;
     let _ = Client::incr;
@@ -296,6 +302,10 @@ fn methods_exist() {
     let _ = Client::lease;
     let _ = Client::lease_guard;
     let _ = Client::limit;
+    let _ = Client::limit_sliding;
+    let _ = Client::limit_sliding_with_retry;
+    let _ = Client::limit_tokens;
+    let _ = Client::limit_tokens_with_retry;
     let _ = Client::lindex;
     let _ = Client::linsert;
     let _ = Client::llen;
@@ -355,6 +365,8 @@ fn methods_exist() {
     let _ = Client::rpushcap;
     let _ = Client::rpushx;
     let _ = Client::ruvio;
+    let _ = Client::move_slots;
+    let _ = Client::move_slots_status;
     let _ = Client::sadd;
     let _ = Client::save;
     let _ = Client::scan;
@@ -378,6 +390,8 @@ fn methods_exist() {
     let _ = Client::set_expires_at;
     let _ = Client::set_if_eq;
     let _ = Client::set_if_eq_keep_ttl;
+    let _ = Client::set_if_greater;
+    let _ = Client::set_if_less;
     let _ = Client::set_keep_ttl;
     let _ = Client::set_with;
     let _ = Client::setbit;
@@ -413,6 +427,8 @@ fn methods_exist() {
     let _ = Client::sunsubscribe;
     let _ = Client::swapdb;
     let _ = Client::take;
+    let _ = Client::transfer;
+    let _ = Client::htransfer;
     let _ = Client::touch;
     let _ = Client::ttl;
     let _ = Client::unlink;
@@ -469,6 +485,8 @@ fn methods_exist() {
     let _ = Client::zmscore;
     let _ = Client::zpopmax;
     let _ = Client::zpopmin;
+    let _ = Client::zpopbyscore;
+    let _ = Client::zmovedue;
     let _ = Client::zrandmember;
     let _ = Client::zrandmember_count;
     let _ = Client::zrandmember_with_scores;
@@ -495,4 +513,20 @@ fn methods_exist() {
     let _ = Client::zunion;
     let _ = Client::zunion_with_scores;
     let _ = Client::zunionstore;
+    let _ = Client::expire_if;
+    let _ = Client::pexpire_if;
+    let _ = Client::expire_at_if;
+    let _ = Client::pexpire_at_if;
+    let _ = Client::incr_with_ttl;
+    let _ = Client::decr_with_ttl;
+    let _ = Client::incr_by_with_ttl;
+    let _ = Client::decr_by_with_ttl;
+    let _ = Client::incr_by_max_with_ttl;
+    let _ = Client::incr_by_float_with_ttl;
+    let _ = Client::hincr_by_with_ttl;
+    let _ = Client::zincr_by_with_ttl;
+    let _ = Client::setbit_with_ttl;
+    let _ = Client::xadd_with_ttl;
+    let _ = Client::xadd_trim_with_ttl;
+    let _ = Client::json_set_with_ttl;
 }

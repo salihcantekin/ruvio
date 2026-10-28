@@ -134,6 +134,20 @@ impl Client {
         self.json_set_with(key, path, &to_json(value)?, condition)
     }
 
+    /// Serializes `value` and sends `JSON.SET ... [NX|XX] EX|PX`, as
+    /// [`Client::json_set_with_ttl`]: the deadline is set when the call creates the key. Returns
+    /// `false` when it was not written. Requires `serde`.
+    pub fn json_set_value_with_ttl<T: Serialize + ?Sized>(
+        &mut self,
+        key: &str,
+        path: &str,
+        value: &T,
+        condition: crate::models::JsonSetCondition,
+        ttl: std::time::Duration,
+    ) -> Result<bool, Error> {
+        self.json_set_with_ttl(key, path, &to_json(value)?, condition, ttl)
+    }
+
     /// `JSON.FIND` for a typed value.
     ///
     /// Serializes `value` the way the index stores it (a string is sent without quotes, a number

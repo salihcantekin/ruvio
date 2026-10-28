@@ -8,13 +8,22 @@ export const clientExamples: Record<string, Record<ClientSlug, string>> = {
 let mut db = Client::connect("127.0.0.1", 6379)?;
 let left = db.limit("api:key-7", 100, 60_000)?;
 // Some(99) -> 99 calls left in this 60 s window
-// None     -> window is full, nothing was counted`,
+// None     -> window is full, nothing was counted
+
+// Smoother: sliding window, or a token bucket that tells you how long to wait
+let sliding = db.limit_sliding("api:key-7", 100, 60_000)?;
+let bucket = db.limit_tokens_with_retry("api:key-7:burst", 10, 1_000, 2)?;
+// bucket.allowed, bucket.remaining, bucket.retry_after_ms`,
     csharp: `await using var connection = await RuvioConnection.ConnectAsync("127.0.0.1", 6379);
 var db = await connection.GetDefaultDatabaseAsync();
 
 long? left = await db.LimitAsync("api:key-7", 100, 60_000);
 // 99   -> 99 calls left in this 60 s window
-// null -> window is full, nothing was counted`,
+// null -> window is full, nothing was counted
+
+// Smoother: sliding window, or a token bucket that tells you how long to wait
+long? sliding = await db.LimitSlidingAsync("api:key-7", 100, 60_000);
+LimitOutcome bucket = await db.LimitTokensWithRetryAsync("api:key-7:burst", 10, 1_000, 2);`,
     go: `c, err := ruvio.Connect(ctx, ruvio.Options{Addr: "127.0.0.1:6379"})
 if err != nil { return err }
 
@@ -22,31 +31,49 @@ left, ok, err := c.Limit(ctx, "api:key-7", 100, time.Minute)
 if err != nil { return err }
 fmt.Println(left, ok)
 // 99 true -> 99 calls left in this 60 s window
-// 0 false -> window is full, nothing was counted`,
+// 0 false -> window is full, nothing was counted
+
+// Smoother: sliding window, or a token bucket that tells you how long to wait
+left, ok, err = c.LimitSliding(ctx, "api:key-7", 100, time.Minute)
+bucket, err := c.LimitTokensWithRetry(ctx, "api:key-7:burst", 10, time.Second, 2)
+// bucket.Allowed, bucket.Remaining, bucket.RetryAfter`,
     java: `var c = RuvioClient.connect("127.0.0.1", 6379);
 
 Long left = c.limit("api:key-7", 100, 60_000);
 // 99   -> 99 calls left in this 60 s window
-// null -> window is full, nothing was counted`,
+// null -> window is full, nothing was counted
+
+// Smoother: sliding window, or a token bucket that tells you how long to wait
+Long sliding = c.limitSliding("api:key-7", 100, 60_000);
+LimitOutcome bucket = c.limitTokensWithRetry("api:key-7:burst", 10, 1_000, 2);`,
     python: `import ruvio
 
 r = ruvio.Ruvio("127.0.0.1", 6379)
 left = r.limit("api:key-7", 100, 60_000)
 # 99   -> 99 calls left in this 60 s window
-# None -> window is full, nothing was counted`,
+# None -> window is full, nothing was counted
+
+# Smoother: sliding window, or a token bucket that tells you how long to wait
+sliding = r.limit_sliding("api:key-7", 100, 60_000)
+allowed, remaining, retry_after_ms = r.limit_tokens_with_retry("api:key-7:burst", 10, 1_000, 2)`,
     node: `import { createClient } from 'ruvio-client';
 
 const c = createClient({ host: '127.0.0.1', port: 6379 });
 const left = await c.limit('api:key-7', 100, 60_000);
 // 99   -> 99 calls left in this 60 s window
-// null -> window is full, nothing was counted`,
+// null -> window is full, nothing was counted
+
+// Smoother: sliding window, or a token bucket that tells you how long to wait
+const sliding = await c.limitSliding('api:key-7', 100, 60_000);
+const bucket = await c.limitTokensWithRetry('api:key-7:burst', 10, 1_000, 2);
+// bucket.allowed, bucket.remaining, bucket.retryAfterMs`,
   },
   locks: {
     rust: `use ruvio_client::Client;
 
 let mut db = Client::connect("127.0.0.1", 6379)?;
 let token = db.lease("job:nightly-report", 30_000)?;
-// Some(17) -> you hold it, token 17
+// Some(token) -> you hold it
 // None     -> someone else holds it
 if let Some(token) = token {
     let released = db.release("job:nightly-report", token as u64)?;
@@ -56,7 +83,7 @@ if let Some(token) = token {
 var db = await connection.GetDefaultDatabaseAsync();
 
 long? token = await db.LeaseAsync("job:nightly-report", 30_000);
-// 17   -> you hold it, token 17
+// token -> you hold it
 // null -> someone else holds it
 if (token is long held)
 {
@@ -69,14 +96,14 @@ if err != nil { return err }
 token, ok, err := c.Lease(ctx, "job:nightly-report", 30*time.Second)
 if err != nil { return err }
 if !ok { return nil } // someone else holds it
-// you hold it, token 17
+// you hold it
 released, err := c.Release(ctx, "job:nightly-report", token)
 if err != nil { return err }
 fmt.Println(released) // true -> released (false if the token no longer matches)`,
     java: `var c = RuvioClient.connect("127.0.0.1", 6379);
 
 Long token = c.lease("job:nightly-report", 30_000);
-// 17   -> you hold it, token 17
+// token -> you hold it
 // null -> someone else holds it
 if (token != null) {
     Boolean released = c.release("job:nightly-report", token);
@@ -86,7 +113,7 @@ if (token != null) {
 
 r = ruvio.Ruvio("127.0.0.1", 6379)
 token = r.lease("job:nightly-report", 30_000)
-# 17   -> you hold it, token 17
+# token -> you hold it
 # None -> someone else holds it
 if token is not None:
     released = r.release("job:nightly-report", token)
@@ -95,7 +122,7 @@ if token is not None:
 
 const c = createClient({ host: '127.0.0.1', port: 6379 });
 const token = await c.lease('job:nightly-report', 30_000);
-// 17   -> you hold it, token 17
+// token -> you hold it
 // null -> someone else holds it
 if (token !== null) {
   const released = await c.release('job:nightly-report', token);
@@ -231,6 +258,8 @@ let mut db = Client::connect("127.0.0.1", 6379)?;
 let first = db.idem_begin("order:42", "request-digest", "attempt-1", Duration::from_secs(60))?;
 // IdemState::Acquired -> run the handler once
 db.idem_complete("order:42", "request-digest", "attempt-1", b"saved-result")?; // true
+// If the handler failed and is safe to run again, free the key instead of completing it:
+// db.idem_abort("order:42", "request-digest", "attempt-1")?; // true
 let retry = db.idem_begin("order:42", "request-digest", "attempt-2", Duration::from_secs(60))?;
 // IdemState::Completed(b"saved-result".to_vec())`,
     csharp: `await using var connection = await RuvioConnection.ConnectAsync("127.0.0.1", 6379);
@@ -239,6 +268,8 @@ var db = await connection.GetDefaultDatabaseAsync();
 var first = await db.TryBeginIdempotencyAsync("order:42", "request-digest", "attempt-1", TimeSpan.FromSeconds(60));
 // first.State == IdempotencyState.Acquired -> run the handler once
 await db.CompleteIdempotencyAsync("order:42", "request-digest", "attempt-1", "saved-result"); // true
+// If the handler failed and is safe to run again, free the key instead of completing it:
+// await db.AbortIdempotencyAsync("order:42", "request-digest", "attempt-1"); // true
 var retry = await db.TryBeginIdempotencyAsync("order:42", "request-digest", "attempt-2", TimeSpan.FromSeconds(60));
 // retry.State == IdempotencyState.Completed, retry.Result holds "saved-result" as bytes`,
     go: `c, err := ruvio.Connect(ctx, ruvio.Options{Addr: "127.0.0.1:6379"})
@@ -250,6 +281,8 @@ fmt.Println(first.State) // acquired -> run the handler once
 n, err := c.IdemComplete(ctx, "order:42", "request-digest", "attempt-1", []byte("saved-result"))
 if err != nil { return err }
 fmt.Println(n) // 1
+// If the handler failed and is safe to run again, free the key instead of completing it:
+// freed, err := c.IdemAbort(ctx, "order:42", "request-digest", "attempt-1") // true
 retry, err := c.IdemBegin(ctx, "order:42", "request-digest", "attempt-2", time.Minute)
 if err != nil { return err }
 fmt.Println(retry.State, string(retry.Result)) // completed saved-result`,
@@ -258,6 +291,8 @@ fmt.Println(retry.State, string(retry.Result)) // completed saved-result`,
 var first = c.idemBegin("order:42", "request-digest", "attempt-1", 60_000);
 // first.state() == IdemResult.State.ACQUIRED -> run the handler once
 c.idemComplete("order:42", "request-digest", "attempt-1", "saved-result"); // 1
+// If the handler failed and is safe to run again, free the key instead of completing it:
+// c.idemAbort("order:42", "request-digest", "attempt-1"); // true
 var retry = c.idemBegin("order:42", "request-digest", "attempt-2", 60_000);
 // retry.state() == COMPLETED, retry.resultString() == "saved-result"`,
     python: `import ruvio
@@ -266,6 +301,8 @@ r = ruvio.Ruvio("127.0.0.1", 6379)
 first = r.idem_begin("order:42", "request-digest", "attempt-1", 60_000)
 # IdemResult(state='acquired', result=None) -> run the handler once
 r.idem_complete("order:42", "request-digest", "attempt-1", "saved-result")  # 1
+# If the handler failed and is safe to run again, free the key instead of completing it:
+# r.idem_abort("order:42", "request-digest", "attempt-1")  # True
 retry = r.idem_begin("order:42", "request-digest", "attempt-2", 60_000)
 # IdemResult(state='completed', result='saved-result')`,
     node: `import { createClient } from 'ruvio-client';
@@ -274,6 +311,8 @@ const c = createClient({ host: '127.0.0.1', port: 6379 });
 const first = await c.idemBegin('order:42', 'request-digest', 'attempt-1', 60_000);
 // { state: 'acquired', result: null } -> run the handler once
 await c.idemComplete('order:42', 'request-digest', 'attempt-1', 'saved-result'); // 1
+// If the handler failed and is safe to run again, free the key instead of completing it:
+// await c.idemAbort('order:42', 'request-digest', 'attempt-1'); // true
 const retry = await c.idemBegin('order:42', 'request-digest', 'attempt-2', 60_000);
 // { state: 'completed', result: 'saved-result' }`,
   },
@@ -390,13 +429,9 @@ if let FillOutcome::Fill(token) | FillOutcome::Stale { token: Some(token), .. } 
     csharp: `await using var connection = await RuvioConnection.ConnectAsync("127.0.0.1", 6379);
 var db = await connection.GetDefaultDatabaseAsync();
 
-FillResult fill = await db.FillGetAsync("product:42", TimeSpan.FromMilliseconds(5000), TimeSpan.FromMilliseconds(200));
-// fill.State: Hit (fill.Value), Fill (fill.Token), Busy, or Stale (fill.Value, and fill.Token when you refresh)
-if (fill.Token is long token)
-{
-    bool stored = await db.FillSetAsync("product:42", "{...}", TimeSpan.FromSeconds(60), token, TimeSpan.FromSeconds(30));
-    // true -> stored (false if the token is no longer live)
-}`,
+// One caller builds the value; the others poll with short FILLGET calls, so the connection is never held.
+string html = await db.GetOrCreateAsync("product:42", TimeSpan.FromSeconds(60),
+    async ct => await LoadProductHtmlAsync(42, ct));`,
     go: `c, err := ruvio.Connect(ctx, ruvio.Options{Addr: "127.0.0.1:6379"})
 if err != nil { return err }
 
@@ -564,6 +599,107 @@ c.on('push', (event) => {
 // No typed method for CHANGES SUBSCRIBE: call sends it.
 const start = await c.call('CHANGES', 'SUBSCRIBE', 'FROM', 'NOW', 'MATCH', 'user:*', 'TYPES', 'put,del');
 // the cursor the stream begins after, '<shard>:<seq>'`,
+  },
+  "replica-reads": {
+    rust: `use ruvio_client::{Client, ClientOptions, ReadPolicy};
+
+let mut db = Client::connect_with(ClientOptions {
+    host: "10.0.0.5".into(),
+    port: 7000,
+    read_policy: ReadPolicy::PreferReplica,
+    ..ClientOptions::default()
+})?;
+db.set("user:1", "Ada")?;            // primary
+let name = db.get_string("user:1")?; // a replica; may not have the write yet`,
+    csharp: `await using var connection = await RuvioConnection.ConnectAsync(new RuvioClientOptions
+{
+    Host = "10.0.0.5",
+    Port = 7000,
+    ReadPolicy = ReadPolicy.PreferReplica,
+});
+var db = await connection.GetDefaultDatabaseAsync();
+
+await db.SetAsync("user:1", "Ada");              // primary
+string? name = await db.GetStringAsync("user:1"); // a replica; may not have the write yet`,
+    go: `c, err := ruvio.Connect(ctx, ruvio.Options{
+	Addr:       "10.0.0.5:7000",
+	ReadPolicy: ruvio.ReadPreferReplica,
+})
+if err != nil { return err }
+
+err = c.Set(ctx, "user:1", "Ada")        // primary
+name, ok, err := c.Get(ctx, "user:1")    // a replica; may not have the write yet`,
+    java: `var c = RuvioClient.connect(RuvioOptions.builder()
+        .host("10.0.0.5").port(7000).cluster(true)
+        .readPolicy(ReadPolicy.PREFER_REPLICA)
+        .build());
+
+c.set("user:1", "Ada");        // primary
+String name = c.get("user:1"); // a replica; may not have the write yet`,
+    python: `from ruvio import ClusterRuvio, ReadPolicy
+
+r = ClusterRuvio("10.0.0.5", 7000, read_policy=ReadPolicy.PREFER_REPLICA)
+r.set("user:1", "Ada")   # primary
+name = r.get("user:1")   # a replica; may not have the write yet`,
+    node: `import { createClusterClient } from 'ruvio-client';
+
+const c = createClusterClient({ host: '10.0.0.5', port: 7000, readPolicy: 'prefer-replica' });
+await c.set('user:1', 'Ada');          // primary
+const name = await c.get('user:1');    // a replica; may not have the write yet`,
+  },
+  rebalance: {
+    rust: `use ruvio_client::Client;
+
+let mut db = Client::connect("127.0.0.1", 6379)?;
+db.move_slots(0, 2047, 3)?; // starts the move to shard 3
+loop {
+    let status = db.move_slots_status()?;
+    let state = status.iter().find(|(name, _)| name == "state").map(|(_, v)| v.clone());
+    if !matches!(state.as_deref(), Some("copying" | "cleaning")) { break; } // "done"
+    std::thread::sleep(std::time::Duration::from_millis(100));
+}`,
+    csharp: `await using var connection = await RuvioConnection.ConnectAsync("127.0.0.1", 6379);
+var db = await connection.GetDefaultDatabaseAsync();
+
+await db.MoveSlotsAsync(0, 2047, 3); // starts the move to shard 3
+while ((await db.GetMoveSlotsStatusAsync())["state"] is "copying" or "cleaning")
+{
+    await Task.Delay(100);
+}
+// state "done"`,
+    go: `c, err := ruvio.Connect(ctx, ruvio.Options{Addr: "127.0.0.1:6379"})
+if err != nil { return err }
+
+if err := c.MoveSlots(ctx, 0, 2047, 3); err != nil { return err } // starts the move to shard 3
+for {
+	status, err := c.MoveSlotsStatus(ctx)
+	if err != nil { return err }
+	if s := status["state"]; s != "copying" && s != "cleaning" { break } // "done"
+	time.Sleep(100 * time.Millisecond)
+}`,
+    java: `var c = RuvioClient.connect("127.0.0.1", 6379);
+
+c.moveSlots(0, 2047, 3); // starts the move to shard 3
+while (List.of("copying", "cleaning").contains(c.moveSlotsStatus().get("state"))) {
+    Thread.sleep(100);
+}
+// state "done"`,
+    python: `import time
+from ruvio import Ruvio
+
+r = Ruvio("127.0.0.1", 6379)
+r.move_slots(0, 2047, 3)  # starts the move to shard 3
+while r.move_slots_status()["state"] in ("copying", "cleaning"):
+    time.sleep(0.1)
+# state "done"`,
+    node: `import { createClient } from 'ruvio-client';
+
+const c = createClient({ host: '127.0.0.1', port: 6379 });
+await c.moveSlots(0, 2047, 3); // starts the move to shard 3
+while (['copying', 'cleaning'].includes((await c.moveSlotsStatus()).state)) {
+  await new Promise((resolve) => setTimeout(resolve, 100));
+}
+// state "done"`,
   },
   data: {
     rust: `use ruvio_client::{Client, GeoFrom, GeoSearch, JsonIndexType};

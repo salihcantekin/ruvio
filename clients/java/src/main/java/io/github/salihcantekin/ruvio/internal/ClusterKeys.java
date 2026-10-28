@@ -22,6 +22,10 @@ public final class ClusterKeys {
     /** Split mode: split by slot and reply OK when every part succeeded (MSET). */
     public static final int SPLIT_VOID = 3;
 
+    /** Server flag bits of the command table; see {@link CommandKeyRules.Rule#flags()}. */
+    private static final int FLAG_READONLY = 2;
+    private static final int FLAG_BLOCKING = 16;
+
     /** The routing rule of one command: where its keys are and how a cross-slot call is split. */
     public static final class Spec {
         final String name;
@@ -32,6 +36,8 @@ public final class ClusterKeys {
         /** Each key is followed by its value (MSET): a split keeps the two together. */
         final boolean pairs;
         final int split;
+        /** The server flags the command readonly and not blocking: it may be served by a replica. */
+        final boolean read;
 
         Spec(String name, Rule rule, int split) {
             this.name = name;
@@ -41,6 +47,7 @@ public final class ClusterKeys {
             this.first = range && rule.a() == 1 && rule.b() == 1;
             this.pairs = range && rule.c() == 2;
             this.split = split;
+            this.read = (rule.flags() & (FLAG_READONLY | FLAG_BLOCKING)) == FLAG_READONLY;
         }
     }
 

@@ -89,6 +89,14 @@ def shard_of(shards, key: str) -> int:
 # --------------------------------------------------------------------------- discovery / hashing
 
 
+async def test_move_slots_status_and_refusal(cc):
+    status = await cc.move_slots_status()
+    assert "state" in status, status
+    # Slot 0 is on shard 0: nothing to move, and the server says why.
+    with pytest.raises(ruvio.ResponseError, match="already on that shard"):
+        await cc.move_slots(0, 10, 0)
+
+
 async def test_discovery_and_slot_table(cc):
     c = cc._c if isinstance(cc, SyncAsAsync) else cc
     if isinstance(cc, SyncAsAsync):

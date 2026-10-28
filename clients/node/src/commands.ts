@@ -2,10 +2,13 @@
 // Typed methods for every command in docs/compatibility-matrix.json.
 // Shared by the client (returns promises), pipelines and transactions (queue frames).
 
+import { createHash } from 'node:crypto';
 import { C } from './command-names.js';
+import { RuvioError } from './errors.js';
 import { cmd, Encoder, type Arg, type Cmd } from './encoder.js';
 import { T, type Tf } from './transforms.js';
 import type {
+  LimitOutcome,
   Key,
   Value,
   SetOptions,
@@ -15,11 +18,13 @@ import type {
   SortedSetEntry,
   PoppedEntry,
   ZAddOptions,
+  TtlOptions,
   ZRangeOptions,
   ZStoreOptions,
   ListPopResult,
   LPosOptions,
   GeoMember,
+  GeoAddOptions,
   GeoUnit,
   GeoSearchOptions,
   GeoRadiusOptions,
@@ -50,15 +55,16 @@ import type {
   InsertPosition,
   BitfieldType,
 } from './types.js';
-import { KW_AGGREGATE, KW_BITOP, KW_BITUNIT, KW_CLIENT_TYPE, KW_GEO_UNIT, KW_INFO_SECTION, KW_ORDER, KW_SCAN_TYPE, KW_SIDE, KW_TRIM_MODE, KW_TRIM_STRATEGY, KW_WHERE, kw } from './keywords.js';
+import { KW_AGGREGATE, KW_EXPIRE_COND, KW_BITOP, KW_BITUNIT, KW_CLIENT_TYPE, KW_GEO_UNIT, KW_INFO_SECTION, KW_ORDER, KW_SCAN_TYPE, KW_SIDE, KW_TRIM_MODE, KW_TRIM_STRATEGY, KW_WHERE, kw } from './keywords.js';
 
 
 // Option words as Buffers: encoded with a single copy, no string scan.
 const w = (s: string): Buffer => Buffer.from(s, 'latin1');
 const W = {
   EX: w('EX'), PX: w('PX'), EXAT: w('EXAT'), PXAT: w('PXAT'), KEEPTTL: w('KEEPTTL'), NX: w('NX'), XX: w('XX'),
-  GET: w('GET'), IFEQ: w('IFEQ'), MAX: w('MAX'), WAIT: w('WAIT'), SWR: w('SWR'), BEGIN: w('BEGIN'),
-  COMPLETE: w('COMPLETE'), START: w('START'), MATCH: w('MATCH'), COUNT: w('COUNT'), TYPE: w('TYPE'),
+  GET: w('GET'), IFEQ: w('IFEQ'), IFGT: w('IFGT'), IFLT: w('IFLT'), MAX: w('MAX'), WAIT: w('WAIT'), SWR: w('SWR'), BEGIN: w('BEGIN'),
+  SLIDING: w('SLIDING'), TOKENS: w('TOKENS'), COST: w('COST'), WITHRETRY: w('WITHRETRY'),
+  ABORT: w('ABORT'), COMPLETE: w('COMPLETE'), START: w('START'), MATCH: w('MATCH'), COUNT: w('COUNT'), TYPE: w('TYPE'),
   ASYNC: w('ASYNC'), REPLACE: w('REPLACE'), ABSTTL: w('ABSTTL'), IDLETIME: w('IDLETIME'), FREQ: w('FREQ'),
   SAMPLES: w('SAMPLES'), DB: w('DB'), RANK: w('RANK'), MAXLEN: w('MAXLEN'), LIMIT: w('LIMIT'),
   WITHSCORES: w('WITHSCORES'), WITHVALUES: w('WITHVALUES'), BYSCORE: w('BYSCORE'), BYLEX: w('BYLEX'), REV: w('REV'),
@@ -72,10 +78,16 @@ const W = {
   GROUP: w('GROUP'), NOACK: w('NOACK'), GTID: w('>'), IDLE: w('IDLE'), JUSTID: w('JUSTID'), TIME: w('TIME'),
   RETRYCOUNT: w('RETRYCOUNT'), FORCE: w('FORCE'), LASTID: w('LASTID'), ON: w('ON'), OFF: w('OFF'), ID: w('ID'),
   ADDR: w('ADDR'), SKIPME: w('SKIPME'), YES: w('yes'), NO: w('no'), SETNAME: w('SETNAME'), AUTH: w('AUTH'),
-  OWNER: w('OWNER'), OVERFLOW: w('OVERFLOW'),
+  REPLICAS: w('REPLICAS'), TIMEOUT: w('TIMEOUT'), OWNER: w('OWNER'), OVERFLOW: w('OVERFLOW'), MIN: w('MIN'),
 } as const;
 
 type R<T> = Promise<T>;
+
+/** `LIMIT ... WITHRETRY` reply: `[remaining, retryAfterMs]`, `remaining` -1 when refused. */
+function limitOutcome(v: unknown): LimitOutcome {
+  const [remaining, retryAfterMs] = v as [number, number];
+  return { allowed: remaining >= 0, remaining: Math.max(remaining, 0), retryAfterMs: Math.max(retryAfterMs, 0) };
+}
 
 function pushScan(a: Arg[], o?: ScanOptions): Arg[] {
   if (o !== undefined) {
@@ -83,6 +95,18 @@ function pushScan(a: Arg[], o?: ScanOptions): Arg[] {
     if (o.count !== undefined) a.push(W.COUNT, o.count);
     if (o.type !== undefined) a.push(W.TYPE, kw(KW_SCAN_TYPE, o.type));
   }
+  return a;
+}
+
+/**
+ * Appends `EX seconds` (whole seconds) or `PX milliseconds` (a sub-second part) for a TTL-on-create option.
+ * A TTL that is not a positive finite number is queued as a RangeError, so the call rejects before anything is sent.
+ */
+function pushTtl(a: Arg[], seconds: number): Arg[] {
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0) {
+    a.push(new RangeError('ruvio: ttl must be a positive, finite number of seconds') as unknown as Arg);
+  } else if (Number.isInteger(seconds)) a.push(W.EX, seconds);
+  else a.push(W.PX, Math.max(1, Math.round(seconds * 1000)));
   return a;
 }
 
@@ -391,6 +415,35 @@ export abstract class Commands {
     return owner ? this._1(null, C.RUVIO, W.OWNER) : this._0(null, C.RUVIO);
   }
   /**
+   * Moves the hash slots `first`..`last` to `shard` (counted from 0) of the same server, which
+   * keeps serving them meanwhile (`RUVIO MOVESLOTS first-last shard`). Resolves once the move has
+   * started; {@link moveSlotsStatus} follows it. One move runs at a time, and every slot of the
+   * range must be on one shard.
+   *
+   * @returns `'OK'`.
+   *
+   * @example
+   * ```ts
+   * await client.moveSlots(0, 1000, 2);
+   * ```
+   */
+  moveSlots(first: number, last: number, shard: number): R<'OK'> {
+    return this._3(null, C.RUVIO, 'MOVESLOTS', `${first}-${last}`, shard);
+  }
+  /**
+   * The running or last slot move (`RUVIO MOVESLOTS STATUS`). `state` is `none`, `copying`,
+   * `cleaning`, `cancelling`, `done` or `cancelled`; the other names are `first`, `last`,
+   * `from`, `to`, `keys`, `rounds`, `elapsed_ms`, `freeze_ms` and `error`.
+   *
+   * @example
+   * ```ts
+   * (await client.moveSlotsStatus()).state;   // 'done'
+   * ```
+   */
+  moveSlotsStatus(): R<Record<string, string>> {
+    return this._2(T.map, C.RUVIO, 'MOVESLOTS', 'STATUS');
+  }
+  /**
    * Checks that the server answers (`PING`).
    *
    * @param message Optional text to echo back.
@@ -574,6 +627,25 @@ export abstract class Commands {
    */
   clientTracking(on: boolean): R<'OK'> {
     return this._1(null, C.CLIENT_TRACKING, on ? W.ON : W.OFF);
+  }
+  /**
+   * Holds this connection's replies until `replicas` replicas have every record written before them on disk (`CLIENT DURABILITY REPLICAS n [TIMEOUT ms]`).
+   * It is per connection and not re-applied after a reconnect; set the `durability` connection option for that. On timeout every reply of the batch becomes `-NOREPLICAS` and the writes stay applied. Refused inside `MULTI` and on a server without replication.
+   *
+   * @param replicas Replicas that must have the data on disk; `0` turns it off.
+   * @param timeoutMs Longest wait in milliseconds (the server default is 5000 when omitted).
+   * @returns `'OK'`.
+   * @throws {@link RuvioError} `ERR` on a server without replication.
+   *
+   * @example
+   * ```ts
+   * await client.clientDurability(1, 2000);
+   * ```
+   */
+  clientDurability(replicas: number, timeoutMs?: number): R<'OK'> {
+    return timeoutMs === undefined
+      ? this._2(null, C.CLIENT_DURABILITY, W.REPLICAS, replicas)
+      : this._4(null, C.CLIENT_DURABILITY, W.REPLICAS, replicas, W.TIMEOUT, timeoutMs);
   }
   /**
    * Returns this connection's id (`CLIENT ID`). Ids are per shard, so on a multi-shard server two connections can share an id.
@@ -845,12 +917,12 @@ export abstract class Commands {
   }
   /**
    * Stores a string (`SET key value [EX|PX|EXAT|PXAT|KEEPTTL] [NX|XX] [GET]`), or Ruvio's compare-and-set form `SET key value IFEQ expected [...]`.
-   * Only one expiry option is sent, in the order `ex`, `px`, `exat`, `pxat`, `keepTtl`; `nx` wins over `xx`. A plain `set` removes any existing TTL. `ifEq` cannot be combined with `nx`, `xx` or `get`.
+   * Only one expiry option is sent, in the order `ex`, `px`, `exat`, `pxat`, `keepTtl`; `nx` wins over `xx`. A plain `set` removes any existing TTL. `ifEq`, `ifGt` and `ifLt` cannot be combined with `nx`, `xx` or `get`.
    *
    * @param key Key to operate on (string, or Buffer for binary keys).
    * @param value Value to store: string, Buffer or number (numbers are sent as ASCII text).
    * @param opts See {@link SetOptions}: `ex`/`px`/`exat`/`pxat`/`keepTtl` for expiry, `nx`/`xx` for conditions, `get` to return the old value, `ifEq` for compare-and-set.
-   * @returns `'OK'` when written. `null` when `nx`/`xx`/`ifEq` blocked the write. With `get`, the previous value instead (`null` if there was none).
+   * @returns `'OK'` when written. `null` when `nx`/`xx`/`ifEq`/`ifGt`/`ifLt` blocked the write. With `get`, the previous value instead (`null` if there was none).
    * @throws {@link RuvioError} `WRONGTYPE` when `get` is used and the key holds a non-string; `ERR` for an invalid expiry or an invalid option mix.
    *
    * @example
@@ -859,12 +931,15 @@ export abstract class Commands {
    * await client.set('session:9', 'tok', { ex: 3600 });          // expires in an hour
    * await client.set('lock:a', 'me', { nx: true, px: 5000 });    // null if already held
    * await client.set('cfg', 'v2', { ifEq: 'v1' });               // null if cfg is not 'v1'
+   * await client.set('watermark', 1700000000, { ifGt: true });   // null unless greater than the stored number
    * ```
    */
   set(key: Key, value: Value, opts?: SetOptions): R<string | null> {
     if (opts === undefined) return this._2(null, C.SET, key, value);
     const a: Arg[] = [key, value];
     if (opts.ifEq !== undefined) a.push(W.IFEQ, opts.ifEq);
+    else if (opts.ifGt) a.push(W.IFGT);
+    else if (opts.ifLt) a.push(W.IFLT);
     if (opts.ex !== undefined) a.push(W.EX, opts.ex);
     else if (opts.px !== undefined) a.push(W.PX, opts.px);
     else if (opts.exat !== undefined) a.push(W.EXAT, opts.exat);
@@ -911,6 +986,50 @@ export abstract class Commands {
    */
   take(key: Key, count: number): R<number | null> {
     return this._2(null, C.TAKE, key, count);
+  }
+  /**
+   * Moves an amount between two integer keys in one step (`TRANSFER source destination amount [MAX max]`, Ruvio extension). Both writes are one WAL record; a missing `destination` starts at 0.
+   *
+   * @param source Key holding a decimal integer; it must hold at least `amount`.
+   * @param destination Integer key that receives the amount. On a cluster it must share a slot with `source` (use a hash tag such as `{user:42}`).
+   * @param amount Positive amount to move.
+   * @param max Optional ceiling for `destination` after the move.
+   * @returns `[sourceAfter, destinationAfter]`, or `null` when `source` is missing or short, or `destination` would overflow or pass `max`. Nothing is written in the `null` case.
+   * @throws {@link RuvioError} `WRONGTYPE` for another type, an error when a value is not an integer, `amount` is not positive, or the keys are the same.
+   *
+   * @example
+   * ```ts
+   * await client.set('{u}:wallet', 50);
+   * await client.transfer('{u}:wallet', '{u}:escrow', 30); // [20, 30]
+   * await client.transfer('{u}:wallet', '{u}:escrow', 30); // null, nothing changed
+   * ```
+   */
+  transfer(source: Key, destination: Key, amount: number, max?: number): R<[number, number] | null> {
+    return max === undefined
+      ? this._3(T.balances, C.TRANSFER, source, destination, amount)
+      : this._v(T.balances, C.TRANSFER, [source, destination, amount, W.MAX, max]);
+  }
+  /**
+   * Moves an amount between two integer fields of one hash (`HTRANSFER key from to amount [MAX max]`, Ruvio extension). A missing `to` field starts at 0 and field TTLs stay.
+   *
+   * @param key Hash key.
+   * @param from Field to subtract from.
+   * @param to Field to add to.
+   * @param amount Positive amount to move.
+   * @param max Optional ceiling for the `to` field after the move.
+   * @returns `[fromAfter, toAfter]`, or `null` when the key or `from` is missing or short, or `to` would overflow or pass `max`. Nothing is written in the `null` case.
+   * @throws {@link RuvioError} `WRONGTYPE` when `key` is not a hash, an error when a field is not an integer.
+   *
+   * @example
+   * ```ts
+   * await client.hset('acct', { available: 50 });
+   * await client.htransfer('acct', 'available', 'held', 30); // [20, 30]
+   * ```
+   */
+  htransfer(key: Key, from: Key, to: Key, amount: number, max?: number): R<[number, number] | null> {
+    return max === undefined
+      ? this._4(T.balances, C.HTRANSFER, key, from, to, amount)
+      : this._v(T.balances, C.HTRANSFER, [key, from, to, amount, W.MAX, max]);
   }
   /**
    * Deletes a string only if it equals the given value (`DELEX key IFEQ value`, Ruvio extension). The safe way to release a lock you own.
@@ -1056,48 +1175,55 @@ export abstract class Commands {
    * Values are signed 64-bit; integers beyond 2^53 arrive as `bigint` at runtime even though the type says `number`.
    *
    * @param key Key to operate on (string, or Buffer for binary keys).
+   * @param opts {@link TtlOptions}: `ttl` in seconds, applied only when this call creates the key (`INCR key EX|PX ...`).
    * @returns The new value.
    * @throws {@link RuvioError} `ERR` when the value is not an integer or the result overflows 64 bits.
+   * @throws RangeError when `opts.ttl` is not a positive finite number (the call rejects before sending).
    *
    * @example
    * ```ts
    * await client.incr('hits'); // 1
    * await client.incr('hits'); // 2
+   * await client.incr('hits:today', { ttl: 86_400 }); // the deadline is set once, on creation
    * ```
    */
-  incr(key: Key): R<number> {
-    return this._1(null, C.INCR, key);
+  incr(key: Key, opts?: TtlOptions): R<number> {
+    return opts?.ttl === undefined ? this._1(null, C.INCR, key) : this._v(null, C.INCR, pushTtl([key], opts.ttl));
   }
   /**
    * Subtracts 1 from an integer string, creating it as `0` first when missing (`DECR`). Signed 64-bit.
    *
    * @param key Key to operate on (string, or Buffer for binary keys).
+   * @param opts {@link TtlOptions}: `ttl` in seconds, applied only when this call creates the key.
    * @returns The new value.
    * @throws {@link RuvioError} `ERR` when the value is not an integer or the result overflows.
+   * @throws RangeError when `opts.ttl` is not a positive finite number (the call rejects before sending).
    *
    * @example
    * ```ts
    * await client.decr('stock');
    * ```
    */
-  decr(key: Key): R<number> {
-    return this._1(null, C.DECR, key);
+  decr(key: Key, opts?: TtlOptions): R<number> {
+    return opts?.ttl === undefined ? this._1(null, C.DECR, key) : this._v(null, C.DECR, pushTtl([key], opts.ttl));
   }
   /**
    * Adds an integer to an integer string, creating it as `0` first when missing (`INCRBY`). Signed 64-bit.
    *
    * @param key Key to operate on (string, or Buffer for binary keys).
    * @param delta Whole number to add (may be negative).
+   * @param opts {@link TtlOptions}: `ttl` in seconds, applied only when this call creates the key.
    * @returns The new value.
    * @throws {@link RuvioError} `ERR` when the value is not an integer or the result overflows.
+   * @throws RangeError when `opts.ttl` is not a positive finite number (the call rejects before sending).
    *
    * @example
    * ```ts
    * await client.incrby('score', 10);
    * ```
    */
-  incrby(key: Key, delta: number): R<number> {
-    return this._2(null, C.INCRBY, key, delta);
+  incrby(key: Key, delta: number, opts?: TtlOptions): R<number> {
+    return opts?.ttl === undefined ? this._2(null, C.INCRBY, key, delta) : this._v(null, C.INCRBY, pushTtl([key, delta], opts.ttl));
   }
   /**
    * Adds to a counter but refuses to pass a ceiling (`INCRBY key delta MAX limit`, Ruvio extension).
@@ -1105,32 +1231,37 @@ export abstract class Commands {
    * @param key Key to operate on (string, or Buffer for binary keys).
    * @param delta Whole number to add.
    * @param limit Highest value the counter may reach.
+   * @param opts {@link TtlOptions}: `ttl` in seconds, applied only when this call creates the key (`INCRBY key delta EX|PX ... MAX limit`).
    * @returns The new value, or `null` (and nothing is written) when the result would exceed `limit`.
    * @throws {@link RuvioError} `ERR` when the value is not an integer.
+   * @throws RangeError when `opts.ttl` is not a positive finite number (the call rejects before sending).
    *
    * @example
    * ```ts
    * await client.incrbyMax('seats', 1, 100); // null once 100 is reached
    * ```
    */
-  incrbyMax(key: Key, delta: number, limit: number): R<number | null> {
-    return this._4(null, C.INCRBY, key, delta, W.MAX, limit);
+  incrbyMax(key: Key, delta: number, limit: number, opts?: TtlOptions): R<number | null> {
+    if (opts?.ttl === undefined) return this._4(null, C.INCRBY, key, delta, W.MAX, limit);
+    return this._v(null, C.INCRBY, pushTtl([key, delta], opts.ttl).concat(W.MAX, limit));
   }
   /**
    * Subtracts an integer from an integer string, creating it as `0` first when missing (`DECRBY`). Signed 64-bit.
    *
    * @param key Key to operate on (string, or Buffer for binary keys).
    * @param delta Whole number to subtract.
+   * @param opts {@link TtlOptions}: `ttl` in seconds, applied only when this call creates the key.
    * @returns The new value.
    * @throws {@link RuvioError} `ERR` when the value is not an integer or the result overflows.
+   * @throws RangeError when `opts.ttl` is not a positive finite number (the call rejects before sending).
    *
    * @example
    * ```ts
    * await client.decrby('stock', 5);
    * ```
    */
-  decrby(key: Key, delta: number): R<number> {
-    return this._2(null, C.DECRBY, key, delta);
+  decrby(key: Key, delta: number, opts?: TtlOptions): R<number> {
+    return opts?.ttl === undefined ? this._2(null, C.DECRBY, key, delta) : this._v(null, C.DECRBY, pushTtl([key, delta], opts.ttl));
   }
   /**
    * Stores a string with a TTL in seconds (`SETEX`). Same as `set(key, value, { ex: seconds })`.
@@ -1198,20 +1329,22 @@ export abstract class Commands {
   }
   /**
    * Adds a decimal number to a string value (`INCRBYFLOAT`). The TTL is kept.
-   * Computed in double precision and printed with 15 significant digits; Redis uses long double, so results with more digits can differ in the last places.
+   * Computed in double precision and printed with 16 significant digits; Redis uses long double, so results with more digits can differ in the last places.
    *
    * @param key Key to operate on (string, or Buffer for binary keys).
    * @param delta Number to add (may be negative).
+   * @param opts {@link TtlOptions}: `ttl` in seconds, applied only when this call creates the key.
    * @returns The new value.
    * @throws {@link RuvioError} `ERR` when the value is not a number or the result is not finite.
+   * @throws RangeError when `opts.ttl` is not a positive finite number (the call rejects before sending).
    *
    * @example
    * ```ts
    * await client.incrbyfloat('balance', 0.5);
    * ```
    */
-  incrbyfloat(key: Key, delta: number): R<number> {
-    return this._2(T.float, C.INCRBYFLOAT, key, delta);
+  incrbyfloat(key: Key, delta: number, opts?: TtlOptions): R<number> {
+    return opts?.ttl === undefined ? this._2(T.float, C.INCRBYFLOAT, key, delta) : this._v(T.float, C.INCRBYFLOAT, pushTtl([key, delta], opts.ttl));
   }
   /**
    * Returns part of a string (`GETRANGE`).
@@ -1335,6 +1468,70 @@ export abstract class Commands {
     return this._3(null, C.LIMIT, key, max, windowMs);
   }
   /**
+   * Sliding-window rate limit on one key (`LIMIT key max windowMs SLIDING`, Ruvio extension).
+   * The previous window counts for the part of it that still overlaps the last `windowMs`, so a burst at a window edge is not doubled.
+   * The key keeps two counters, not one entry per call, and keeps the mode it was created with.
+   *
+   * @param key Key to operate on (string, or Buffer for binary keys).
+   * @param max Calls allowed per window, at most 2147483647.
+   * @param windowMs Window length in milliseconds.
+   * @returns The calls left after this one, or `null` when the call is refused (nothing is counted).
+   * @throws {@link RuvioError} `WRONGTYPE` when `key` holds another type, or when it was created by another `LIMIT` mode.
+   *
+   * @example
+   * ```ts
+   * if ((await client.limitSliding('rl:user:7', 100, 60_000)) === null) throw new Error('slow down');
+   * ```
+   */
+  limitSliding(key: Key, max: number, windowMs: number): R<number | null> {
+    return this._v(null, C.LIMIT, [key, max, windowMs, W.SLIDING]);
+  }
+  /**
+   * Token-bucket rate limit on one key (`LIMIT key capacity refillMs TOKENS COST cost`, Ruvio extension).
+   * The bucket holds `capacity` tokens and refills completely over `refillMs`; a call takes `cost` tokens.
+   * The key keeps one timestamp and disappears when the bucket is full again.
+   *
+   * @param key Key to operate on (string, or Buffer for binary keys).
+   * @param capacity Bucket size, 1 to 1000000.
+   * @param refillMs Time to refill an empty bucket in milliseconds, up to 4294967295.
+   * @param cost Tokens this call takes, 1 to `capacity` (default 1).
+   * @returns The tokens left after this call, or `null` when the bucket holds too few (nothing is taken).
+   * @throws {@link RuvioError} `WRONGTYPE` when `key` holds another type, or when it was created by another `LIMIT` mode.
+   *
+   * @example
+   * ```ts
+   * const left = await client.limitTokens('rl:api:7', 10, 1_000, 2); // 10 per second, this call costs 2
+   * ```
+   */
+  limitTokens(key: Key, capacity: number, refillMs: number, cost = 1): R<number | null> {
+    return this._v(null, C.LIMIT, [key, capacity, refillMs, W.TOKENS, W.COST, cost]);
+  }
+  /**
+   * {@link limitSliding} with `WITHRETRY`: the answer also says how long to wait.
+   *
+   * @param key Key to operate on.
+   * @param max Calls allowed per window.
+   * @param windowMs Window length in milliseconds.
+   * @returns A {@link LimitOutcome}; `retryAfterMs` is the wait until the same call would pass.
+   * @throws {@link RuvioError} as {@link limitSliding}.
+   */
+  limitSlidingWithRetry(key: Key, max: number, windowMs: number): R<LimitOutcome> {
+    return this._v(limitOutcome, C.LIMIT, [key, max, windowMs, W.SLIDING, W.WITHRETRY]);
+  }
+  /**
+   * {@link limitTokens} with `WITHRETRY`: the answer also says how long to wait.
+   *
+   * @param key Key to operate on.
+   * @param capacity Bucket size.
+   * @param refillMs Time to refill an empty bucket in milliseconds.
+   * @param cost Tokens this call takes (default 1).
+   * @returns A {@link LimitOutcome}; `retryAfterMs` is the wait until the same call would pass.
+   * @throws {@link RuvioError} as {@link limitTokens}.
+   */
+  limitTokensWithRetry(key: Key, capacity: number, refillMs: number, cost = 1): R<LimitOutcome> {
+    return this._v(limitOutcome, C.LIMIT, [key, capacity, refillMs, W.TOKENS, W.COST, cost, W.WITHRETRY]);
+  }
+  /**
    * Starts an idempotent operation (`IDEM key BEGIN fingerprint owner ttlMs`, Ruvio extension). Most code should use {@link idempotent}.
    * Atomically reserves a missing key, or reports what is already there. It is not exactly-once for external effects.
    *
@@ -1371,6 +1568,27 @@ export abstract class Commands {
    */
   idemComplete(key: Key, fingerprint: Value, owner: Value, result: Value): R<number> {
     return this._v(null, C.IDEM, [key, W.COMPLETE, fingerprint, owner, result]);
+  }
+  /**
+   * Gives up a pending idempotent operation (`IDEM key ABORT fingerprint owner`, Ruvio extension), so the next
+   * {@link idemBegin} acquires the key at once. A completed record is never removed.
+   *
+   * Abort only when the work did not take effect or is safe to run again; a retry after an abort runs it again.
+   *
+   * @param key Idempotency key.
+   * @param fingerprint Same fingerprint used in {@link idemBegin}.
+   * @param owner Same owner used in {@link idemBegin}.
+   * @returns `true` when the pending record of this owner and fingerprint was removed; `false` when nothing changed
+   * (the key is missing or expired, the record is completed, or another owner or fingerprint holds it).
+   * @throws {@link ReplyError} for tokens out of range, or a key that holds no idempotency record.
+   *
+   * @example
+   * ```ts
+   * await client.idemAbort('pay:123', hash, owner); // true
+   * ```
+   */
+  idemAbort(key: Key, fingerprint: Value, owner: Value): R<boolean> {
+    return this._v(T.bool, C.IDEM, [key, W.ABORT, fingerprint, owner]);
   }
   /**
    * Marks "first time only" (`ONCE key ttlMs`, Ruvio extension).
@@ -1439,6 +1657,22 @@ export abstract class Commands {
    */
   release(key: Key, token: Value | bigint): R<boolean> {
     return this._2(T.bool, C.RELEASE, key, token);
+  }
+  /**
+   * Moves the deadline of a lease or semaphore slot you hold to now + `ttlMs` (`RENEW key token ttlMs`, Ruvio extension).
+   *
+   * @param key Key to operate on (string, or Buffer for binary keys).
+   * @param token The token returned by {@link lease} or {@link semaphore}.
+   * @param ttlMs New lifetime in milliseconds (positive). It replaces the remaining time.
+   * @returns `true` when the deadline moved; `false` when the token expired, was released or belongs to someone else (nothing changes).
+   *
+   * @example
+   * ```ts
+   * await client.renew('job:nightly', token, 30_000);
+   * ```
+   */
+  renew(key: Key, token: Value | bigint, ttlMs: number): R<boolean> {
+    return this._3(T.bool, C.RENEW, key, token, ttlMs);
   }
   /**
    * Arms the in-memory change feed on this shard (`CHANGES START`, Ruvio extension) and returns the cursor to read from.
@@ -1657,65 +1891,70 @@ export abstract class Commands {
     return this._2(T.bool, C.MOVE, key, db);
   }
   /**
-   * Sets a TTL in seconds (`EXPIRE`). Ruvio takes no `NX`/`XX`/`GT`/`LT` option here.
+   * Sets a TTL in seconds (`EXPIRE key seconds [NX|XX|GT|LT]`).
    * A TTL of zero or less deletes the key and still returns `true`, as Redis does.
    *
    * @param key Key to operate on (string, or Buffer for binary keys).
    * @param seconds Time to live in seconds.
-   * @returns `true` when applied; `false` when the key does not exist.
+   * @param cond Optional {@link ExpireCondition}: `NX` (no deadline yet), `XX` (has a deadline), `GT` (new deadline later), `LT` (new deadline earlier). A key without a deadline counts as infinite.
+   * @returns `true` when applied; `false` when the key does not exist or the condition failed.
    *
    * @example
    * ```ts
    * await client.expire('session:9', 3600);
+   * await client.expire('session:9', 7200, ExpireCondition.Gt); // only ever extends
    * ```
    */
-  expire(key: Key, seconds: number): R<boolean> {
-    return this._2(T.bool, C.EXPIRE, key, seconds);
+  expire(key: Key, seconds: number, cond?: ExpireCondition): R<boolean> {
+    return cond === undefined ? this._2(T.bool, C.EXPIRE, key, seconds) : this._3(T.bool, C.EXPIRE, key, seconds, kw(KW_EXPIRE_COND, cond));
   }
   /**
-   * Sets a TTL in milliseconds (`PEXPIRE`). A value of zero or less deletes the key and returns `true`.
+   * Sets a TTL in milliseconds (`PEXPIRE key ms [NX|XX|GT|LT]`). A value of zero or less deletes the key and returns `true`.
    *
    * @param key Key to operate on (string, or Buffer for binary keys).
    * @param ms Time to live in milliseconds.
-   * @returns `true` when applied; `false` when the key does not exist.
+   * @param cond Optional {@link ExpireCondition} (see {@link expire}).
+   * @returns `true` when applied; `false` when the key does not exist or the condition failed.
    *
    * @example
    * ```ts
    * await client.pexpire('session:9', 1500);
    * ```
    */
-  pexpire(key: Key, ms: number): R<boolean> {
-    return this._2(T.bool, C.PEXPIRE, key, ms);
+  pexpire(key: Key, ms: number, cond?: ExpireCondition): R<boolean> {
+    return cond === undefined ? this._2(T.bool, C.PEXPIRE, key, ms) : this._3(T.bool, C.PEXPIRE, key, ms, kw(KW_EXPIRE_COND, cond));
   }
   /**
-   * Sets an absolute deadline in Unix seconds (`EXPIREAT`). A deadline in the past deletes the key and still returns `true`.
+   * Sets an absolute deadline in Unix seconds (`EXPIREAT key unixSeconds [NX|XX|GT|LT]`). A deadline in the past deletes the key and still returns `true`.
    *
    * @param key Key to operate on (string, or Buffer for binary keys).
    * @param unixSeconds Deadline as Unix time in seconds.
-   * @returns `true` when applied; `false` when the key does not exist.
+   * @param cond Optional {@link ExpireCondition} (see {@link expire}).
+   * @returns `true` when applied; `false` when the key does not exist or the condition failed.
    *
    * @example
    * ```ts
    * await client.expireat('promo', Math.floor(Date.now() / 1000) + 86_400);
    * ```
    */
-  expireat(key: Key, unixSeconds: number): R<boolean> {
-    return this._2(T.bool, C.EXPIREAT, key, unixSeconds);
+  expireat(key: Key, unixSeconds: number, cond?: ExpireCondition): R<boolean> {
+    return cond === undefined ? this._2(T.bool, C.EXPIREAT, key, unixSeconds) : this._3(T.bool, C.EXPIREAT, key, unixSeconds, kw(KW_EXPIRE_COND, cond));
   }
   /**
-   * Sets an absolute deadline in Unix milliseconds (`PEXPIREAT`). A deadline in the past deletes the key and still returns `true`.
+   * Sets an absolute deadline in Unix milliseconds (`PEXPIREAT key unixMs [NX|XX|GT|LT]`). A deadline in the past deletes the key and still returns `true`.
    *
    * @param key Key to operate on (string, or Buffer for binary keys).
    * @param unixMs Deadline as Unix time in milliseconds.
-   * @returns `true` when applied; `false` when the key does not exist.
+   * @param cond Optional {@link ExpireCondition} (see {@link expire}).
+   * @returns `true` when applied; `false` when the key does not exist or the condition failed.
    *
    * @example
    * ```ts
    * await client.pexpireat('promo', Date.now() + 5000);
    * ```
    */
-  pexpireat(key: Key, unixMs: number): R<boolean> {
-    return this._2(T.bool, C.PEXPIREAT, key, unixMs);
+  pexpireat(key: Key, unixMs: number, cond?: ExpireCondition): R<boolean> {
+    return cond === undefined ? this._2(T.bool, C.PEXPIREAT, key, unixMs) : this._3(T.bool, C.PEXPIREAT, key, unixMs, kw(KW_EXPIRE_COND, cond));
   }
   /**
    * Remaining time to live in seconds (`TTL`).
@@ -2861,6 +3100,22 @@ export abstract class Commands {
     return this._v(null, C.HSET, flatPairs([key], f));
   }
   /**
+   * Sets hash fields like {@link hset} but sends `HMSET`, which replies `OK` instead of the count of new fields.
+   * Redis marks `HMSET` deprecated; prefer `hset` in new code.
+   *
+   * @param key Key to operate on (string, or Buffer for binary keys).
+   * @param fields An object `{ field: value }` or an array of `[field, value]` pairs.
+   * @returns `'OK'`.
+   *
+   * @example
+   * ```ts
+   * await client.hmset('user:1', { name: 'Ada', city: 'London' });
+   * ```
+   */
+  hmset(key: Key, fields: Record<string, Value> | ReadonlyArray<readonly [Key, Value]>): R<'OK'> {
+    return this._v(null, C.HMSET, flatPairs([key], fields));
+  }
+  /**
    * Reads one hash field (`HGET`).
    *
    * @param key Key to operate on (string, or Buffer for binary keys).
@@ -3006,20 +3261,22 @@ export abstract class Commands {
    * @param key Key to operate on (string, or Buffer for binary keys).
    * @param field Hash field name.
    * @param delta Whole number to add (may be negative).
+   * @param opts {@link TtlOptions}: `ttl` in seconds, applied to the key only when this call creates it.
    * @returns The new value.
    * @throws {@link RuvioError} `ERR` when the field is not an integer or the result overflows; nothing is written then.
    * @throws {@link RuvioError} `WRONGTYPE` when `key` holds a value of another type.
+   * @throws RangeError when `opts.ttl` is not a positive finite number (the call rejects before sending).
    *
    * @example
    * ```ts
    * await client.hincrby('stats', 'views', 1);
    * ```
    */
-  hincrby(key: Key, field: Key, delta: number): R<number> {
-    return this._3(null, C.HINCRBY, key, field, delta);
+  hincrby(key: Key, field: Key, delta: number, opts?: TtlOptions): R<number> {
+    return opts?.ttl === undefined ? this._3(null, C.HINCRBY, key, field, delta) : this._v(null, C.HINCRBY, pushTtl([key, field, delta], opts.ttl));
   }
   /**
-   * Adds a decimal number to a field (`HINCRBYFLOAT`). Computed in double precision and printed with 15 significant digits (Redis uses long double). Keeps a field TTL.
+   * Adds a decimal number to a field (`HINCRBYFLOAT`). Computed in double precision and printed with 16 significant digits (Redis uses long double). Keeps a field TTL.
    *
    * @param key Key to operate on (string, or Buffer for binary keys).
    * @param field Hash field name.
@@ -3328,7 +3585,7 @@ export abstract class Commands {
    * @param score Score of the member (single form). Doubles, `-Infinity` and `Infinity` are accepted.
    * @param member Member name (single form).
    * @param members Array of `{ member, score }` objects or `[score, member]` pairs (multi form).
-   * @param opts {@link ZAddOptions}: `nx` only add, `xx` only update, `gt`/`lt` only update when the new score is greater/smaller, `ch` count changed members too.
+   * @param opts {@link ZAddOptions}: `nx` only add, `xx` only update, `gt`/`lt` only update when the new score is greater/smaller, `ch` count changed members too, `ttl` (seconds) sets a deadline only when this call creates the key (`EX`/`PX`).
    * @returns The number of members added; with `ch`, added plus changed.
    * @throws {@link RuvioError} `ERR` for a non-numeric score or a bad option mix; `WRONGTYPE`.
    *
@@ -3348,7 +3605,7 @@ export abstract class Commands {
    * @param score Score of the member (single form). Doubles, `-Infinity` and `Infinity` are accepted.
    * @param member Member name (single form).
    * @param members Array of `{ member, score }` objects or `[score, member]` pairs (multi form).
-   * @param opts {@link ZAddOptions}: `nx` only add, `xx` only update, `gt`/`lt` only update when the new score is greater/smaller, `ch` count changed members too.
+   * @param opts {@link ZAddOptions}: `nx` only add, `xx` only update, `gt`/`lt` only update when the new score is greater/smaller, `ch` count changed members too, `ttl` (seconds) sets a deadline only when this call creates the key (`EX`/`PX`).
    * @returns The number of members added; with `ch`, added plus changed.
    * @throws {@link RuvioError} `ERR` for a non-numeric score or a bad option mix; `WRONGTYPE`.
    *
@@ -3368,7 +3625,7 @@ export abstract class Commands {
    * @param score Score of the member (single form). Doubles, `-Infinity` and `Infinity` are accepted.
    * @param member Member name (single form).
    * @param members Array of `{ member, score }` objects or `[score, member]` pairs (multi form).
-   * @param opts {@link ZAddOptions}: `nx` only add, `xx` only update, `gt`/`lt` only update when the new score is greater/smaller, `ch` count changed members too.
+   * @param opts {@link ZAddOptions}: `nx` only add, `xx` only update, `gt`/`lt` only update when the new score is greater/smaller, `ch` count changed members too, `ttl` (seconds) sets a deadline only when this call creates the key (`EX`/`PX`).
    * @returns The number of members added; with `ch`, added plus changed.
    * @throws {@link RuvioError} `ERR` for a non-numeric score or a bad option mix; `WRONGTYPE`.
    *
@@ -3394,7 +3651,7 @@ export abstract class Commands {
    * @param key Key to operate on (string, or Buffer for binary keys).
    * @param increment Amount added to the score (the member is created with it if missing).
    * @param member Member name.
-   * @param opts {@link ZAddOptions} conditions (`nx`, `xx`, `gt`, `lt`).
+   * @param opts {@link ZAddOptions} conditions (`nx`, `xx`, `gt`, `lt`) and `ttl`.
    * @returns The new score, or `null` when a condition blocked the update.
    * @throws {@link RuvioError} `WRONGTYPE` when `key` holds a value of another type.
    *
@@ -3582,16 +3839,18 @@ export abstract class Commands {
    * @param key Key to operate on (string, or Buffer for binary keys).
    * @param increment Amount to add (may be negative).
    * @param member Member name.
+   * @param opts {@link TtlOptions}: `ttl` in seconds, applied to the key only when this call creates it.
    * @returns The new score.
    * @throws {@link RuvioError} `WRONGTYPE` when `key` holds a value of another type.
+   * @throws RangeError when `opts.ttl` is not a positive finite number (the call rejects before sending).
    *
    * @example
    * ```ts
    * await client.zincrby('board', 10, 'ada');
    * ```
    */
-  zincrby(key: Key, increment: number, member: Value): R<number> {
-    return this._3(T.float, C.ZINCRBY, key, increment, member);
+  zincrby(key: Key, increment: number, member: Value, opts?: TtlOptions): R<number> {
+    return opts?.ttl === undefined ? this._3(T.float, C.ZINCRBY, key, increment, member) : this._v(T.float, C.ZINCRBY, pushTtl([key, increment, member], opts.ttl));
   }
   /**
    * Number of members (`ZCARD`).
@@ -3687,6 +3946,46 @@ export abstract class Commands {
    */
   zpopmin(key: Key, count?: number): R<SortedSetEntry[]> {
     return count === undefined ? this._1(T.zentries, C.ZPOPMIN, key) : this._2(T.zentries, C.ZPOPMIN, key, count);
+  }
+  /**
+   * Removes and returns the members that are due (`ZPOPBYSCORE key max MIN min COUNT count WITHSCORES`):
+   * up to `count` members whose score is between `min` and `max`, lowest score first. With scores set to due
+   * times this takes the jobs that are ready.
+   *
+   * @param key Key to operate on (string, or Buffer for binary keys).
+   * @param max Upper bound: a number, `+inf`, or `(5` for exclusive.
+   * @param min Lower bound: a number, `-inf` (default), or `(5` for exclusive.
+   * @param count Number of members, 1 to 10000 (default 1).
+   * @returns {@link SortedSetEntry} objects, lowest first; empty when nothing is due.
+   * @throws {@link RuvioError} `WRONGTYPE` when `key` holds a value of another type.
+   *
+   * @example
+   * ```ts
+   * const jobs = await client.zpopbyscore('scheduled', Date.now(), '-inf', 100);
+   * ```
+   */
+  zpopbyscore(key: Key, max: Value, min: Value = '-inf', count = 1): R<SortedSetEntry[]> {
+    return this._v(T.zentries, C.ZPOPBYSCORE, [key, max, W.MIN, min, W.COUNT, count, W.WITHSCORES]);
+  }
+  /**
+   * Moves the members that are due from a sorted set to the tail of a list (`ZMOVEDUE source destination max COUNT count`):
+   * up to `count` members whose score is at most `max`, lowest score first. Clients blocked on `destination`
+   * are served first. On a sharded server both keys must hash to the same slot.
+   *
+   * @param source Sorted set to take members from.
+   * @param destination List that receives them.
+   * @param max Upper bound: a number, `+inf`, or `(5` for exclusive.
+   * @param count Number of members, 1 to 10000 (default 1).
+   * @returns The number of members moved.
+   * @throws {@link RuvioError} `WRONGTYPE` when `source` is not a sorted set or `destination` is not a list.
+   *
+   * @example
+   * ```ts
+   * const moved = await client.zmovedue('{q}scheduled', '{q}ready', Date.now(), 100);
+   * ```
+   */
+  zmovedue(source: Key, destination: Key, max: Value, count = 1): R<number> {
+    return this._v(null, C.ZMOVEDUE, [source, destination, max, W.COUNT, count]);
   }
   /**
    * Removes and returns the highest-scored members (`ZPOPMAX [count]`).
@@ -4066,12 +4365,12 @@ export abstract class Commands {
   // ---- geo -------------------------------------------------------------------------------
 
   /**
-   * Adds geographic points to a key (`GEOADD key [NX|XX] [CH] longitude latitude member ...`). The key is stored as a sorted set whose score is a 52-bit geohash, so the `z*` commands work on it too.
+   * Adds geographic points to a key (`GEOADD key [EX|PX] [NX|XX] [CH] longitude latitude member ...`). The key is stored as a sorted set whose score is a 52-bit geohash, so the `z*` commands work on it too.
    * Valid coordinates: longitude -180 to 180 and latitude -85.05112878 to 85.05112878 (degrees). Anything else is rejected and nothing is written.
    *
    * @param key Key to operate on (string, or Buffer for binary keys).
    * @param members Points to add: `{ longitude, latitude, member }`.
-   * @param opts `nx` only add new members, `xx` only update existing ones, `ch` count changed members too.
+   * @param opts `nx` only add new members, `xx` only update existing ones, `ch` count changed members too, `ttl` (seconds) sets a deadline only when this call creates the key.
    * @returns The number of members added; with `ch`, added plus changed.
    * @throws {@link RuvioError} `ERR` when a longitude/latitude pair is out of range; `WRONGTYPE`.
    *
@@ -4083,8 +4382,9 @@ export abstract class Commands {
    * ]);
    * ```
    */
-  geoadd(key: Key, members: GeoMember[], opts?: { nx?: boolean; xx?: boolean; ch?: boolean }): R<number> {
+  geoadd(key: Key, members: GeoMember[], opts?: GeoAddOptions): R<number> {
     const a: Arg[] = [key];
+    if (opts?.ttl !== undefined) pushTtl(a, opts.ttl);
     if (opts?.nx) a.push(W.NX);
     else if (opts?.xx) a.push(W.XX);
     if (opts?.ch) a.push(W.CH);
@@ -4293,12 +4593,12 @@ export abstract class Commands {
     return this._kv(T.boolArr, C.BF_MADD, key, items);
   }
   /**
-   * Adds items, creating the filter with options if needed (`BF.INSERT`).
+   * Adds items, creating the filter with options if needed (`BF.INSERT key [EX|PX] ...`).
    * The creation options apply only when the key is new.
    *
    * @param key Key to operate on (string, or Buffer for binary keys).
    * @param items Items to add.
-   * @param opts {@link BfInsertOptions}: `capacity`, `error`, `expansion`, `nonScaling` (creation only) and `noCreate` (fail instead of creating).
+   * @param opts {@link BfInsertOptions}: `capacity`, `error`, `expansion`, `nonScaling` (creation only), `noCreate` (fail instead of creating) and `ttl` (seconds; a deadline set only when this call creates the filter).
    * @returns Per item: `true` when added, `false` when probably present.
    * @throws {@link RuvioError} `ERR not found` with `noCreate` on a missing key; `ERR` when a non-scaling filter is full.
    *
@@ -4310,6 +4610,7 @@ export abstract class Commands {
   bfInsert(key: Key, items: Value[], opts?: BfInsertOptions): R<boolean[]> {
     const a: Arg[] = [key];
     if (opts !== undefined) {
+      if (opts.ttl !== undefined) pushTtl(a, opts.ttl);
       if (opts.capacity !== undefined) a.push(W.CAPACITY, opts.capacity);
       if (opts.error !== undefined) a.push(W.ERROR, opts.error);
       if (opts.expansion !== undefined) a.push(W.EXPANSION, opts.expansion);
@@ -4448,13 +4749,14 @@ export abstract class Commands {
     return path === undefined ? this._1(tf, C.JSON_GET, key) : this._2(tf, C.JSON_GET, key, path);
   }
   /**
-   * Writes a JSON value at a path (`JSON.SET key path json [NX|XX]`).
+   * Writes a JSON value at a path (`JSON.SET key path json [NX|XX] [EX|PX]`).
    * Whole-document updates; only existing intermediate nodes are allowed, and the document is limited to 16 MiB. Writing at `[N]` where N equals the array length appends.
    *
    * @param key Key to operate on (string, or Buffer for binary keys).
    * @param path Path to write; `$` for the whole document.
    * @param json The JSON text to store (a string such as `'{"a":1}'`, `'"text"'` or `'42'`).
    * @param cond `'NX'` write only when the path is missing; `'XX'` only when it exists.
+   * @param opts {@link TtlOptions}: `ttl` in seconds, applied only when this call creates the key.
    * @returns `true` when written; `false` when `NX`/`XX` blocked the write.
    * @throws {@link RuvioError} `ERR` for invalid JSON, a missing parent node or an oversized document; `WRONGTYPE`.
    *
@@ -4464,7 +4766,12 @@ export abstract class Commands {
    * await client.jsonSet('user:1', '$.age', '36', 'NX');
    * ```
    */
-  jsonSet(key: Key, path: string, json: Value, cond?: 'NX' | 'XX'): R<boolean> {
+  jsonSet(key: Key, path: string, json: Value, cond?: 'NX' | 'XX', opts?: TtlOptions): R<boolean> {
+    if (opts?.ttl !== undefined) {
+      const a: Arg[] = [key, path, json];
+      if (cond !== undefined) a.push(cond === 'NX' ? W.NX : W.XX);
+      return this._v(T.okBool, C.JSON_SET, pushTtl(a, opts.ttl));
+    }
     return cond === undefined
       ? this._3(T.okBool, C.JSON_SET, key, path, json)
       : this._4(T.okBool, C.JSON_SET, key, path, json, cond === 'NX' ? W.NX : W.XX);
@@ -4476,6 +4783,7 @@ export abstract class Commands {
    * @param path Path to write; `$` for the whole document.
    * @param value Any JSON-serialisable value.
    * @param cond `'NX'` or `'XX'`.
+   * @param opts {@link TtlOptions}: `ttl` in seconds, applied only when this call creates the key.
    * @returns `true` when written; `false` when `NX`/`XX` blocked the write.
    * @throws {@link RuvioError} as for {@link jsonSet}.
    *
@@ -4484,8 +4792,8 @@ export abstract class Commands {
    * await client.jsonSetAs('user:1', '$', { name: 'Ada', tags: ['a'] });
    * ```
    */
-  jsonSetAs<T>(key: Key, path: string, value: T, cond?: 'NX' | 'XX'): R<boolean> {
-    return this.jsonSet(key, path, JSON.stringify(value), cond);
+  jsonSetAs<T>(key: Key, path: string, value: T, cond?: 'NX' | 'XX', opts?: TtlOptions): R<boolean> {
+    return this.jsonSet(key, path, JSON.stringify(value), cond, opts);
   }
   /**
    * Deletes a value at a path (`JSON.DEL`).
@@ -4895,13 +5203,13 @@ export abstract class Commands {
   // ---- streams ---------------------------------------------------------------------------
 
   /**
-   * Appends an entry to a stream (`XADD key [NOMKSTREAM] [MAXLEN|MINID [~] n] [DELAY ms] id field value ...`).
+   * Appends an entry to a stream (`XADD key [EX|PX] [NOMKSTREAM] [MAXLEN|MINID [~] n] [DELAY ms] id field value ...`).
    * `maxLen` and `minId` both trim exactly (also with `approximate`) and cannot be combined. An id that is not above the top id is rejected.
    *
    * @param key Key to operate on (string, or Buffer for binary keys).
    * @param id `'*'` for an automatic id, `'ms-*'` for an automatic sequence, or an explicit `'ms-seq'`.
    * @param fields Object `{ field: value }` or a flat array `[field, value, ...]`.
-   * @param opts {@link XAddOptions}: `noMkStream`, `trim` (a {@link StreamTrim}) or the older `maxLen`, `minId`, `approximate`, and Ruvio's `delayMs` which hides the entry from {@link xreadgroup} for that long.
+   * @param opts {@link XAddOptions}: `noMkStream`, `trim` (a {@link StreamTrim}) or the older `maxLen`, `minId`, `approximate`, Ruvio's `delayMs` which hides the entry from {@link xreadgroup} for that long, and `ttl` (seconds) which sets a deadline only when this call creates the stream.
    * @returns The entry id, or `null` when `noMkStream` is set and the key does not exist.
    * @throws {@link RuvioError} `ERR` for an id not above the top id or a bad trim option; `WRONGTYPE`.
    *
@@ -4913,6 +5221,7 @@ export abstract class Commands {
   xadd(key: Key, id: string, fields: Record<string, Value> | Value[], opts?: XAddOptions): R<string | null> {
     const a: Arg[] = [key];
     if (opts !== undefined) {
+      if (opts.ttl !== undefined) pushTtl(a, opts.ttl);
       if (opts.noMkStream) a.push(W.NOMKSTREAM);
       pushStreamId(a, opts);
       if (opts.delayMs !== undefined) a.push(W.DELAY, opts.delayMs);
@@ -5335,7 +5644,7 @@ export abstract class Commands {
     return section === undefined ? this._0(T.lines, C.INFO) : this._1(T.lines, C.INFO, kw(KW_INFO_SECTION, section));
   }
   /**
-   * Reads server settings (`CONFIG GET pattern`). `requirepass` is redacted; `CONFIG SET` is not supported.
+   * Reads server settings (`CONFIG GET pattern`). `requirepass` is redacted.
    *
    * @param pattern Glob over setting names, e.g. `'max*'`.
    * @returns An object of setting name to value.
@@ -5347,6 +5656,79 @@ export abstract class Commands {
    */
   configGet(pattern: string): R<Record<string, string>> {
     return this._1(T.map, C.CONFIG_GET, pattern);
+  }
+  /**
+   * Changes live settings (`CONFIG SET name value ...`), named as `CONFIG GET` shows them.
+   * Every shard of the server applies the change before it answers. All pairs apply or
+   * none: an unknown or restart-only name, or an invalid value, rejects and changes
+   * nothing. Not written to the config file (see {@link configRewrite}) and not replicated.
+   *
+   * @param settings Setting names and values.
+   * @returns `'OK'`.
+   *
+   * @example
+   * ```ts
+   * await client.configSet({ maxmemory: '1073741824', 'maxmemory-policy': 'allkeys-lru' });
+   * ```
+   */
+  configSet(settings: Record<string, Value> | ReadonlyArray<readonly [Key, Value]>): R<'OK'> {
+    return this._v(null, C.CONFIG_SET, flatPairs([], settings));
+  }
+  /**
+   * Writes the live settings into the config file the server started from (`CONFIG REWRITE`).
+   *
+   * @returns `'OK'`.
+   *
+   * @example
+   * ```ts
+   * await client.configRewrite();
+   * ```
+   */
+  configRewrite(): R<'OK'> {
+    return this._0(null, C.CONFIG_REWRITE);
+  }
+  /**
+   * Makes every shard of the server follow the primary at `host:port` (`REPLICAOF host port`);
+   * shard `i` dials `port + i`. Writes are refused at once. A shard continues from its own log
+   * when the new primary's history allows it, otherwise it takes a full copy. Lasts until the
+   * server restarts.
+   *
+   * @returns `'OK'`.
+   *
+   * @example
+   * ```ts
+   * await client.replicaOf('10.0.0.5', 26379);
+   * ```
+   */
+  replicaOf(host: string, port: number): R<'OK'> {
+    return this._2(null, C.REPLICAOF, host, port);
+  }
+  /**
+   * Promotes a replica in place (`REPLICAOF NO ONE`), one epoch above its old primary. `force`
+   * adds `FORCE`: promote even when a shard has not finished copying its primary, which may
+   * lose writes.
+   *
+   * @returns `'OK'`.
+   *
+   * @example
+   * ```ts
+   * await client.replicaOfNoOne();
+   * ```
+   */
+  replicaOfNoOne(force = false): R<'OK'> {
+    return force ? this._1(null, C.REPLICAOF_NO_ONE, 'FORCE') : this._0(null, C.REPLICAOF_NO_ONE);
+  }
+  /**
+   * `ROLE` for the shard this connection is on: a primary answers `['master', sequence, []]`; a
+   * replica `['slave', host, port, 'connect' | 'connected', sequence]`.
+   *
+   * @example
+   * ```ts
+   * const [role] = await client.role();
+   * ```
+   */
+  role(): R<unknown[]> {
+    return this._0(null, C.ROLE);
   }
   /**
    * Writes a checkpoint now (`SAVE`). In-process.
@@ -5462,6 +5844,30 @@ export abstract class Commands {
    */
   evalsha(sha1: string, keys: Key[] = [], args: Value[] = []): R<unknown> {
     return this._v(null, C.EVALSHA, pushAll(pushAll([sha1, keys.length], keys), args));
+  }
+  /**
+   * Runs a script by its SHA-1 and sends the whole script only when the shard does not have it: `EVALSHA`, then `EVAL` once on `NOSCRIPT`.
+   * The hash is computed here, and `EVAL` also caches the script on that shard.
+   * The retry is safe because `NOSCRIPT` is answered before any command of the script ran.
+   *
+   * @param script Lua source.
+   * @param keys Keys (`KEYS`).
+   * @param args Other arguments (`ARGV`).
+   * @returns The script's result.
+   * @throws {@link RuvioError} as {@link eval}.
+   *
+   * @example
+   * ```ts
+   * await client.evalCached('return ARGV[1]', [], ['x']);
+   * ```
+   */
+  async evalCached(script: string, keys: Key[] = [], args: Value[] = []): Promise<unknown> {
+    try {
+      return await this.evalsha(createHash('sha1').update(script).digest('hex'), keys, args);
+    } catch (error) {
+      if (error instanceof RuvioError && error.code === 'NOSCRIPT') return this.eval(script, keys, args);
+      throw error;
+    }
   }
   /**
    * Caches a script without running it (`SCRIPT LOAD`). The cache is not durable.
@@ -5735,16 +6141,18 @@ export abstract class Commands {
    * @param key Key to operate on (string, or Buffer for binary keys).
    * @param offset Bit position, 0 to 134,217,727.
    * @param bit `0` or `1`.
+   * @param opts {@link TtlOptions}: `ttl` in seconds, applied only when this call creates the key.
    * @returns The previous value of the bit.
    * @throws {@link RuvioError} `ERR` for an offset out of range; `WRONGTYPE`.
+   * @throws RangeError when `opts.ttl` is not a positive finite number (the call rejects before sending).
    *
    * @example
    * ```ts
    * await client.setbit('online', 1234, 1);
    * ```
    */
-  setbit(key: Key, offset: number, bit: 0 | 1): R<number> {
-    return this._3(null, C.SETBIT, key, offset, bit);
+  setbit(key: Key, offset: number, bit: 0 | 1, opts?: TtlOptions): R<number> {
+    return opts?.ttl === undefined ? this._3(null, C.SETBIT, key, offset, bit) : this._v(null, C.SETBIT, pushTtl([key, offset, bit], opts.ttl));
   }
   /**
    * Reads one bit (`GETBIT`).
@@ -5922,6 +6330,7 @@ function pushZAddFlags(a: Arg[], o?: ZAddOptions): void {
   if (o.gt) a.push(W.GT);
   else if (o.lt) a.push(W.LT);
   if (o.ch) a.push(W.CH);
+  if (o.ttl !== undefined) pushTtl(a, o.ttl);
 }
 
 function zrangeArgs(key: Key, start: Value, stop: Value, o: ZRangeOptions | undefined, scores: boolean): Arg[] {

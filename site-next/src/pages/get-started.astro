@@ -2,6 +2,8 @@
 import Page from "../layouts/Page.astro";
 import CodeBlock from "../components/content/CodeBlock.astro";
 import type { Lang } from "../lib/highlight";
+import CodeTabs from "../components/content/CodeTabs.astro";
+import { tlsExamples } from "../data/tls-examples";
 import SideNav from "../components/content/SideNav.astro";
 import Tabs from "../components/content/Tabs.astro";
 import PageIntro from "../components/PageIntro.astro";
@@ -29,6 +31,7 @@ const nav = [
   { id: "connect", label: "Connect with redis-cli" },
   { id: "durability", label: "Choose durability" },
   { id: "clients", label: "Add a client" },
+  { id: "tls", label: "Encrypt with TLS" },
   { id: "ui", label: "Operator UI" },
   { id: "next", label: "Next steps" },
 ];
@@ -130,7 +133,9 @@ cd ruvio-$v-linux-x64
         <p>
           Settings merge in this order: built-in defaults, <code>ruvio.toml</code> (or <code>--config</code> /{" "}
           <code>RUVIO_CONFIG</code>), <code>RUVIO_*</code> environment variables, then command-line flags. The file is
-          read once, at process start, and unknown TOML fields are rejected.
+          read once, at process start, and unknown TOML fields are rejected. Memory limits, slowlog, connection limits,
+          script limits and the password also change while the server runs with <code>CONFIG SET</code>, and
+          <code>CONFIG REWRITE</code> writes them back to the file; see <a href="/docs/configuration/#changing-settings-at-runtime">Changing settings at runtime</a>.
         </p>
       </section>
 
@@ -174,7 +179,8 @@ cd ruvio-$v-linux-x64
           round trip. The rules and
           the measured cost per client are in <a href="/docs/client-behavior/#routing-cost">Client behavior</a>; the
           C# client also has an opt-in reader thread per socket (<code>DedicatedReaderThread</code>) for the lowest CPU
-          per round trip.
+          per round trip. A read policy (<code>prefer-replica</code> or <code>replica</code>) sends read-only commands
+          to the replicas the server lists; see <a href="/docs/client-behavior/#reads-from-replicas">Reads from replicas</a>.
         </p>
         <ul class="client-list">
           {clients.map((c) => {
@@ -194,6 +200,25 @@ cd ruvio-$v-linux-x64
         <p>
           For ASP.NET Core, <code>Ruvio.Client.AspNetCore</code> registers the connection with dependency injection:{" "}
           <code>dotnet add package Ruvio.Client.AspNetCore</code>.
+        </p>
+      </section>
+
+      <section class="step panel prose" id="tls" aria-labelledby="tls-h">
+        <h2 id="tls-h">Encrypt with TLS</h2>
+        <p>
+          TLS is off by default. Give the server a certificate and key and its client port speaks TLS only; every
+          first-party client can then connect with it, checking the certificate chain and the host name.
+        </p>
+        <CodeBlock lang="shell" code={`ruvio --tls-cert server.pem --tls-key server-key.pem
+# or RUVIO_TLS_CERT / RUVIO_TLS_KEY, or security.tls_cert / security.tls_key in ruvio.toml
+# add tls_client_ca and tls_client_auth to demand client certificates (mutual TLS)`} />
+        <CodeTabs id="tls-clients" label="Connect with TLS" tabs={clients.map((k) => ({ key: k.slug, label: k.language, lang: k.lang, code: tlsExamples[k.slug] }))} />
+        <p>
+          Every client also takes a client certificate for mutual TLS and a server name for connecting by IP address.
+          Skipping verification is a separate, clearly named option for throwaway tests only. The settings are in{" "}
+          <a href="/docs/configuration/">Configuration</a>, and each client guide has a TLS section:{" "}
+          <a href="/docs/clients/">Clients</a>. The operator UI connects to a TLS server with{" "}
+          <code>RUVIO_UI_TLS</code>; see <a href="/docs/ui-connections/">UI connections</a>.
         </p>
       </section>
 
@@ -276,7 +301,7 @@ docker run --rm -p 8080:8080 \\
   .step h2 { display: flex; align-items: center; gap: 14px; margin: 0 0 4px; font-size: 24px; line-height: 1.25; color: var(--ink); }
   .step-no {
     display: inline-grid; place-items: center; width: 30px; height: 30px; flex: none;
-    font-family: var(--f-mono); font-size: 13px; font-weight: 500; color: var(--c1);
+    font-family: var(--f-mono); font-size: 14px; font-weight: 500; color: var(--c1);
     border: 1px solid color-mix(in srgb, var(--c1) 45%, var(--paper-line)); border-radius: 4px;
   }
   .table-wrap { border-color: var(--paper-line); }
@@ -284,7 +309,7 @@ docker run --rm -p 8080:8080 \\
   .table-wrap td { color: var(--ink-body); }
 
   .expand { border: 1px solid var(--paper-line); border-radius: var(--radius-s); background: var(--surface); }
-  .expand summary { cursor: pointer; padding: 12px 16px; font-weight: 600; font-size: 15px; color: var(--ink); }
+  .expand summary { cursor: pointer; padding: 12px 16px; font-weight: 600; font-size: 16px; color: var(--ink); }
   .expand[open] { display: grid; gap: 14px; padding-bottom: 16px; }
   .expand[open] > :not(summary) { margin-inline: 16px; }
   .expand[open] summary { border-bottom: 1px solid var(--line); }
@@ -292,11 +317,11 @@ docker run --rm -p 8080:8080 \\
   .client-list { list-style: none; margin: 4px 0; padding: 0; display: grid; gap: 14px; container-type: inline-size; }
   .client { display: grid; gap: 12px; align-content: start; padding: 18px; border: 1px solid var(--paper-line); border-radius: var(--radius); background: var(--surface); min-width: 0; }
   .client-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
-  .client h3 { margin: 0; font-size: 17px; color: var(--ink); }
-  .client .registry { font-size: 13px; color: var(--mute); text-decoration: none; }
-  .client .guide { font-size: 14px; font-weight: 600; text-decoration: none; }
+  .client h3 { margin: 0; font-size: 18px; color: var(--ink); }
+  .client .registry { font-size: 14px; color: var(--mute); text-decoration: none; }
+  .client .guide { font-size: 15px; font-weight: 600; text-decoration: none; }
   .client .guide::after { content: " →"; color: var(--mute); }
-  .client :global(pre) { font-size: 13px; padding: 12px 14px 14px; }
+  .client :global(pre) { font-size: 14px; padding: 12px 14px 14px; }
   @supports (container-type: inline-size) {
     .step { container-type: inline-size; }
   }
@@ -304,7 +329,7 @@ docker run --rm -p 8080:8080 \\
 
   .next-grid { gap: 16px; }
   .next-grid .card { padding: 20px 22px; background: var(--surface); border-color: var(--paper-line); }
-  .next-grid .card h3 { font-size: 17px; color: var(--ink); }
+  .next-grid .card h3 { font-size: 18px; color: var(--ink); }
   @media (max-width: 900px) {
     .step { scroll-margin-top: 124px; }
     .step h2 { font-size: 21px; }

@@ -15,6 +15,10 @@ public final class ClusterNode {
     public final TxPool txPool;
     /** Position in the router's node list (0 for the seed); lets a pipeline find the node's group by index. */
     public int index;
+    /** A primary's replica that serves its reads, picked when the slot map loads; null when none or unusable. */
+    public volatile ClusterNode reader;
+    /** A replica's primary as of the last slot map load. */
+    public volatile ClusterNode primary;
 
     /**
      * Creates a node.

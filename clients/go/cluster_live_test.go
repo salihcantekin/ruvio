@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -777,4 +778,18 @@ func TestStandaloneFallbackLive(t *testing.T) {
 	noErr(t, err)
 	noErr(t, ps.SSubscribe(ctx, "sc"))
 	noErr(t, ps.Close())
+}
+
+func TestLiveClusterMoveSlotsStatusAndRefusal(t *testing.T) {
+	c, ctx := liveCluster(t)
+	status := must[map[string]string](t)(c.MoveSlotsStatus(ctx))
+	if _, ok := status["state"]; !ok {
+		t.Fatalf("status has no state: %v", status)
+	}
+	// Slot 0 is on shard 0: nothing to move, and the server says why.
+	err := c.MoveSlots(ctx, 0, 10, 0)
+	var server *Error
+	if !errors.As(err, &server) || !strings.Contains(err.Error(), "already on that shard") {
+		t.Fatalf("expected a refusal, got %v", err)
+	}
 }

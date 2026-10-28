@@ -145,6 +145,16 @@ pub fn backup_data_dir_with(
 
     copy_persistence_tree(source, destination)?;
     write_backup_signature(destination, seal)?;
+    // The report below must not be printed for files that only sit in the page cache.
+    sync_tree(destination)?;
+
+    if let Some(parent) = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        sync_directory(parent)?;
+    }
+
     verify_backup_signature(destination, &seal.key)?;
     check_data_dir(destination)
 }
@@ -348,7 +358,8 @@ fn remove_persistence_tree(path: &Path) -> io::Result<()> {
 /// backup's while replicas may already hold later writes under the same numbers; keeping the
 /// old `HISTORY` would let such a replica resume (and merge two logs) once the restored
 /// primary passed its position. Without the file the server creates a new id, and replicas
-/// take a full copy. Upstream records go too: the restored log is not the one they described.
+/// take a full copy. Upstream records and lineages go too: the restored log is not the one
+/// they described.
 fn forget_write_history(path: &Path) -> io::Result<()> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
@@ -357,6 +368,7 @@ fn forget_write_history(path: &Path) -> io::Result<()> {
 
         if name == "HISTORY"
             || name.starts_with("UPSTREAM")
+            || name.starts_with("LINEAGE")
             || (name.starts_with("HISTORY.") && name.ends_with(".tmp"))
         {
             fs::remove_file(entry.path())?;
@@ -626,7 +638,15 @@ mod tests {
         let target = tempfile::tempdir().unwrap();
         let old = crate::replication::load_or_create_history(target.path()).unwrap();
 
-        crate::replication::record_upstream_history(target.path(), 0, &[5; 16]).unwrap();
+        crate::replication::record_upstream_history(
+            target.path(),
+            0,
+            &crate::replication::Origin {
+                history: [5; 16],
+                epoch: 0,
+            },
+        )
+        .unwrap();
         fs::write(target.path().join("UPSTREAM"), [6; 16]).unwrap();
 
         for force in [false, true] {

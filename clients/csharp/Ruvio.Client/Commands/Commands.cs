@@ -43,6 +43,82 @@ public sealed partial class RuvioClient
     }
 
     /// <inheritdoc />
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    public async ValueTask<long?> LimitSlidingAsync(
+        string key,
+        long max,
+        long windowMs,
+        CancellationToken cancellationToken = default)
+    {
+        RespValue reply = await ExecuteCommandAsync(
+            new RespCommand("LIMIT", key, max, windowMs, "SLIDING"),
+            cancellationToken);
+
+        return reply.Kind == RespKind.Null ? null : reply.Integer;
+    }
+
+    /// <inheritdoc />
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    public async ValueTask<long?> LimitTokensAsync(
+        string key,
+        long capacity,
+        long refillMs,
+        long cost = 1,
+        CancellationToken cancellationToken = default)
+    {
+        RespValue reply = await ExecuteCommandAsync(
+            new RespCommand("LIMIT", key, capacity, refillMs, "TOKENS", "COST").With(cost),
+            cancellationToken);
+
+        return reply.Kind == RespKind.Null ? null : reply.Integer;
+    }
+
+    /// <inheritdoc />
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    public async ValueTask<LimitOutcome> LimitSlidingWithRetryAsync(
+        string key,
+        long max,
+        long windowMs,
+        CancellationToken cancellationToken = default)
+    {
+        RespValue reply = await ExecuteCommandAsync(
+            new RespCommand("LIMIT", key, max, windowMs, "SLIDING", "WITHRETRY"),
+            cancellationToken);
+
+        return ReadLimitOutcome(reply);
+    }
+
+    /// <inheritdoc />
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    public async ValueTask<LimitOutcome> LimitTokensWithRetryAsync(
+        string key,
+        long capacity,
+        long refillMs,
+        long cost = 1,
+        CancellationToken cancellationToken = default)
+    {
+        RespValue reply = await ExecuteCommandAsync(
+            new RespCommand("LIMIT", key, capacity, refillMs, "TOKENS", "COST").With(cost).With("WITHRETRY"),
+            cancellationToken);
+
+        return ReadLimitOutcome(reply);
+    }
+
+    private static LimitOutcome ReadLimitOutcome(RespValue reply)
+    {
+        if (reply.Items is not { Count: 2 } items
+            || items[0].Kind != RespKind.Integer
+            || items[1].Kind != RespKind.Integer)
+        {
+            throw new RuvioException("Invalid LIMIT WITHRETRY response.");
+        }
+
+        long remaining = items[0].Integer;
+
+        return new LimitOutcome(remaining >= 0, Math.Max(remaining, 0), Math.Max(items[1].Integer, 0));
+    }
+
+    /// <inheritdoc />
     public ValueTask<long> OnceAsync(string key, long ttlMs, CancellationToken cancellationToken = default)
     {
         return Integer(new RespCommand("ONCE", key, ttlMs), cancellationToken);
@@ -55,6 +131,34 @@ public sealed partial class RuvioClient
         RespValue reply = await ExecuteCommandAsync(new RespCommand("TAKE", key, count), cancellationToken);
 
         return reply.Kind == RespKind.Null ? null : reply.Integer;
+    }
+
+    /// <inheritdoc />
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    public async ValueTask<(long Source, long Destination)?> TransferAsync(string source, string destination, long amount, long? max = null, CancellationToken cancellationToken = default)
+    {
+        var command = new RespCommand("TRANSFER", source, destination, amount);
+
+        if (max is { } cap)
+        {
+            command = command.With("MAX").With(cap);
+        }
+
+        return BalancePair("TRANSFER", await ExecuteCommandAsync(command, cancellationToken));
+    }
+
+    /// <inheritdoc />
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    public async ValueTask<(long From, long To)?> TransferHashFieldAsync(string key, string from, string to, long amount, long? max = null, CancellationToken cancellationToken = default)
+    {
+        var command = new RespCommand("HTRANSFER", key, from, to, amount);
+
+        if (max is { } cap)
+        {
+            command = command.With("MAX").With(cap);
+        }
+
+        return BalancePair("HTRANSFER", await ExecuteCommandAsync(command, cancellationToken));
     }
 
     /// <inheritdoc />
@@ -88,6 +192,12 @@ public sealed partial class RuvioClient
         RespValue reply = await ExecuteCommandAsync(new RespCommand("INCRBY", key, delta, "MAX", limit), cancellationToken);
 
         return reply.Kind == RespKind.Null ? null : reply.Integer;
+    }
+
+    /// <inheritdoc />
+    public ValueTask<long> RenewAsync(string key, long token, long ttlMilliseconds, CancellationToken cancellationToken = default)
+    {
+        return Integer(new RespCommand("RENEW", key, token, ttlMilliseconds), cancellationToken);
     }
 
     /// <inheritdoc />
@@ -583,6 +693,13 @@ public sealed partial class RuvioClient
     }
 
     /// <inheritdoc />
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    public async ValueTask SetHashManyAsync(string key, params (string Field, string Value)[] fields)
+    {
+        await Ok(RespCommand.KeyedPairs("HMSET", key, fields));
+    }
+
+    /// <inheritdoc />
     public ValueTask<string?> GetHashFieldAsync(string key, string field, CancellationToken cancellationToken = default)
     {
         return BulkOrNull(new RespCommand("HGET", key, field), cancellationToken);
@@ -917,6 +1034,19 @@ public sealed partial class RuvioClient
     public async ValueTask<IReadOnlyList<SortedSetEntry>> PopSortedSetMinAsync(string key, long count = 1, CancellationToken cancellationToken = default)
     {
         return ParseSortedSet(await ExecuteCommandAsync(new RespCommand("ZPOPMIN", key, count), cancellationToken));
+    }
+
+    /// <inheritdoc />
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    public async ValueTask<IReadOnlyList<SortedSetEntry>> PopSortedSetByScoreAsync(string key, string min, string max, long count = 1, CancellationToken cancellationToken = default)
+    {
+        return ParseSortedSet(await ExecuteCommandAsync(new RespCommand("ZPOPBYSCORE", key, max, "MIN", min, "COUNT").With(count).With("WITHSCORES"), cancellationToken));
+    }
+
+    /// <inheritdoc />
+    public ValueTask<long> MoveDueSortedSetAsync(string source, string destination, string max, long count = 1, CancellationToken cancellationToken = default)
+    {
+        return Integer(new RespCommand("ZMOVEDUE", source, destination, max, "COUNT", count), cancellationToken);
     }
 
     /// <inheritdoc />
@@ -1970,10 +2100,64 @@ public sealed partial class RuvioClient
     }
 
     /// <inheritdoc />
+    public ValueTask SetDurabilityAsync(int replicas, TimeSpan? timeout = null, CancellationToken cancellationToken = default)
+    {
+        string count = replicas.ToString(CultureInfo.InvariantCulture);
+
+        return timeout is { } limit
+            ? Ok(new RespCommand("CLIENT", "DURABILITY", "REPLICAS", count, "TIMEOUT", ((long)limit.TotalMilliseconds).ToString(CultureInfo.InvariantCulture)), cancellationToken)
+            : Ok(new RespCommand("CLIENT", "DURABILITY", "REPLICAS", count), cancellationToken);
+    }
+
+    /// <inheritdoc />
     public ValueTask<RespValue> GetConfigAsync(string parameter, CancellationToken cancellationToken = default)
     {
         return ExecuteCommandAsync(new RespCommand("CONFIG", "GET", parameter), cancellationToken);
     }
+
+    /// <inheritdoc />
+    public ValueTask SetConfigAsync(IReadOnlyList<(string Name, string Value)> settings, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+
+        var arguments = new string[2 + settings.Count * 2];
+
+        arguments[0] = "CONFIG";
+        arguments[1] = "SET";
+        int index = 2;
+
+        foreach ((string name, string value) in settings)
+        {
+            arguments[index++] = name;
+            arguments[index++] = value;
+        }
+
+        return Ok(arguments, cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public ValueTask RewriteConfigAsync(CancellationToken cancellationToken = default)
+    {
+        return Ok(new RespCommand("CONFIG", "REWRITE"), cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public ValueTask ReplicaOfAsync(string host, int port, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(host);
+
+        return Ok(new RespCommand("REPLICAOF", host, port.ToString(System.Globalization.CultureInfo.InvariantCulture)), cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public ValueTask ReplicaOfNoOneAsync(bool force = false, CancellationToken cancellationToken = default)
+    {
+        return Ok(force ? new RespCommand("REPLICAOF", "NO", "ONE", "FORCE") : new RespCommand("REPLICAOF", "NO", "ONE"), cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public ValueTask<RespValue> GetRoleAsync(CancellationToken cancellationToken = default)
+        => ExecuteCommandAsync(new RespCommand("ROLE"), cancellationToken);
 
     /// <inheritdoc />
     public ValueTask FlushDatabaseAsync(CancellationToken cancellationToken = default)
@@ -2418,6 +2602,22 @@ public sealed partial class RuvioClient
             new SortedSetEntry(items[1].AsString() ?? "", ParseDouble(items[2].AsString() ?? "0")));
     }
 
+    /// <summary>The two balances of a <c>TRANSFER</c> or <c>HTRANSFER</c> reply; a null reply means nothing moved.</summary>
+    private static (long, long)? BalancePair(string name, RespValue reply)
+    {
+        if (reply.Kind == RespKind.Null)
+        {
+            return null;
+        }
+
+        if (reply.Items is not { Count: 2 } items || items[0].Kind is not RespKind.Integer || items[1].Kind is not RespKind.Integer)
+        {
+            throw new RuvioException($"{name} returned {reply.Kind}");
+        }
+
+        return (items[0].Integer, items[1].Integer);
+    }
+
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     private async ValueTask<IReadOnlyList<long>> IntegerArray(RespCommand arguments)
     {
@@ -2526,9 +2726,9 @@ public sealed partial class RuvioClient
             }
 
             string id = item.Items[0].AsString() ?? "";
-            IReadOnlyDictionary<string, string> fields = Pairs(item.Items[1].Items);
+            IReadOnlyList<KeyValuePair<string, string>> fields = RespRead.Pairs(item.Items[1], "stream entry");
 
-            entries.Add(new StreamEntry(id, [.. fields]));
+            entries.Add(new StreamEntry(id, fields));
         }
 
         return entries;

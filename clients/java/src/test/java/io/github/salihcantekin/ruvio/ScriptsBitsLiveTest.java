@@ -41,6 +41,8 @@ class ScriptsBitsLiveTest {
         assertEquals(Arrays.asList(false), c.scriptExists(sha));
         RuvioServerException noscript = assertThrows(RuvioServerException.class, () -> c.evalsha(sha, new String[0]));
         assertEquals("NOSCRIPT", noscript.code());
+        assertEquals("again", c.evalCached("return ARGV[1]", new String[0], "again"));
+        assertEquals("again", c.evalCached("return ARGV[1]", new String[0], "again"));
         c.functionLoad("jfn", "return ARGV[1] .. KEYS[1]");
         assertTrue(c.functionList().contains("jfn"));
         assertEquals("ak", c.fcall("jfn", new String[] {"k"}, "a"));

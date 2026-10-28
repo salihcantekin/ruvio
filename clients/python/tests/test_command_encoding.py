@@ -62,6 +62,16 @@ def test_set_with_a_non_text_key_takes_the_generic_path():
     assert r.set("k", "v", nx=True) is False  # NX refused: nil reply
 
 
+def test_client_durability_encoding():
+    r = Rec(reply="OK")
+    assert r.client_durability(1) is True
+    assert r.frame == encode("CLIENT DURABILITY", ("REPLICAS", 1))
+    assert r.client_durability(2, 750) is True
+    assert r.frame == encode("CLIENT DURABILITY", ("REPLICAS", 2, "TIMEOUT", 750))
+    assert r.client_durability(0) is True
+    assert r.args == ["CLIENT", "DURABILITY", "REPLICAS", "0"]
+
+
 def test_delete_variants():
     r = Rec()
     r.delete("a", "b")
@@ -88,6 +98,11 @@ def test_set_options_in_wire_order():
     r = Rec(reply="OK")
     r.set("k", "v", ex=1, px=2, exat=3, pxat=4, keepttl=True, nx=True, xx=True, ifeq="old")
     assert r.args == ["SET", "k", "v", "IFEQ", "old", "EX", "1", "PX", "2", "EXAT", "3", "PXAT", "4", "KEEPTTL", "NX", "XX"]
+    r.reply = "OK"
+    r.set("k", 5, px=9, ifgt=True)
+    assert r.args == ["SET", "k", "5", "IFGT", "PX", "9"]
+    r.set("k", -5, iflt=True)
+    assert r.args == ["SET", "k", "-5", "IFLT"]
     r.reply = "prev"
     assert r.set("k", "v", get=True) == "prev"
     assert r.args == ["SET", "k", "v", "GET"]
@@ -210,10 +225,10 @@ def test_stream_reads_and_reply_shapes():
     r = Rec(reply=None)
     assert r.xread({"s": "0"}) is None
     r.reply = [["s", [["1-0", ["f", "v"]], ["2-0", None]]]]  # RESP2: list of [stream, entries]
-    assert r.xread({"s": "0"}, count=2, block=10) == [("s", [StreamEntry("1-0", {"f": "v"}), StreamEntry("2-0", {})])]
+    assert r.xread({"s": "0"}, count=2, block=10) == [("s", [StreamEntry("1-0", [("f", "v")]), StreamEntry("2-0", [])])]
     assert r.args == ["XREAD", "COUNT", "2", "BLOCK", "10", "STREAMS", "s", "0"]
     r.reply = {"s": [["1-0", ["f", "v"]]]}  # RESP3: map of stream -> entries
-    assert r.xreadgroup("g", "c", {"s": ">"}, count=3, block=0, noack=True) == [("s", [StreamEntry("1-0", {"f": "v"})])]
+    assert r.xreadgroup("g", "c", {"s": ">"}, count=3, block=0, noack=True) == [("s", [StreamEntry("1-0", [("f", "v")])])]
     assert r.args == ["XREADGROUP", "GROUP", "g", "c", "COUNT", "3", "BLOCK", "0", "NOACK", "STREAMS", "s", ">"]
     r.xreadgroup("g", "c", {"s": ">"})
     assert r.args == ["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"]
@@ -224,10 +239,24 @@ def test_stream_reads_and_reply_shapes():
 def test_xinfo_stream_entries_become_stream_entries():
     r = Rec(reply=["length", 2, "first-entry", ["1-0", ["f", "v"]], "last-entry", None, "groups", 0])
     info = r.xinfo_stream("s")
-    assert info["first-entry"] == StreamEntry("1-0", {"f": "v"})
+    assert info["first-entry"] == StreamEntry("1-0", [("f", "v")])
     assert info["last-entry"] is None and info["length"] == 2
     r.reply = {"length": 0, "first-entry": None}
     assert r.xinfo_stream("s")["first-entry"] is None
+
+
+def test_stream_fields_keep_order_and_repeats():
+    r = Rec(reply=[["1-0", ["f", "1", "g", "", "f", "3"]]])
+    assert r.xrange("s", "-", "+")[0].fields == [("f", "1"), ("g", ""), ("f", "3")]
+    r.reply = [["s", [["1-0", ["f", "1", "f", "2"]]]]]
+    assert r.xread({"s": "0"})[0][1][0].fields == [("f", "1"), ("f", "2")]
+
+
+def test_hrandfield_with_values_keeps_repeated_fields():
+    r = Rec(reply=["a", "1", "a", "1"])
+    assert r.hrandfield("h", -2, withvalues=True) == [("a", "1"), ("a", "1")]
+    r.reply = [["a", "1"], ["a", "1"]]  # RESP3 nested pairs
+    assert r.hrandfield("h", -2, withvalues=True) == [("a", "1"), ("a", "1")]
 
 
 def test_bloom_info_accepts_both_reply_shapes():
@@ -247,3 +276,124 @@ def test_flush_variants_and_geo_without_hash():
     assert r.georadius("g", 1, 2, 3, withcoord=True, withdist=True) == [GeoResult("m", 2.5, None, (1.0, 2.0))]
     r.reply = [["m", ["1", "2"]]]
     assert r.georadius("g", 1, 2, 3, withcoord=True) == [GeoResult("m", None, None, (1.0, 2.0))]
+
+
+def test_limit_modes_encode_their_keywords_and_convert_the_retry_reply():
+    r = Rec(3)
+    assert r.limit_sliding("k", 5, 1000) == 3
+    assert r.args == ["LIMIT", "k", "5", "1000", "SLIDING"]
+    assert r.limit_tokens("k", 10, 2000, 2) == 3
+    assert r.args == ["LIMIT", "k", "10", "2000", "TOKENS", "COST", "2"]
+    assert r.limit_tokens("k", 10, 2000) == 3
+    assert r.args[-2:] == ["COST", "1"]
+
+    r = Rec([2, 0])
+    assert r.limit_sliding_with_retry("k", 5, 1000) == (True, 2, 0)
+    assert r.args == ["LIMIT", "k", "5", "1000", "SLIDING", "WITHRETRY"]
+    r = Rec([-1, 250])
+    out = r.limit_tokens_with_retry("k", 10, 2000)
+    assert (out.allowed, out.remaining, out.retry_after_ms) == (False, 0, 250)
+    assert r.args == ["LIMIT", "k", "10", "2000", "TOKENS", "COST", "1", "WITHRETRY"]
+
+
+def test_due_commands_encode_their_options():
+    r = Rec(reply=[b"m", b"2"])
+
+    assert r.zpopbyscore("z", "(5", min=1, count=3) == [(b"m", 2.0)]
+    assert r.args == ["ZPOPBYSCORE", "z", "(5", "MIN", "1", "COUNT", "3", "WITHSCORES"]
+
+    r = Rec(reply=2)
+
+    assert r.zmovedue("{t}z", "{t}l", "+inf", count=4) == 2
+    assert r.args == ["ZMOVEDUE", "{t}z", "{t}l", "+inf", "COUNT", "4"]
+
+
+def test_transfer_commands_encode_the_optional_cap_and_return_a_pair():
+    r = Rec(reply=[6, 4])
+    assert r.transfer("a", "b", 4) == (6, 4)
+    assert r.args == ["TRANSFER", "a", "b", "4"]
+    assert r.transfer("a", "b", 4, max=9) == (6, 4)
+    assert r.args == ["TRANSFER", "a", "b", "4", "MAX", "9"]
+    assert r.htransfer("h", "f", "g", 1, max=5) == (6, 4)
+    assert r.args == ["HTRANSFER", "h", "f", "g", "1", "MAX", "5"]
+    r.reply = None
+    assert r.transfer("a", "b", 4) is None
+    assert r.htransfer("h", "f", "g", 1) is None
+
+
+# --------------------------------------------------------------------------- IDEM ABORT
+
+
+@pytest.mark.parametrize("reply,expected", [(1, True), (0, False)])
+def test_idem_abort_encoding_and_reply(reply, expected):
+    r = Rec(reply)
+    assert r.idem_abort("k", "fp", "me") is expected
+    assert r.args == ["IDEM", "k", "ABORT", "fp", "me"]
+
+
+class _IdemStub:
+    """Just the three methods ``idempotent`` calls, recording whether ABORT was sent."""
+
+    def __init__(self, abort_fails=False):
+        self.aborts = []
+        self.abort_fails = abort_fails
+
+    def idem_begin(self, key, fingerprint, owner, ttl_ms):
+        from ruvio import IdemResult
+
+        return IdemResult("acquired", None)
+
+    def idem_complete(self, key, fingerprint, owner, result):
+        return 1
+
+    def idem_abort(self, key, fingerprint, owner):
+        self.aborts.append((key, fingerprint, owner))
+        if self.abort_fails:
+            raise ConnectionError("down")
+        return True
+
+
+@pytest.mark.parametrize("flag", [False, True])
+@pytest.mark.parametrize("abort_fails", [False, True])
+def test_idempotent_aborts_only_when_asked_and_keeps_the_error(flag, abort_fails):
+    import ruvio
+
+    stub = _IdemStub(abort_fails)
+
+    def boom():
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        ruvio.Ruvio.idempotent(stub, "k", "fp", 1000, boom, owner="me", abort_on_error=flag)
+    assert stub.aborts == ([("k", "fp", "me")] if flag else [])
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_async_idempotent_aborts_only_when_asked(flag):
+    import asyncio
+
+    import ruvio.asyncio
+
+    stub = _IdemStub()
+
+    async def begin(*a):
+        return stub.idem_begin(*a)
+
+    async def abort(*a):
+        return stub.idem_abort(*a)
+
+    stub.idem_begin_async, stub.idem_abort_async = begin, abort
+
+    class AStub:
+        idem_begin = staticmethod(begin)
+        idem_abort = staticmethod(abort)
+
+    async def boom():
+        raise RuntimeError("boom")
+
+    async def run():
+        await ruvio.asyncio.Ruvio.idempotent(AStub(), "k", "fp", 1000, boom, owner="me", abort_on_error=flag)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        asyncio.run(run())
+    assert stub.aborts == ([("k", "fp", "me")] if flag else [])

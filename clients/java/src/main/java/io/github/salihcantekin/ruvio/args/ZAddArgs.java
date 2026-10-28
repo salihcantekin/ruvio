@@ -3,6 +3,8 @@ package io.github.salihcantekin.ruvio.args;
 
 import io.github.salihcantekin.ruvio.internal.Args;
 
+import java.time.Duration;
+
 /**
  * Flags of {@code ZADD}. {@code NX} excludes {@code XX}, and {@code GT}, {@code LT} and {@code NX} exclude each other; the server answers {@code ERR} for an invalid mix.
  *
@@ -13,6 +15,7 @@ public final class ZAddArgs {
     public ZAddArgs() {
     }
 
+    private Duration ttl;
     private boolean nx;
     private boolean xx;
     private boolean gt;
@@ -79,11 +82,25 @@ public final class ZAddArgs {
     }
 
     /**
+     * Sets {@code EX} or {@code PX}: gives the sorted set a time to live, but only when this call creates it; an existing key keeps its own deadline.
+     * Whole seconds are sent as {@code EX}, anything finer as {@code PX}.
+     *
+     * @param ttl the time to live (above zero)
+     * @return this builder
+     * @throws IllegalArgumentException when {@code ttl} is zero, negative or too large (checked when the command is built)
+     */
+    public ZAddArgs ttl(Duration ttl) {
+        this.ttl = ttl;
+        return this;
+    }
+
+    /**
      * Appends these options to a command being encoded. Used by the client; you do not call it.
      *
      * @param a the argument writer
      */
     public void write(Args a) {
+        if (ttl != null) a.ttl(ttl);
         if (nx) a.s("NX");
         if (xx) a.s("XX");
         if (gt) a.s("GT");

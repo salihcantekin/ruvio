@@ -59,7 +59,7 @@
         <version>3.13.0</version>
         <configuration>
           <compilerArgs>
-            <arg>-Xlint:all,-serial,-deprecation,-processing</arg>
+            <arg>-Xlint:all,-serial,-deprecation,-processing,-varargs</arg>
           </compilerArgs>
         </configuration>
       </plugin>

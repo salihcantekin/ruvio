@@ -283,6 +283,35 @@ pub enum Mutation<'a> {
         key: &'a [u8],
         destination: u8,
     },
+    /// A key's value copied from another shard by a slot move, as a checkpoint entry frame
+    /// (`None`: the key is absent there). Replaces what this shard held under the name.
+    SlotCopy {
+        key: &'a [u8],
+        entry: Option<&'a [u8]>,
+    },
+    /// Slots `first..=last` moved from this shard to shard `to`, whose log continues them
+    /// from `position`. Changes nothing here; a change stream reports it.
+    SlotsMoved {
+        first: u16,
+        last: u16,
+        to: u16,
+        position: u64,
+    },
+    /// Slots `first..=last` are arriving from another node: a step of that move
+    /// ([`crate::slot_moves::IncomingStep`]). Changes nothing here; a replica records it.
+    SlotsIncoming {
+        first: u16,
+        last: u16,
+        step: u8,
+    },
+    /// Slots `first..=last` moved from this shard to another node, reached at `address`,
+    /// whose log continues them from `position`. A change stream reports it.
+    SlotsGiven {
+        first: u16,
+        last: u16,
+        address: &'a [u8],
+        position: u64,
+    },
     LeasePut {
         key: &'a [u8],
         token: u64,
@@ -569,6 +598,27 @@ pub enum OwnedMutation {
         key: Vec<u8>,
         destination: u8,
     },
+    SlotCopy {
+        key: Vec<u8>,
+        entry: Option<Vec<u8>>,
+    },
+    SlotsMoved {
+        first: u16,
+        last: u16,
+        to: u16,
+        position: u64,
+    },
+    SlotsIncoming {
+        first: u16,
+        last: u16,
+        step: u8,
+    },
+    SlotsGiven {
+        first: u16,
+        last: u16,
+        address: Vec<u8>,
+        position: u64,
+    },
     LeasePut {
         key: Vec<u8>,
         token: u64,
@@ -626,7 +676,12 @@ impl OwnedMutation {
                 }
             }
 
-            Self::FlushDatabase | Self::FlushAll | Self::SwapDatabases { .. } => {}
+            Self::FlushDatabase
+            | Self::FlushAll
+            | Self::SwapDatabases { .. }
+            | Self::SlotsMoved { .. }
+            | Self::SlotsIncoming { .. }
+            | Self::SlotsGiven { .. } => {}
 
             Self::SetBytes { key, .. }
             | Self::SetBytesExpiring { key, .. }
@@ -681,7 +736,8 @@ impl OwnedMutation {
             | Self::StreamGroupAdvance { key, .. }
             | Self::ExpireAt { key, .. }
             | Self::Persist { key }
-            | Self::MoveKey { key, .. } => visit(key),
+            | Self::MoveKey { key, .. }
+            | Self::SlotCopy { key, .. } => visit(key),
         }
     }
 }
@@ -1056,6 +1112,35 @@ impl Mutation<'_> {
             Self::MoveKey { key, destination } => OwnedMutation::MoveKey {
                 key: key.to_vec(),
                 destination,
+            },
+            Self::SlotCopy { key, entry } => OwnedMutation::SlotCopy {
+                key: key.to_vec(),
+                entry: entry.map(<[u8]>::to_vec),
+            },
+            Self::SlotsMoved {
+                first,
+                last,
+                to,
+                position,
+            } => OwnedMutation::SlotsMoved {
+                first,
+                last,
+                to,
+                position,
+            },
+            Self::SlotsIncoming { first, last, step } => {
+                OwnedMutation::SlotsIncoming { first, last, step }
+            }
+            Self::SlotsGiven {
+                first,
+                last,
+                address,
+                position,
+            } => OwnedMutation::SlotsGiven {
+                first,
+                last,
+                address: address.to_vec(),
+                position,
             },
             Self::LeasePut {
                 key,

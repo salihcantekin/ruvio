@@ -1,0 +1,105 @@
+name: Nightly faults
+
+# Coordinator fault scenarios on real processes and real Docker network partitions, and the
+# RustSec advisory check.
+# Every night (GitHub runs schedules from the default branch only) and by manual dispatch;
+# the only automatic workflow besides the PR gate.
+# Secrets: none. On failure it opens one issue labelled nightly-failure, or comments on the
+# open one, so repeated failures do not pile up.
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: How many times each scenario runs
+        type: string
+        default: "3"
+  schedule:
+    - cron: "17 2 * * *"
+
+permissions:
+  contents: read
+
+env:
+  RUNS: ${{ inputs.runs || '3' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@f08ac54821369508305fcb9e0121ec6e30ae9ada # 1.97.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: cargo build --locked --profile release-fast --bin ruvio
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ruvio
+          path: target/release-fast/ruvio
+          retention-days: 3
+
+  faults:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ruvio
+      - run: sudo apt-get update && sudo apt-get install -y redis-tools
+      - name: Coordinator fault scenarios
+        run: |
+          chmod +x ruvio
+          list=""
+          for s in partition leader minority restart loss durable stall coord-partition; do
+            for _ in $(seq "$RUNS"); do list="$list $s"; done
+          done
+          python3 scripts/coordinator_faults.py ./ruvio $list
+
+  docker:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ruvio
+      - run: sudo apt-get update && sudo apt-get install -y redis-tools
+      - run: docker pull ubuntu:24.04
+      - name: Docker network partitions
+        run: |
+          chmod +x ruvio
+          list=""
+          for _ in $(seq "$RUNS"); do list="$list leader lease-off lease-on"; done
+          scripts/docker_partition.sh ./ruvio $list
+
+  # RustSec advisories change daily, so they are checked here and not on pull requests.
+  advisories:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check advisories
+
+  report:
+    needs: [faults, docker, advisories]
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create nightly-failure --color B60205 --description "Nightly fault run failed" 2>/dev/null || true
+          open=$(gh issue list --label nightly-failure --state open --json number --jq '.[0].number')
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body "Failed again: $RUN_URL"
+          else
+            gh issue create --label nightly-failure --title "Nightly fault scenarios failed" --body "Run: $RUN_URL"
+          fi

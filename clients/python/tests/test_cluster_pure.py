@@ -273,7 +273,11 @@ def test_parse_moved_variants():
     assert cl.parse_moved(ruvio.MovedError("MOVED 12 h:1")) == (12, "h", 1)
     assert cl.parse_moved(ruvio.MovedError("MOVED 12 h:1 extra")) == (12, "h", 1)
     assert cl.parse_moved(ruvio.MovedError("MOVED 12 :7")) == (12, "", 7)
-    assert cl.parse_moved(ruvio.MovedError("ASK 12 h:1")) is None  # only MOVED is followed
+    assert cl.parse_moved(ruvio.MovedError("ASK 12 h:1")) is None
+    assert cl.parse_ask(ruvio.MovedError("ASK 12 h:1")) == (12, "h", 1)
+    assert cl.parse_ask(ruvio.MovedError("MOVED 12 h:1")) is None
+    assert cl.is_tryagain(ruvio.ResponseError("TRYAGAIN try later")) and not cl.is_tryagain(ruvio.MovedError("ASK 1 h:1"))
+    assert not cl.is_tryagain("TRYAGAIN") and not cl.is_tryagain(1)
     for bad in ("MOVED", "MOVED 12", "MOVED x h:1", "MOVED 12 h:y", "MOVED 12 hostonly", "MOVEDx 1 h:1"):
         assert cl.parse_moved(ruvio.MovedError(bad)) is None, bad
     assert cl.parse_moved(Exception()) is None  # no message at all

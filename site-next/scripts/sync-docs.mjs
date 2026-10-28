@@ -7,6 +7,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { pageInfo, pages as iconPages, svg } from "./docs-icons.mjs";
 import { COMMANDS, EXCLUDED, README_PAGES, REPO_ROOT, allGroups, slugFor } from "./docs-nav.mjs";
 
 const SITE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -144,8 +145,13 @@ function convertAlerts(text) {
 
 /** Plain text of a markdown or HTML snippet, for titles and descriptions. */
 function plain(s) {
+  // Strip tags until stable so nested input like "<scr<b>ipt>" cannot reassemble a tag.
+  let previous;
+  do {
+    previous = s;
+    s = s.replace(/<[^>]*>/g, "");
+  } while (s !== previous);
   return s
-    .replace(/<[^>]+>/g, "")
     .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
     .replace(/`([^`]*)`/g, "$1")
@@ -170,7 +176,11 @@ function firstParagraph(body) {
       continue;
     }
     if (fence) continue;
-    if (/^#{1,6} /.test(line)) break; // only the introduction, before the first section
+    // Only the introduction, before the first section; a page that opens with a heading uses the text under it.
+    if (/^#{1,6} /.test(line)) {
+      if (paras.length || cur.length) break;
+      continue;
+    }
     if (!line.trim()) {
       if (cur.length) paras.push(cur), (cur = []);
       continue;
@@ -294,6 +304,12 @@ for (const [src, page] of pages) {
   );
 }
 
+// Icon and section of every page, read by the page title component (src/components/docs/DocsPageTitle.astro).
+writeFileSync(
+  path.join(SITE_ROOT, "src/config/docs-pages.json"),
+  JSON.stringify(Object.fromEntries(["", ...iconPages.map((p) => p.slug)].map((slug) => [slug, pageInfo(slug)])), null, 1) + "\n",
+);
+
 // ---------------------------------------------------------------- command reference
 
 const matrix = JSON.parse(readFileSync(path.join(REPO_ROOT, "docs/compatibility-matrix.json"), "utf8"));
@@ -312,7 +328,7 @@ const matrix = JSON.parse(readFileSync(path.join(REPO_ROOT, "docs/compatibility-
   // Same rule as the heading ids Starlight generates (github-slugger).
   const anchor = (s) => s.toLowerCase().replace(/[^\p{L}\p{N}\s-]/gu, "").replace(/\s/g, "-");
   const nameOf = (f) => familyNames[f] ?? f.charAt(0).toUpperCase() + f.slice(1);
-  const cell = (s) => escapeStrayTags(String(s ?? "")).replace(/\|/g, "\\|").replace(/\s*\n\s*/g, " ");
+  const cell = (s) => escapeStrayTags(String(s ?? "")).replace(/[\\|]/g, "\\$&").replace(/\s*\n\s*/g, " ");
 
   const byFamily = new Map();
   for (const c of matrix.commands) {
@@ -371,18 +387,19 @@ const matrix = JSON.parse(readFileSync(path.join(REPO_ROOT, "docs/compatibility-
 
 {
   const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const slugOf = (i) => (i.items ? slugOf(i.items[0]) : (i.generated ?? slugFor(i.src)));
   let html = `<div class="docs-index not-content">\n`;
   for (const group of allGroups()) {
-    html += `<section class="docs-index-group">\n<h2>${esc(group.label)}</h2>\n<ul>\n`;
+    html += `<section class="docs-index-group">\n<h2>${svg(pageInfo(slugOf(group.items[0])).icon)}${esc(group.label)}</h2>\n<ul>\n`;
     for (const item of group.items) {
       if (item.items) {
         const first = meta.get(item.items[0].src);
-        html += `<li><a href="${first.url}">${esc(item.label)}</a><span>${esc(firstSentence(first.description))}</span></li>\n`;
+        html += `<li>${svg(pageInfo(slugOf(item.items[0])).icon)}<a href="${first.url}">${esc(item.label)}</a><span>${esc(firstSentence(first.description))}</span></li>\n`;
         continue;
       }
       const m = meta.get(item.src ?? `generated:${item.generated}`);
       if (!m) throw new Error(`No page for sidebar item ${item.src ?? item.generated}`);
-      html += `<li><a href="${m.url}">${esc(m.title)}</a>`;
+      html += `<li>${svg(pageInfo(slugOf(item)).icon)}<a href="${m.url}">${esc(m.title)}</a>`;
       if (m.description) html += `<span>${esc(firstSentence(m.description))}</span>`;
       html += `</li>\n`;
     }

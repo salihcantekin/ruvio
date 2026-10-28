@@ -165,6 +165,181 @@ public class MultiplexingTests
     }
 
     [Fact(Timeout = 15000)]
+    public async Task CommandTimeoutFailsACallWhoseReplyNeverComes()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var tcp = new TcpClient { NoDelay = true };
+        Task connecting = tcp.ConnectAsync(IPAddress.Loopback, ((IPEndPoint)listener.LocalEndpoint).Port);
+        using TcpClient server = await TestDeadlines.AcceptAsync(listener);
+        await connecting;
+        using NetworkStream stream = tcp.GetStream();
+        var mux = new CommandMultiplexer(stream, new RespReader(stream), 2, commandTimeout: TimeSpan.FromMilliseconds(200));
+        try
+        {
+            await Assert.ThrowsAsync<TimeoutException>(async () => await mux.SendAsync(
+                new IReadOnlyList<string>[] { new[] { "GET", "k" } }, CancellationToken.None));
+        }
+        finally
+        {
+            await mux.StopAsync();
+        }
+    }
+
+    [Fact(Timeout = 15000)]
+    public async Task CommandTimeoutDropsTheLateReplyAndKeepsTheConnection()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var tcp = new TcpClient { NoDelay = true };
+        Task connecting = tcp.ConnectAsync(IPAddress.Loopback, ((IPEndPoint)listener.LocalEndpoint).Port);
+        using TcpClient server = await TestDeadlines.AcceptAsync(listener);
+        await connecting;
+        using NetworkStream stream = tcp.GetStream();
+        var mux = new CommandMultiplexer(stream, new RespReader(stream), 4, commandTimeout: TimeSpan.FromMilliseconds(200));
+        try
+        {
+            // The first caller reads the socket itself; the second waits behind it. Both run out.
+            ValueTask<RespValue> first = mux.SendCommandAsync(new RespCommand("GET", "a"), CancellationToken.None);
+            ValueTask<IReadOnlyList<RespValue>> second = mux.SendAsync(
+                new IReadOnlyList<string>[] { new[] { "GET", "b" }, new[] { "GET", "c" } }, CancellationToken.None);
+            await Assert.ThrowsAsync<TimeoutException>(async () => await first);
+            await Assert.ThrowsAsync<TimeoutException>(async () => await second);
+            Assert.False(mux.IsBroken);
+
+            // The late replies are read and dropped; the next command gets its own reply.
+            await server.GetStream().WriteAsync(Encoding.ASCII.GetBytes("+late-a\r\n+late-b\r\n+late-c\r\n"));
+            ValueTask<RespValue> third = mux.SendCommandAsync(new RespCommand("PING"), CancellationToken.None);
+            await Task.Delay(50);
+            await server.GetStream().WriteAsync(Encoding.ASCII.GetBytes("+PONG\r\n"));
+            Assert.Equal("PONG", (await third).AsString());
+        }
+        finally
+        {
+            await mux.StopAsync();
+        }
+    }
+
+    [Fact]
+    public void CommandTimeoutDefaultsToThirtySeconds()
+    {
+        Assert.Equal(TimeSpan.FromSeconds(30), new RuvioClientOptions().CommandTimeout);
+    }
+
+    [Fact(Timeout = 15000)]
+    public async Task CommandTimeoutAddsABlockingCommandsOwnWait()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var tcp = new TcpClient { NoDelay = true };
+        Task connecting = tcp.ConnectAsync(IPAddress.Loopback, ((IPEndPoint)listener.LocalEndpoint).Port);
+        using TcpClient server = await TestDeadlines.AcceptAsync(listener);
+        await connecting;
+        using NetworkStream stream = tcp.GetStream();
+        var mux = new CommandMultiplexer(stream, new RespReader(stream), 2, commandTimeout: TimeSpan.FromMilliseconds(200));
+        try
+        {
+            // An empty list: the server answers nil when BLPOP's 1 s runs out, well past the 200 ms limit.
+            Task answer = Task.Run(async () =>
+            {
+                await Task.Delay(1000);
+                await server.GetStream().WriteAsync(Encoding.ASCII.GetBytes("*-1\r\n"));
+            });
+            var started = System.Diagnostics.Stopwatch.StartNew();
+            IReadOnlyList<RespValue> replies = await mux.SendAsync(
+                new IReadOnlyList<string>[] { new[] { "BLPOP", "k", "1" } }, CancellationToken.None);
+            Assert.Equal(RespKind.Null, replies[0].Kind);
+            Assert.InRange(started.ElapsedMilliseconds, 900L, 3000L);
+            await answer;
+
+            // The plain limit still holds for the next command.
+            await Assert.ThrowsAsync<TimeoutException>(async () => await mux.SendAsync(
+                new IReadOnlyList<string>[] { new[] { "PING" } }, CancellationToken.None));
+        }
+        finally
+        {
+            await mux.StopAsync();
+        }
+    }
+
+    [Fact]
+    public void BlockingWaitTable()
+    {
+        const long forever = -1;
+        var cases = new (string[] Args, long Millis)[]
+        {
+            (new[] { "GET", "k" }, 0),
+            (new[] { "SET", "k", "v" }, 0),
+            (new[] { "blpop", "a", "b", "1" }, 1000),
+            (new[] { "BLPOP", "k", "0" }, forever),
+            (new[] { "BLPOP", "k", "0.5" }, 500),
+            (new[] { "BLPOP", "k", "soon" }, forever),
+            (new[] { "BLPOP", "k", "-1" }, forever),
+            (new[] { "BRPOP", "k", "2" }, 2000),
+            (new[] { "BZPOPMIN", "k", "1.5" }, 1500),
+            (new[] { "BZPOPMAX", "k", "3" }, 3000),
+            (new[] { "BRPOPLPUSH", "a", "b", "4" }, 4000),
+            (new[] { "BLMOVE", "a", "b", "LEFT", "RIGHT", "0.25" }, 250),
+            (new[] { "BLMPOP", "2", "2", "a", "b", "LEFT" }, 2000),
+            (new[] { "BZMPOP", "0", "1", "z", "MIN" }, forever),
+            (new[] { "XREAD", "STREAMS", "s", "$" }, 0),
+            (new[] { "XREAD", "COUNT", "1", "BLOCK", "700", "STREAMS", "s", "$" }, 700),
+            (new[] { "XREAD", "BLOCK", "0", "STREAMS", "s", "$" }, forever),
+            (new[] { "XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">" }, 0),
+            (new[] { "XREADGROUP", "GROUP", "BLOCK", "c", "STREAMS", "s", ">" }, 0),
+            (new[] { "XREADGROUP", "GROUP", "g", "c", "BLOCK", "50", "STREAMS", "s", ">" }, 50),
+            (new[] { "WAIT", "1", "100" }, 100),
+            (new[] { "WAIT", "1", "0" }, forever),
+            (new[] { "WAITAOF", "1", "0", "200" }, 200),
+            (new[] { "FILLGET", "k", "1000" }, 0),
+            (new[] { "FILLGET", "k", "1000", "WAIT", "300" }, 300),
+            (new[] { "FILLGET", "k", "1000", "WAIT", "0" }, forever),
+            (new[] { "MONITOR" }, forever),
+            (new[] { "SUBSCRIBE", "news" }, forever),
+            (new[] { "PSUBSCRIBE", "n*" }, forever),
+            (new[] { "SSUBSCRIBE", "news" }, forever),
+            (new[] { "PUBLISH", "news", "x" }, 0),
+            (new[] { "BLPOP" }, forever),
+        };
+
+        var failures = new List<string>();
+
+        foreach ((string[] args, long millis) in cases)
+        {
+            var raw = new ReadOnlyMemory<byte>[args.Length];
+
+            for (int index = 0; index < args.Length; index++)
+            {
+                raw[index] = Encoding.UTF8.GetBytes(args[index]);
+            }
+
+            long[] got =
+            [
+                (long)BlockingWait.OfParts(args).TotalMilliseconds,
+                (long)BlockingWait.OfCommand(new RespCommand(args)).TotalMilliseconds,
+                (long)BlockingWait.OfPayload(RespCodec.Encode((IReadOnlyList<string>)args)).TotalMilliseconds,
+                (long)BlockingWait.OfArguments(raw).TotalMilliseconds,
+            ];
+
+            foreach (long value in got)
+            {
+                if (value != millis)
+                    failures.Add($"{string.Join(" ", args)}: got {value}, want {millis}");
+            }
+        }
+
+        Assert.Empty(failures);
+
+        // A pipeline takes its widest wait; any wait-forever wins.
+        var pipeline = new IReadOnlyList<string>[] { new[] { "GET", "k" }, new[] { "BLPOP", "k", "2" }, new[] { "XREAD", "BLOCK", "100", "STREAMS", "s", "$" } };
+        Assert.Equal(TimeSpan.FromSeconds(2), BlockingWait.OfPipeline(pipeline));
+        Assert.Equal(BlockingWait.Forever, BlockingWait.OfPipeline(new IReadOnlyList<string>[] { new[] { "BLPOP", "k", "2" }, new[] { "BLPOP", "k", "0" } }));
+        byte[] joined = RespCodec.Encode((IReadOnlyList<string>)new[] { "GET", "k" }).Concat(RespCodec.Encode((IReadOnlyList<string>)new[] { "BLPOP", "k", "2" })).ToArray();
+        Assert.Equal(TimeSpan.FromSeconds(2), BlockingWait.OfPayload(joined));
+        Assert.Equal(TimeSpan.Zero, BlockingWait.OfPayload(Encoding.ASCII.GetBytes("garbage")));
+    }
+
+    [Fact(Timeout = 15000)]
     public async Task CancelsQueuedWriteWithoutSendingOrEncodingIt()
     {
         using var listener = new TcpListener(IPAddress.Loopback, 0);

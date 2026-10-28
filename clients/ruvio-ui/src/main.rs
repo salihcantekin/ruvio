@@ -15,7 +15,9 @@ use std::{
 
 use include_dir::{Dir, include_dir};
 
-use ruvio_client::{Client, ClientOptions, Error as ClientError, PubSubMessage, RespValue};
+use ruvio_client::{
+    Client, ClientOptions, Error as ClientError, PubSubMessage, RespValue, TlsOptions,
+};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -166,7 +168,16 @@ fn handle(mut stream: TcpStream, disk: Option<&Path>) -> std::io::Result<()> {
     let path = parts.next().unwrap_or("/");
     let body = request.get(header_end + 4..).unwrap_or(&[]);
     let session_id = match request_session_id(&head) {
-        Ok(id) => id,
+        Ok(Some(id)) => id,
+        // The page, its assets and the defaults need no session; every other API call does.
+        Ok(None) if !path.starts_with("/api/") || path == "/api/defaults" => String::new(),
+        Ok(None) => {
+            return write_json(
+                &mut stream,
+                400,
+                json!({"ok": false, "error": "missing UI session id"}),
+            );
+        }
         Err(error) => {
             return write_json(&mut stream, 400, json!({"ok": false, "error": error}));
         }
@@ -306,7 +317,9 @@ fn read_request(reader: &mut impl Read) -> std::io::Result<Vec<u8>> {
     }
 }
 
-fn request_session_id(headers: &str) -> Result<String, &'static str> {
+/// The session named by `x-ruvio-session`, or `None` when the request carries none. API calls that
+/// need a session refuse `None`; there is no shared fallback session.
+fn request_session_id(headers: &str) -> Result<Option<String>, &'static str> {
     let id = headers
         .lines()
         .find_map(|line| {
@@ -314,10 +327,13 @@ fn request_session_id(headers: &str) -> Result<String, &'static str> {
             name.eq_ignore_ascii_case("x-ruvio-session")
                 .then(|| value.trim())
         })
-        .unwrap_or("default");
+        .unwrap_or("");
 
-    if id.is_empty()
-        || id.len() > 128
+    if id.is_empty() {
+        return Ok(None);
+    }
+
+    if id.len() > 128
         || !id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
@@ -325,7 +341,7 @@ fn request_session_id(headers: &str) -> Result<String, &'static str> {
         return Err("invalid UI session id");
     }
 
-    Ok(id.to_owned())
+    Ok(Some(id.to_owned()))
 }
 
 fn connect(stream: &mut TcpStream, body: &[u8], session_id: &str) -> std::io::Result<()> {
@@ -339,6 +355,14 @@ fn connect(stream: &mut TcpStream, body: &[u8], session_id: &str) -> std::io::Re
             );
         }
     };
+
+    let mut parsed = parsed;
+
+    if parsed.password.is_empty()
+        && let Some(password) = target_password(&parsed.host, parsed.port)
+    {
+        parsed.password = password;
+    }
 
     let mut options = ClientOptions::default();
 
@@ -357,6 +381,13 @@ fn connect(stream: &mut TcpStream, body: &[u8], session_id: &str) -> std::io::Re
     };
     options.max_reconnect_attempts = 2;
     options.reconnect_base_delay = Duration::from_millis(50);
+
+    match target_tls() {
+        Ok(tls) => options.tls = tls,
+        Err(error) => {
+            return write_json(stream, 200, json!({"ok": false, "error": error}));
+        }
+    }
 
     let mut direct_options = options.clone();
 
@@ -518,6 +549,16 @@ fn pubsub_listen(
             options.discover_cluster = false;
             options.max_reconnect_attempts = 2;
             options.reconnect_base_delay = Duration::from_millis(50);
+
+            match target_tls() {
+                Ok(tls) => options.tls = tls,
+                Err(error) => {
+                    drop(guard);
+
+                    return write_json(stream, 200, json!({"ok": false, "error": error}));
+                }
+            }
+
             options.username = if session.username.is_empty() {
                 None
             } else {
@@ -816,6 +857,7 @@ fn node_client<'a>(session: &'a mut Session, node: &NodeTarget) -> Result<&'a mu
         options.host = node.host.clone();
         options.port = node.port;
         options.discover_cluster = false;
+        options.tls = target_tls()?;
         options.username = if session.username.is_empty() {
             None
         } else {
@@ -957,10 +999,76 @@ fn text_of(value: &RespValue) -> Option<String> {
     }
 }
 
+fn parsed_port(port: &str) -> u16 {
+    port.parse::<u16>().unwrap_or(6379)
+}
+
+/// TLS for every connection to the target, from the environment: `RUVIO_UI_TLS=true` turns it
+/// on (certificate and host name are checked), `RUVIO_UI_TLS_CA` is a PEM file of the CA to
+/// trust, `RUVIO_UI_TLS_CLIENT_CERT` / `RUVIO_UI_TLS_CLIENT_KEY` are PEM files for a server that
+/// asks for a client certificate, and `RUVIO_UI_TLS_SERVER_NAME` is the name the certificate
+/// carries when it differs from the host. `RUVIO_UI_TLS_INSECURE=true` skips verification.
+fn target_tls() -> Result<Option<TlsOptions>, String> {
+    tls_from(|name| env::var(name).ok())
+}
+
+fn tls_from(get: impl Fn(&str) -> Option<String>) -> Result<Option<TlsOptions>, String> {
+    let flag = |name: &str| {
+        get(name).is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+    };
+
+    if !flag("RUVIO_UI_TLS") {
+        return Ok(None);
+    }
+
+    let file = |name: &str| -> Result<Option<Vec<u8>>, String> {
+        match get(name).filter(|path| !path.is_empty()) {
+            Some(path) => std::fs::read(&path)
+                .map(Some)
+                .map_err(|error| format!("{name}: cannot read {path}: {error}")),
+            None => Ok(None),
+        }
+    };
+
+    Ok(Some(TlsOptions {
+        ca_pem: file("RUVIO_UI_TLS_CA")?,
+        client_cert_pem: file("RUVIO_UI_TLS_CLIENT_CERT")?,
+        client_key_pem: file("RUVIO_UI_TLS_CLIENT_KEY")?,
+        server_name: get("RUVIO_UI_TLS_SERVER_NAME").filter(|name| !name.is_empty()),
+        insecure_skip_verify: flag("RUVIO_UI_TLS_INSECURE"),
+    }))
+}
+
+/// `RUVIO_UI_TARGET_PASSWORD`, only for the configured target host and port.
+fn target_password(host: &str, port: u16) -> Option<String> {
+    let target_host = env::var("RUVIO_UI_TARGET_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let target_port = env::var("RUVIO_UI_TARGET_PORT").unwrap_or_else(|_| "6379".into());
+
+    password_for_target(
+        env::var("RUVIO_UI_TARGET_PASSWORD").ok(),
+        (&target_host, parsed_port(&target_port)),
+        (host, port),
+    )
+}
+
+fn password_for_target(
+    password: Option<String>,
+    target: (&str, u16),
+    requested: (&str, u16),
+) -> Option<String> {
+    password.filter(|password| !password.is_empty() && target == requested)
+}
+
 fn defaults(stream: &mut TcpStream) -> std::io::Result<()> {
     let host = env::var("RUVIO_UI_TARGET_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let port = env::var("RUVIO_UI_TARGET_PORT").unwrap_or_else(|_| "6379".into());
-    let password = env::var("RUVIO_UI_TARGET_PASSWORD").unwrap_or_default();
+    let pinned = env::var_os("RUVIO_UI_TARGET_HOST").is_some()
+        || env::var_os("RUVIO_UI_TARGET_PORT").is_some();
 
     write_json(
         stream,
@@ -968,8 +1076,12 @@ fn defaults(stream: &mut TcpStream) -> std::io::Result<()> {
         json!({
             "ok": true,
             "host": host,
-            "port": port.parse::<u16>().unwrap_or(6379),
-            "password": password,
+            "port": parsed_port(&port),
+            // The target password never leaves the server: `connect` applies it when the
+            // sign-in form leaves the password empty for this host and port.
+            "password": "",
+            "password_set": target_password(&host, parsed_port(&port)).is_some(),
+            "pinned": pinned,
         }),
     )
 }
@@ -1115,7 +1227,7 @@ fn write_json(stream: &mut TcpStream, status: u16, body: Value) -> std::io::Resu
 
     write!(
         stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{SECURITY_HEADERS}Connection: close\r\n\r\n",
         bytes.len()
     )?;
     stream.write_all(&bytes)
@@ -1123,12 +1235,55 @@ fn write_json(stream: &mut TcpStream, status: u16, body: Value) -> std::io::Resu
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_read_retry, read_request, request_session_id, reroute_loopback, retryable_read};
-    use serde_json::json;
+    use super::{
+        execute_read_retry, password_for_target, read_request, request_session_id,
+        reroute_loopback, retryable_read, tls_from,
+    };
     use ruvio_client::{Client, ClientOptions, RespValue};
+    use serde_json::json;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn tls_is_off_unless_asked_for() {
+        assert!(tls_from(|_| None).unwrap().is_none());
+        assert!(
+            tls_from(|name| (name == "RUVIO_UI_TLS").then(|| "false".to_owned()))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn tls_verifies_by_default_and_skipping_is_explicit() {
+        let on = |name: &str| (name == "RUVIO_UI_TLS").then(|| "true".to_owned());
+        let tls = tls_from(on).unwrap().unwrap();
+
+        assert!(!tls.insecure_skip_verify);
+        assert!(tls.ca_pem.is_none() && tls.client_cert_pem.is_none());
+
+        let skip = tls_from(|name| match name {
+            "RUVIO_UI_TLS" | "RUVIO_UI_TLS_INSECURE" => Some("1".to_owned()),
+            _ => None,
+        })
+        .unwrap()
+        .unwrap();
+
+        assert!(skip.insecure_skip_verify);
+    }
+
+    #[test]
+    fn an_unreadable_ca_file_is_an_error_naming_the_variable() {
+        let error = tls_from(|name| match name {
+            "RUVIO_UI_TLS" => Some("true".to_owned()),
+            "RUVIO_UI_TLS_CA" => Some("/nonexistent/ca.pem".to_owned()),
+            _ => None,
+        })
+        .unwrap_err();
+
+        assert!(error.starts_with("RUVIO_UI_TLS_CA: cannot read /nonexistent/ca.pem"));
+    }
 
     #[test]
     fn fragmented_http_requests_include_the_whole_body() {
@@ -1246,21 +1401,44 @@ mod tests {
     }
 
     #[test]
+    fn the_target_password_is_only_for_the_target() {
+        let target = ("db.internal", 6379);
+
+        assert_eq!(
+            password_for_target(Some("pw".into()), target, target),
+            Some("pw".into())
+        );
+        assert_eq!(
+            password_for_target(Some("pw".into()), target, ("evil.example", 6379)),
+            None
+        );
+        assert_eq!(
+            password_for_target(Some("pw".into()), target, ("db.internal", 6380)),
+            None
+        );
+        assert_eq!(
+            password_for_target(Some(String::new()), target, target),
+            None
+        );
+        assert_eq!(password_for_target(None, target, target), None);
+    }
+
+    #[test]
     fn request_session_ids_are_read_and_validated() {
         assert_eq!(
             request_session_id("GET / HTTP/1.1\r\nX-Ruvio-Session: tab_123-abc\r\n"),
-            Ok("tab_123-abc".to_owned())
+            Ok(Some("tab_123-abc".to_owned()))
         );
-        assert_eq!(
-            request_session_id("GET / HTTP/1.1\r\n"),
-            Ok("default".to_owned())
-        );
+        assert_eq!(request_session_id("GET / HTTP/1.1\r\n"), Ok(None));
         assert_eq!(
             request_session_id("GET / HTTP/1.1\r\nX-Ruvio-Session: bad/id\r\n"),
             Err("invalid UI session id")
         );
     }
 }
+
+/// Sent with every response: no framing of the UI, no content-type sniffing.
+const SECURITY_HEADERS: &str = "X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: frame-ancestors 'none'\r\nReferrer-Policy: no-referrer\r\n";
 
 fn write_bytes(
     stream: &mut TcpStream,
@@ -1270,7 +1448,7 @@ fn write_bytes(
 ) -> std::io::Result<()> {
     write!(
         stream,
-        "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{SECURITY_HEADERS}Connection: close\r\n\r\n",
         bytes.len()
     )?;
     stream.write_all(bytes)

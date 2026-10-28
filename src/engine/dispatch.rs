@@ -95,6 +95,24 @@ pub fn execute_in_database<'a, C: Clock, I: StorageIndex, S: MutationSink, W: Li
         Command::Save | Command::Bgsave => {
             Ok(Response::Error(b"ERR SAVE is handled by the server"))
         }
+        Command::ConfigSet(_) | Command::ConfigRewrite => {
+            Ok(Response::Error(b"ERR CONFIG SET is handled by the server"))
+        }
+        Command::ReplicaOf { .. } | Command::Role => Ok(Response::Error(
+            b"ERR REPLICAOF and ROLE are handled by the server",
+        )),
+        Command::MoveSlots(_) => Ok(Response::Error(
+            b"ERR RUVIO MOVESLOTS needs more than one shard",
+        )),
+        Command::Topology(_) => Ok(Response::Error(
+            b"ERR RUVIO TOPOLOGY is handled by the server",
+        )),
+        Command::PrimaryLease(_) => {
+            Ok(Response::Error(b"ERR RUVIO LEASE is handled by the server"))
+        }
+        Command::Migrate(_) => Ok(Response::Error(
+            b"ERR RUVIO MIGRATE is handled by the server",
+        )),
 
         Command::Multi
         | Command::Exec
@@ -116,6 +134,7 @@ pub fn execute_in_database<'a, C: Clock, I: StorageIndex, S: MutationSink, W: Li
         Command::Hello { .. }
         | Command::ClientGetName
         | Command::ClientId
+        | Command::ClientSetInfo
         | Command::ClientList { .. }
         | Command::ClientInfo
         | Command::ClientKill { .. }
@@ -123,6 +142,7 @@ pub fn execute_in_database<'a, C: Clock, I: StorageIndex, S: MutationSink, W: Li
         | Command::LatencyLatest
         | Command::ClientSetName(_)
         | Command::ClientTracking(_)
+        | Command::ClientDurability { .. }
         | Command::Select(_) => Ok(Response::Error(b"ERR command is handled by the connection")),
 
         Command::ShardPublish { .. }
@@ -232,6 +252,11 @@ pub fn execute_in_database<'a, C: Clock, I: StorageIndex, S: MutationSink, W: Li
             owner,
             result,
         } => idempotency::complete(shard, sink, &key, &fingerprint, &owner, &result),
+        Command::IdempotencyAbort {
+            key,
+            fingerprint,
+            owner,
+        } => idempotency::abort(shard, sink, &key, &fingerprint, &owner),
         Command::Lease { key, ttl_ms } => {
             let planned = match shard.lease_plan(&key, ttl_ms) {
                 Ok(planned) => planned,
@@ -320,23 +345,55 @@ pub fn execute_in_database<'a, C: Clock, I: StorageIndex, S: MutationSink, W: Li
         }
 
         Command::Release { key, token } => {
-            let expires_at = match shard.lease_release_plan(&key, token) {
-                Ok(Some(expires_at)) => expires_at,
+            match shard.lease_release_plan(&key, token) {
+                Ok(Some(_)) => {}
+                Ok(None) => return Ok(Response::Integer(0)),
+                Err(_) => return Ok(wrong_type()),
+            }
+
+            // A released lease takes its key with it, recorded as a plain delete so a replica and
+            // a replayed log drop it too. A running snapshot still keeps the held lease.
+            before_mutation_allow_oom(shard, sink, [key.as_ref()], 0)?;
+
+            sink.record(Mutation::Delete {
+                keys: std::slice::from_ref(&key),
+            })?;
+
+            shard.delete(&key);
+
+            Ok(Response::Integer(1))
+        }
+
+        Command::Renew { key, token, ttl_ms } => {
+            let (kind, expires_at) = match shard.renew_plan(&key, token, ttl_ms) {
+                Ok(Some(planned)) => planned,
                 Ok(None) => return Ok(Response::Integer(0)),
                 Err(_) => return Ok(wrong_type()),
             };
 
-            // Releasing rewrites the lease in place: a running snapshot keeps the held one.
+            // A renewal rewrites the holder in place: a running snapshot keeps the held one.
             before_mutation_allow_oom(shard, sink, [key.as_ref()], 0)?;
 
-            sink.record(Mutation::LeasePut {
-                key: &key,
-                token,
-                expires_at,
-            })?;
+            let applied = if kind == crate::store::ValueKind::Semaphore {
+                sink.record(Mutation::SemaphoreAcquire {
+                    key: &key,
+                    token,
+                    expires_at,
+                })?;
 
-            if shard.lease_put(&key, token, expires_at, "RELEASE").is_err() {
-                debug_assert!(false, "lease release failed after validation");
+                shard.semaphore_put(&key, token, expires_at)
+            } else {
+                sink.record(Mutation::LeasePut {
+                    key: &key,
+                    token,
+                    expires_at,
+                })?;
+
+                shard.lease_put(&key, token, expires_at, "RENEW")
+            };
+
+            if applied.is_err() {
+                debug_assert!(false, "renew failed after validation");
 
                 return Ok(wrong_type());
             }
@@ -386,7 +443,8 @@ pub fn execute_in_database<'a, C: Clock, I: StorageIndex, S: MutationSink, W: Li
             key,
             max,
             window_ms,
-        } => idempotency::limit(shard, sink, key, max, window_ms),
+            mode,
+        } => idempotency::limit(shard, sink, key, max, window_ms, mode),
 
         Command::Once { key, ttl_ms } => {
             let expires_at = match shard.plan_once(&key, ttl_ms) {
@@ -506,6 +564,13 @@ pub fn execute_in_database<'a, C: Clock, I: StorageIndex, S: MutationSink, W: Li
             expected,
             options,
         } => set_if_eq_key(shard, sink, key, value, &expected, options),
+        Command::SetIfCmp {
+            key,
+            value,
+            number,
+            greater,
+            options,
+        } => set_if_cmp_key(shard, sink, key, value, number, greater, options),
         Command::DelIfEq { key, expected } => del_if_eq_key(shard, sink, key, &expected),
         Command::ListPushCapped {
             key,
@@ -532,6 +597,25 @@ pub fn execute_in_database<'a, C: Clock, I: StorageIndex, S: MutationSink, W: Li
                 .expect("take type was validated before recording");
 
             Ok(Response::Integer(updated))
+        }
+
+        Command::Transfer {
+            source,
+            destination,
+            amount,
+            max,
+        } => transfer(shard, sink, source, destination, amount, max),
+
+        Command::HashTransfer {
+            key,
+            from,
+            to,
+            amount,
+            max,
+        } => {
+            shard.expire_hash_fields(&key);
+
+            hash_transfer(shard, sink, key, from, to, amount, max)
         }
 
         Command::GetEx { key, ttl_ms } => {
@@ -858,6 +942,17 @@ pub fn execute_in_database<'a, C: Clock, I: StorageIndex, S: MutationSink, W: Li
             destination,
             member,
         } => set_move(shard, sink, &source, &destination, &member),
+        Command::HashMSet { key, pairs } => execute_in_database(
+            shard,
+            Command::HashSet { key, pairs },
+            sink,
+            waiters,
+            database,
+        )
+        .map(|response| match response {
+            Response::Integer(_) => Response::Simple(b"OK"),
+            response => response,
+        }),
         Command::HashSet { key, pairs } => {
             shard.expire_hash_fields(&key);
 
@@ -1134,6 +1229,19 @@ pub fn execute_in_database<'a, C: Clock, I: StorageIndex, S: MutationSink, W: Li
             Err(_) => Ok(wrong_type()),
         },
         Command::SortedSetPop { key, count, max } => pop_sorted(shard, sink, key, count, max),
+        Command::SortedSetPopByScore {
+            key,
+            min,
+            max,
+            count,
+            with_scores,
+        } => pop_sorted_by_score(shard, sink, key, min, max, count, with_scores),
+        Command::SortedSetMoveDue {
+            source,
+            destination,
+            max,
+            count,
+        } => move_due_sorted(shard, sink, waiters, source, destination, max, count),
         Command::SortedSetBlockPop {
             keys,
             timeout_ms,
@@ -1497,8 +1605,19 @@ pub fn execute_in_database<'a, C: Clock, I: StorageIndex, S: MutationSink, W: Li
             Ok(info) => Response::Integer(info.map_or(0, |info| info.items as i64)),
             Err(error) => bloom_error(error),
         }),
-        Command::Expire { key, milliseconds } => expire_key(shard, sink, key, milliseconds, false),
-        Command::PExpireAt { key, unix_millis } => expire_key(shard, sink, key, unix_millis, true),
+        Command::CreateTtl { ttl_ms, inner } => {
+            transaction::create_with_ttl(shard, sink, waiters, ttl_ms, *inner, database)
+        }
+        Command::Expire {
+            key,
+            milliseconds,
+            condition,
+        } => expire_key(shard, sink, key, milliseconds, false, condition),
+        Command::PExpireAt {
+            key,
+            unix_millis,
+            condition,
+        } => expire_key(shard, sink, key, unix_millis, true, condition),
         Command::Ttl(key) => Ok(Response::Integer(shard.ttl_seconds(&key))),
         Command::PTtl(key) => Ok(Response::Integer(shard.pttl(&key))),
         Command::Persist(key) => persist_key(shard, sink, key),
@@ -1539,12 +1658,14 @@ pub fn execute_in_database<'a, C: Clock, I: StorageIndex, S: MutationSink, W: Li
             pattern,
             count,
             type_name,
+            slot,
         } => Ok(scan_keys(
             shard,
             cursor,
             pattern.as_deref(),
             count,
             type_name.as_deref(),
+            slot,
         )),
         Command::DbSize => Ok(Response::Integer(shard.database_len() as i64)),
         Command::FlushDb => {

@@ -258,7 +258,7 @@ impl CheckpointManager {
         let checkpoints = self.config.data_dir.join("checkpoints");
 
         if !checkpoints.exists() {
-            fs::create_dir_all(&checkpoints)?;
+            crate::persistence::create_private_directory(&checkpoints)?;
             sync_directory(&self.config.data_dir)?;
         }
         let directory = self.generation_directory(generation);
@@ -394,7 +394,7 @@ impl CheckpointManager {
             std::thread::sleep(*delay);
         }
         let copied = (|| -> Result<ShardFile, PersistenceError> {
-            let mut output = OpenOptions::new()
+            let mut output = crate::persistence::private_file_options()
                 .create(true)
                 .truncate(true)
                 .write(true)
@@ -550,7 +550,7 @@ impl CheckpointManager {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
 
-        fs::create_dir_all(&self.config.data_dir)?;
+        crate::persistence::create_private_directory(&self.config.data_dir)?;
         let floor = self.load_clock()?.unwrap_or(UnixMillis::new(0));
         let value = UnixMillis::new(floor.get().max(now.get()));
 

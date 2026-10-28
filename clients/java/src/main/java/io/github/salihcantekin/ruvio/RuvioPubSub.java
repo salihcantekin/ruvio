@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 package io.github.salihcantekin.ruvio;
 
+import io.github.salihcantekin.ruvio.internal.Address;
 import io.github.salihcantekin.ruvio.internal.ClusterRouter;
 import io.github.salihcantekin.ruvio.internal.Connection;
 import io.github.salihcantekin.ruvio.internal.HashSlot;
@@ -60,6 +61,10 @@ public final class RuvioPubSub implements AutoCloseable {
     private final ClusterRouter router;
     /** True for the per-node subscribers of a cluster: SSUBSCRIBE must then carry one slot per command. */
     private final boolean slotGroups;
+    /** The addresses tried in order: the seeds, or the single host and port. */
+    private final Address[] addresses;
+    /** Index of the address the subscriber connection is (or was last) on. */
+    private volatile int opened;
     private final java.util.Map<String, RuvioPubSub> shardSubscribers = new java.util.LinkedHashMap<>();
 
     RuvioPubSub(RuvioOptions options, Consumer<PubSubMessage> listener) {
@@ -75,23 +80,39 @@ public final class RuvioPubSub implements AutoCloseable {
         this.listener = listener;
         this.router = router;
         this.slotGroups = slotGroups;
-        this.connection = open();
+        this.addresses = options.seeds.isEmpty()
+                ? new Address[] {new Address(options.host, options.port)}
+                : Address.parseAll(options.seeds).toArray(new Address[0]);
+        this.connection = open(0);
     }
 
-    private SubConnection open() {
-        SubConnection c;
-        try {
-            c = new SubConnection(this, options);
-        } catch (IOException e) {
-            throw new RuvioConnectionException("cannot connect to " + options.host + ":" + options.port + ": " + e.getMessage(), e);
+    /**
+     * Opens the first address that accepts a connection, starting at {@code start} and wrapping around, one
+     * attempt each. A refused {@code AUTH} is thrown at once.
+     */
+    private SubConnection open(int start) {
+        RuvioConnectionException last = null;
+        int n = addresses.length;
+        for (int step = 0; step < n; step++) {
+            int index = (start + step) % n;
+            Address a = addresses[index];
+            SubConnection c;
+            try {
+                c = new SubConnection(this, a.host, a.port, options);
+            } catch (IOException e) {
+                last = new RuvioConnectionException("cannot connect to " + a + ": " + e.getMessage(), e);
+                continue;
+            }
+            try {
+                Link.handshake(c, options, 0);
+            } catch (RuntimeException e) {
+                c.close();
+                throw e;
+            }
+            opened = index;
+            return c;
         }
-        try {
-            Link.handshake(c, options, 0);
-        } catch (RuntimeException e) {
-            c.close();
-            throw e;
-        }
-        return c;
+        throw last;
     }
 
     // ---- API -------------------------------------------------------------------------------
@@ -200,7 +221,7 @@ public final class RuvioPubSub implements AutoCloseable {
                         if (!add) {
                             continue;
                         }
-                        sub = new RuvioPubSub(router.node(address).link.options, listener, null, true);
+                        sub = new RuvioPubSub(router.node(address).link.siblingOptions(), listener, null, true);
                         shardSubscribers.put(address, sub);
                     }
                     String[] names = e.getValue().toArray(new String[0]);
@@ -411,7 +432,8 @@ public final class RuvioPubSub implements AutoCloseable {
                 return;
             }
             try {
-                SubConnection c = open();
+                // Each attempt tries every address once, starting with the one after the address that dropped.
+                SubConnection c = open((opened + 1) % addresses.length);
                 String[] ch;
                 String[] pt;
                 String[] sh;
@@ -462,8 +484,8 @@ public final class RuvioPubSub implements AutoCloseable {
     static final class SubConnection extends Connection {
         private final RuvioPubSub owner;
 
-        SubConnection(RuvioPubSub owner, RuvioOptions o) throws IOException {
-            super(o.host, o.port, o.connectTimeoutMillis, 1024, "ruvio-pubsub");
+        SubConnection(RuvioPubSub owner, String host, int port, RuvioOptions options) throws IOException {
+            super(host, port, options.connectTimeoutMillis, 1024, "ruvio-pubsub", options.sslContext, options.tlsServerName);
             this.owner = owner;
         }
 

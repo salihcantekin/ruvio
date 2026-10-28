@@ -88,10 +88,20 @@ pub(in crate::protocol) fn parse_xadd<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
     let mut min_id = None;
     let mut delay_ms = None;
     let mut nomkstream = false;
+    let mut ttl = None;
     let mut index = 1;
 
     while index < args.len() {
         let argument = args.bytes(index);
+
+        if ttl.is_none()
+            && let Some(found) = create_ttl_option(args, index)?
+        {
+            ttl = Some(found);
+            index += 2;
+
+            continue;
+        }
 
         if argument.eq_ignore_ascii_case(b"DELAY") {
             if delay_ms.is_some() {
@@ -138,7 +148,10 @@ pub(in crate::protocol) fn parse_xadd<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
 
             index += 1;
 
+            let mut approximate = false;
+
             if index < args.len() && matches!(args.bytes(index), b"~" | b"=") {
+                approximate = args.bytes(index) == b"~";
                 index += 1;
             }
 
@@ -148,6 +161,7 @@ pub(in crate::protocol) fn parse_xadd<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
 
             max_len = Some(parse_usize(args.bytes(index))?);
             index += 1;
+            skip_trim_limit(args, &mut index, approximate)?;
 
             continue;
         }
@@ -192,15 +206,18 @@ pub(in crate::protocol) fn parse_xadd<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
         fields.push((args.arg(at), args.arg(at + 1)));
     }
 
-    Ok(Command::StreamAdd {
-        key: args.arg(0),
-        id,
-        max_len,
-        min_id,
-        delay_ms,
-        nomkstream,
-        fields,
-    })
+    Ok(with_create_ttl(
+        ttl,
+        Command::StreamAdd {
+            key: args.arg(0),
+            id,
+            max_len,
+            min_id,
+            delay_ms,
+            nomkstream,
+            fields,
+        },
+    ))
 }
 
 pub(in crate::protocol) fn parse_xrange<'a>(reverse: bool, args: &Args<'a, '_>) -> Parsed<'a> {
@@ -375,7 +392,10 @@ pub(in crate::protocol) fn parse_min_id(
     args: &Args<'_, '_>,
     index: &mut usize,
 ) -> Result<(u64, u64), ProtocolError> {
+    let mut approximate = false;
+
     if *index < args.len() && matches!(args.bytes(*index), b"~" | b"=") {
+        approximate = args.bytes(*index) == b"~";
         *index += 1;
     }
 
@@ -383,22 +403,40 @@ pub(in crate::protocol) fn parse_min_id(
         return Err(ProtocolError::Invalid("MINID expects an id"));
     }
 
-    let raw = args.bytes(*index);
-
-    if raw.eq_ignore_ascii_case(b"LIMIT") {
-        return Err(ProtocolError::Invalid("LIMIT is not supported"));
-    }
-
-    let id =
-        crate::stream::parse_id(raw).ok_or(ProtocolError::Invalid("MINID id must be ms-seq"))?;
+    let id = crate::stream::parse_id(args.bytes(*index))
+        .ok_or(ProtocolError::Invalid("MINID id must be ms-seq"))?;
 
     *index += 1;
-
-    if *index < args.len() && args.bytes(*index).eq_ignore_ascii_case(b"LIMIT") {
-        return Err(ProtocolError::Invalid("LIMIT is not supported"));
-    }
+    skip_trim_limit(args, index, approximate)?;
 
     Ok(id)
+}
+
+/// An optional `LIMIT count` after a trim threshold, as Redis allows it with `~`. It bounds the
+/// work of an approximate trim; Ruvio always trims to the threshold, so the count is read and
+/// ignored.
+fn skip_trim_limit(
+    args: &Args<'_, '_>,
+    index: &mut usize,
+    approximate: bool,
+) -> Result<(), ProtocolError> {
+    if *index >= args.len() || !args.bytes(*index).eq_ignore_ascii_case(b"LIMIT") {
+        return Ok(());
+    }
+
+    if !approximate {
+        return Err(ProtocolError::Invalid(
+            "syntax error, LIMIT cannot be used without the special ~ option",
+        ));
+    }
+
+    if *index + 1 >= args.len() {
+        return Err(ProtocolError::Invalid("syntax error"));
+    }
+
+    parse_usize(args.bytes(*index + 1))?;
+    *index += 2;
+    Ok(())
 }
 
 pub(in crate::protocol) fn parse_xsetid<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
@@ -442,18 +480,27 @@ pub(in crate::protocol) fn parse_xtrim<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
         ));
     }
 
+    let mut approximate = false;
+
     if matches!(args.bytes(index), b"~" | b"=") {
+        approximate = args.bytes(index) == b"~";
         index += 1;
     }
 
-    if args.len() - index != 1 {
+    if index >= args.len() {
         return Err(ProtocolError::Invalid("XTRIM expects MAXLEN and a count"));
     }
 
-    Ok(Command::StreamTrim {
-        key,
-        max_len: parse_usize(args.bytes(index))?,
-    })
+    let max_len = parse_usize(args.bytes(index))?;
+
+    index += 1;
+    skip_trim_limit(args, &mut index, approximate)?;
+
+    if index != args.len() {
+        return Err(ProtocolError::Invalid("XTRIM expects MAXLEN and a count"));
+    }
+
+    Ok(Command::StreamTrim { key, max_len })
 }
 
 pub(in crate::protocol) fn parse_group_start(

@@ -4,6 +4,7 @@ mod command;
 mod direct;
 mod hot;
 mod inline;
+mod one_or_many;
 mod parse;
 mod resp;
 mod table;
@@ -22,6 +23,7 @@ mod validate;
 
 pub(crate) use command::*;
 pub use hot::*;
+pub use one_or_many::OneOrMany;
 pub(crate) use parse::*;
 pub use resp::*;
 use validate::*;
@@ -435,6 +437,25 @@ pub enum ObjectKind {
     Freq,
 }
 
+/// A slot range and the shard of this process it should move to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotRangeMove {
+    pub first: u16,
+    pub last: u16,
+    pub shard: u16,
+}
+
+/// `RUVIO LEASE GRANT token coordinator voters epoch lease_ms`: coordinator `coordinator` of
+/// `voters` grants this primary its lease from the `RUVIO LEASE BEGIN` that answered `token`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseGrant {
+    pub token: u64,
+    pub coordinator: u64,
+    pub voters: u32,
+    pub epoch: u64,
+    pub lease_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command<'a> {
     Ping(Option<Bytes<'a>>),
@@ -461,6 +482,8 @@ pub enum Command<'a> {
     },
     ClientGetName,
     ClientId,
+    /// `CLIENT SETINFO LIB-NAME|LIB-VER value`: accepted and answered `OK`; nothing is kept.
+    ClientSetInfo,
     /// `CLIENT LIST [ID id ...]`; empty `ids` lists every connection of the shard.
     ClientList {
         ids: Vec<u64>,
@@ -484,6 +507,12 @@ pub enum Command<'a> {
     ClientSetName(Bytes<'a>),
     /// `true` is `ON`. `false` is `OFF`.
     ClientTracking(bool),
+    /// `CLIENT DURABILITY REPLICAS n [TIMEOUT ms]`: writes on this connection are answered
+    /// once `replicas` replicas hold them on disk. `0` turns it off.
+    ClientDurability {
+        replicas: u64,
+        timeout_ms: u64,
+    },
     ShardPublish {
         channel: Bytes<'a>,
         message: Bytes<'a>,
@@ -508,6 +537,29 @@ pub enum Command<'a> {
     ReadOnly,
     ReadWrite,
     ConfigGet(Bytes<'a>),
+    /// `CONFIG SET name value [name value ...]`: names and values as sent, checked by the
+    /// connection that receives it.
+    ConfigSet(Vec<(Bytes<'a>, Bytes<'a>)>),
+    ConfigRewrite,
+    /// `REPLICAOF host port [YIELD]`, or `REPLICAOF NO ONE [FORCE]` (`primary` is `None`);
+    /// `force` is `FORCE` or `YIELD`.
+    ReplicaOf {
+        primary: Option<(Bytes<'a>, Bytes<'a>)>,
+        force: bool,
+    },
+    Role,
+    /// `RUVIO MOVESLOTS first-last shard` moves a slot range to another shard of this
+    /// process; `RUVIO MOVESLOTS STATUS` (`None`) reports the current or last move.
+    MoveSlots(Option<SlotRangeMove>),
+    /// `RUVIO TOPOLOGY SET map` installs a multi-node cluster map; `RUVIO TOPOLOGY VERSION`
+    /// (`None`) reports the version this node serves (0 without a map).
+    Topology(Option<Bytes<'a>>),
+    /// `RUVIO LEASE BEGIN` (`None`) and `RUVIO LEASE GRANT ...`: the primary lease
+    /// `ruvio coordinator` renews (see `primary-lease`). Rare, so the grant is boxed.
+    PrimaryLease(Option<Box<LeaseGrant>>),
+    /// `RUVIO MIGRATE ...`: the steps of moving a slot range to another node, sent by the
+    /// coordinators and by the source node; the runtime reads the arguments.
+    Migrate(Vec<Bytes<'a>>),
     Info(Option<Bytes<'a>>),
     Save,
     Bgsave,
@@ -561,6 +613,12 @@ pub enum Command<'a> {
         key: Bytes<'a>,
         token: u64,
     },
+    /// `RENEW key token ttl_ms`: moves a live lease or semaphore holder's deadline to now + TTL.
+    Renew {
+        key: Bytes<'a>,
+        token: u64,
+        ttl_ms: u64,
+    },
     /// `SEMAPHORE key max ttl_ms`: one of at most `max` holders, each with its own TTL.
     Semaphore {
         key: Bytes<'a>,
@@ -580,6 +638,7 @@ pub enum Command<'a> {
         key: Bytes<'a>,
         max: u64,
         window_ms: u64,
+        mode: LimitMode,
     },
     Once {
         key: Bytes<'a>,
@@ -597,9 +656,32 @@ pub enum Command<'a> {
         owner: Bytes<'a>,
         result: Bytes<'a>,
     },
+    /// `IDEM key ABORT fingerprint owner`: removes a pending record of this owner.
+    IdempotencyAbort {
+        key: Bytes<'a>,
+        fingerprint: Bytes<'a>,
+        owner: Bytes<'a>,
+    },
     Take {
         key: Bytes<'a>,
         count: i64,
+    },
+    /// `TRANSFER source destination amount [MAX cap]`: moves `amount` between two integer
+    /// strings in one step. Nil when `source` is missing or short, or `destination` would
+    /// pass `max`.
+    Transfer {
+        source: Bytes<'a>,
+        destination: Bytes<'a>,
+        amount: i64,
+        max: Option<i64>,
+    },
+    /// `HTRANSFER key from to amount [MAX cap]`: `TRANSFER` between two fields of one hash.
+    HashTransfer {
+        key: Bytes<'a>,
+        from: Bytes<'a>,
+        to: Bytes<'a>,
+        amount: i64,
+        max: Option<i64>,
     },
     /// `SET key value IFEQ expected [EX|PX|EXAT|PXAT|KEEPTTL]`: writes only when the
     /// string at `key` equals `expected`. Nil otherwise.
@@ -607,6 +689,15 @@ pub enum Command<'a> {
         key: Bytes<'a>,
         value: Bytes<'a>,
         expected: Bytes<'a>,
+        options: SetOptions,
+    },
+    /// `SET key value IFGT|IFLT [EX|PX|EXAT|PXAT|KEEPTTL]`: writes when the key is missing or
+    /// `number` (the parsed `value`) is greater (`greater`) or smaller than the stored integer.
+    SetIfCmp {
+        key: Bytes<'a>,
+        value: Bytes<'a>,
+        number: i64,
+        greater: bool,
         options: SetOptions,
     },
     /// `DELEX key IFEQ expected`: deletes the string at `key` only when it equals `expected`.
@@ -735,11 +826,13 @@ pub enum Command<'a> {
         pattern: Option<Bytes<'a>>,
         count: usize,
         type_name: Option<Bytes<'a>>,
+        /// `SLOT n`: only keys of that hash slot; the command goes to the slot's owner.
+        slot: Option<u16>,
     },
     DbSize,
     Del(Keys<'a>),
-    ListPush(Bytes<'a>, Vec<Bytes<'a>>),
-    ListPushBack(Bytes<'a>, Vec<Bytes<'a>>),
+    ListPush(Bytes<'a>, OneOrMany<Bytes<'a>>),
+    ListPushBack(Bytes<'a>, OneOrMany<Bytes<'a>>),
     ListPop {
         key: Bytes<'a>,
         count: Option<usize>,
@@ -849,6 +942,11 @@ pub enum Command<'a> {
         key: Bytes<'a>,
         pairs: Vec<(Bytes<'a>, Bytes<'a>)>,
     },
+    /// `HMSET`: `HSET` that replies `OK`.
+    HashMSet {
+        key: Bytes<'a>,
+        pairs: Vec<(Bytes<'a>, Bytes<'a>)>,
+    },
     HashDelete {
         key: Bytes<'a>,
         fields: Vec<Bytes<'a>>,
@@ -918,7 +1016,7 @@ pub enum Command<'a> {
     },
     SortedSetAdd {
         key: Bytes<'a>,
-        pairs: Vec<(f64, Bytes<'a>)>,
+        pairs: OneOrMany<(f64, Bytes<'a>)>,
         options: SortedSetAddOptions,
     },
     SortedSetRange {
@@ -1009,6 +1107,23 @@ pub enum Command<'a> {
         key: Bytes<'a>,
         count: Option<usize>,
         max: bool,
+    },
+    /// `ZPOPBYSCORE key max [MIN min] [COUNT n] [WITHSCORES]`: removes and returns up to
+    /// `count` members with `min <= score <= max`, lowest score first.
+    SortedSetPopByScore {
+        key: Bytes<'a>,
+        min: ScoreBound,
+        max: ScoreBound,
+        count: usize,
+        with_scores: bool,
+    },
+    /// `ZMOVEDUE source destination max [COUNT n]`: moves up to `count` members with
+    /// `score <= max`, lowest first, from a sorted set to the tail of a list.
+    SortedSetMoveDue {
+        source: Bytes<'a>,
+        destination: Bytes<'a>,
+        max: ScoreBound,
+        count: usize,
     },
     /// `BZPOPMIN` or `BZPOPMAX`.
     SortedSetBlockPop {
@@ -1192,10 +1307,18 @@ pub enum Command<'a> {
     Expire {
         key: Bytes<'a>,
         milliseconds: i64,
+        condition: ExpireCondition,
     },
     PExpireAt {
         key: Bytes<'a>,
         unix_millis: i64,
+        condition: ExpireCondition,
+    },
+    /// A write that sets a key deadline only when it creates the key (`EX`/`PX` on `INCRBY`,
+    /// `ZADD`, ...). The inner write and the deadline are logged as one record.
+    CreateTtl {
+        ttl_ms: u64,
+        inner: Box<Command<'a>>,
     },
     Ttl(Bytes<'a>),
     PTtl(Bytes<'a>),
@@ -1325,6 +1448,20 @@ impl ScoreBound {
     }
 }
 
+/// How `LIMIT` counts. `Fixed` is the plain `LIMIT key max window_ms`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitMode {
+    Fixed,
+    Sliding {
+        with_retry: bool,
+    },
+    /// `cost` tokens are taken from a bucket of `max` tokens that refills over `window_ms`.
+    Tokens {
+        cost: u32,
+        with_retry: bool,
+    },
+}
+
 /// `LIMIT offset count` on a score or lexicographical range. A negative count means the rest of the range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RangeLimit {
@@ -1345,6 +1482,17 @@ pub enum SortedRemoveRange<'a> {
 pub enum CollectionScanKind {
     Set,
     SortedSet,
+}
+
+/// `NX`, `XX`, `GT`, or `LT` on `EXPIRE`, `PEXPIRE`, `EXPIREAT` or `PEXPIREAT`. A key without a
+/// deadline counts as infinite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpireCondition {
+    Always,
+    Nx,
+    Xx,
+    Gt,
+    Lt,
 }
 
 /// `NX`, `XX`, `GT`, or `LT` on a hash field expire. A field without a TTL counts as infinite.
@@ -1529,5 +1677,48 @@ impl std::error::Error for ProtocolError {}
 impl From<io::Error> for ProtocolError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+/// `EX seconds` or `PX milliseconds` at `at`, as milliseconds, for a write that sets a
+/// deadline when it creates the key. `None` when the argument at `at` is neither keyword.
+pub(crate) fn create_ttl_option(
+    args: &table::Args<'_, '_>,
+    at: usize,
+) -> Result<Option<u64>, ProtocolError> {
+    let option = args.bytes(at);
+    let seconds = option.eq_ignore_ascii_case(b"EX");
+
+    if !seconds && !option.eq_ignore_ascii_case(b"PX") {
+        return Ok(None);
+    }
+
+    if at + 1 >= args.len() {
+        return Err(ProtocolError::Invalid("syntax error"));
+    }
+
+    const INVALID: ProtocolError = ProtocolError::Invalid("invalid expire time");
+
+    let value = u64::try_from(parse_i64(args.bytes(at + 1))?).map_err(|_| INVALID)?;
+
+    if value == 0 {
+        return Err(INVALID);
+    }
+
+    if seconds {
+        value.checked_mul(1_000).map(Some).ok_or(INVALID)
+    } else {
+        Ok(Some(value))
+    }
+}
+
+/// `command`, wrapped so the deadline is set only when it creates the key.
+pub(crate) fn with_create_ttl(ttl_ms: Option<u64>, command: Command<'_>) -> Command<'_> {
+    match ttl_ms {
+        Some(ttl_ms) => Command::CreateTtl {
+            ttl_ms,
+            inner: Box::new(command),
+        },
+        None => command,
     }
 }

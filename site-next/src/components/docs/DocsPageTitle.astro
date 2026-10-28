@@ -1,0 +1,44 @@
+---
+// Starlight page title override: an icon chip and the section name above the heading,
+// so every docs page opens the same recognisable way. Icons come from scripts/docs-icons.mjs.
+import { ICONS } from "../../config/docs-icons.mjs";
+import pages from "../../config/docs-pages.json";
+
+const { entry } = Astro.locals.starlightRoute;
+const slug = entry.id === "docs" ? "" : entry.id.replace(/^docs\//, "");
+const { icon, group } = (pages as Record<string, { icon: keyof typeof ICONS; group?: string }>)[slug] ?? { icon: "file" as const };
+const isHome = slug === "";
+---
+
+{
+  !isHome && (
+    <div class="kicker-row">
+      <span class="chip" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><path d={ICONS[icon]} /></svg>
+      </span>
+      {group && <span class="section">{group}</span>}
+    </div>
+  )
+}
+<h1 id="_top">{entry.data.title}</h1>
+
+<style>
+  @layer starlight.core {
+    h1 {
+      margin-top: 0.6rem;
+      font-size: var(--sl-text-h1);
+      line-height: var(--sl-line-height-headings);
+      font-weight: 600;
+      color: var(--sl-color-white);
+    }
+  }
+  .kicker-row { display: flex; align-items: center; gap: 0.6rem; margin-top: 0.25rem; }
+  .chip {
+    display: grid; place-items: center; width: 2rem; height: 2rem; border-radius: 8px;
+    color: var(--accent);
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+  }
+  .chip svg { width: 1.1rem; height: 1.1rem; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+  .section { font-size: var(--sl-text-sm); font-weight: 600; letter-spacing: 0.02em; color: var(--sl-color-gray-3); }
+</style>

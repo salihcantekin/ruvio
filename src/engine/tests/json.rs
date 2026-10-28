@@ -27,6 +27,7 @@ fn json_commands_preserve_ttl_and_type_isolation() {
         execute(
             &mut shard,
             Command::PExpireAt {
+                condition: crate::protocol::ExpireCondition::Always,
                 key: key.clone(),
                 unix_millis: 2_000
             }
@@ -123,6 +124,7 @@ fn json_merge_preserves_ttl_and_applies_one_atomic_document() {
         execute(
             &mut shard,
             Command::PExpireAt {
+                condition: crate::protocol::ExpireCondition::Always,
                 key: owned(b"doc"),
                 unix_millis: 2_000,
             }
@@ -247,6 +249,7 @@ fn large_json_uses_deltas_and_survives_wal_and_snapshot_recovery() {
             &mut sink,
             0,
             Command::PExpireAt {
+                condition: crate::protocol::ExpireCondition::Always,
                 key: owned(b"doc"),
                 unix_millis: 4_000_000_000_000
             }

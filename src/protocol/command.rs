@@ -53,6 +53,7 @@ impl<'a> Command<'a> {
             },
             Self::ClientGetName => Command::ClientGetName,
             Self::ClientId => Command::ClientId,
+            Self::ClientSetInfo => Command::ClientSetInfo,
             Self::ClientList { ids } => Command::ClientList { ids },
             Self::ClientInfo => Command::ClientInfo,
             Self::ClientKill {
@@ -76,6 +77,13 @@ impl<'a> Command<'a> {
             Self::MemoryUsage(key) => Command::MemoryUsage(owned(key)),
             Self::ClientSetName(name) => Command::ClientSetName(owned(name)),
             Self::ClientTracking(on) => Command::ClientTracking(on),
+            Self::ClientDurability {
+                replicas,
+                timeout_ms,
+            } => Command::ClientDurability {
+                replicas,
+                timeout_ms,
+            },
             Self::ShardPublish { channel, message } => Command::ShardPublish {
                 channel: owned(channel),
                 message: owned(message),
@@ -99,6 +107,22 @@ impl<'a> Command<'a> {
             Self::ReadOnly => Command::ReadOnly,
             Self::ReadWrite => Command::ReadWrite,
             Self::ConfigGet(pattern) => Command::ConfigGet(owned(pattern)),
+            Self::ConfigSet(pairs) => Command::ConfigSet(
+                pairs
+                    .into_iter()
+                    .map(|(name, value)| (owned(name), owned(value)))
+                    .collect(),
+            ),
+            Self::ConfigRewrite => Command::ConfigRewrite,
+            Self::MoveSlots(target) => Command::MoveSlots(target),
+            Self::Topology(map) => Command::Topology(map.map(owned)),
+            Self::PrimaryLease(grant) => Command::PrimaryLease(grant),
+            Self::Migrate(args) => Command::Migrate(args.into_iter().map(owned).collect()),
+            Self::ReplicaOf { primary, force } => Command::ReplicaOf {
+                primary: primary.map(|(host, port)| (owned(host), owned(port))),
+                force,
+            },
+            Self::Role => Command::Role,
             Self::Info(message) => Command::Info(message.map(owned)),
             Self::Save => Command::Save,
             Self::Bgsave => Command::Bgsave,
@@ -159,6 +183,11 @@ impl<'a> Command<'a> {
                 key: owned(key),
                 token,
             },
+            Self::Renew { key, token, ttl_ms } => Command::Renew {
+                key: owned(key),
+                token,
+                ttl_ms,
+            },
             Self::SetVersioned {
                 key,
                 value,
@@ -174,10 +203,12 @@ impl<'a> Command<'a> {
                 key,
                 max,
                 window_ms,
+                mode,
             } => Command::Limit {
                 key: owned(key),
                 max,
                 window_ms,
+                mode,
             },
             Self::Once { key, ttl_ms } => Command::Once {
                 key: owned(key),
@@ -205,6 +236,15 @@ impl<'a> Command<'a> {
                 owner: owned(owner),
                 result: owned(result),
             },
+            Self::IdempotencyAbort {
+                key,
+                fingerprint,
+                owner,
+            } => Command::IdempotencyAbort {
+                key: owned(key),
+                fingerprint: owned(fingerprint),
+                owner: owned(owner),
+            },
             Self::SetIfEq {
                 key,
                 value,
@@ -214,6 +254,19 @@ impl<'a> Command<'a> {
                 key: owned(key),
                 value: owned(value),
                 expected: owned(expected),
+                options,
+            },
+            Self::SetIfCmp {
+                key,
+                value,
+                number,
+                greater,
+                options,
+            } => Command::SetIfCmp {
+                key: owned(key),
+                value: owned(value),
+                number,
+                greater,
                 options,
             },
             Self::DelIfEq { key, expected } => Command::DelIfEq {
@@ -234,6 +287,30 @@ impl<'a> Command<'a> {
             Self::Take { key, count } => Command::Take {
                 key: owned(key),
                 count,
+            },
+            Self::Transfer {
+                source,
+                destination,
+                amount,
+                max,
+            } => Command::Transfer {
+                source: owned(source),
+                destination: owned(destination),
+                amount,
+                max,
+            },
+            Self::HashTransfer {
+                key,
+                from,
+                to,
+                amount,
+                max,
+            } => Command::HashTransfer {
+                key: owned(key),
+                from: owned(from),
+                to: owned(to),
+                amount,
+                max,
             },
             Self::GetEx { key, ttl_ms } => Command::GetEx {
                 key: owned(key),
@@ -400,16 +477,20 @@ impl<'a> Command<'a> {
                 pattern,
                 count,
                 type_name,
+                slot,
             } => Command::Scan {
                 cursor,
                 pattern: pattern.map(owned),
                 count,
                 type_name: type_name.map(owned),
+                slot,
             },
             Self::DbSize => Command::DbSize,
             Self::Del(keys) => Command::Del(owned_vec(keys.into_vec()).into()),
-            Self::ListPush(key, values) => Command::ListPush(owned(key), owned_vec(values)),
-            Self::ListPushBack(key, values) => Command::ListPushBack(owned(key), owned_vec(values)),
+            Self::ListPush(key, values) => Command::ListPush(owned(key), values.map(&owned)),
+            Self::ListPushBack(key, values) => {
+                Command::ListPushBack(owned(key), values.map(&owned))
+            }
             Self::ListPop { key, count } => Command::ListPop {
                 key: owned(key),
                 count,
@@ -532,6 +613,13 @@ impl<'a> Command<'a> {
                     .map(|(field, value)| (owned(field), owned(value)))
                     .collect(),
             },
+            Self::HashMSet { key, pairs } => Command::HashMSet {
+                key: owned(key),
+                pairs: pairs
+                    .into_iter()
+                    .map(|(field, value)| (owned(field), owned(value)))
+                    .collect(),
+            },
             Self::HashDelete { key, fields } => Command::HashDelete {
                 key: owned(key),
                 fields: owned_vec(fields),
@@ -596,10 +684,7 @@ impl<'a> Command<'a> {
                 options,
             } => Command::SortedSetAdd {
                 key: owned(key),
-                pairs: pairs
-                    .into_iter()
-                    .map(|(score, member)| (score, owned(member)))
-                    .collect(),
+                pairs: pairs.map(|(score, member)| (score, owned(member))),
                 options,
             },
             Self::SortedSetRange {
@@ -736,6 +821,30 @@ impl<'a> Command<'a> {
                 key: owned(key),
                 count,
                 max,
+            },
+            Self::SortedSetPopByScore {
+                key,
+                min,
+                max,
+                count,
+                with_scores,
+            } => Command::SortedSetPopByScore {
+                key: owned(key),
+                min,
+                max,
+                count,
+                with_scores,
+            },
+            Self::SortedSetMoveDue {
+                source,
+                destination,
+                max,
+                count,
+            } => Command::SortedSetMoveDue {
+                source: owned(source),
+                destination: owned(destination),
+                max,
+                count,
             },
             Self::SortedSetBlockPop {
                 keys,
@@ -1047,14 +1156,32 @@ impl<'a> Command<'a> {
                 count,
                 just_id,
             },
-            Self::Expire { key, milliseconds } => Command::Expire {
+            Self::Expire {
+                key,
+                milliseconds,
+                condition,
+            } => Command::Expire {
                 key: owned(key),
                 milliseconds,
+                condition,
             },
-            Self::PExpireAt { key, unix_millis } => Command::PExpireAt {
+            Self::PExpireAt {
+                key,
+                unix_millis,
+                condition,
+            } => Command::PExpireAt {
                 key: owned(key),
                 unix_millis,
+                condition,
             },
+            Self::CreateTtl { ttl_ms, inner } => {
+                let (inner, bytes) = (*inner).into_owned_measured();
+                copied.set(copied.get().saturating_add(bytes));
+                Command::CreateTtl {
+                    ttl_ms,
+                    inner: Box::new(inner),
+                }
+            }
             Self::Ttl(key) => Command::Ttl(owned(key)),
             Self::PTtl(key) => Command::PTtl(owned(key)),
             Self::Persist(key) => Command::Persist(owned(key)),
@@ -1130,6 +1257,7 @@ pub(crate) fn command_mutates_store(command: &Command<'_>) -> bool {
             | Command::ClientGetName
             | Command::ClientSetName(_)
             | Command::ClientTracking(_)
+            | Command::ClientDurability { .. }
             | Command::ShardPublish { .. }
             | Command::ShardSubscribe(_)
             | Command::ShardUnsubscribe(_)
@@ -1149,6 +1277,14 @@ pub(crate) fn command_mutates_store(command: &Command<'_>) -> bool {
             | Command::ConfigGet(_)
             | Command::Info(_)
             | Command::Save
+            | Command::ConfigSet(_)
+            | Command::ConfigRewrite
+            | Command::ReplicaOf { .. }
+            | Command::MoveSlots(_)
+            | Command::Topology(_)
+            | Command::PrimaryLease(_)
+            | Command::Migrate(_)
+            | Command::Role
             | Command::Bgsave
             | Command::Get(_)
             | Command::JsonGet { .. }
@@ -1164,6 +1300,7 @@ pub(crate) fn command_mutates_store(command: &Command<'_>) -> bool {
             | Command::Exists(_)
             | Command::Keys(_)
             | Command::ClientId
+            | Command::ClientSetInfo
             | Command::ClientList { .. }
             | Command::ClientInfo
             | Command::Slowlog(_)

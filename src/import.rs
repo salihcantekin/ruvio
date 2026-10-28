@@ -124,6 +124,23 @@ pub fn parse_endpoint(url: &str) -> Result<Endpoint, String> {
     })
 }
 
+/// The endpoint of `url`; a URL without a password takes it from the environment variable, so
+/// the password need not appear in the process list.
+fn endpoint_from_env(url: &str, variable: &str) -> Result<Endpoint, String> {
+    let mut endpoint = parse_endpoint(url)?;
+
+    if endpoint.password.as_deref().is_none_or(str::is_empty) {
+        endpoint.password = std::env::var(variable)
+            .ok()
+            .filter(|value| !value.is_empty());
+    } else {
+        eprintln!(
+            "warning: a password in the URL is visible in the process list; set {variable} instead"
+        );
+    }
+    Ok(endpoint)
+}
+
 impl Connection {
     fn open(endpoint: &Endpoint) -> Result<Self, String> {
         let stream = TcpStream::connect(&endpoint.address)
@@ -186,58 +203,83 @@ impl Connection {
         (0..commands.len()).map(|_| self.read_reply()).collect()
     }
 
-    fn read_line(&mut self) -> Result<Vec<u8>, String> {
-        let mut line = Vec::new();
-
-        self.reader
-            .read_until(b'\n', &mut line)
-            .map_err(|error| format!("read: {error}"))?;
-
-        if !line.ends_with(b"\r\n") {
-            return Err("connection closed".into());
-        }
-
-        line.truncate(line.len() - 2);
-        Ok(line)
-    }
-
     fn read_reply(&mut self) -> Result<Resp, String> {
-        let line = self.read_line()?;
-        let (kind, rest) = line.split_first().ok_or("empty reply")?;
-        let number = || -> Result<i64, String> {
-            std::str::from_utf8(rest)
-                .ok()
-                .and_then(|text| text.parse().ok())
-                .ok_or_else(|| "bad length in reply".to_owned())
-        };
-
-        Ok(match kind {
-            b'+' => Resp::Simple(rest.to_vec()),
-            b'-' => Resp::Error(rest.to_vec()),
-            b':' => Resp::Int(number()?),
-            b'$' => match number()? {
-                length if length < 0 => Resp::Bulk(None),
-                length => {
-                    let mut body = vec![0; length as usize + 2];
-
-                    self.reader
-                        .read_exact(&mut body)
-                        .map_err(|error| format!("read: {error}"))?;
-                    body.truncate(length as usize);
-                    Resp::Bulk(Some(body))
-                }
-            },
-            b'*' => match number()? {
-                length if length < 0 => Resp::Array(None),
-                length => Resp::Array(Some(
-                    (0..length)
-                        .map(|_| self.read_reply())
-                        .collect::<Result<_, _>>()?,
-                )),
-            },
-            other => return Err(format!("unsupported reply type {:?}", *other as char)),
-        })
+        read_resp(&mut self.reader, 0)
     }
+}
+
+/// Longest bulk string, most array items and deepest nesting accepted from the source, so a
+/// broken or hostile peer gets an error instead of an allocation, abort or stack overflow.
+const MAX_BULK_BYTES: i64 = 512 * 1024 * 1024;
+const MAX_ARRAY_ITEMS: i64 = 64 * 1024 * 1024;
+const MAX_NESTING: usize = 32;
+
+fn read_line(reader: &mut impl BufRead) -> Result<Vec<u8>, String> {
+    let mut line = Vec::new();
+
+    reader
+        .read_until(b'\n', &mut line)
+        .map_err(|error| format!("read: {error}"))?;
+
+    if !line.ends_with(b"\r\n") {
+        return Err("connection closed".into());
+    }
+
+    line.truncate(line.len() - 2);
+    Ok(line)
+}
+
+fn read_resp(reader: &mut impl BufRead, depth: usize) -> Result<Resp, String> {
+    let line = read_line(reader)?;
+    let (kind, rest) = line.split_first().ok_or("empty reply")?;
+    let number = || -> Result<i64, String> {
+        std::str::from_utf8(rest)
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .ok_or_else(|| "bad length in reply".to_owned())
+    };
+
+    Ok(match kind {
+        b'+' => Resp::Simple(rest.to_vec()),
+        b'-' => Resp::Error(rest.to_vec()),
+        b':' => Resp::Int(number()?),
+        b'$' => match number()? {
+            length if length < 0 => Resp::Bulk(None),
+            length if length > MAX_BULK_BYTES => {
+                return Err(format!("bulk string of {length} bytes is too large"));
+            }
+            length => {
+                // The buffer grows with the bytes that arrive, never with the announced length.
+                let wanted = length as u64 + 2;
+                let mut body = Vec::new();
+
+                reader
+                    .take(wanted)
+                    .read_to_end(&mut body)
+                    .map_err(|error| format!("read: {error}"))?;
+
+                if body.len() as u64 != wanted {
+                    return Err("connection closed".into());
+                }
+
+                body.truncate(length as usize);
+                Resp::Bulk(Some(body))
+            }
+        },
+        b'*' => match number()? {
+            length if length < 0 => Resp::Array(None),
+            length if length > MAX_ARRAY_ITEMS => {
+                return Err(format!("array of {length} items is too large"));
+            }
+            _ if depth >= MAX_NESTING => return Err("reply is nested too deeply".into()),
+            length => Resp::Array(Some(
+                (0..length)
+                    .map(|_| read_resp(reader, depth + 1))
+                    .collect::<Result<_, _>>()?,
+            )),
+        },
+        other => return Err(format!("unsupported reply type {:?}", *other as char)),
+    })
 }
 
 fn expect_ok(reply: &Resp, what: &str) -> Result<(), String> {
@@ -263,6 +305,16 @@ enum Value {
 }
 
 impl Value {
+    fn is_empty(&self) -> bool {
+        match self {
+            Value::Text(_) => false,
+            Value::List(items) | Value::Set(items) => items.is_empty(),
+            Value::Hash(pairs) => pairs.is_empty(),
+            Value::Sorted(entries) => entries.is_empty(),
+            Value::Stream(entries) => entries.is_empty(),
+        }
+    }
+
     /// Order-insensitive types sorted so two reads compare equal.
     fn normalized(mut self) -> Self {
         match &mut self {
@@ -276,13 +328,16 @@ impl Value {
     }
 }
 
+/// Error text of a read that found the key gone; the key is counted as vanished, not copied.
+const VANISHED: &str = "key vanished";
+
 const TYPES: [&str; 6] = ["string", "list", "set", "hash", "zset", "stream"];
 
 fn read_value(source: &mut Connection, key: &[u8], kind: &str) -> Result<Value, String> {
     Ok(match kind {
         "string" => match source.call(&[b"GET", key])? {
             Resp::Bulk(Some(value)) => Value::Text(value),
-            _ => return Err("string vanished".into()),
+            _ => return Err(VANISHED.into()),
         },
         "list" => {
             let mut items = Vec::new();
@@ -421,6 +476,34 @@ fn next_stream_id(id: &[u8]) -> Result<Vec<u8>, String> {
     .into_bytes())
 }
 
+const STAGING_SUFFIX: &[u8] = b":import-tmp";
+
+/// A temporary name that hashes to the same slot as `key` (same hash tag, or `{key}` when it
+/// has no braces). None for a key with braces but no usable tag, where no same-slot name can
+/// be built by adding text; that key is replaced in place.
+fn staging_key(key: &[u8]) -> Option<Vec<u8>> {
+    let tag_end = key.iter().position(|byte| *byte == b'{').and_then(|open| {
+        key[open + 1..]
+            .iter()
+            .position(|byte| *byte == b'}')
+            .map(|close| (open, close))
+    });
+    let mut staging = Vec::with_capacity(key.len() + STAGING_SUFFIX.len() + 2);
+
+    match tag_end {
+        Some((_, close)) if close > 0 => staging.extend_from_slice(key),
+        _ if !key.contains(&b'{') && !key.contains(&b'}') => {
+            staging.push(b'{');
+            staging.extend_from_slice(key);
+            staging.push(b'}');
+        }
+        _ => return None,
+    }
+
+    staging.extend_from_slice(STAGING_SUFFIX);
+    Some(staging)
+}
+
 fn write_value(target: &mut Connection, key: &[u8], value: &Value) -> Result<(), String> {
     let mut commands: Vec<Vec<Vec<u8>>> = Vec::new();
 
@@ -494,8 +577,14 @@ pub fn run(
     options: &ImportOptions,
     progress: &mut dyn FnMut(&ImportReport),
 ) -> Result<ImportReport, String> {
-    let mut source = Connection::open(&parse_endpoint(&options.from)?)?;
-    let mut target = Connection::open(&parse_endpoint(&options.to)?)?;
+    let mut source = Connection::open(&endpoint_from_env(
+        &options.from,
+        "RUVIO_IMPORT_SOURCE_PASSWORD",
+    )?)?;
+    let mut target = Connection::open(&endpoint_from_env(
+        &options.to,
+        "RUVIO_IMPORT_TARGET_PASSWORD",
+    )?)?;
     let batch = options.batch.max(1).to_string();
     let mut report = ImportReport {
         by_type: TYPES.map(|name| (name, 0)),
@@ -557,22 +646,57 @@ pub fn run(
                 continue;
             };
 
-            if existing[index].int().unwrap_or(0) != 0 {
+            if existing[index].int()? != 0 {
                 report.skipped_existing += 1;
                 continue;
             }
 
             if !options.dry_run {
-                let value = read_value(&mut source, key, &kind)?.normalized();
+                let value = match read_value(&mut source, key, &kind) {
+                    Ok(value) => value.normalized(),
+                    Err(error) if error == VANISHED => {
+                        report.vanished += 1;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
 
-                if options.replace {
-                    target.call(&[b"DEL", key])?;
+                // An empty collection means the key went away after the probe: skip it before
+                // `--replace` deletes the target's copy. The deadline is read again so it does
+                // not include the time the copy took.
+                let ttl = if value.is_empty() {
+                    -2
+                } else {
+                    source.call(&[b"PTTL", key])?.int()?
+                };
+
+                if ttl == -2 {
+                    report.vanished += 1;
+                    continue;
                 }
 
-                write_value(&mut target, key, &value)?;
+                // `--replace` builds the copy under a temporary key in the same slot and
+                // renames it over the target's key, so a crash leaves the old value or the
+                // new one (with its TTL), never a half-written key.
+                let staging = if options.replace {
+                    staging_key(key)
+                } else {
+                    None
+                };
+                let destination: &[u8] = staging.as_deref().unwrap_or(key);
+
+                if options.replace {
+                    target.call(&[b"DEL", destination])?;
+                }
+
+                write_value(&mut target, destination, &value)?;
 
                 if ttl > 0 {
-                    target.call(&[b"PEXPIRE", key, ttl.to_string().as_bytes()])?;
+                    target.call(&[b"PEXPIRE", destination, ttl.to_string().as_bytes()])?;
+                }
+
+                if staging.is_some() {
+                    target.call(&[b"RENAME", destination, key])?;
                 }
 
                 if options.verify {
@@ -598,6 +722,26 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_password_missing_from_the_url_comes_from_the_variable() {
+        // Variable names unique to this test, so no other test reads or sets them.
+        let variable = "RUVIO_IMPORT_TEST_ONLY_PASSWORD";
+
+        assert!(
+            super::endpoint_from_env("redis://u:@h:1", variable)
+                .unwrap()
+                .password
+                .is_none()
+        );
+        assert_eq!(
+            super::endpoint_from_env("redis://u:pw@h:1", variable)
+                .unwrap()
+                .password
+                .as_deref(),
+            Some("pw")
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -627,11 +771,52 @@ mod tests {
     }
 
     #[test]
+    fn staging_key_keeps_the_slot_of_the_target() {
+        assert_eq!(
+            staging_key(b"user:1").as_deref(),
+            Some(&b"{user:1}:import-tmp"[..])
+        );
+        assert_eq!(
+            staging_key(b"post:{9001}:body").as_deref(),
+            Some(&b"post:{9001}:body:import-tmp"[..])
+        );
+        // No usable tag but braces present: no same-slot name exists by adding text.
+        assert_eq!(staging_key(b"a{}b"), None);
+        assert_eq!(staging_key(b"a}b{c"), None);
+        assert_eq!(staging_key(b"{open"), None);
+    }
+
+    #[test]
     fn normalizing_makes_unordered_reads_equal() {
         let a = Value::Set(vec![b"b".to_vec(), b"a".to_vec()]).normalized();
         let b = Value::Set(vec![b"a".to_vec(), b"b".to_vec()]).normalized();
 
         assert_eq!(a, b);
+    }
+
+    fn parse(bytes: &[u8]) -> Result<Resp, String> {
+        read_resp(&mut std::io::BufReader::new(bytes), 0)
+    }
+
+    #[test]
+    fn reads_replies_and_refuses_hostile_lengths() {
+        assert_eq!(
+            parse(b"*2\r\n$3\r\nabc\r\n:7\r\n").unwrap(),
+            Resp::Array(Some(vec![Resp::Bulk(Some(b"abc".to_vec())), Resp::Int(7)]))
+        );
+        assert_eq!(parse(b"$-1\r\n").unwrap(), Resp::Bulk(None));
+        assert!(parse(b"$9223372036854775807\r\n").is_err());
+        assert!(parse(b"$536870913\r\n").is_err());
+        assert!(parse(b"$5\r\nab").is_err(), "a short body is an error");
+        assert!(parse(b"*9223372036854775807\r\n").is_err());
+        assert!(parse(b"*67108865\r\n").is_err());
+
+        // A huge announced array with no items behind it fails when the data ends.
+        assert!(parse(b"*67108864\r\n").is_err());
+
+        let deep = b"*1\r\n".repeat(100_000);
+
+        assert!(parse(&deep).is_err());
     }
 
     #[test]

@@ -93,6 +93,40 @@ deadlines. Upgrade replicas and recovery tools before writing this opcode; older
 readers reject it. Retention, eviction and the RPO above still apply and do not
 provide exactly-once external side effects. See [IDEM.md](IDEM.md).
 
+## Moved slot ranges
+
+`RUVIO MOVESLOTS` records the slot ranges it moved between shards in the `SLOTS` file of
+the data directory (written to a temporary file, synced and renamed, so a restart reads
+either the old or the new file). Each entry names the range, the source and target shards,
+the target's first log sequence of the copy and the source's first sequence after the
+hand-over; an entry without the latter is a move that did not finish. Without the file every
+shard owns the slots the formula gives it.
+
+At start the slot table takes the finished moves, and each shard's recovery keeps, per slot,
+only what the shard held while it owned the slot: copies of an unfinished move are skipped,
+and keys of a range that left the shard are dropped after replay. The copy is logged on the
+target as `SlotCopy` records (WAL format minor 4), and the target syncs its log before the
+move is recorded, so a crash at any step leaves each key on exactly one shard. A damaged
+`SLOTS` file, or one written for another shard count, stops startup instead of falling back
+to the formula. Back the file up with the rest of the directory. A server with a `SLOTS` file
+refuses to start with replication on.
+
+### Ranges moving between groups
+
+A multi-node cluster moves ranges between groups (`COORDINATOR MOVE`, see `docs/COORDINATOR.md`) with
+the same file. The target shard logs a `SlotsIncoming` record when a range begins to arrive, its copies
+as `SlotCopy` records, and a second `SlotsIncoming` record once the whole copy is synced (prepared);
+the `SLOTS` file names the range as gained from another node. A restart before the prepared record
+skips the copies. A prepared range is kept, not served, until a cluster map gives it to the group,
+which completes it (a `SlotsArrived` record, WAL format minor 6, so replicas complete it from the
+log too), or `RUVIO MIGRATE CANCEL` drops it (a third `SlotsIncoming` record). The source logs a `SlotsGiven`
+record when a newer map gave the range away; its copy is dropped after replay. Both records are WAL
+format minor 5, and replicas follow both sides from them. While the map has not decided, each side
+also keeps the move in a small file of its data directory (`MIGRATE_IN` on the target, `MIGRATE_OUT`
+on the source): after a restart the source keeps the range frozen (`TRYAGAIN`) and both still accept
+`RUVIO MIGRATE CANCEL` with the move's id. A replica restarted with such a history keeps it with
+replication on.
+
 ## Recovery-Time Objective
 
 Startup time is the time to acquire `LOCK`, validate `CURRENT` and every
@@ -173,7 +207,12 @@ path.
 ## Upgrade
 
 An upgrade keeps the data directory and replaces the `ruvio` binary. Shard
-count, durability profile, and format major must stay the same. Changing
+count, durability profile, and format major must stay the same. A new release reads the logs of
+older ones, but not the other way round: every log segment a release opens carries its WAL format
+minor in the header (minor 6 in this release; 0.3.4 wrote 3 and refuses anything above it), so once
+the upgraded server has started, the data directory cannot be opened by the earlier release, slot
+moves or not. To go back, restore the backup taken before the upgrade (step 2 below), or give the
+node a full copy from a primary of the older release with an empty data directory. Changing
 `shards` is a new directory, not an in-place upgrade.
 
 1. Stop `ruvio`. `backup` takes an exclusive `LOCK` and fails immediately if the
@@ -187,17 +226,33 @@ count, durability profile, and format major must stay the same. Changing
 6. `redis-cli PING`, then `INFO server` and confirm `ruvio_readiness:ready`
    and a known key.
 
+With replication, a primary and its replicas must run the same release when the
+replication handshake changed between the two (the release notes say so); see
+*Promote a replica by hand* below. To upgrade such a group without losing
+acknowledged writes, either stop every member and run the steps above on each
+(primary first when starting again), or switch over to upgraded replicas: stop
+writes on the primary (`CONFIG SET min-replicas-to-write` above its replica count),
+wait until every replica holds what the primary has (steps 2 and 3 of *Promote a
+replica by hand*), upgrade and restart the replicas, stop the primary, promote one replica
+(`REPLICAOF NO ONE` on it, `REPLICAOF host port` on the others), and start the old
+primary with the new binary as a replica. Under `ruvio coordinator` the coordinators
+do the promotion; see [COORDINATOR.md](COORDINATOR.md#data-nodes), which also
+covers the order for the coordinators themselves.
+
 Host and cluster examples live in `deploy/`. Give the process one core per
 shard. Set `LimitNOFILE` above `max_global` (the example uses 65535). Size the
-volume for the data set plus WAL until the next checkpoint. `GET /metrics` on
-`metrics_address` is the scrape endpoint. It is not a readiness probe. Readiness
+volume for the data set plus WAL until the next checkpoint. `INFO prometheus` is the
+metrics read. It is not a readiness probe. Readiness
 is the RESP port opening, because the listen happens after recovery.
 `INFO server` reports `ruvio_health:ok` and `ruvio_readiness:ready` once that
 listen has started.
 
 ## Promote a replica by hand
 
-The process does not elect a primary. You stop writers, wait until the replica's disk matches the primary's durable WAL, then start that data directory as the writer. Do this on every shard. Shard `i` is the RESP port plus `i`, and the same offset on the replication port.
+To have this done automatically when a primary stops answering, run coordinators; see
+[COORDINATOR.md](COORDINATOR.md). The steps below are what they automate.
+
+The process does not elect a primary. You stop writers, wait until the replica's disk matches the primary's durable WAL, then make the replica the writer: with `REPLICAOF NO ONE` while it runs, or by restarting its data directory as the writer. Either way every shard is promoted. Shard `i` is the RESP port plus `i`, and the same offset on the replication port.
 
 `redis-cli -p <port> INFO` prints a `# Replication` block:
 
@@ -209,14 +264,17 @@ The process does not elect a primary. You stop writers, wait until the replica's
 | `replication_replicas` | Replica sockets connected to this primary. `0` on a replica |
 | `replication_replica_sequence` | Oldest sequence this primary has written to a connected replica socket |
 | `replication_send_lag` | `wal_durable_sequence` minus that oldest send |
+| `slave0`, `slave1`, ... | One line per replica that announced its client address and finished copying: `ip`, `port`, `state=online`, `offset` (acknowledged sequence), `lag` (seconds since its last acknowledgement) |
 
 `replication_send_lag` `0` means the bytes left the primary. The copy you can serve is the replica's `wal_durable_sequence`.
 
-1. Stop clients from writing to the primary. A replica answers `READONLY` to a write.
+1. Stop clients from writing to the primary. A replica answers `READONLY` to a write. Clients with a replica read policy may keep reading from replicas meanwhile; those reads can miss the last writes.
 2. On each primary shard, wait until `wal_last_sequence` equals `wal_durable_sequence`. With `everysec` this is the sync interval. With `always` they already match after an acknowledged write.
 3. On each replica shard, wait until `wal_durable_sequence` equals that same number. `replication_send_lag` `0` on the primary is not this check.
 4. If the replica's replication stream stopped because a WAL prefix was missing and no checkpoint covered it, do not treat it as complete. Its memory is the generation it had when the stream stopped. An interrupted snapshot/WAL catch-up leaves a durable per-shard `REPLICA_CATCHUP_0000` (and corresponding shard-numbered) marker. Reads return `LOADING`, then `MASTERDOWN` after 30 seconds if recovery stalls; neither response exposes partial data. While still configured as a replica, the process retries a fresh snapshot when the primary returns. Do not remove these marker files manually.
-5. Stop the replica process. Keep its data directory.
+5. **Without a restart:** send `REPLICAOF NO ONE` to the replica. Every shard applies what it already received, forks a new history one epoch up and takes writes; with `replication.listen` set it also ships to replicas. A shard that has not finished copying (a catch-up marker) refuses it; `REPLICAOF NO ONE FORCE` promotes it anyway, with the same meaning as `--force-promote-incomplete` below. A replica whose every shard is still copying answers `LOADING` to every command, so it is promoted with a restart. The role lasts until the process restarts: change `replication.role` in the config file too. Then go to step 7.
+
+   **With a restart:** stop the replica process and keep its data directory.
 6. Start that directory as the new writer. One process, no further replicas:
 
 ```toml
@@ -239,8 +297,8 @@ ruvio --config ./ruvio.toml --force-promote-incomplete
 ```
 
    The flag is CLI-only, not a config or environment setting, and is not saved to the config file. It bypasses the completion gate, **not** WAL/checkpoint corruption checks. The marker remains on disk: a later writer restart needs another explicit force decision. Force does not restore missing writes; keys, JSON documents, or transactions not copied before the failure may be absent. An incomplete replica cannot use this flag while its role is still `replica`.
-7. Point clients at the new process's RESP address.
-8. Leave the old primary stopped. Starting it again next to the new writer forks the history. Take a backup of the old directory if you still need it, then retire it.
+7. Point clients at the new process's RESP address. Point the other replicas at the new primary's replication address, with `REPLICAOF host port` or a restart with the new `replication.primary`: each continues from its own log when it stopped at or before the point where the new primary took over (see *Write history*), and takes a full copy otherwise. `ROLE` on each shard shows `master` or `slave` and the address it follows.
+8. Leave the old primary stopped. Starting it again next to the new writer forks the history. A replica that already follows the new primary refuses the old one (its epoch is lower), and the old primary refuses such a replica. Take a backup of the old directory if you still need it, then retire it.
 
 ### Write history
 
@@ -258,26 +316,72 @@ count.
 The id changes when the primary's history does:
 
 - A wiped data directory (including `HISTORY`) starts a new id.
-- `ruvio-ctl restore` removes `HISTORY` and every `UPSTREAM*` file from the
+- `ruvio-ctl restore` removes `HISTORY` and every `UPSTREAM*` and `LINEAGE*` file from the
   destination (backups never contain them), so a restored directory starts a new
   id on its first start and its former replicas take a full copy. This matters
   because a restored primary reuses sequence numbers its replicas may already
   hold: with the old id, a replica that is ahead would be refused only until the
   primary wrote past it, then resume and mix the two logs.
-- If you restore by copying files yourself, delete `HISTORY` and `UPSTREAM*` in
-  the restored directory before starting it.
+- If you restore by copying files yourself, delete `HISTORY`, `UPSTREAM*` and
+  `LINEAGE*` in the restored directory before starting it.
 
 A directory written by an older build has one shared `UPSTREAM` file. Shards that
 have no file of their own then claim no history, so each takes one full copy and
 records its own id.
 
+#### Promotion keeps the replicas' logs
+
+A writer shard keeps its lineage in `LINEAGE_0000`, `LINEAGE_0001`, ... (one file
+per shard): its history id, the history it forked from, the sequence where it
+forked, and an epoch. A shard whose last role was replica (it has an `UPSTREAM_####`
+record and no lineage) is being promoted. On that first start as a writer it takes
+a new id, records the history it followed as its parent, its last logged sequence
+as the fork, and the followed primary's epoch plus one. The file is written before
+the shard accepts a write and is not changed later; following a primary again
+removes it.
+
+A promoted primary lets a replica resume from its own log when the replica followed
+the parent history and stopped at or before the fork. A replica past the fork holds
+writes from the old primary that the new one never saw, so it takes a full copy.
+Without this every other replica took a full copy after a promotion.
+
+The epoch only grows. Replicas send the highest epoch they have followed, and the
+primary sends its own:
+
+- A primary refuses a replica that has followed a higher epoch (`Stale`): the
+  replica already follows a primary that replaced this one.
+- A replica does not follow a primary with a lower epoch than the one it followed.
+
+A shard whose last role was replica forks one epoch up whenever it starts as a
+writer, also when that start was only a restart with a primary's configuration
+and not a promotion. Pointed at the real primary afterwards with plain
+`REPLICAOF host port`, it would claim that newer epoch and fence the real
+primary. `REPLICAOF host port YIELD` (a Ruvio extension, what `ruvio coordinator`
+sends) makes every shard claim no epoch to the primary it is pointed at: it
+follows that primary whatever epoch it wrote or followed, and takes a full copy
+when its log does not continue the primary's history. The epoch recorded on disk
+is not lowered, so a restart before the primary accepts the shard forks above it
+as before. `YIELD` trusts that the named primary is the current one: pointed at
+an old primary, the shard drops the newer writes it held and does not fence it.
+Plain `REPLICAOF` keeps the fencing above.
+
+`INFO` does not show the lineage yet. A shard of a server that never replicated
+(role `off`, no `UPSTREAM_####`) writes no lineage file.
+
 Primary and replicas must run the same Ruvio version. The replication handshake
 carries a version; a primary refuses any other version with a `Version` status and
 logs a warning naming both versions, and a replica logs a warning when the primary
 refuses it or does not answer its handshake (an older primary cannot parse it and
-closes the link). Upgrade the primary and its replicas together.
+closes the link). Upgrade the primary and its replicas together (see *Upgrade*).
 
-`REPLICAOF` does not exist. Changing role is a restart with a new config.
+`REPLICAOF host port` makes a running primary or replica follow another primary
+without a restart: writes answer `READONLY` at once, and every shard resumes from
+its own log or takes a full copy by the rules above. A former primary that wrote
+past the point where its replacement forked loses those writes. `REPLICAOF` lasts
+until the process restarts; the config file's role applies again after that.
+
+`min-replicas-to-write` limits how long a primary cut off from its replicas keeps
+taking writes (see [CONFIGURATION.md](CONFIGURATION.md)).
 A client can block with `WAIT replicas milliseconds` until that many replicas
 have synced this shard's `wal_last_sequence` (in `port_mode = "single"` every shard's; in per-shard mode also the shards this connection's writes were forwarded to). The integer reply is the number
 that reached it. Timeout `0` waits until the process shuts down.

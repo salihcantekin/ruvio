@@ -5,6 +5,7 @@ import io.github.salihcantekin.ruvio.RuvioCodec;
 import io.github.salihcantekin.ruvio.RuvioException;
 import io.github.salihcantekin.ruvio.RuvioServerException;
 import io.github.salihcantekin.ruvio.internal.Args;
+import io.github.salihcantekin.ruvio.internal.Blocking;
 import io.github.salihcantekin.ruvio.internal.Reply;
 import io.github.salihcantekin.ruvio.internal.Request;
 import io.github.salihcantekin.ruvio.internal.RespOut;
@@ -339,6 +340,10 @@ public abstract class BaseCommands<K, V> {
 
     /** Sends a frame built with {@link Args}. */
     final <T> CompletableFuture<T> send(Args a, Reply<T> reply) {
+        // A blocking command's request carries its wait, which the synchronous facade adds to
+        // commandTimeoutMillis; every other command gets the plain request.
+        long wait = Blocking.waitMillis(a.out.buf, a.out.pos, a.count);
+        Request<T> request = wait == 0 ? req(reply) : Blocking.request(routed, reply, kc, vc, wait);
         RespOut o = begin();
         try {
             o.header(a.count);
@@ -346,7 +351,7 @@ public abstract class BaseCommands<K, V> {
         } catch (Throwable t) {
             throw fail(o, t);
         }
-        return end(o, req(reply));
+        return end(o, request);
     }
 
     /**

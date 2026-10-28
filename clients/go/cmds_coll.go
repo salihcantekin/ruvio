@@ -461,6 +461,14 @@ func (c *cmds) HSetBytes(ctx context.Context, key, field string, value []byte) (
 	return c.intR(ctx, newCmd(4, cHSET).s(key).s(field).b(value))
 }
 
+// HMSet sets fields of the hash at key like HSet but sends HMSET, which replies OK
+// instead of the count of new fields. Redis marks HMSET deprecated; prefer HSet.
+//
+//	err := c.HMSet(ctx, "user:1", "name", "Ada", "city", "London")
+func (c *cmds) HMSet(ctx context.Context, key string, fieldValues ...string) error {
+	return c.ok(ctx, newCmd(2+len(fieldValues), cHMSET).s(key).ss(fieldValues))
+}
+
 // HSetNX sets the field only when it does not exist (HSETNX) and returns true when it
 // wrote.
 func (c *cmds) HSetNX(ctx context.Context, key, field, value string) (bool, error) {
@@ -522,6 +530,30 @@ func (c *cmds) HVals(ctx context.Context, key string) ([]string, error) {
 // The field TTL is kept.
 func (c *cmds) HIncrBy(ctx context.Context, key, field string, delta int64) (int64, error) {
 	return c.intR(ctx, newCmd(4, cHINCRBY).s(key).s(field).i(delta))
+}
+
+// HIncrByWithTTL is HIncrBy that also sets a deadline on the key when the call creates
+// it (HINCRBY key field delta EX|PX). EX is sent for whole seconds, PX otherwise; an
+// existing hash keeps its deadline. A ttl of zero or less returns ErrInvalidTTL.
+func (c *cmds) HIncrByWithTTL(ctx context.Context, key, field string, delta int64, ttl time.Duration) (int64, error) {
+	tok, v, err := ttlArg(ttl)
+	if err != nil {
+		return 0, err
+	}
+	return c.intR(ctx, newCmd(6, cHINCRBY).s(key).s(field).i(delta).t(tok).i(v))
+}
+
+// HTransfer is Transfer between two integer fields of one hash (HTRANSFER key from to
+// amount). A missing to field starts at 0 and field TTLs stay. ok is false, and nothing
+// is written, when the key or the from field is missing or short or to would overflow.
+func (c *cmds) HTransfer(ctx context.Context, key, from, to string, amount int64) (fromAfter, toAfter int64, ok bool, err error) {
+	return c.pairNil(ctx, newCmd(5, cHTRANSFER).s(key).s(from).s(to).i(amount))
+}
+
+// HTransferMax is HTransfer that also refuses when to would end above max (HTRANSFER
+// ... MAX max).
+func (c *cmds) HTransferMax(ctx context.Context, key, from, to string, amount, max int64) (fromAfter, toAfter int64, ok bool, err error) {
+	return c.pairNil(ctx, newCmd(7, cHTRANSFER).s(key).s(from).s(to).i(amount).t(tMAX).i(max))
 }
 
 // HIncrByFloat adds a float to field and returns the new value (HINCRBYFLOAT). A missing

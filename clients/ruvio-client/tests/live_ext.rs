@@ -1,6 +1,6 @@
 //! Live tests for the commands and helpers added for full matrix coverage. Runs only when
 //! `RUVIO_TEST_ADDR` is set (e.g. `RUVIO_TEST_ADDR=127.0.0.1:17101 cargo test`). Each test
-//! owns one logical database (8 to 14, and 0 for `JSON.INDEX`, which is database-0 only) and
+//! owns one logical database (6 to 15, and 0 for `JSON.INDEX`, which is database-0 only) and
 //! flushes it first.
 
 mod common;
@@ -10,10 +10,10 @@ use std::time::Duration;
 
 use ruvio_client::{
     Aggregate, BitOperation, BitUnit, BloomInsertOptions, BloomReserveOptions, CacheOptions,
-    Client, Error, FillOutcome, GeoFrom, GeoOrder, GeoSearch, GeoShape, GeoUnit, IdemOutcome,
-    IdemState, JsonIndexType, JsonSetCondition, ListPositionOptions, ListSide, RangeBy,
-    RangeOptions, RespValue, RestoreOptions, SetMode, SortedSetAddOptions, SortedSetCombine,
-    SortedSetEntry,
+    Client, Error, ExpireCondition, FillOutcome, GeoFrom, GeoOrder, GeoSearch, GeoShape, GeoUnit,
+    IdemOutcome, IdemState, JsonIndexType, JsonSetCondition, ListPositionOptions, ListSide,
+    RangeBy, RangeOptions, RespValue, RestoreOptions, SetMode, SortedSetAddOptions,
+    SortedSetCombine, SortedSetEntry, StreamTrim,
 };
 
 fn connect(database: u32) -> Option<Client> {
@@ -60,6 +60,17 @@ fn ruvio_extension_strings_and_set_ifeq() {
     assert!(db.set_if_eq_keep_ttl("k", "v3", "v2").unwrap());
     assert!(db.pttl("k").unwrap() > 0);
     assert!(!db.set_if_eq("missing", "x", "y", None).unwrap());
+
+    assert!(db.set_if_greater("wm", 10, None).unwrap());
+    assert!(!db.set_if_greater("wm", 10, None).unwrap());
+    assert!(
+        db.set_if_greater("wm", 11, Some(Duration::from_secs(60)))
+            .unwrap()
+    );
+    assert!(db.pttl("wm").unwrap() > 0);
+    assert!(!db.set_if_less("wm", 12, None).unwrap());
+    assert!(db.set_if_less("wm", -1, None).unwrap());
+    assert_eq!(db.get("wm").unwrap(), Some(b"-1".to_vec()));
     assert!(!db.delex("k", "v2").unwrap());
     assert!(db.delex("k", "v3").unwrap());
     assert_eq!(db.exists_key("k").unwrap(), 0);
@@ -1052,6 +1063,70 @@ fn helpers_cache_idempotency_recent() {
         IdemState::Completed(vec![0, 1, 255])
     );
 
+    // Abort frees a pending record; a completed one is kept; another owner cannot abort.
+    assert_eq!(
+        db.idem_begin("pay:3", "fp", "worker-a", Duration::from_secs(60))
+            .unwrap(),
+        IdemState::Acquired
+    );
+    assert!(!db.idem_abort("pay:3", "fp", "worker-b").unwrap());
+    assert!(!db.idem_abort("pay:3", "other", "worker-a").unwrap());
+    assert!(db.idem_abort("pay:3", "fp", "worker-a").unwrap());
+    assert_eq!(
+        db.idem_begin("pay:3", "fp", "worker-b", Duration::from_secs(60))
+            .unwrap(),
+        IdemState::Acquired
+    );
+    assert!(
+        db.idem_complete("pay:3", "fp", "worker-b", b"done")
+            .unwrap()
+    );
+    assert!(!db.idem_abort("pay:3", "fp", "worker-b").unwrap());
+    assert_eq!(
+        db.idem_begin("pay:3", "fp", "worker-c", Duration::from_secs(60))
+            .unwrap(),
+        IdemState::Completed(b"done".to_vec())
+    );
+
+    // The helper with abort_on_error frees the key after a failing work function; the plain
+    // helper leaves it pending.
+    let failed = db.idempotent_abort_on_error(
+        "pay:4",
+        "fp",
+        "worker-a",
+        Duration::from_secs(60),
+        || -> Result<Vec<u8>, Error> { Err(Error::Protocol("boom".into())) },
+    );
+    assert!(failed.is_err());
+    assert_eq!(
+        db.idempotent("pay:4", "fp", "worker-b", Duration::from_secs(60), || Ok::<
+            _,
+            Error,
+        >(
+            b"ok:4".to_vec()
+        ))
+        .unwrap(),
+        IdemOutcome::Executed(b"ok:4".to_vec())
+    );
+    let failed = db.idempotent(
+        "pay:5",
+        "fp",
+        "worker-a",
+        Duration::from_secs(60),
+        || -> Result<Vec<u8>, Error> { Err(Error::Protocol("boom".into())) },
+    );
+    assert!(failed.is_err());
+    assert_eq!(
+        db.idempotent("pay:5", "fp", "worker-b", Duration::from_secs(60), || Ok::<
+            _,
+            Error,
+        >(
+            Vec::new()
+        ))
+        .unwrap(),
+        IdemOutcome::Pending
+    );
+
     // Recent items.
     for item in ["a", "b", "c", "d"] {
         db.push_recent("recent", 3, item).unwrap();
@@ -1060,4 +1135,214 @@ fn helpers_cache_idempotency_recent() {
     assert_eq!(db.recent("recent", 10).unwrap(), ["d", "c", "b"]);
     assert_eq!(db.recent("recent", 2).unwrap(), ["d", "c"]);
     assert!(db.recent("recent", 0).unwrap().is_empty());
+}
+
+/// A deadline is set when the call creates the key and kept by later calls.
+fn assert_deadline(db: &mut Client, key: &str, low_ms: i64, high_ms: i64) {
+    let left = db.pttl(key).unwrap();
+
+    assert!(
+        (low_ms..=high_ms).contains(&left),
+        "{key}: pttl {left} not in {low_ms}..={high_ms}"
+    );
+}
+
+#[test]
+fn ttl_on_create_sets_the_deadline_once() {
+    let Some(mut db) = connect(1) else { return };
+    let long = Duration::from_secs(1000);
+    let short = Duration::from_secs(100);
+
+    // Every command creates its key with the long deadline, then a second call with a short
+    // one must leave the long deadline alone.
+    assert_eq!(db.incr_with_ttl("incr", long).unwrap(), 1);
+    assert_eq!(db.incr_with_ttl("incr", short).unwrap(), 2);
+    assert_eq!(db.decr_with_ttl("decr", long).unwrap(), -1);
+    assert_eq!(db.decr_with_ttl("decr", short).unwrap(), -2);
+    assert_eq!(db.incr_by_with_ttl("incrby", 5, long).unwrap(), 5);
+    assert_eq!(db.incr_by_with_ttl("incrby", 5, short).unwrap(), 10);
+    assert_eq!(db.decr_by_with_ttl("decrby", 5, long).unwrap(), -5);
+    assert_eq!(db.decr_by_with_ttl("decrby", 5, short).unwrap(), -10);
+    assert_eq!(db.incr_by_max_with_ttl("cap", 1, 2, long).unwrap(), Some(1));
+    assert_eq!(
+        db.incr_by_max_with_ttl("cap", 1, 2, short).unwrap(),
+        Some(2)
+    );
+    assert_eq!(db.incr_by_max_with_ttl("cap", 1, 2, short).unwrap(), None);
+    assert_eq!(db.incr_by_float_with_ttl("float", 1.5, long).unwrap(), 1.5);
+    assert_eq!(db.incr_by_float_with_ttl("float", 1.0, short).unwrap(), 2.5);
+    assert_eq!(db.hincr_by_with_ttl("hash", "f", 1, long).unwrap(), 1);
+    assert_eq!(db.hincr_by_with_ttl("hash", "f", 1, short).unwrap(), 2);
+    assert_eq!(db.zincr_by_with_ttl("zset", "m", 1.0, long).unwrap(), 1.0);
+    assert_eq!(db.zincr_by_with_ttl("zset", "m", 1.0, short).unwrap(), 2.0);
+    assert!(!db.setbit_with_ttl("bits", 3, true, long).unwrap());
+    assert!(db.setbit_with_ttl("bits", 3, true, short).unwrap());
+
+    for key in [
+        "incr", "decr", "incrby", "decrby", "cap", "float", "hash", "zset", "bits",
+    ] {
+        assert_deadline(&mut db, key, 900_000, 1_000_000);
+    }
+
+    // A millisecond TTL uses PX.
+    db.incr_with_ttl("px", Duration::from_millis(500_500))
+        .unwrap();
+    assert_deadline(&mut db, "px", 400_000, 500_500);
+
+    // A refused capped increment creates nothing.
+    assert_eq!(db.incr_by_max_with_ttl("full", 5, 2, long).unwrap(), None);
+    assert_eq!(db.exists(&["full"]).unwrap(), 0);
+
+    // A key that already exists without a deadline gets none.
+    db.set("plain", "1").unwrap();
+    db.incr_with_ttl("plain", long).unwrap();
+    assert_eq!(db.pttl("plain").unwrap(), -1);
+
+    // The server refuses a zero TTL; the client refuses it before sending.
+    assert!(matches!(
+        db.incr_with_ttl("zero", Duration::ZERO),
+        Err(Error::Protocol(_))
+    ));
+    assert_eq!(db.exists(&["zero"]).unwrap(), 0);
+}
+
+#[test]
+fn ttl_on_create_for_zadd_geoadd_xadd_json_and_bloom() {
+    let Some(mut db) = connect(2) else { return };
+    let long = Duration::from_secs(1000);
+    let short = Duration::from_secs(100);
+    let options = |ttl| SortedSetAddOptions {
+        ttl: Some(ttl),
+        ..SortedSetAddOptions::default()
+    };
+
+    assert_eq!(db.zadd_with("z", options(long), &[("a", 1.0)]).unwrap(), 1);
+    assert_eq!(db.zadd_with("z", options(short), &[("b", 2.0)]).unwrap(), 1);
+    assert_eq!(
+        db.geo_add_with("g", options(long), &[(13.36, 38.11, "p")])
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.geo_add_with("g", options(short), &[(15.08, 37.5, "q")])
+            .unwrap(),
+        1
+    );
+
+    let id = db.xadd_with_ttl("s", long, "*", &[("f", "v")]).unwrap();
+    assert!(id.contains('-'));
+    db.xadd_with_ttl("s", short, "*", &[("f", "v")]).unwrap();
+    let trim = StreamTrim::max_len(10);
+    db.xadd_trim_with_ttl("st", long, &trim, "*", &[("f", "v")])
+        .unwrap();
+    db.xadd_trim_with_ttl("st", short, &trim, "*", &[("f", "v")])
+        .unwrap();
+
+    assert!(
+        db.json_set_with_ttl("j", "$", "{\"a\":1}", JsonSetCondition::Always, long)
+            .unwrap()
+    );
+    assert!(
+        db.json_set_with_ttl("j", "$.b", "2", JsonSetCondition::Always, short)
+            .unwrap()
+    );
+    assert!(
+        !db.json_set_with_ttl("jnx", "$", "{}", JsonSetCondition::IfExists, long)
+            .unwrap()
+    );
+    assert_eq!(db.exists(&["jnx"]).unwrap(), 0);
+
+    let bloom = |ttl| BloomInsertOptions {
+        ttl: Some(ttl),
+        ..BloomInsertOptions::default()
+    };
+    assert_eq!(db.bf_insert("bf", &bloom(long), &["x"]).unwrap(), [true]);
+    assert_eq!(db.bf_insert("bf", &bloom(short), &["y"]).unwrap(), [true]);
+
+    for key in ["z", "g", "s", "st", "j", "bf"] {
+        assert_deadline(&mut db, key, 900_000, 1_000_000);
+    }
+}
+
+#[test]
+fn expire_conditions() {
+    let Some(mut db) = connect(3) else { return };
+    let minute = Duration::from_secs(60);
+    let hour = Duration::from_secs(3600);
+
+    db.set("k", "v").unwrap();
+
+    // No deadline counts as infinite: GT and XX fail, LT and NX apply.
+    assert!(!db.expire_if("k", minute, ExpireCondition::Gt).unwrap());
+    assert!(!db.expire_if("k", minute, ExpireCondition::Xx).unwrap());
+    assert_eq!(db.pttl("k").unwrap(), -1);
+    assert!(db.expire_if("k", hour, ExpireCondition::Nx).unwrap());
+    assert!(!db.expire_if("k", minute, ExpireCondition::Nx).unwrap());
+    assert!(db.expire_if("k", minute, ExpireCondition::Lt).unwrap());
+    assert!(!db.expire_if("k", hour, ExpireCondition::Lt).unwrap());
+    assert!(db.expire_if("k", hour, ExpireCondition::Gt).unwrap());
+    assert!(
+        db.pexpire_if("k", Duration::from_secs(7200), ExpireCondition::Xx)
+            .unwrap()
+    );
+    assert!(!db.pexpire_if("k", hour, ExpireCondition::Gt).unwrap());
+    assert_deadline(&mut db, "k", 7_100_000, 7_200_000);
+
+    let now = std::time::SystemTime::now();
+    let soon = now + Duration::from_secs(60);
+    let later = now + Duration::from_secs(10_000) + Duration::from_millis(250);
+
+    assert!(!db.expire_at_if("k", soon, ExpireCondition::Gt).unwrap());
+    assert!(db.expire_at_if("k", soon, ExpireCondition::Lt).unwrap());
+    assert!(db.pexpire_at_if("k", later, ExpireCondition::Gt).unwrap());
+    assert!(!db.pexpire_at_if("k", soon, ExpireCondition::Gt).unwrap());
+    assert!(db.expire_at_if("k", later, ExpireCondition::Xx).unwrap());
+    assert_deadline(&mut db, "k", 9_000_000, 10_300_000);
+
+    // A missing key replies false for every condition.
+    assert!(!db.expire_if("none", minute, ExpireCondition::Nx).unwrap());
+}
+
+#[test]
+fn limit_sliding_and_tokens_modes() {
+    let Some(mut db) = connect(7) else { return };
+
+    assert_eq!(db.limit_sliding("rl:s", 2, 60_000).unwrap(), Some(1));
+    assert_eq!(db.limit_sliding("rl:s", 2, 60_000).unwrap(), Some(0));
+    let refused = db.limit_sliding_with_retry("rl:s", 2, 60_000).unwrap();
+    assert!(!refused.allowed && refused.remaining == 0 && refused.retry_after_ms > 0);
+    // A key keeps the mode it was created with.
+    assert!(db.limit_tokens("rl:s", 2, 60_000, 1).is_err());
+
+    assert_eq!(db.limit_tokens("rl:t", 5, 60_000, 2).unwrap(), Some(3));
+    let taken = db.limit_tokens_with_retry("rl:t", 5, 60_000, 3).unwrap();
+    assert!(taken.allowed && taken.remaining == 0 && taken.retry_after_ms == 0);
+    assert_eq!(db.limit_tokens("rl:t", 5, 60_000, 1).unwrap(), None);
+}
+
+#[test]
+fn transfer_and_htransfer_move_amounts_atomically() {
+    let Some(mut db) = connect(6) else { return };
+
+    db.set("{w}:a", "10").unwrap();
+    assert_eq!(
+        db.transfer("{w}:a", "{w}:b", 4, None).unwrap(),
+        Some((6, 4))
+    );
+    assert_eq!(db.transfer("{w}:a", "{w}:b", 7, None).unwrap(), None);
+    assert_eq!(db.transfer("{w}:a", "{w}:b", 3, Some(6)).unwrap(), None);
+    assert_eq!(
+        db.transfer("{w}:a", "{w}:b", 2, Some(6)).unwrap(),
+        Some((4, 6))
+    );
+    assert_eq!(db.transfer("{w}:none", "{w}:b", 1, None).unwrap(), None);
+    assert_eq!(db.get("{w}:a").unwrap().as_deref(), Some(&b"4"[..]));
+    assert!(db.transfer("{w}:a", "{w}:a", 1, None).is_err());
+    assert!(db.transfer("{w}:a", "{w}:b", 0, None).is_err());
+
+    db.hset("h", &[("f", "10")]).unwrap();
+    assert_eq!(db.htransfer("h", "f", "g", 4, None).unwrap(), Some((6, 4)));
+    assert_eq!(db.htransfer("h", "f", "g", 7, None).unwrap(), None);
+    assert_eq!(db.htransfer("h", "f", "g", 2, Some(5)).unwrap(), None);
+    assert_eq!(db.hget("h", "g").unwrap().as_deref(), Some("4"));
 }

@@ -159,19 +159,23 @@ test('stream transforms', () => {
   const e1 = ['1-0', ['f', 'v', 'g', 'w']];
   const e2 = ['2-0', null];
   assert.deepEqual(t.stream(null), []);
-  assert.deepEqual(t.stream([e1, e2]), [{ id: '1-0', fields: { f: 'v', g: 'w' } }, { id: '2-0', fields: {} }]);
-  assert.deepEqual(t.stream([[Buffer.from('3-0'), [Buffer.from('k'), 'v']]]), [{ id: '3-0', fields: { k: 'v' } }]);
+  assert.deepEqual(t.stream([e1, e2]), [{ id: '1-0', fields: [['f', 'v'], ['g', 'w']] }, { id: '2-0', fields: [] }]);
+  assert.deepEqual(t.stream([[Buffer.from('3-0'), [Buffer.from('k'), 'v']]]), [{ id: '3-0', fields: [['k', 'v']] }]);
+  // repeated names and numeric names keep their order
+  assert.deepEqual(t.stream([['4-0', ['f', '1', '2', 'x', 'f', '3', '1', 'y']]]), [
+    { id: '4-0', fields: [['f', '1'], ['2', 'x'], ['f', '3'], ['1', 'y']] },
+  ]);
   assert.deepEqual(t.streamOrIds(null), []);
   assert.deepEqual(t.streamOrIds(['1-0', '2-0']), ['1-0', '2-0'], 'XAUTOCLAIM JUSTID answers ids');
-  assert.deepEqual(t.streamOrIds([e1, null]), [{ id: '1-0', fields: { f: 'v', g: 'w' } }], 'deleted entries are dropped');
+  assert.deepEqual(t.streamOrIds([e1, null]), [{ id: '1-0', fields: [['f', 'v'], ['g', 'w']] }], 'deleted entries are dropped');
   assert.deepEqual(t.streamOrIds([]), []);
   assert.equal(t.xread(null), null);
-  assert.deepEqual(t.xread({ s: [e1] }), [{ key: 's', entries: [{ id: '1-0', fields: { f: 'v', g: 'w' } }] }]);
-  assert.deepEqual(t.xread([['s', [e1]]]), [{ key: 's', entries: [{ id: '1-0', fields: { f: 'v', g: 'w' } }] }]);
+  assert.deepEqual(t.xread({ s: [e1] }), [{ key: 's', entries: [{ id: '1-0', fields: [['f', 'v'], ['g', 'w']] }] }]);
+  assert.deepEqual(t.xread([['s', [e1]]]), [{ key: 's', entries: [{ id: '1-0', fields: [['f', 'v'], ['g', 'w']] }] }]);
   // an entry that came back without its wrapping list is accepted
-  assert.deepEqual(t.xread([['s', e1]]), [{ key: 's', entries: [{ id: '1-0', fields: { f: 'v', g: 'w' } }] }]);
+  assert.deepEqual(t.xread([['s', e1]]), [{ key: 's', entries: [{ id: '1-0', fields: [['f', 'v'], ['g', 'w']] }] }]);
   assert.deepEqual(t.xread([['s', null]]), [{ key: 's', entries: [] }]);
-  assert.deepEqual(t.autoclaim(['0-0', [e1], ['9-0']]), { next: '0-0', entries: [{ id: '1-0', fields: { f: 'v', g: 'w' } }], deleted: ['9-0'] });
+  assert.deepEqual(t.autoclaim(['0-0', [e1], ['9-0']]), { next: '0-0', entries: [{ id: '1-0', fields: [['f', 'v'], ['g', 'w']] }], deleted: ['9-0'] });
   assert.deepEqual(t.autoclaim(['5-0', ['1-0'], null]), { next: '5-0', entries: ['1-0'], deleted: [] });
   assert.deepEqual(t.pendingSummary([3, '1-0', '3-0', [['c1', '2'], ['c2', Buffer.from('1')]]]), {
     count: 3,
@@ -324,6 +328,14 @@ test('parser: protocol violations throw RuvioError', () => {
     const p = new Parser();
     p.feed(Buffer.from(wire, 'latin1'));
     assert.throws(() => p.next(), (e: unknown) => e instanceof RuvioError && /bad integer/.test((e as Error).message), JSON.stringify(wire));
+  }
+});
+
+test('parser: a bulk or aggregate over the limit throws before it is read', () => {
+  for (const wire of ['$67108865\r\n', '*1048577\r\n', '%1048577\r\n', '=67108865\r\n', '*1\r\n$67108865\r\n']) {
+    const p = new Parser();
+    p.feed(Buffer.from(wire, 'latin1'));
+    assert.throws(() => p.next(), (e: unknown) => e instanceof RuvioError && /over the limit/.test((e as Error).message), JSON.stringify(wire));
   }
 });
 

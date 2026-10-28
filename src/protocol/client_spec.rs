@@ -201,6 +201,7 @@ const OPTION_SAMPLES: &[&[&str]] = &[
     &["MSETNX", "a", "1", "b", "2"],
     &["BLPOP", "a", "b", "0"],
     &["BZPOPMIN", "a", "b", "1.5"],
+    &["ZMOVEDUE", "a", "b", "10"],
     &["JSON.MGET", "a", "b", "$.x"],
     &["BITOP", "OR", "d", "a", "b", "c"],
     &["DEL", "a", "b", "c"],

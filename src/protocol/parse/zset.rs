@@ -331,6 +331,85 @@ pub(in crate::protocol) fn parse_sorted_set_pop<'a>(args: &Args<'a, '_>, max: bo
     })
 }
 
+/// Most members one `ZPOPBYSCORE`/`ZMOVEDUE` call takes, so one call's work stays bounded.
+pub(crate) const MAX_DUE_COUNT: usize = 10_000;
+
+fn parse_due_count(bytes: &[u8]) -> Result<usize, ProtocolError> {
+    let parsed = parse_i64(bytes)?;
+
+    match usize::try_from(parsed) {
+        Ok(count) if (1..=MAX_DUE_COUNT).contains(&count) => Ok(count),
+        _ => Err(ProtocolError::Invalid("count is out of range")),
+    }
+}
+
+/// `ZPOPBYSCORE key max [MIN min] [COUNT n] [WITHSCORES]`.
+pub(in crate::protocol) fn parse_sorted_set_pop_by_score<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
+    if args.len() < 2 {
+        return Err(ProtocolError::Invalid(
+            "wrong number of arguments for 'zpopbyscore' command",
+        ));
+    }
+
+    let max = parse_score_bound(args.bytes(1))?;
+    let mut min = ScoreBound::NegInf;
+    let mut count = 1;
+    let mut with_scores = false;
+    let mut index = 2;
+
+    while index < args.len() {
+        let option = args.bytes(index);
+
+        if option.eq_ignore_ascii_case(b"WITHSCORES") {
+            with_scores = true;
+            index += 1;
+        } else if option.eq_ignore_ascii_case(b"MIN") && index + 1 < args.len() {
+            min = parse_score_bound(args.bytes(index + 1))?;
+            index += 2;
+        } else if option.eq_ignore_ascii_case(b"COUNT") && index + 1 < args.len() {
+            count = parse_due_count(args.bytes(index + 1))?;
+            index += 2;
+        } else {
+            return Err(ProtocolError::Invalid("syntax error"));
+        }
+    }
+
+    Ok(Command::SortedSetPopByScore {
+        key: args.arg(0),
+        min,
+        max,
+        count,
+        with_scores,
+    })
+}
+
+/// `ZMOVEDUE source destination max [COUNT n]`.
+pub(in crate::protocol) fn parse_sorted_set_move_due<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
+    if args.len() != 3 && args.len() != 5 {
+        return Err(ProtocolError::Invalid(
+            "wrong number of arguments for 'zmovedue' command",
+        ));
+    }
+
+    let max = parse_score_bound(args.bytes(2))?;
+    let mut count = 1;
+
+    if args.len() == 5 {
+        if !args.bytes(3).eq_ignore_ascii_case(b"COUNT") {
+            return Err(ProtocolError::Invalid("syntax error"));
+        }
+
+        count = parse_due_count(args.bytes(4))?;
+    }
+
+    Ok(Command::SortedSetMoveDue {
+        source: args.arg(0),
+        destination: args.arg(1),
+        max,
+        count,
+    })
+}
+
 pub(in crate::protocol) fn parse_sorted_set_remove_range<'a>(
     args: &Args<'a, '_>,
     name: &[u8],

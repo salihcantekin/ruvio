@@ -7,7 +7,7 @@
 
 use super::*;
 
-use crate::{engine::RespVersion, routing::hash_slot, routing::shard_for_slot};
+use crate::{engine::RespVersion, routing::SlotTable, routing::hash_slot};
 use std::sync::atomic::AtomicUsize;
 
 /// Data directories whose next commit before a forwarded command fails, once each.
@@ -115,6 +115,62 @@ pub(super) enum Message {
     /// Redis Cluster node answers for the node that took the command. One copy is shared by
     /// every destination; the receiver returns its reservation (see `Fabric::reserve_publish`).
     Publish(Arc<PublishDelivery>),
+    /// A change another shard made that every shard applies on its own thread (see
+    /// [`Forwarding::apply_everywhere`]).
+    Broadcast(Arc<Broadcast>),
+    /// A step of `RUVIO MOVESLOTS`.
+    Move(super::moveslots::MoveMessage),
+}
+
+/// Something every shard applies on its own thread, such as a `CONFIG SET`.
+pub(super) trait ShardChange: Send + Sync {
+    fn apply(&self, state: &ShardState);
+}
+
+/// One [`ShardChange`] handed to the other shards, shared by all of them.
+pub(super) struct Broadcast {
+    change: Box<dyn ShardChange>,
+    /// Shards that have not applied it yet.
+    pending: AtomicUsize,
+    done: tokio::sync::Notify,
+}
+
+impl Broadcast {
+    fn apply_on(&self, state: &ShardState) {
+        self.change.apply(state);
+
+        if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.done.notify_one();
+        }
+    }
+}
+
+impl Forwarding {
+    /// Sends `change` to every other shard and waits until each has applied it. The caller
+    /// applies it on its own shard. Nothing is sent with one shard.
+    pub(super) async fn apply_everywhere(&self, change: Box<dyn ShardChange>) {
+        let others = self.fabric.count - 1;
+
+        if others == 0 {
+            return;
+        }
+
+        let broadcast = Arc::new(Broadcast {
+            change,
+            pending: AtomicUsize::new(others),
+            done: tokio::sync::Notify::new(),
+        });
+
+        for dst in (0..self.fabric.count).filter(|&dst| dst != self.me) {
+            self.fabric
+                .send(self.me, dst, Message::Broadcast(Arc::clone(&broadcast)));
+        }
+
+        // `notify_one` keeps a permit when it runs before this waits.
+        while broadcast.pending.load(Ordering::Acquire) > 0 {
+            broadcast.done.notified().await;
+        }
+    }
 }
 
 /// One classic `PUBLISH` handed to the other shards.
@@ -149,12 +205,25 @@ pub(crate) struct Fabric {
     boxes: Vec<Mutex<Vec<Message>>>,
     /// Each shard's log and replica acknowledgements, so `WAIT` covers every shard.
     durability: Mutex<Vec<Option<ShardDurability>>>,
+    /// Which shard owns each hash slot (see [`SlotTable`]).
+    slots: SlotTable,
+    /// The primary lease from the coordinators, held for the whole process.
+    pub(super) lease: Arc<crate::primary_lease::LeaseTable>,
+    /// The newest `CONFIG SET` configuration and its version (see `live`).
+    pub(super) config: Mutex<super::live::ConfigAuthority>,
+    /// Slot moves between these shards.
+    pub(super) mover: super::moveslots::SlotMover,
+    /// Ranges moving to or from another node.
+    pub(super) migrations: super::migrate::Migrations,
+    /// The cluster map when this node is one of several; set before any shard serves.
+    topology: std::sync::OnceLock<crate::topology::SharedTopology>,
 }
 
 #[derive(Clone)]
 pub(super) struct ShardDurability {
     pub(super) wal: Arc<Mutex<crate::persistence::WalSink>>,
     pub(super) acks: Arc<crate::replication::DurableAcks>,
+    pub(super) replies: Arc<crate::replication::DurableReplies>,
 }
 
 impl Fabric {
@@ -173,7 +242,40 @@ impl Fabric {
                 .collect(),
             boxes: (0..count * count).map(|_| Mutex::new(Vec::new())).collect(),
             durability: Mutex::new(vec![None; count]),
+            slots: SlotTable::from_formula(count),
+            config: Mutex::new(super::live::ConfigAuthority::default()),
+            mover: super::moveslots::SlotMover::default(),
+            migrations: super::migrate::Migrations::default(),
+            topology: std::sync::OnceLock::new(),
+            lease: Arc::default(),
         })
+    }
+
+    /// Makes this node one of a multi-node cluster: the slots of other groups point past
+    /// the local shards (see [`crate::topology::Topology::apply`]).
+    pub(crate) fn set_topology(&self, topology: crate::topology::Topology) {
+        match self.topology.get() {
+            // A newer map keeps this node's slots (and the moves between its shards); only
+            // the other groups' entries are rewritten.
+            Some(shared) => {
+                for (slot, owner) in topology.placement(self.count).into_iter().enumerate() {
+                    if usize::from(owner) >= self.count {
+                        self.slots.assign(slot as u16, usize::from(owner));
+                    }
+                }
+                shared.replace(topology);
+            }
+            None => {
+                topology.apply(&self.slots, self.count);
+                let _ = self
+                    .topology
+                    .set(crate::topology::SharedTopology::new(topology));
+            }
+        }
+    }
+
+    pub(crate) fn topology(&self) -> Option<&crate::topology::SharedTopology> {
+        self.topology.get()
     }
 
     pub(super) fn register_durability(&self, shard: usize, durability: ShardDurability) {
@@ -190,6 +292,30 @@ impl Fabric {
             .iter()
             .flatten()
             .cloned()
+            .collect()
+    }
+
+    /// Each shard's replicas, or the primary it follows, by shard index; a shard not yet
+    /// registered has none.
+    pub(super) fn shard_peers(&self) -> Vec<crate::runtime::cluster::ShardPeers> {
+        let durability = self
+            .durability
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+
+        durability
+            .iter()
+            .map(|durability| {
+                durability
+                    .as_ref()
+                    .map(|durability| crate::runtime::cluster::ShardPeers {
+                        primary: durability.acks.primary(),
+                        following: durability.acks.following(),
+                        replicas: durability.acks.replicas(),
+                    })
+                    .unwrap_or_default()
+            })
             .collect()
     }
 
@@ -210,7 +336,18 @@ impl Fabric {
     }
 
     pub(super) fn owner_of(&self, key: &[u8]) -> usize {
-        shard_for_slot(hash_slot(key), self.count)
+        self.slots.owner(hash_slot(key))
+    }
+
+    /// The shard that owns `slot`.
+    #[inline]
+    pub(super) fn slot_owner(&self, slot: u16) -> usize {
+        self.slots.owner(slot)
+    }
+
+    /// Which shard owns each slot; shared with the cluster route of every shard.
+    pub(crate) fn slot_table(&self) -> SlotTable {
+        self.slots.clone()
     }
 
     pub(super) fn hand_off(&self, shard: usize, item: Handoff) {
@@ -234,7 +371,17 @@ impl Fabric {
         // Only the 0 -> non-zero transition wakes the target; a busy shard is already draining.
         let previous = self.ports[dst].mask.fetch_or(1 << src, Ordering::AcqRel);
 
-        if previous == 0 {
+        if previous == 0 && !defer_wake(dst) {
+            self.ports[dst].notify.notify_one();
+        }
+    }
+
+    /// Wakes every shard in `mask` (see [`run_doorbell`]).
+    fn ring(&self, mut mask: u64) {
+        while mask != 0 {
+            let dst = mask.trailing_zeros() as usize;
+
+            mask &= mask - 1;
             self.ports[dst].notify.notify_one();
         }
     }
@@ -283,6 +430,84 @@ impl Fabric {
                 .unwrap_or_else(|error| error.into_inner());
 
             into.append(&mut mailbox);
+        }
+    }
+}
+
+/// Waking another shard's thread is a syscall, and an inter-processor interrupt when that
+/// thread sleeps: on a VM it cost a sending shard over a third of its time when it forwarded
+/// most of its commands. A shard thread therefore only notes whom a send must wake, and its
+/// [`run_doorbell`] task wakes each of them once, after the tasks already queued this turn ran.
+/// Threads without a doorbell (tests, helper threads) wake at once.
+struct Doorbell {
+    fabric: Arc<Fabric>,
+    pending: Cell<u64>,
+    notify: tokio::sync::Notify,
+}
+
+thread_local! {
+    static DOORBELL: RefCell<Option<Rc<Doorbell>>> = const { RefCell::new(None) };
+}
+
+/// True when this thread's doorbell took the wake of `dst`.
+fn defer_wake(dst: usize) -> bool {
+    DOORBELL.with(|slot| {
+        let slot = slot.borrow();
+        let Some(doorbell) = slot.as_ref() else {
+            return false;
+        };
+        let pending = doorbell.pending.get();
+
+        if pending == 0 {
+            // Same-thread wake: the task goes to the back of this shard's run queue.
+            doorbell.notify.notify_one();
+        }
+        doorbell.pending.set(pending | 1 << dst);
+        true
+    })
+}
+
+/// Rings now every wake this thread deferred. For a shard that blocks its thread right after a
+/// send (and so would not reach its doorbell task until the wait ends).
+pub(super) fn ring_deferred_wakes() {
+    let doorbell = DOORBELL.with(|slot| slot.borrow().clone());
+
+    if let Some(doorbell) = doorbell {
+        doorbell.fabric.ring(doorbell.pending.replace(0));
+    }
+}
+
+/// Rings the wakes this shard's sends deferred, until the shard stops. Spawned on the shard's
+/// own `LocalSet` before it serves.
+pub(super) async fn run_doorbell(fabric: Arc<Fabric>) {
+    let doorbell = Rc::new(Doorbell {
+        fabric,
+        pending: Cell::new(0),
+        notify: tokio::sync::Notify::new(),
+    });
+    let _installed = DoorbellGuard::install(Rc::clone(&doorbell));
+
+    loop {
+        doorbell.notify.notified().await;
+        doorbell.fabric.ring(doorbell.pending.replace(0));
+    }
+}
+
+/// Removes the doorbell when its task ends and rings what it still owed, so no wake is lost
+/// and later sends on this thread wake at once.
+struct DoorbellGuard;
+
+impl DoorbellGuard {
+    fn install(doorbell: Rc<Doorbell>) -> Self {
+        DOORBELL.with(|slot| *slot.borrow_mut() = Some(doorbell));
+        Self
+    }
+}
+
+impl Drop for DoorbellGuard {
+    fn drop(&mut self) {
+        if let Some(doorbell) = DOORBELL.with(|slot| slot.borrow_mut().take()) {
+            doorbell.fabric.ring(doorbell.pending.replace(0));
         }
     }
 }
@@ -451,9 +676,21 @@ impl Forwarding {
     }
 }
 
+/// Most bytes a forwarding buffer reserves up front from a size hint, so one large value does
+/// not make every later batch allocate as much.
+const PRESIZE_LIMIT: usize = 16 * 1024;
+
 struct Lane {
     frames: Vec<u8>,
     count: u32,
+    /// Bytes the lane sent last time: the next batch reserves that much (up to
+    /// `PRESIZE_LIMIT`) at once instead of growing from empty; an idle lane holds no buffer.
+    last_bytes: usize,
+    /// Index of this lane's reply in `Forwarder::replies` once it was sent.
+    reply: usize,
+    /// Read cursor into the reply while it is spliced: commands and data bytes.
+    command: usize,
+    data_at: usize,
 }
 
 struct Mark {
@@ -469,6 +706,12 @@ pub(super) struct Forwarder {
     /// Bit `dst` is set once a command that may write went to shard `dst` (see
     /// `TxSession::forwarded_shards`). Reads do not count: a WAIT waits for writes.
     wrote: u64,
+    /// Kept between batches so a settle allocates nothing of its own.
+    tokens: Vec<u64>,
+    replies: Vec<Option<Reply>>,
+    arrived: Vec<Reply>,
+    /// The output after the first mark while answers are spliced in.
+    tail: Vec<u8>,
 }
 
 impl Forwarder {
@@ -478,11 +721,19 @@ impl Forwarder {
                 .map(|_| Lane {
                     frames: Vec::new(),
                     count: 0,
+                    last_bytes: 0,
+                    reply: 0,
+                    command: 0,
+                    data_at: 0,
                 })
                 .collect(),
             marks: Vec::new(),
             next_token: 1,
             wrote: 0,
+            tokens: Vec::new(),
+            replies: Vec::new(),
+            arrived: Vec::new(),
+            tail: Vec::new(),
         }
     }
 
@@ -508,12 +759,17 @@ impl Forwarder {
             self.wrote |= 1 << dst;
         }
 
+        if lane.frames.capacity() == 0 {
+            lane.frames
+                .reserve(lane.last_bytes.min(PRESIZE_LIMIT).max(frame.len()));
+        }
         lane.frames.extend_from_slice(frame);
         lane.count += 1;
         self.marks.push(Mark { dst, offset });
     }
 
-    /// Sends the queued frames and waits for every reply. Returns the lane order and replies.
+    /// Sends the queued frames and waits for every reply. The replies land in `replies` in
+    /// shard order; each lane sent records its index there.
     async fn exchange(
         &mut self,
         forwarding: &Forwarding,
@@ -521,10 +777,13 @@ impl Forwarder {
         conn: u64,
         session: &TxSession,
         auth: &crate::acl::ConnectionAuth,
-    ) -> io::Result<(Vec<(usize, u64)>, Vec<Reply>)> {
-        let mut tokens: Vec<(usize, u64)> = Vec::new();
+    ) -> io::Result<()> {
+        self.tokens.clear();
+        self.replies.clear();
 
         for (dst, lane) in self.lanes.iter_mut().enumerate() {
+            // A lane not sent this time has no reply: a mark left for it fails loudly.
+            lane.reply = usize::MAX;
             if lane.count == 0 {
                 continue;
             }
@@ -532,7 +791,9 @@ impl Forwarder {
             let token = self.next_token;
 
             self.next_token += 1;
-            tokens.push((dst, token));
+            lane.reply = self.tokens.len();
+            lane.last_bytes = lane.frames.len();
+            self.tokens.push(token);
             forwarding.fabric.send(
                 forwarding.me,
                 dst,
@@ -553,15 +814,16 @@ impl Forwarder {
             lane.count = 0;
         }
 
-        let mut replies: Vec<Option<Reply>> = tokens.iter().map(|_| None).collect();
-        let mut missing = tokens.len();
+        self.replies.resize_with(self.tokens.len(), || None);
+        let mut missing = self.tokens.len();
 
         while missing > 0 {
-            let arrived: Vec<Reply> = entry.ready.borrow_mut().drain(..).collect();
+            // Swapped, not drained into a new Vec: both buffers keep their capacity.
+            std::mem::swap(&mut *entry.ready.borrow_mut(), &mut self.arrived);
 
-            for reply in arrived {
-                if let Some(index) = tokens.iter().position(|(_, token)| *token == reply.token) {
-                    replies[index] = Some(reply);
+            for reply in self.arrived.drain(..) {
+                if let Some(index) = self.tokens.iter().position(|token| *token == reply.token) {
+                    self.replies[index] = Some(reply);
                     missing -= 1;
                 }
             }
@@ -571,12 +833,7 @@ impl Forwarder {
             }
         }
 
-        let replies = replies
-            .into_iter()
-            .map(|reply| reply.expect("reply arrived"))
-            .collect();
-
-        Ok((tokens, replies))
+        Ok(())
     }
 
     /// Sends the queued frames, waits for every reply and splices them into `output`.
@@ -593,35 +850,64 @@ impl Forwarder {
             return Ok(());
         }
 
-        let (tokens, replies) = self
-            .exchange(forwarding, entry, conn, session, auth)
+        self.exchange(forwarding, entry, conn, session, auth)
             .await?;
-        let old = output.to_vec();
-        let mut cursors = vec![(0usize, 0usize); tokens.len()];
-        let mut written = 0usize;
 
-        output.clear();
+        let spliced = self.splice(output);
 
-        for mark in self.marks.drain(..) {
-            let lane = tokens
-                .iter()
-                .position(|(dst, _)| *dst == mark.dst)
-                .expect("lane was sent");
-            let reply = &replies[lane];
-            let (command, data_at) = &mut cursors[lane];
-            let length =
-                *reply.lens.get(*command).ok_or_else(|| {
-                    io::Error::other("forwarded reply is shorter than its request")
-                })? as usize;
+        self.marks.clear();
+        self.replies.clear();
+        spliced
+    }
 
-            output.write_all(&old[written..mark.offset])?;
-            written = mark.offset;
-            output.write_all(&reply.data[*data_at..*data_at + length])?;
-            *data_at += length;
-            *command += 1;
+    /// Puts each lane's answers at their marks in `output`. Only the bytes after the first mark
+    /// are set aside and written back around the answers; the part before it stays in place.
+    fn splice(&mut self, output: &mut BoundedOutput) -> io::Result<()> {
+        // An output already past its limit is rebuilt from the start, so the limit cuts it
+        // again where the answers now fall.
+        let first = if output.exceeded() {
+            0
+        } else {
+            self.marks.first().map_or(0, |mark| mark.offset)
+        };
+
+        self.tail.clear();
+        self.tail.extend_from_slice(&output[first..]);
+        if first == 0 {
+            output.clear();
+        } else {
+            output.truncate_to(first);
+        }
+        for lane in &mut self.lanes {
+            lane.command = 0;
+            lane.data_at = 0;
         }
 
-        output.write_all(&old[written..])?;
+        let mut written = first;
+
+        for mark in &self.marks {
+            let lane = &mut self.lanes[mark.dst];
+            let reply = self.replies[lane.reply].as_ref().expect("reply arrived");
+            let length =
+                *reply.lens.get(lane.command).ok_or_else(|| {
+                    io::Error::other("forwarded reply is shorter than its request")
+                })? as usize;
+            let answer = reply
+                .data
+                .get(lane.data_at..lane.data_at + length)
+                .ok_or_else(|| io::Error::other("forwarded reply is shorter than its lengths"))?;
+
+            output.write_all(&self.tail[written - first..mark.offset - first])?;
+            written = mark.offset;
+            output.write_all(answer)?;
+            lane.data_at += length;
+            lane.command += 1;
+        }
+
+        output.write_all(&self.tail[written - first..])?;
+        if self.tail.capacity() > PRESIZE_LIMIT {
+            self.tail = Vec::new();
+        }
         Ok(())
     }
 
@@ -642,11 +928,14 @@ impl Forwarder {
         }
 
         self.marks.clear();
-        let (_, replies) = self
-            .exchange(forwarding, entry, conn, session, auth)
+        self.exchange(forwarding, entry, conn, session, auth)
             .await?;
 
-        Ok(replies.into_iter().map(|reply| reply.data).collect())
+        Ok(self
+            .replies
+            .drain(..)
+            .map(|reply| reply.expect("reply arrived").data)
+            .collect())
     }
 }
 
@@ -815,6 +1104,10 @@ pub(super) async fn remote_loop(state: Rc<ShardState>, shutdown: ShutdownToken) 
                     forwarding.fabric.release_publish(forwarding.me, &delivery);
                 }
 
+                Message::Broadcast(broadcast) => broadcast.apply_on(&state),
+
+                Message::Move(message) => super::moveslots::on_message(&state, message),
+
                 Message::Cancel { src, conn } => {
                     if let Some(cancel) = forwarding.blocked.borrow().get(&(src, conn)) {
                         cancel.cancel();
@@ -823,6 +1116,25 @@ pub(super) async fn remote_loop(state: Rc<ShardState>, shutdown: ShutdownToken) 
 
                 Message::Unwatch { src, conn } => {
                     state.store.borrow_mut().unwatch(remote_id(src, conn));
+                }
+
+                // Every key of it now belongs to another shard (see `SlotMover::moved`).
+                Message::Request(request)
+                    if forwarding.fabric.mover.moved()
+                        && super::moveslots::request_owner(
+                            &state,
+                            &request.frames,
+                            request.count,
+                        )
+                        .is_some() =>
+                {
+                    let owner =
+                        super::moveslots::request_owner(&state, &request.frames, request.count)
+                            .unwrap_or(forwarding.me);
+
+                    forwarding
+                        .fabric
+                        .send(forwarding.me, owner, Message::Request(request));
                 }
 
                 Message::Request(request) if request.spawn => {
@@ -1031,8 +1343,12 @@ async fn execute_request_in(
         rules: Arc::clone(&request.rules),
     };
     let mut rate = CommandRateLimiter::new(0);
-    let mut output =
-        BoundedOutput::with_capacity(0, state.published_config.requests.max_output_buffer_bytes);
+    // Short answers (the common forwarded GET or SET) fit in the size of their requests, so
+    // the reply buffer is usually allocated once instead of growing from empty.
+    let mut output = BoundedOutput::with_capacity(
+        request.frames.len().min(PRESIZE_LIMIT),
+        state.live.max_output_buffer_bytes.get(),
+    );
     let mut lens = Vec::with_capacity(request.count as usize);
     let mut unlogged = Vec::new();
     let suspended = std::cell::Cell::new(false);
@@ -1085,7 +1401,22 @@ async fn execute_request_in(
 
                     (!waiters.is_empty()).then(|| waiters.unlogged_deliveries())
                 };
-                let failed = if synced {
+                // Routed here before another shard took the slot over: the client sends it
+                // again and reaches the new owner.
+                let misrouted = state
+                    .forwarding
+                    .as_ref()
+                    .is_some_and(|forwarding| forwarding.fabric.mover.moved())
+                    && super::moveslots::runs_elsewhere(state, &session, &command);
+                let failed = if misrouted {
+                    if matches!(command, Command::Exec) {
+                        state.store.borrow_mut().unwatch(id);
+                        session.finish_exec();
+                        session.clear_watches();
+                    }
+
+                    Some(super::moveslots::TRYAGAIN_REPLY)
+                } else if synced {
                     let dispatch = std::pin::pin!(dispatch_command(
                         state,
                         &mut output,
@@ -1189,6 +1520,8 @@ pub(super) fn forward_refusal(
 pub(super) enum Owner {
     Local,
     Remote(usize),
+    /// Another node of a multi-node cluster owns this slot: the answer is `MOVED`.
+    Node(u16),
     /// Keys live on different shards.
     Split,
 }
@@ -1228,13 +1561,15 @@ pub(super) fn command_owner(
         match crate::routing::command_slot(command) {
             Ok(None) => return (Owner::Local, true),
             Ok(Some(slot)) => {
-                let found = shard_for_slot(slot, forwarding.fabric.count);
+                let found = forwarding.fabric.slot_owner(slot);
 
                 return (
                     if found == forwarding.me {
                         Owner::Local
-                    } else {
+                    } else if found < forwarding.fabric.count {
                         Owner::Remote(found)
+                    } else {
+                        Owner::Node(slot)
                     },
                     true,
                 );
@@ -1250,7 +1585,12 @@ pub(super) fn command_owner(
         if hot && crate::hot_store::matches_hot_key(&state.published_config.hot_keys, key) {
             continue;
         }
-        let found = forwarding.fabric.owner_of(key);
+        let slot = hash_slot(key);
+        let found = forwarding.fabric.slot_owner(slot);
+
+        if found >= forwarding.fabric.count {
+            return (Owner::Node(slot), one_slot);
+        }
 
         match owner {
             None => owner = Some(found),
@@ -1273,11 +1613,34 @@ pub(super) fn command_owner(
 pub(super) fn hot_remote_owner(
     forwarding: &Forwarding,
     command: &crate::protocol::HotCommand<'_>,
-) -> Option<usize> {
+) -> Option<(usize, u16)> {
     let slot = hot_command_slot(command)?;
-    let owner = shard_for_slot(slot, forwarding.fabric.count);
+    let owner = forwarding.fabric.slot_owner(slot);
 
-    (owner != forwarding.me).then_some(owner)
+    (owner != forwarding.me).then_some((owner, slot))
+}
+
+/// Answers `MOVED` when another node of the cluster owns `slot` (`owner` is the slot
+/// table entry); `false` when the owner is a shard of this process.
+pub(super) fn redirect_to_node(
+    forwarding: &Forwarding,
+    output: &mut impl std::io::Write,
+    slot: u16,
+    owner: usize,
+) -> io::Result<bool> {
+    let count = forwarding.fabric.count;
+
+    if owner < count {
+        return Ok(false);
+    }
+    match forwarding.fabric.topology() {
+        Some(topology) => {
+            crate::runtime::cluster::write_moved(output, &topology.get(), slot, owner, count)?
+        }
+        None => output.write_all(b"-CLUSTERDOWN Hash slot not served\r\n")?,
+    }
+
+    Ok(true)
 }
 
 /// Sends queued foreign commands and splices their replies into `output`.
@@ -1578,7 +1941,7 @@ fn unwatch_remote(forwarding: &Forwarding, session: &TxSession, conn: u64) {
     let Some(slot) = session.watch_slot() else {
         return;
     };
-    let dst = shard_for_slot(slot, forwarding.fabric.count);
+    let dst = forwarding.fabric.slot_owner(slot);
 
     if dst != forwarding.me {
         forwarding.fabric.send(
@@ -1635,7 +1998,7 @@ pub(super) async fn forward_special(
                 let Some(slot) = slot else {
                     return Ok(false);
                 };
-                let dst = shard_for_slot(slot, shards);
+                let dst = forwarding.fabric.slot_owner(slot);
 
                 if session.watch_slot().is_some_and(|watched| watched != slot) {
                     unwatch_remote(forwarding, session, conn);
@@ -1643,6 +2006,18 @@ pub(super) async fn forward_special(
                     session.clear_watches();
                     log.clear();
                     output.write_all(CROSSSLOT_REPLY)?;
+
+                    return Ok(true);
+                }
+
+                // The watched keys moved to another shard since WATCH: they count as changed.
+                if session.watch_shard().is_some_and(|watches| watches != dst) {
+                    unwatch_remote(forwarding, session, conn);
+                    state.store.borrow_mut().unwatch(conn);
+                    session.finish_exec();
+                    session.clear_watches();
+                    log.clear();
+                    output.write_all(session.resp.null_aggregate())?;
 
                     return Ok(true);
                 }
@@ -1701,7 +2076,7 @@ pub(super) async fn forward_special(
             let slot = hash_slot(first);
             let crossed = matches!(owner, Owner::Split)
                 || session.watch_slot().is_some_and(|watched| {
-                    shard_for_slot(watched, shards) != shard_for_slot(slot, shards)
+                    forwarding.fabric.slot_owner(watched) != forwarding.fabric.slot_owner(slot)
                 });
 
             if crossed {
@@ -1728,7 +2103,7 @@ pub(super) async fn forward_special(
                 .await;
 
             if reply.data == b"+OK\r\n" {
-                session.accept_watch(slot, keys.len());
+                session.accept_watch(slot, keys.len(), *dst);
                 entry.remote_state.set(true);
             }
 
@@ -1767,6 +2142,7 @@ pub(super) async fn forward_special(
             pattern,
             count,
             type_name,
+            slot: None,
         } if state.single_port => {
             scan_all(
                 state,
@@ -1788,6 +2164,11 @@ pub(super) async fn forward_special(
 
         _ => match owner {
             Owner::Local => Ok(false),
+            Owner::Node(slot) => {
+                let owner = forwarding.fabric.slot_owner(*slot);
+
+                redirect_to_node(forwarding, output, *slot, owner)
+            }
             Owner::Split => {
                 output.write_all(SPLIT_REPLY)?;
 
@@ -1894,6 +2275,7 @@ async fn scan_all(
             pattern: pattern.map(std::borrow::Cow::Borrowed),
             count,
             type_name: type_name.map(std::borrow::Cow::Borrowed),
+            slot: None,
         };
         let mut local_out = BoundedOutput::with_capacity(0, usize::MAX);
 
@@ -1949,6 +2331,20 @@ async fn scan_all(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn keys_and_slots_are_routed_by_the_slot_table_not_the_formula() {
+        let fabric = Fabric::new(2);
+        let slot = crate::routing::hash_slot(b"user:1");
+        let formula = crate::routing::shard_for_slot(slot, 2);
+
+        assert_eq!(fabric.owner_of(b"user:1"), formula);
+        fabric.slots.assign(slot, 1 - formula);
+        assert_eq!(fabric.owner_of(b"user:1"), 1 - formula);
+        assert_eq!(fabric.slot_owner(slot), 1 - formula);
+        // The route each shard gets shares the same table.
+        assert_eq!(fabric.slot_table().owner(slot), 1 - formula);
+    }
+
+    #[test]
     fn publish_budget_bounds_messages_and_bytes_per_shard_and_is_returned_on_delivery() {
         let fabric = Fabric::new(2);
         let small = PublishDelivery {
@@ -2003,11 +2399,13 @@ mod tests {
         "ChangesSubscribe",
         "ClientGetName",
         "ClientId",
+        "ClientSetInfo",
         "ClientInfo",
         "ClientKill",
         "ClientList",
         "ClientSetName",
         "ClientTracking",
+        "ClientDurability",
         "ClusterInfo",
         "ClusterKeySlot",
         "ClusterMyId",
@@ -2016,6 +2414,12 @@ mod tests {
         "ClusterSlots",
         "CommandMeta",
         "ConfigGet",
+        "ConfigRewrite",
+        "ConfigSet",
+        "ReplicaOf",
+        "MoveSlots",
+        "Topology",
+        "Role",
         "Discard",
         "Echo",
         "Eval",
@@ -2111,5 +2515,158 @@ mod tests {
         let error = b"-MISCONF persistence error\r\n";
         assert_eq!(reply.lens, [error.len() as u32, 4, error.len() as u32]);
         assert_eq!(reply.data, [&error[..], b":0\r\n", error].concat());
+    }
+
+    /// Queues one mark per `(dst, offset)` and hands each lane its reply, as `exchange` does.
+    fn forwarder_with(marks: &[(usize, usize)], replies: &[(usize, &[&[u8]])]) -> Forwarder {
+        let mut forwarder = Forwarder::new(4);
+
+        load(&mut forwarder, marks, replies);
+        forwarder
+    }
+
+    fn load(forwarder: &mut Forwarder, marks: &[(usize, usize)], replies: &[(usize, &[&[u8]])]) {
+        forwarder.marks.clear();
+        forwarder.replies.clear();
+        for &(dst, offset) in marks {
+            forwarder.push(dst, b"", offset, false);
+        }
+        for (index, (dst, answers)) in replies.iter().enumerate() {
+            forwarder.lanes[*dst].reply = index;
+            forwarder.lanes[*dst].count = 0;
+            forwarder.replies.push(Some(Reply {
+                conn: 1,
+                token: index as u64,
+                lens: answers.iter().map(|answer| answer.len() as u32).collect(),
+                data: answers.concat(),
+                unlogged: Vec::new(),
+            }));
+        }
+    }
+
+    fn output_of(bytes: &[u8], maximum: usize) -> BoundedOutput {
+        let mut output = BoundedOutput::with_capacity(0, maximum);
+
+        output.write_all(bytes).unwrap();
+        output
+    }
+
+    #[test]
+    fn spliced_replies_land_at_their_marks_between_local_answers() {
+        // local "+A" | lane 1 | local "+B" | lane 2 | lane 1 | local "+C"
+        let mut forwarder = forwarder_with(
+            &[(1, 4), (2, 8), (1, 8)],
+            &[(1, &[b":1\r\n", b":2\r\n"]), (2, &[b"$1\r\nx\r\n"])],
+        );
+        let mut output = output_of(b"+A\r\n+B\r\n+C\r\n", 1 << 20);
+
+        forwarder.splice(&mut output).unwrap();
+        assert_eq!(&*output, b"+A\r\n:1\r\n+B\r\n$1\r\nx\r\n:2\r\n+C\r\n");
+    }
+
+    /// The splice as it was first written: the whole output copied aside and written back.
+    fn copying_splice(
+        output: &mut BoundedOutput,
+        marks: &[(usize, usize)],
+        lanes: &[(usize, &[&[u8]])],
+    ) {
+        let old = output.to_vec();
+        let mut taken = [0usize; 4];
+        let mut written = 0;
+
+        output.clear();
+        for &(dst, offset) in marks {
+            let answers = lanes.iter().find(|(lane, _)| *lane == dst).unwrap().1;
+
+            output.write_all(&old[written..offset]).unwrap();
+            written = offset;
+            output.write_all(answers[taken[dst]]).unwrap();
+            taken[dst] += 1;
+        }
+        output.write_all(&old[written..]).unwrap();
+    }
+
+    #[test]
+    fn splice_matches_copying_the_whole_output_for_every_layout_and_limit() {
+        let answers: [&[u8]; 3] = [b"+OK\r\n", b"$3\r\nabc\r\n", b":-1\r\n"];
+
+        for layout in 0u32..512 {
+            let mut marks = Vec::new();
+            let mut local = Vec::new();
+            let mut counts = [0usize; 4];
+
+            for step in 0..9 {
+                if layout >> step & 1 == 1 {
+                    local.extend_from_slice(b"+L\r\n");
+                }
+                let dst = 1 + (layout as usize + step) % 3;
+
+                marks.push((dst, local.len()));
+                counts[dst] += 1;
+            }
+            local.extend_from_slice(b"+E\r\n");
+
+            let lanes: Vec<(usize, Vec<&[u8]>)> = (1..4)
+                .filter(|dst| counts[*dst] > 0)
+                .map(|dst| {
+                    (
+                        dst,
+                        (0..counts[dst]).map(|i| answers[(i + dst) % 3]).collect(),
+                    )
+                })
+                .collect();
+            let lanes: Vec<(usize, &[&[u8]])> =
+                lanes.iter().map(|(dst, list)| (*dst, &list[..])).collect();
+
+            // Roomy, cut inside the answers, exactly full, and already past the limit.
+            for (maximum, overflow) in [
+                (1 << 20, false),
+                (local.len() + 20, false),
+                (local.len(), false),
+                (local.len() + 20, true),
+            ] {
+                let mut forwarder = forwarder_with(&marks, &lanes);
+                let mut output = output_of(&local, maximum);
+                let mut expected = output_of(&local, maximum);
+
+                if overflow {
+                    output.write_all(&[b'x'; 64]).unwrap();
+                    expected.write_all(&[b'x'; 64]).unwrap();
+                }
+                forwarder.splice(&mut output).unwrap();
+                copying_splice(&mut expected, &marks, &lanes);
+                assert_eq!(&*output, &*expected, "layout {layout:b}, limit {maximum}");
+                assert_eq!(output.exceeded(), expected.exceeded());
+            }
+        }
+    }
+
+    #[test]
+    fn a_splice_past_the_output_limit_is_cut_at_the_first_piece_that_does_not_fit() {
+        let mut forwarder = forwarder_with(&[(1, 4), (1, 8)], &[(1, &[b":1\r\n", b":2\r\n"])]);
+        let mut output = output_of(b"+A\r\n+B\r\n+C\r\n", 18);
+
+        forwarder.splice(&mut output).unwrap();
+        assert!(output.exceeded());
+        assert_eq!(&*output, b"+A\r\n:1\r\n+B\r\n:2\r\n");
+    }
+
+    #[test]
+    fn a_reply_shorter_than_its_request_is_an_error_and_the_next_splice_still_works() {
+        let mut forwarder = forwarder_with(&[(1, 0), (1, 0)], &[(1, &[b":1\r\n"])]);
+        let mut output = output_of(b"", 1 << 20);
+
+        assert!(forwarder.splice(&mut output).is_err());
+
+        // The connection is closed on that error; a later batch starts from its own output.
+        let mut output = output_of(b"", 1 << 20);
+
+        load(
+            &mut forwarder,
+            &[(2, 0), (1, 0)],
+            &[(2, &[b":7\r\n"]), (1, &[b":8\r\n"])],
+        );
+        forwarder.splice(&mut output).unwrap();
+        assert_eq!(&*output, b":7\r\n:8\r\n");
     }
 }

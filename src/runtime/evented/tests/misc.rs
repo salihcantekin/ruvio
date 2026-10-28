@@ -142,6 +142,73 @@ fn config_get_in_a_transaction_answers_the_running_settings() {
     join_within(server, PATIENCE).unwrap();
 }
 
+/// `EVAL`, `EVALSHA` and `FCALL` queue in `MULTI` and run in their place at `EXEC`, seeing
+/// the writes queued before them; `SELECT` stays refused.
+#[test]
+fn scripts_queue_in_a_transaction_and_run_in_order() {
+    let (address, stop, server) = serve_with(|_| {});
+    let sha = String::from_utf8(request(
+        address,
+        &resp(&[&[b"SCRIPT", b"LOAD", b"return ruvio.call('INCR', KEYS[1])"]]),
+    ))
+    .unwrap();
+    let sha = sha.trim_end().rsplit('\n').next().unwrap().to_owned();
+
+    assert_eq!(
+        request(
+            address,
+            &resp(&[&[b"FUNCTION", b"LOAD", b"seven", b"return 7"]])
+        ),
+        b"$5\r\nseven\r\n"
+    );
+    assert_eq!(
+        request(
+            address,
+            &resp(&[
+                &[b"MULTI"],
+                &[b"SET", b"n", b"1"],
+                &[b"EVAL", b"return ruvio.call('INCR', KEYS[1])", b"1", b"n"],
+                &[b"EVALSHA", sha.as_bytes(), b"1", b"n"],
+                &[b"FCALL", b"seven", b"0"],
+                &[b"GET", b"n"],
+                &[b"EXEC"],
+            ])
+        ),
+        b"+OK\r\n+QUEUED\r\n+QUEUED\r\n+QUEUED\r\n+QUEUED\r\n+QUEUED\r\n*5\r\n+OK\r\n:2\r\n:3\r\n:7\r\n$1\r\n3\r\n"
+    );
+
+    // A script error is that command's reply; the others still run, as in Redis.
+    assert_eq!(
+        request(
+            address,
+            &resp(&[
+                &[b"MULTI"],
+                &[b"EVALSHA", b"0000000000000000000000000000000000000000", b"0"],
+                &[b"INCR", b"n"],
+                &[b"EXEC"],
+            ])
+        ),
+        b"+OK\r\n+QUEUED\r\n+QUEUED\r\n*2\r\n-NOSCRIPT No matching script. Please use EVAL.\r\n:4\r\n"
+    );
+
+    assert_eq!(
+        request(
+            address,
+            &resp(&[&[b"MULTI"], &[b"PUBLISH", b"news", b"m"], &[b"EXEC"]])
+        ),
+        b"+OK\r\n+QUEUED\r\n*1\r\n:0\r\n"
+    );
+
+    let refused = request(
+        address,
+        &resp(&[&[b"MULTI"], &[b"SELECT", b"1"], &[b"EXEC"]]),
+    );
+
+    assert!(refused.ends_with(b"-EXECABORT Transaction discarded because of previous errors.\r\n"));
+    stop.request();
+    join_within(server, PATIENCE).unwrap();
+}
+
 /// `INFO` queued in `MULTI` answers with the server's report, as it does outside one.
 #[test]
 fn info_in_a_transaction_reports_the_server() {
@@ -232,4 +299,30 @@ fn info_fields_and_the_observability_table_agree() {
         "INFO fields with no row: {undocumented:?}"
     );
     assert!(missing.is_empty(), "rows INFO does not write: {missing:?}");
+}
+
+/// `HMSET` writes like multi-field `HSET` and replies `OK`, as Redis does (CodeIgniter's
+/// and other PHP cache handlers send it through phpredis `hMSet`).
+#[test]
+fn hmset_writes_like_hset_and_replies_ok() {
+    let (address, stop, server) = serve_with(|_| {});
+
+    assert_eq!(
+        request(
+            address,
+            &resp(&[
+                &[b"HMSET", b"h", b"a", b"1", b"b", b"2"],
+                &[b"HMSET", b"h", b"a", b"3"],
+                &[b"HGET", b"h", b"a"],
+                &[b"HLEN", b"h"],
+                &[b"HMSET", b"h", b"a"],
+                &[b"SET", b"s", b"v"],
+                &[b"HMSET", b"s", b"a", b"1"],
+            ])
+        ),
+        b"+OK\r\n+OK\r\n$1\r\n3\r\n:2\r\n-ERR wrong number of arguments for 'hmset' command\r\n+OK\r\n\
+          -WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+    );
+    stop.request();
+    join_within(server, PATIENCE).unwrap();
 }

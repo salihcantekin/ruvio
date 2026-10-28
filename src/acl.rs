@@ -122,6 +122,10 @@ impl AclRules {
     }
 
     pub fn authorize_hot(&self, command: &HotCommand<'_>) -> Result<(), AclDeny> {
+        if self.all_commands && self.all_keys {
+            return Ok(());
+        }
+
         let (name, key) = match command {
             HotCommand::Ping(_) => ("ping", None),
             HotCommand::Get(key) => ("get", Some(*key)),
@@ -152,7 +156,7 @@ impl ConnectionAuth {
             .find_user(b"default")
             .unwrap_or_else(|| AclUser::default_user(&security.requirepass));
 
-        if default.enabled && !default.has_password() {
+        if default.enabled && default.nopass {
             Self {
                 authenticated: true,
                 username: default.name.into(),
@@ -332,10 +336,6 @@ impl AclUser {
             matched |= constant_time_eq(&digest, candidate);
         }
 
-        if self.passwords.is_empty() {
-            matched |= constant_time_eq(password, b"");
-        }
-
         matched
     }
 
@@ -351,6 +351,19 @@ impl AclUser {
         };
 
         for token in rules.split_whitespace() {
+            // A rule on a subcommand this server does not check never matched a command; a
+            // release before this one stored it anyway (and wrote it back on `ACL SAVE`), so a
+            // file from that release still loads: the rule is dropped with a warning. `ACL
+            // SETUSER` refuses it.
+            if is_unknown_subcommand_rule(token) {
+                tracing::warn!(
+                    user = name,
+                    rule = token,
+                    "ACL rule names no checked subcommand; dropped"
+                );
+                continue;
+            }
+
             apply_rule(&mut user, token)?;
         }
 
@@ -861,7 +874,10 @@ fn apply_command(user: &mut AclUser, name: &str, enable: bool) -> Result<(), Str
             return Err(format!("unknown ACL command `{name}`"));
         }
 
-        apply_named_command(user, leak_command_name(&name), enable);
+        let known =
+            known_subcommand(&name).ok_or_else(|| format!("unknown ACL subcommand `{name}`"))?;
+
+        apply_named_command(user, known, enable);
 
         return Ok(());
     }
@@ -919,34 +935,47 @@ fn apply_named_command(user: &mut AclUser, name: &'static str, enable: bool) {
     }
 }
 
-fn leak_command_name(name: &str) -> &'static str {
-    if let Some((known, _)) = SUBCOMMAND_CATEGORIES
-        .iter()
-        .find(|(known, _)| *known == name)
-    {
-        return known;
-    }
+/// Every `parent|sub` name [`command_acl_name`] can return. A rule on any other subcommand
+/// could never match a command, so it is refused rather than stored.
+const ACL_SUBCOMMANDS: &[&str] = &[
+    "acl|cat",
+    "acl|getuser",
+    "acl|list",
+    "acl|load",
+    "acl|save",
+    "acl|setuser",
+    "acl|users",
+    "acl|whoami",
+    "client|kill",
+    "client|list",
+    "config|get",
+    "config|rewrite",
+    "config|set",
+    "ruvio|bigkeys",
+    "ruvio|hotkeys",
+    "ruvio|lease",
+    "ruvio|migrate",
+    "ruvio|moveslots",
+    "ruvio|topology",
+];
 
-    if let Some(spec) = crate::protocol::command_spec(name.as_bytes()) {
-        return spec.name;
-    }
+/// `+parent|sub` or `-parent|sub` on a known parent and a subcommand that is not checked.
+fn is_unknown_subcommand_rule(token: &str) -> bool {
+    let Some(name) = token.strip_prefix(['+', '-']) else {
+        return false;
+    };
+    let Some((parent, _)) = name.split_once('|') else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
 
-    // Other `parent|sub` names live as long as the process. One set holds them, so a name is
-    // allocated once however often ACL rules repeat it, and stays reachable (no leak report).
-    static NAMES: std::sync::Mutex<BTreeSet<&'static str>> = std::sync::Mutex::new(BTreeSet::new());
+    !name.starts_with('@')
+        && is_known_command(&parent.to_ascii_lowercase())
+        && known_subcommand(&lower).is_none()
+}
 
-    let mut names = NAMES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-    if let Some(known) = names.get(name) {
-        return known;
-    }
-
-    let leaked: &'static str = Box::leak(name.into());
-
-    names.insert(leaked);
-    leaked
+fn known_subcommand(name: &str) -> Option<&'static str> {
+    ACL_SUBCOMMANDS.iter().copied().find(|known| *known == name)
 }
 
 fn all_command_names() -> BTreeSet<&'static str> {
@@ -975,6 +1004,10 @@ const SUBCOMMAND_CATEGORIES: &[(&str, &[&str])] = &[
     ("client|list", &["admin", "slow", "dangerous"]),
     ("ruvio|hotkeys", &["admin", "slow"]),
     ("ruvio|bigkeys", &["admin", "slow"]),
+    ("ruvio|migrate", &["admin", "slow", "dangerous"]),
+    ("ruvio|moveslots", &["admin", "slow", "dangerous"]),
+    ("ruvio|topology", &["admin", "slow", "dangerous"]),
+    ("ruvio|lease", &["admin", "slow", "dangerous"]),
 ];
 
 fn commands_in_category(category: &str) -> Vec<&'static str> {
@@ -994,10 +1027,17 @@ fn commands_in_category(category: &str) -> Vec<&'static str> {
         .collect()
 }
 
-/// Key names a key-restricted user must not see: the change feed, the key statistics and the
-/// keyspace notification channels report keys of every pattern.
+/// Key names a key-restricted user must not see, and keyspace-wide writes it must not make: the
+/// listing commands, the change feed, the key statistics and the keyspace notification channels
+/// report keys of every pattern, and `FLUSH*` and `SWAPDB` touch all of them. These need `allkeys`.
 fn exposes_any_key_name(command: &Command<'_>) -> bool {
     match command {
+        Command::Keys(_)
+        | Command::Scan { .. }
+        | Command::RandomKey
+        | Command::FlushDb
+        | Command::FlushAll
+        | Command::SwapDb(_, _) => true,
         Command::Changes(_) | Command::ChangesSubscribe(_) => true,
         Command::Ruvio(Some(word)) => {
             word.eq_ignore_ascii_case(b"hotkeys") || word.eq_ignore_ascii_case(b"bigkeys")
@@ -1034,6 +1074,7 @@ fn pattern_may_match_notifications(pattern: &[u8]) -> bool {
 
 pub fn command_acl_name(command: &Command<'_>) -> &'static str {
     match command {
+        Command::CreateTtl { inner, .. } => command_acl_name(inner),
         Command::Ping(_) => "ping",
         Command::CommandMeta { .. } => "command",
         Command::Wait { .. } => "wait",
@@ -1041,14 +1082,19 @@ pub fn command_acl_name(command: &Command<'_>) -> &'static str {
         Command::Semaphore { .. } => "semaphore",
         Command::Limit { .. } => "limit",
         Command::Once { .. } => "once",
-        Command::IdempotencyBegin { .. } | Command::IdempotencyComplete { .. } => "idem",
+        Command::IdempotencyBegin { .. }
+        | Command::IdempotencyComplete { .. }
+        | Command::IdempotencyAbort { .. } => "idem",
         Command::Take { .. } => "take",
-        Command::SetIfEq { .. } => "set",
+        Command::Transfer { .. } => "transfer",
+        Command::HashTransfer { .. } => "htransfer",
+        Command::SetIfEq { .. } | Command::SetIfCmp { .. } => "set",
         Command::DelIfEq { .. } => "delex",
         Command::ListPushCapped { back: false, .. } => "lpushcap",
         Command::ListPushCapped { back: true, .. } => "rpushcap",
         Command::GetEx { .. } => "getex",
         Command::Release { .. } => "release",
+        Command::Renew { .. } => "renew",
         Command::SetVersioned { .. } => "setv",
         Command::Changes(_) | Command::ChangesSubscribe(_) => "changes",
         Command::Ruvio(Some(word)) if word.eq_ignore_ascii_case(b"hotkeys") => "ruvio|hotkeys",
@@ -1071,7 +1117,15 @@ pub fn command_acl_name(command: &Command<'_>) -> &'static str {
         | Command::ClusterKeySlot(_) => "cluster",
         Command::ReadOnly => "readonly",
         Command::ReadWrite => "readwrite",
-        Command::ConfigGet(_) => "config",
+        Command::ConfigGet(_) => "config|get",
+        Command::ConfigSet(_) => "config|set",
+        Command::ConfigRewrite => "config|rewrite",
+        Command::ReplicaOf { .. } => "replicaof",
+        Command::MoveSlots(_) => "ruvio|moveslots",
+        Command::Topology(_) => "ruvio|topology",
+        Command::PrimaryLease(_) => "ruvio|lease",
+        Command::Migrate(_) => "ruvio|migrate",
+        Command::Role => "role",
         Command::Info(_) => "info",
         Command::Save => "save",
         Command::Bgsave => "bgsave",
@@ -1111,7 +1165,7 @@ pub fn command_acl_name(command: &Command<'_>) -> &'static str {
         Command::Keys(_) => "keys",
         Command::ClientList { .. } => "client|list",
         Command::ClientKill { .. } => "client|kill",
-        Command::ClientId | Command::ClientInfo => "client",
+        Command::ClientId | Command::ClientInfo | Command::ClientSetInfo => "client",
         Command::Slowlog(_) => "slowlog",
         Command::LatencyLatest => "latency",
         Command::Echo(_) => "echo",
@@ -1224,6 +1278,7 @@ pub fn command_acl_name(command: &Command<'_>) -> &'static str {
             ..
         } => "zdiffstore",
         Command::HashSet { .. } => "hset",
+        Command::HashMSet { .. } => "hmset",
         Command::HashDelete { .. } => "hdel",
         Command::HashGet { .. } => "hget",
         Command::HashMGet { .. } => "hmget",
@@ -1268,6 +1323,8 @@ pub fn command_acl_name(command: &Command<'_>) -> &'static str {
         Command::SortedSetRank { reverse: true, .. } => "zrevrank",
         Command::SortedSetPop { max: false, .. } => "zpopmin",
         Command::SortedSetPop { max: true, .. } => "zpopmax",
+        Command::SortedSetPopByScore { .. } => "zpopbyscore",
+        Command::SortedSetMoveDue { .. } => "zmovedue",
         Command::SortedSetBlockPop { max: false, .. } => "bzpopmin",
         Command::SortedSetBlockPop { max: true, .. } => "bzpopmax",
         Command::SortedSetRemoveRange {
@@ -1349,7 +1406,10 @@ pub fn command_acl_name(command: &Command<'_>) -> &'static str {
         Command::PTtl(_) => "pttl",
         Command::Persist(_) => "persist",
         Command::Hello { .. } => "hello",
-        Command::ClientGetName | Command::ClientSetName(_) | Command::ClientTracking(_) => "client",
+        Command::ClientGetName
+        | Command::ClientSetName(_)
+        | Command::ClientTracking(_)
+        | Command::ClientDurability { .. } => "client",
         Command::Publish { .. } => "publish",
         Command::Subscribe(_) => "subscribe",
         Command::Unsubscribe(_) => "unsubscribe",
@@ -1437,12 +1497,11 @@ mod tests {
         assert_eq!(user.rules.authorize(&by_member), Ok(()));
     }
 
-    /// ACL rules name subcommands outside the command table; each name is allocated once,
-    /// however many rules repeat it.
+    /// A subcommand rule stores the name from the static list: nothing is allocated per rule.
     #[test]
-    fn a_subcommand_name_is_allocated_once() {
-        let first = leak_command_name("acl|setuser");
-        let again = leak_command_name(&String::from("acl|setuser"));
+    fn a_subcommand_name_is_not_allocated() {
+        let first = known_subcommand("acl|setuser").unwrap();
+        let again = known_subcommand(&String::from("acl|setuser")).unwrap();
 
         assert!(std::ptr::eq(first, again));
         assert_eq!(first, "acl|setuser");
@@ -1544,6 +1603,18 @@ mod tests {
         let everyone = AclUser::parse("ops", "on >pw ~* +@all").unwrap();
         let refused = [
             Command::Changes(Some(0)),
+            Command::Keys(Cow::Borrowed(b"*")),
+            Command::Scan {
+                cursor: 0,
+                pattern: None,
+                count: 10,
+                type_name: None,
+                slot: None,
+            },
+            Command::RandomKey,
+            Command::FlushDb,
+            Command::FlushAll,
+            Command::SwapDb(0, 1),
             Command::Ruvio(Some(Cow::Borrowed(b"hotkeys"))),
             Command::Ruvio(Some(Cow::Borrowed(b"BIGKEYS"))),
             Command::Subscribe(vec![Cow::Borrowed(b"__keyspace@0__:secret")]),
@@ -1611,6 +1682,34 @@ mod tests {
     }
 
     #[test]
+    fn user_without_password_hashes_matches_no_password() {
+        let user = AclUser::parse("worker", "on ~* +@all").unwrap();
+
+        assert!(!user.nopass);
+        assert!(!user.password_matches(b""));
+        assert!(!user.password_matches(b"anything"));
+        assert!(
+            AclUser::parse("open", "on nopass ~* +@all")
+                .unwrap()
+                .password_matches(b"")
+        );
+    }
+
+    #[test]
+    fn resetpass_on_default_user_stops_auto_login() {
+        let security = SecurityConfig::default();
+        assert!(ConnectionAuth::from_security(&security).authenticated);
+
+        security
+            .directory()
+            .set_user(b"default", &[b"resetpass"])
+            .unwrap();
+
+        assert!(!ConnectionAuth::from_security(&security).authenticated);
+        assert!(security.authenticate(None, b"").is_err());
+    }
+
+    #[test]
     fn default_user_is_nopass_until_requirepass_is_set() {
         let open = SecurityConfig::default();
 
@@ -1630,6 +1729,79 @@ mod tests {
             locked.authenticate(None, b"wrong"),
             Err(AuthError::WrongPass)
         );
+    }
+
+    #[test]
+    fn config_set_and_rewrite_can_be_denied_while_config_get_stays() {
+        let user = AclUser::parse("ops", "on nopass ~* +@all -config|set").unwrap();
+        let set = Command::ConfigSet(vec![(
+            Cow::Borrowed(&b"maxmemory"[..]),
+            Cow::Borrowed(&b"1"[..]),
+        )]);
+
+        assert_eq!(
+            user.rules.authorize(&set),
+            Err(AclDeny::Command("config|set"))
+        );
+        user.rules
+            .authorize(&Command::ConfigGet(Cow::Borrowed(b"*")))
+            .unwrap();
+        user.rules.authorize(&Command::ConfigRewrite).unwrap();
+
+        let viewer = AclUser::parse("viewer", "on nopass ~* +config|get").unwrap();
+        viewer
+            .rules
+            .authorize(&Command::ConfigGet(Cow::Borrowed(b"*")))
+            .unwrap();
+        assert!(viewer.rules.authorize(&set).is_err());
+        assert!(viewer.rules.authorize(&Command::ConfigRewrite).is_err());
+
+        let reader = AclUser::parse("reader", "on nopass ~* +@read").unwrap();
+        assert!(reader.rules.authorize(&set).is_err());
+        assert!(reader.rules.authorize(&Command::ConfigRewrite).is_err());
+    }
+
+    /// A rule on a subcommand no command maps to is refused: it could never match, and each
+    /// distinct name used to be kept for the life of the process (issue #38).
+    #[test]
+    fn a_file_rule_on_an_unchecked_subcommand_is_dropped_not_refused() {
+        let user = AclUser::parse("app", "on nopass ~* +@all -client|setname -config|get").unwrap();
+
+        assert!(user.rules.denied_subcommands.contains("config|get"));
+        assert!(!user.rules.denied_subcommands.contains("client|setname"));
+        assert!(AclUser::parse("app", "on -nosuch|thing").is_err());
+    }
+
+    #[test]
+    fn unknown_subcommand_rules_are_refused() {
+        // `ACL SETUSER` applies rules one by one and refuses an unchecked subcommand.
+        let mut user = AclUser::parse("u", "on nopass ~*").unwrap();
+        let error = apply_rule(&mut user, "+get|anything").unwrap_err();
+
+        assert!(
+            error.contains("unknown ACL subcommand `get|anything`"),
+            "{error}"
+        );
+        assert!(apply_rule(&mut user, "-config|nosuch").is_err());
+        AclUser::parse("u", "on nopass ~* +config|get -client|kill").unwrap();
+    }
+
+    /// `ACL_SUBCOMMANDS` lists exactly the `parent|sub` names `command_acl_name` returns.
+    #[test]
+    fn the_subcommand_list_matches_command_acl_name() {
+        let source = include_str!("acl.rs");
+        let start = source.find("pub fn command_acl_name").unwrap();
+        let body = &source[start..start + source[start..].find("\n}\n").unwrap()];
+        let mut named: Vec<&str> = body
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .filter(|literal| literal.contains('|'))
+            .collect();
+
+        named.sort_unstable();
+        named.dedup();
+        assert_eq!(named, ACL_SUBCOMMANDS);
     }
 
     #[test]

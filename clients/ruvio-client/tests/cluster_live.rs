@@ -128,3 +128,19 @@ fn a_pipeline_splits_cross_slot_commands_and_refuses_the_rest() {
         ]
     );
 }
+
+#[test]
+fn reports_slot_moves_and_refuses_a_range_already_in_place() {
+    let _turn = turn();
+    let Some(mut db) = connect() else { return };
+    let status = db.move_slots_status().unwrap();
+
+    assert!(status.iter().any(|(name, _)| name == "state"), "{status:?}");
+    // Slot 0 is on shard 0: nothing to move, and the server says why.
+    match db.move_slots(0, 10, 0) {
+        Err(Error::Server(message)) => {
+            assert!(message.contains("already on that shard"), "{message}")
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}

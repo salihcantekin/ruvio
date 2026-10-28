@@ -4,6 +4,7 @@ package ruvio
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -153,6 +154,34 @@ func (c *cmds) SetIfEq(ctx context.Context, key, value, expected string, o SetOp
 	return err == nil && v.Kind != KindNil, err
 }
 
+// SetIfGreater writes value (Ruvio extension, SET key value IFGT) when the key is missing or
+// value is greater than the stored integer, and reports whether it wrote. Use it to keep a
+// watermark, a version or the highest bid.
+//
+// The result is false, with a nil error, when the stored number is greater or equal. TTL,
+// ExpireAt and KeepTTL in o apply to the write; NX and XX are ignored because IFGT cannot be
+// combined with them. A stored string that is not an integer returns an error and writes
+// nothing; a key that holds another type returns WRONGTYPE.
+//
+//	advanced, err := c.SetIfGreater(ctx, "watermark", 1700000000, ruvio.SetOptions{})
+func (c *cmds) SetIfGreater(ctx context.Context, key string, value int64, o SetOptions) (bool, error) {
+	return c.setIfCompare(ctx, key, value, tIFGT, o)
+}
+
+// SetIfLess is SetIfGreater for a smaller number (SET key value IFLT): lowest price,
+// earliest deadline.
+func (c *cmds) SetIfLess(ctx context.Context, key string, value int64, o SetOptions) (bool, error) {
+	return c.setIfCompare(ctx, key, value, tIFLT, o)
+}
+
+func (c *cmds) setIfCompare(ctx context.Context, key string, value int64, condition []byte, o SetOptions) (bool, error) {
+	o.NX, o.XX = false, false
+	r := newCmd(4+o.count(), cSET).s(key).i(value).t(condition)
+	o.append(r)
+	v, err := c.value(ctx, r)
+	return err == nil && v.Kind != KindNil, err
+}
+
 // SetEX stores value with a TTL given in whole seconds (SETEX key seconds value). The
 // duration is truncated to seconds, so a ttl below one second becomes 0 and the server
 // returns "ERR invalid expire time in 'setex' command". Use PSetEX or SetArgs for
@@ -286,12 +315,81 @@ func (c *cmds) DecrBy(ctx context.Context, key string, delta int64) (int64, erro
 
 // IncrByFloat adds a floating point delta to the number stored at key (INCRBYFLOAT) and
 // returns the new value. A missing key counts as 0. The sum is computed in float64 and
-// stored with 15 significant digits (Redis uses long double, so the last digits can
+// stored with 16 significant digits (Redis uses long double, so the last digits can
 // differ). The value must be a valid number, otherwise the server returns "ERR value is
 // not a valid float"; NaN is rejected and an infinite result is an error. An existing
 // TTL is kept.
 func (c *cmds) IncrByFloat(ctx context.Context, key string, delta float64) (float64, error) {
 	return c.floatR(ctx, newCmd(3, cINCRBYFLOAT).s(key).f(delta))
+}
+
+// ---- TTL on create ----------------------------------------------------------
+//
+// The WithTTL methods below send EX seconds (when ttl is a whole number of seconds) or
+// PX milliseconds (otherwise). The deadline is set only when the call creates the key; an
+// existing key keeps its current deadline. A ttl of zero or less returns ErrInvalidTTL
+// without contacting the server.
+
+// IncrWithTTL is Incr that also sets a deadline when it creates the key (INCR key EX|PX).
+// An existing key keeps its deadline.
+func (c *cmds) IncrWithTTL(ctx context.Context, key string, ttl time.Duration) (int64, error) {
+	tok, v, err := ttlArg(ttl)
+	if err != nil {
+		return 0, err
+	}
+	return c.intR(ctx, newCmd(4, cINCR).s(key).t(tok).i(v))
+}
+
+// DecrWithTTL is Decr that also sets a deadline when it creates the key (DECR key
+// EX|PX). An existing key keeps its deadline.
+func (c *cmds) DecrWithTTL(ctx context.Context, key string, ttl time.Duration) (int64, error) {
+	tok, v, err := ttlArg(ttl)
+	if err != nil {
+		return 0, err
+	}
+	return c.intR(ctx, newCmd(4, cDECR).s(key).t(tok).i(v))
+}
+
+// IncrByWithTTL is IncrBy that also sets a deadline when it creates the key (INCRBY key
+// delta EX|PX). An existing key keeps its deadline.
+func (c *cmds) IncrByWithTTL(ctx context.Context, key string, delta int64, ttl time.Duration) (int64, error) {
+	tok, v, err := ttlArg(ttl)
+	if err != nil {
+		return 0, err
+	}
+	return c.intR(ctx, newCmd(5, cINCRBY).s(key).i(delta).t(tok).i(v))
+}
+
+// DecrByWithTTL is DecrBy that also sets a deadline when it creates the key (DECRBY key
+// delta EX|PX). An existing key keeps its deadline.
+func (c *cmds) DecrByWithTTL(ctx context.Context, key string, delta int64, ttl time.Duration) (int64, error) {
+	tok, v, err := ttlArg(ttl)
+	if err != nil {
+		return 0, err
+	}
+	return c.intR(ctx, newCmd(5, cDECRBY).s(key).i(delta).t(tok).i(v))
+}
+
+// IncrByMaxWithTTL is IncrByMax that also sets a deadline when it creates the key
+// (INCRBY key delta EX|PX MAX limit). The deadline is set only when the add is applied
+// and creates the key; when the result would pass limit nothing is written (ok is false)
+// and no key is created.
+func (c *cmds) IncrByMaxWithTTL(ctx context.Context, key string, delta, limit int64, ttl time.Duration) (int64, bool, error) {
+	tok, v, err := ttlArg(ttl)
+	if err != nil {
+		return 0, false, err
+	}
+	return c.intNil(ctx, newCmd(7, cINCRBY).s(key).i(delta).t(tok).i(v).t(tMAX).i(limit))
+}
+
+// IncrByFloatWithTTL is IncrByFloat that also sets a deadline when it creates the key
+// (INCRBYFLOAT key delta EX|PX). An existing key keeps its deadline.
+func (c *cmds) IncrByFloatWithTTL(ctx context.Context, key string, delta float64, ttl time.Duration) (float64, error) {
+	tok, v, err := ttlArg(ttl)
+	if err != nil {
+		return 0, err
+	}
+	return c.floatR(ctx, newCmd(5, cINCRBYFLOAT).s(key).f(delta).t(tok).i(v))
 }
 
 // GetRange returns the substring of the string at key between the byte offsets start and
@@ -350,6 +448,25 @@ func (c *cmds) Take(ctx context.Context, key string, count int64) (remaining int
 	return c.intNil(ctx, newCmd(3, cTAKE).s(key).i(count))
 }
 
+// Transfer moves amount from the integer at source to the integer at destination in
+// one step, only when source holds at least that much (Ruvio TRANSFER source destination
+// amount). A missing destination starts at 0, and both keys are written as one WAL record.
+//
+// It returns the two values after the move and ok == true. When source is missing or
+// holds fewer than amount, or destination would overflow, nothing changes and ok is false.
+// amount must be > 0, source and destination must differ and, on a sharded server, share a
+// slot ("CROSSSLOT"; a hash tag such as {user:42} puts them together). A value that is not
+// an integer returns "ERR value is not an integer or out of range".
+func (c *cmds) Transfer(ctx context.Context, source, destination string, amount int64) (sourceAfter, destinationAfter int64, ok bool, err error) {
+	return c.pairNil(ctx, newCmd(4, cTRANSFER).s(source).s(destination).i(amount))
+}
+
+// TransferMax is Transfer that also refuses (ok == false, nothing written) when the
+// destination would end above max (TRANSFER source destination amount MAX max).
+func (c *cmds) TransferMax(ctx context.Context, source, destination string, amount, max int64) (sourceAfter, destinationAfter int64, ok bool, err error) {
+	return c.pairNil(ctx, newCmd(6, cTRANSFER).s(source).s(destination).i(amount).t(tMAX).i(max))
+}
+
 // DelIfEq deletes key only when its string equals expected (Ruvio DELEX key IFEQ
 // expected) and reports whether it deleted. It returns false when the key is missing or
 // holds a different value. It is the safe way to release a lock you hold. A non-string
@@ -370,6 +487,77 @@ func (c *cmds) DelIfEq(ctx context.Context, key, expected string) (bool, error) 
 // another type (WRONGTYPE). Use RateLimit for the allowed-first return order.
 func (c *cmds) Limit(ctx context.Context, key string, max int64, window time.Duration) (remaining int64, allowed bool, err error) {
 	return c.intNil(ctx, newCmd(4, cLIMIT).s(key).i(max).i(ms(window)))
+}
+
+// LimitOutcome is the reply of LimitSlidingWithRetry and LimitTokensWithRetry.
+type LimitOutcome struct {
+	// Allowed is true when the call was let through.
+	Allowed bool
+	// Remaining is the allowance left after the call (0 when refused).
+	Remaining int64
+	// RetryAfter is the wait until the same call would pass (0 when it was let through),
+	// rounded up to whole milliseconds. Fit for a Retry-After header.
+	RetryAfter time.Duration
+}
+
+// LimitSliding counts one call against a sliding-window limit (Ruvio LIMIT key max
+// window_ms SLIDING).
+//
+// The previous window counts for the part of it that still overlaps the last window, so a
+// burst at a window edge is not doubled. The key keeps two counters, not one entry per
+// call. It returns allowed == true with remaining = the allowance left after this call;
+// when the call does not fit, allowed is false and nothing is counted. max must be from 1
+// to 2147483647. A key keeps the mode it was created with: another mode on it returns a
+// server error. The key must not hold another type (WRONGTYPE).
+func (c *cmds) LimitSliding(ctx context.Context, key string, max int64, window time.Duration) (remaining int64, allowed bool, err error) {
+	return c.intNil(ctx, newCmd(5, cLIMIT).s(key).i(max).i(ms(window)).t(tSLIDING))
+}
+
+// LimitTokens takes cost tokens from a token bucket (Ruvio LIMIT key capacity refill_ms
+// TOKENS COST cost).
+//
+// The bucket holds capacity tokens (1 to 1000000) and refills completely over refill (up
+// to 4294967295 ms). It returns allowed == true with the tokens left; when the bucket
+// holds fewer than cost tokens, allowed is false and nothing is taken. The key keeps one
+// timestamp and disappears when the bucket is full again. cost is from 1 to capacity. A
+// key keeps the mode it was created with. The key must not hold another type (WRONGTYPE).
+func (c *cmds) LimitTokens(ctx context.Context, key string, capacity int64, refill time.Duration, cost int64) (remaining int64, allowed bool, err error) {
+	return c.intNil(ctx, newCmd(7, cLIMIT).s(key).i(capacity).i(ms(refill)).t(tTOKENS).t(tCOST).i(cost))
+}
+
+// LimitSlidingWithRetry is LimitSliding with WITHRETRY: the outcome also says how long to
+// wait before the same call would pass.
+func (c *cmds) LimitSlidingWithRetry(ctx context.Context, key string, max int64, window time.Duration) (LimitOutcome, error) {
+	return c.limitOutcome(ctx, newCmd(6, cLIMIT).s(key).i(max).i(ms(window)).t(tSLIDING).t(tWITHRETRY))
+}
+
+// LimitTokensWithRetry is LimitTokens with WITHRETRY: the outcome also says how long to
+// wait before the same call would pass.
+func (c *cmds) LimitTokensWithRetry(ctx context.Context, key string, capacity int64, refill time.Duration, cost int64) (LimitOutcome, error) {
+	return c.limitOutcome(ctx, newCmd(8, cLIMIT).s(key).i(capacity).i(ms(refill)).t(tTOKENS).t(tCOST).i(cost).t(tWITHRETRY))
+}
+
+func (c *cmds) limitOutcome(ctx context.Context, r *request) (LimitOutcome, error) {
+	v, err := c.ex.exec(ctx, r)
+	if err != nil {
+		return LimitOutcome{}, err
+	}
+	if !v.isAgg() || len(v.Array) != 2 {
+		return LimitOutcome{}, unexpected(v)
+	}
+	remaining, err := v.Array[0].AsInt64()
+	if err != nil {
+		return LimitOutcome{}, err
+	}
+	retry, err := v.Array[1].AsInt64()
+	if err != nil {
+		return LimitOutcome{}, err
+	}
+	return LimitOutcome{
+		Allowed:    remaining >= 0,
+		Remaining:  max(remaining, 0),
+		RetryAfter: time.Duration(max(retry, 0)) * time.Millisecond,
+	}, nil
 }
 
 // Once returns true for the first caller and false for every other call until ttl has
@@ -399,6 +587,14 @@ func (c *cmds) Lease(ctx context.Context, key string, ttl time.Duration) (token 
 // an error. The key must not hold another type (WRONGTYPE). See AcquirePermit.
 func (c *cmds) Semaphore(ctx context.Context, key string, max int64, ttl time.Duration) (token int64, ok bool, err error) {
 	return c.intNil(ctx, newCmd(4, cSEMAPHORE).s(key).i(max).i(ms(ttl)))
+}
+
+// Renew moves the deadline of a lease or semaphore slot you hold to now + ttl (Ruvio RENEW
+// key token ttl). It returns true when token was a live holder and false when it expired,
+// was released or belongs to someone else. ttl replaces the remaining time. The fencing
+// token does not change and no holder is ever created.
+func (c *cmds) Renew(ctx context.Context, key string, token int64, ttl time.Duration) (bool, error) {
+	return c.boolR(ctx, newCmd(4, cRENEW).s(key).i(token).i(ms(ttl)))
 }
 
 // Release frees a lease or a semaphore slot (Ruvio RELEASE key token). It returns true
@@ -465,6 +661,18 @@ func (c *cmds) IdemBegin(ctx context.Context, key, fingerprint, owner string, tt
 // result is binary-safe, at most 4 MiB. Completing never extends the record's lifetime.
 func (c *cmds) IdemComplete(ctx context.Context, key, fingerprint, owner string, result []byte) (int64, error) {
 	return c.intR(ctx, newCmd(6, cIDEM).s(key).t(tCOMPLETE).s(fingerprint).s(owner).b(result))
+}
+
+// IdemAbort gives up the pending record that this fingerprint and owner began (Ruvio
+// IDEM key ABORT fingerprint owner), so the next IdemBegin acquires the key at once. It
+// returns true when the record was removed and false when nothing changed: the key is
+// missing or expired, the record is completed (its result is never removed), or it is
+// held by another owner or fingerprint.
+//
+// Abort only when the work did not take effect or is safe to run again; a retry after an
+// abort runs it again. Idempotent does this for you with WithAbortOnError.
+func (c *cmds) IdemAbort(ctx context.Context, key, fingerprint, owner string) (bool, error) {
+	return c.boolR(ctx, newCmd(5, cIDEM).s(key).t(tABORT).s(fingerprint).s(owner))
 }
 
 // ChangesStart arms the in-memory change feed of the shard that answers and returns the
@@ -607,6 +815,21 @@ func (c *cmds) RuvioOwner(ctx context.Context) (string, error) {
 	return c.strR(ctx, newCmd(2, cRUVIO).t(tOWNER))
 }
 
+// MoveSlots moves the hash slots first..last to shard (counted from 0) of the same server,
+// which keeps serving them meanwhile (RUVIO MOVESLOTS first-last shard). It returns once
+// the move has started; MoveSlotsStatus follows it. One move runs at a time, and every slot
+// of the range must be on one shard.
+func (c *cmds) MoveSlots(ctx context.Context, first, last, shard int) error {
+	return c.ok(ctx, newCmd(4, cRUVIO).s("MOVESLOTS").s(fmt.Sprintf("%d-%d", first, last)).i(int64(shard)))
+}
+
+// MoveSlotsStatus returns the running or last slot move (RUVIO MOVESLOTS STATUS) as a
+// name-to-value map. state is none, copying, cleaning, cancelling, done or cancelled; the
+// other names are first, last, from, to, keys, rounds, elapsed_ms, freeze_ms and error.
+func (c *cmds) MoveSlotsStatus(ctx context.Context) (map[string]string, error) {
+	return c.strMap(ctx, newCmd(3, cRUVIO).s("MOVESLOTS").s("STATUS"))
+}
+
 // ---- bitmaps & HyperLogLog ---------------------------------------------------
 
 // SetBit sets or clears the bit at offset and returns the previous value (SETBIT). bit
@@ -616,6 +839,17 @@ func (c *cmds) RuvioOwner(ctx context.Context) (string, error) {
 // returns WRONGTYPE.
 func (c *cmds) SetBit(ctx context.Context, key string, offset int64, bit int) (int64, error) {
 	return c.intR(ctx, newCmd(4, cSETBIT).s(key).i(offset).i(int64(bit)))
+}
+
+// SetBitWithTTL is SetBit that also sets a deadline when it creates the key (SETBIT key
+// offset bit EX|PX). An existing key keeps its deadline. A ttl of zero or less returns
+// ErrInvalidTTL.
+func (c *cmds) SetBitWithTTL(ctx context.Context, key string, offset int64, bit int, ttl time.Duration) (int64, error) {
+	tok, v, err := ttlArg(ttl)
+	if err != nil {
+		return 0, err
+	}
+	return c.intR(ctx, newCmd(6, cSETBIT).s(key).i(offset).i(int64(bit)).t(tok).i(v))
 }
 
 // GetBit returns the bit at offset (GETBIT): 0 for a missing key or an offset beyond the

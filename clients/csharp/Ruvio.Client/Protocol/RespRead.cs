@@ -103,6 +103,18 @@ internal static class RespRead
         Entries(await pending.ConfigureAwait(false), name);
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    internal static async ValueTask<IReadOnlyDictionary<string, string>> Map(ValueTask<RespValue> pending, string name)
+    {
+        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        foreach (var (field, value) in Pairs(await pending.ConfigureAwait(false), name))
+        {
+            map[field] = value;
+        }
+
+        return map;
+    }
+
     internal static async ValueTask<IReadOnlyList<KeyValuePair<string, string>>> Pairs(ValueTask<RespValue> pending, string name) =>
         Pairs(await pending.ConfigureAwait(false), name);
 
@@ -328,6 +340,22 @@ internal static class RespRead
     internal static long Milliseconds(TimeSpan span) => Math.Max(1, (long)Math.Ceiling(span.TotalMilliseconds));
 
     internal static long Seconds(TimeSpan span) => (long)Math.Ceiling(span.TotalSeconds);
+
+    /// <summary>
+    /// The <c>EX</c> or <c>PX</c> word and value for a deadline that is set only when a command creates the key:
+    /// <c>EX</c> for a whole number of seconds, otherwise <c>PX</c> with the time rounded up to milliseconds.
+    /// </summary>
+    internal static (string Word, long Value) CreateTtl(TimeSpan ttl, string name)
+    {
+        if (ttl <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(name, "Expiry must be positive.");
+        }
+
+        long milliseconds = Milliseconds(ttl);
+
+        return milliseconds % 1000 == 0 ? ("EX", milliseconds / 1000) : ("PX", milliseconds);
+    }
 
     internal static string Word(BitOperation operation) => operation switch
     {

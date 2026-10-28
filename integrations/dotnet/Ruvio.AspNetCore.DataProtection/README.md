@@ -47,8 +47,23 @@ is checked after options configuration, so method ordering does not disable the
 requirement. Keep old decryption certificates available when rotating certificates.
 The package does not provision certificates, export secrets or install an exporter.
 
-For a separate durable Ruvio connection, use a connection factory, for example
-after registering a keyed `IRuvioConnection` named `"key-ring"`:
+For a separate durable Ruvio connection, register it with `AddKeyedRuvioClient`
+(from `Ruvio.Client.AspNetCore`) and name it in `ClientKey`:
+
+```csharp
+builder.Services.AddKeyedRuvioClient("key-ring", builder.Configuration.GetSection("RuvioDurable"));
+builder.Services.AddDataProtection()
+    .SetApplicationName("orders-production")
+    .PersistKeysToRuvio(o =>
+    {
+        o.ClientKey = "key-ring";
+        o.Key = "orders:production:data-protection:v1";
+    })
+    .ProtectKeysWithCertificate(certificate);
+```
+
+A connection factory does the same for a connection registered some other way
+(`ClientKey` is ignored by this overload):
 
 ```csharp
 builder.Services.AddDataProtection()
@@ -78,6 +93,20 @@ point production key rings at a memory-only deployment or an eviction-prone cach
 The provider cannot inspect or guarantee the deployment's durability, replication
 or failover policy. A separate durable connection is recommended when ordinary
 caches use different retention/eviction settings.
+
+The server's default durability profile is `memory`: a ring stored there is gone when the server restarts. On its
+first key-ring access the repository reads `INFO server` once. When the profile is `memory`, or the server does not say
+(an ACL without `INFO`), it logs a warning through the host's logging. Set `RequireDurableStorage = true` to refuse
+reads and writes instead, before the ring is touched:
+
+```csharp
+builder.Services.AddDataProtection()
+    .PersistKeysToRuvio(o => o.RequireDurableStorage = true)
+    .ProtectKeysWithCertificate(certificate);
+```
+
+The check costs one command per process; a transport error leaves it for the next access. It does not see replication
+or failover settings.
 
 There is no TTL, key pruning, automatic retry or fallback to an ephemeral local
 ring. An existing key with a TTL is rejected on reads and writes. Keep old keys
@@ -114,6 +143,10 @@ XML parsing prohibits DTDs/external entity resolution and limits document size.
 Corrupt XML, wrong server types, capacity errors and transport failures propagate
 to Data Protection; none are treated as a successful empty read.
 
+No outage mode: a key ring that cannot be read or written cannot be replaced by "carry on", because requests would
+fail to decrypt, or new keys would be issued that other instances never see. Keep the framework's in-process key-ring
+cache and `OperationTimeout`, and run the ring on storage that stays up.
+
 ## Session integration
 
 This package protects the **session cookie**, while
@@ -142,6 +175,14 @@ cookie consent, HTTPS, authentication and authorization configuration in your
 application. Session remains ASP.NET Core's non-locking, last-writer-wins model;
 the counter above is illustrative, not a concurrent atomic counter. Use native
 Ruvio coordination commands for that requirement.
+
+## Startup checks
+
+A configuration mistake stops the host while it starts, before the server takes a request, with the fix named in the error. This package checks:
+
+- the connection is registered: `AddRuvioClient(...)`, or `AddKeyedRuvioClient(key, ...)` when `ClientKey` is set (Data Protection uses `IRuvioConnection`). Data Protection loads its key ring while the host starts, so a missing connection fails there with the same message naming the call to add.
+
+See [Startup checks](../README.md#startup-checks) for how the checks run.
 
 ## Development
 

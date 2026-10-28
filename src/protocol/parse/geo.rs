@@ -8,10 +8,20 @@ pub(in crate::protocol) fn parse_geo_add<'a>(args: &Args<'a, '_>) -> Parsed<'a> 
     }
 
     let mut options = SortedSetAddOptions::default();
+    let mut ttl = None;
     let mut index = 1;
 
     while index < args.len() {
         let token = args.bytes(index);
+
+        if ttl.is_none()
+            && let Some(found) = create_ttl_option(args, index)?
+        {
+            ttl = Some(found);
+            index += 2;
+
+            continue;
+        }
 
         if token.eq_ignore_ascii_case(b"nx") {
             if options.condition == SortedSetCondition::Exists {
@@ -52,11 +62,14 @@ pub(in crate::protocol) fn parse_geo_add<'a>(args: &Args<'a, '_>) -> Parsed<'a> 
         ));
     }
 
-    Ok(Command::GeoAdd {
-        key: args.arg(0),
-        members,
-        options,
-    })
+    Ok(with_create_ttl(
+        ttl,
+        Command::GeoAdd {
+            key: args.arg(0),
+            members,
+            options,
+        },
+    ))
 }
 
 pub(in crate::protocol) fn parse_geo_dist<'a>(args: &Args<'a, '_>) -> Parsed<'a> {

@@ -176,6 +176,22 @@ public class IdempotencyTests
     }
 
     [Fact]
+    public async Task AFailedAbortLeavesTheHandlersExceptionAndThePendingRecord()
+    {
+        // The stub refuses every call but BEGIN and COMPLETE, so the abort itself fails here.
+        var (client, stub) = StubClient.Create();
+        var options = Options();
+
+        options.AbortOnException = true;
+        var middleware = Middleware(_ => throw new InvalidOperationException("handler"), options);
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() => middleware.InvokeAsync(Context(client)));
+
+        Assert.Equal("handler", error.Message);
+        Assert.Equal("pending", Assert.Single(stub.Records).Value.State);
+    }
+
+    [Fact]
     public async Task ConcurrentPendingRequestConflictsAndNeverRunsHandler()
     {
         var (client, _) = StubClient.Create();
@@ -754,29 +770,87 @@ public class IdempotencyTests
     [InlineData(1)]
     [InlineData(7)]
     [InlineData(8193)]
-    public async Task KnownLengthRequestAllocatesExactBodySize(int length)
+    public async Task KnownLengthRequestIsReadIntoPooledStorage(int length)
     {
         var input = new MemoryStream(new byte[length]);
         var result = await RequestBuffer.ReadAsync(input, length, IdempotencyOptions.MaximumPayloadBytes, default);
 
         Assert.Null(result.RejectionStatus);
         Assert.Equal(length, result.Length);
-        Assert.Equal(length, result.Bytes.Length);
+        // The pool may hand out a larger array; only the first Length bytes belong to the request.
+        Assert.True(result.Bytes.Length >= length);
+        RequestBuffer.Release(result.Bytes);
     }
 
     [Theory]
-    [InlineData(0, 4096)]
-    [InlineData(1, 4096)]
-    [InlineData(4097, 8192)]
-    [InlineData(8193, 16384)]
-    public async Task UnknownLengthRequestGrowsOnlyAsNeeded(int length, int capacity)
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(4097)]
+    [InlineData(8193)]
+    public async Task UnknownLengthRequestGrowsOnlyAsNeeded(int length)
     {
         var input = new MemoryStream(new byte[length]);
         var result = await RequestBuffer.ReadAsync(input, null, IdempotencyOptions.MaximumPayloadBytes, default);
 
         Assert.Null(result.RejectionStatus);
         Assert.Equal(length, result.Length);
-        Assert.Equal(capacity, result.Bytes.Length);
+        Assert.True(result.Bytes.Length >= length);
+        Assert.Equal(new byte[length], result.Bytes.AsSpan(0, length).ToArray());
+        RequestBuffer.Release(result.Bytes);
+    }
+
+    [Fact]
+    public async Task UnknownLengthRequestKeepsEveryByteAcrossGrowth()
+    {
+        byte[] body = Enumerable.Range(0, 20_000).Select(i => (byte)(i * 31)).ToArray();
+        var result = await RequestBuffer.ReadAsync(new MemoryStream(body), null, 1_000_000, default);
+
+        Assert.Null(result.RejectionStatus);
+        Assert.Equal(body, result.Bytes.AsSpan(0, result.Length).ToArray());
+        RequestBuffer.Release(result.Bytes);
+    }
+
+    [Fact]
+    public async Task RejectedRequestReturnsNoStorage()
+    {
+        var result = await RequestBuffer.ReadAsync(new MemoryStream(new byte[50]), null, 10, default);
+
+        Assert.Equal(413, result.RejectionStatus);
+        Assert.Empty(result.Bytes);
+    }
+
+    [Fact]
+    public async Task ResponseBufferGrowsPastItsInitialStorageWithoutLosingBytes()
+    {
+        var body = new BoundedResponseBody(100_000);
+        byte[] expected = Enumerable.Range(0, 70_000).Select(i => (byte)(i * 7)).ToArray();
+
+        // Mix every write API across several growth steps.
+        await body.Stream.WriteAsync(expected.AsMemory(0, 10));
+        body.Stream.WriteByte(expected[10]);
+        body.Stream.Write(expected, 11, 5_000);
+        expected.AsMemory(5_011, 30_000).CopyTo(body.Writer.GetMemory(30_000));
+        body.Writer.Advance(30_000);
+        await body.Stream.WriteAsync(expected.AsMemory(35_011));
+
+        Assert.Equal(expected, body.Buffer.Written.ToArray());
+        Assert.Equal(expected.Length, body.Buffer.Length);
+
+        body.Release();
+        Assert.Equal(0, body.Buffer.Length);
+        Assert.Equal(0, body.Buffer.Written.Length);
+    }
+
+    [Fact]
+    public void ResponseBufferRejectsAHintBeyondItsLimitEvenWhenStorageIsLarger()
+    {
+        var body = new BoundedResponseBody(10);
+
+        body.Buffer.Write(new byte[4]);
+        // The pool may rent more than 10 bytes; the limit, not the array, decides.
+        Assert.Throws<IOException>(() => body.Buffer.Reserve(7));
+        Assert.True(body.Buffer.Failed);
+        body.Release();
     }
 
     [Theory]
@@ -887,6 +961,7 @@ public class StubClient : DispatchProxy
     internal bool LoseOwnership;
     internal Func<Task>? BeforeCompletion;
     internal int Acquisitions;
+    internal long LastTtl;
 
     internal static (IRuvioClient Client, StubClient Stub) Create()
     {
@@ -914,6 +989,7 @@ public class StubClient : DispatchProxy
             if (operation == nameof(IRuvioClient.BeginIdempotencyAsync))
             {
                 Acquisitions++;
+                LastTtl = (long)args[3]!;
 
                 if (!Records.TryGetValue(key, out var entry))
                 {

@@ -53,6 +53,8 @@ def run(host: str, port: int):
         assert request(stream, b"SPOP", b"pop") == (b"$", b"only")
         assert request(stream, b"SPOP", b"pop", b"1") == (b"*", [])
         assert request(stream, b"HSET", b"user", b"name", b"ada", b"city", b"london") == (b":", 2)
+        assert request(stream, b"HMSET", b"legacy", b"a", b"1", b"b", b"2") == (b"+", b"OK")
+        assert request(stream, b"HMGET", b"legacy", b"a", b"b") == (b"*", [(b"$", b"1"), (b"$", b"2")])
         assert request(stream, b"HGET", b"user", b"name") == (b"$", b"ada")
         assert request(stream, b"HLEN", b"user") == (b":", 2)
         assert request(stream, b"HEXISTS", b"user", b"city") == (b":", 1)

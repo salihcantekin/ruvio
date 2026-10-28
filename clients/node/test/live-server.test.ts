@@ -95,6 +95,15 @@ test('introspection, persistence, replication', { skip: SKIP }, async () => {
     assert.match(await c.info('server'), /:/);
     const cfg = await c.configGet('*');
     assert.ok(Object.keys(cfg).length > 0);
+    assert.equal(await c.configSet({ 'slowlog-max-len': '128' }), 'OK');
+    assert.equal((await c.configGet('slowlog-max-len'))['slowlog-max-len'], '128');
+    assert.ok((await rejects(c.configSet({ shards: '2' }))) instanceof RuvioError);
+    assert.equal(String((await c.role())[0]), 'master');
+    // The live server keeps no WAL, so it cannot replicate: both forms are refused unchanged.
+    assert.ok((await rejects(c.replicaOf('127.0.0.1', 1))) instanceof RuvioError);
+    assert.ok((await rejects(c.replicaOfNoOne())) instanceof RuvioError);
+    // Only on a throwaway server: CONFIG REWRITE rewrites the server's config file.
+    if (process.env.RUVIO_TEST_CONFIG_REWRITE === '1') assert.equal(await c.configRewrite(), 'OK');
     assert.equal(await c.save(), 'OK');
     assert.ok(typeof (await c.bgsave()) === 'string');
     assert.equal(await c.wait(0, 10), 0);
@@ -114,6 +123,7 @@ test('scripts and functions', { skip: SKIP }, async () => {
     assert.deepEqual(await c.scriptExists(sha, '0'.repeat(40)), [true, false]);
     assert.equal(await c.scriptFlush(), 'OK');
     assert.equal((await rejects(c.evalsha(sha, ['ek']))).code, 'NOSCRIPT');
+    for (let i = 0; i < 2; i++) assert.equal(await c.evalCached('return ARGV[1]', [], ['again']), 'again');
     assert.equal((await rejects(c.scriptKill())).code, 'NOTBUSY');
     await c.functionLoad('nodefn', "return 'fn:' .. ARGV[1]");
     assert.ok(JSON.stringify(await c.functionList()).includes('nodefn'));
@@ -354,5 +364,16 @@ test('multiplexing, ordering, binary view, errors, reconnect', { skip: SKIP }, a
     assert.ok((await rejects(nobody.ping())) instanceof ConnectionError);
   } finally {
     await c.quit();
+  }
+});
+
+test('CLIENT DURABILITY needs replication on a standalone server', { skip: SKIP }, async () => {
+  const c = await live(7);
+  try {
+    const e = await rejects(c.clientDurability(1, 1000));
+    assert.ok(e instanceof RuvioError);
+    assert.match(e.message, /needs replication/);
+  } finally {
+    c.disconnect();
   }
 });

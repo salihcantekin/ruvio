@@ -128,6 +128,7 @@ fn commands_logging_their_own_transaction_still_run_inside_multi() {
             key: owned(b"{t}rate"),
             max: 5,
             window_ms: 60_000,
+            mode: crate::protocol::LimitMode::Fixed,
         },
         Command::Copy {
             source: owned(b"{t}src"),
@@ -150,4 +151,34 @@ fn commands_logging_their_own_transaction_still_run_inside_multi() {
         crate::persistence::apply_mutation(&mut replay, *database, mutation).unwrap();
     }
     assert!(replay.expires_at(b"{t}rate").is_some());
+}
+
+#[test]
+fn ttl_on_create_logs_the_write_and_its_deadline_in_one_record() {
+    for command in [
+        &[b"INCR".as_slice(), b"k", b"EX", b"60"][..],
+        &[b"INCRBY", b"k", b"5", b"PX", b"60000", b"MAX", b"9"],
+        &[b"DECRBY", b"k", b"5", b"EX", b"60"],
+        &[b"INCRBYFLOAT", b"k", b"1.5", b"EX", b"60"],
+        &[b"HINCRBY", b"k", b"f", b"2", b"EX", b"60"],
+        &[b"ZADD", b"k", b"EX", b"60", b"1", b"a", b"2", b"b"],
+        &[b"ZINCRBY", b"k", b"2", b"a", b"PX", b"60000"],
+        &[b"GEOADD", b"k", b"EX", b"60", b"13.36", b"38.11", b"p"],
+        &[b"XADD", b"k", b"EX", b"60", b"*", b"f", b"v"],
+        &[b"SETBIT", b"k", b"7", b"1", b"EX", b"60"],
+        &[b"JSON.SET", b"k", b"$", b"{\"a\":1}", b"NX", b"EX", b"60"],
+        &[b"BF.INSERT", b"k", b"EX", b"60", b"ITEMS", b"a", b"b"],
+    ] {
+        check(&[], command, b"k");
+    }
+}
+
+#[test]
+fn ttl_on_create_leaves_an_existing_key_alone() {
+    let mut shard = KvShard::new();
+    let mut log = DatabaseLog::default();
+
+    run(&mut shard, &mut log, &[b"SET", b"k", b"1"]);
+    run(&mut shard, &mut log, &[b"INCR", b"k", b"EX", b"60"]);
+    assert_eq!(shard.expires_at(b"k"), None);
 }

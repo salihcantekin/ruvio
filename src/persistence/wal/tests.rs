@@ -153,7 +153,7 @@ fn a_failed_fill_sync_cuts_always_records_whose_batch_is_refused() {
     let start = write(&mut sink, b"acknowledged");
     sink.sync_batch(start).unwrap();
     let start = write(&mut sink, b"refused");
-    *sink.sync_error.lock().unwrap() = Some("injected fill sync failure".into());
+    sink.sync_error.report("injected fill sync failure".into());
 
     assert!(sink.sync_batch(start).is_err());
     drop(sink);
@@ -871,6 +871,46 @@ fn failed_prefill_sync_is_a_failed_sync_of_the_segment() {
 
     let (_sink, mutations, _) = WalSink::open(config, 0, limits).unwrap();
     assert!(mutations.is_empty());
+}
+
+/// Segments written with a larger `wal_segment_bytes` still recover after the setting is
+/// lowered (issue #32: they were reported as corrupt, which also broke `ruvio-ctl` on a data
+/// directory written with segments above its 256 MiB default), and new records go on.
+#[test]
+fn segments_longer_than_a_lowered_setting_still_recover() {
+    let directory = tempdir().unwrap();
+    let large = PersistenceConfig {
+        wal_segment_bytes: 1 << 20,
+        ..config(directory.path(), DurabilityProfile::Always)
+    };
+    let limits = ProtocolLimits::default();
+    let (mut sink, _, _) = WalSink::open(large, 0, limits).unwrap();
+
+    set(&mut sink, b"one", b"v").unwrap();
+    set(&mut sink, b"two", b"v").unwrap();
+    // Fill past the smaller size so the segment is longer even without preallocation.
+    for index in 0..64u32 {
+        set(&mut sink, format!("pad{index}").as_bytes(), &[7; 96]).unwrap();
+    }
+    drop(sink);
+
+    let small = config(directory.path(), DurabilityProfile::Always);
+    let shard_wal = shard_wal_directory(directory.path(), 0);
+    let longest = fs::read_dir(&shard_wal)
+        .unwrap()
+        .map(|entry| entry.unwrap().metadata().unwrap().len())
+        .max()
+        .unwrap();
+
+    assert!(longest > small.wal_segment_bytes, "{longest}");
+    let (mut sink, mutations, _) = WalSink::open(small.clone(), 0, limits).unwrap();
+
+    assert_eq!(mutations.len(), 66);
+    set(&mut sink, b"three", b"v").unwrap();
+    drop(sink);
+
+    let (_sink, mutations, _) = WalSink::open(small, 0, limits).unwrap();
+    assert_eq!(mutations.len(), 67);
 }
 
 #[test]
@@ -2483,6 +2523,60 @@ fn a_resumed_reader_follows_rotation_and_rescans_when_its_segment_is_gone() {
     assert!(matches!(resumed, Ok(FrameRead::Gap)));
 }
 
+// Only Unix keeps the segment open between chunks.
+#[cfg(unix)]
+#[test]
+fn a_resumed_reader_keeps_the_live_segment_open_and_drops_a_replaced_one() {
+    let directory = tempdir().unwrap();
+    let limits = ProtocolLimits::default();
+    let config = config(directory.path(), DurabilityProfile::Always);
+    let (mut sink, _, _) = WalSink::open(config, 0, limits).unwrap();
+    let write = |sink: &mut WalSink, count: u8| {
+        for index in 0..count {
+            sink.record(Mutation::SetBytes {
+                key: b"key",
+                value: &[index; 16],
+            })
+            .unwrap();
+        }
+        sink.flush().unwrap();
+    };
+    write(&mut sink, 5);
+
+    let mut reader = FrameCursor::default();
+    let FrameRead::Frames(first) =
+        read_frames_resuming(&mut reader, directory.path(), 0, 0, 5, limits, usize::MAX).unwrap()
+    else {
+        panic!("missing WAL history");
+    };
+    assert_eq!(first.len(), 5);
+    assert!(reader.open.is_some());
+
+    // Records appended to the live segment after the first chunk come from the open file.
+    write(&mut sink, 3);
+    let FrameRead::Frames(next) =
+        read_frames_resuming(&mut reader, directory.path(), 0, 5, 8, limits, usize::MAX).unwrap()
+    else {
+        panic!("missing WAL history");
+    };
+    let FrameRead::Frames(scanned) = read_frames(directory.path(), 0, 5, 8, limits).unwrap() else {
+        panic!("missing WAL history");
+    };
+    assert_eq!(next, scanned);
+    assert!(reader.open.is_some());
+
+    // The same path now names another file: the reader rescans instead of reading on.
+    let (held, _) = reader.position.clone().unwrap();
+    let copy = held.with_extension("copy");
+    fs::copy(&held, &copy).unwrap();
+    fs::remove_file(&held).unwrap();
+    fs::rename(&copy, &held).unwrap();
+    write(&mut sink, 1);
+    let resumed = read_frames_resuming(&mut reader, directory.path(), 0, 8, 9, limits, usize::MAX);
+    let scanned = read_frames(directory.path(), 0, 8, 9, limits);
+    assert_eq!(format!("{resumed:?}"), format!("{scanned:?}"));
+}
+
 #[test]
 fn compact_of_the_full_log_leaves_recovery_from_the_covered_sequence() {
     let directory = tempdir().unwrap();
@@ -2664,4 +2758,120 @@ fn everysec_group_is_readable_before_the_background_sync() {
         read_frames(directory.path(), 0, 0, 1, limits).unwrap(),
         FrameRead::Frames(frames) if frames.len() == 1
     ));
+}
+
+/// Records staged inside a group are encoded onto the end of the batch buffer. A record that
+/// needs a new segment, overflows the batch, or is refused must leave the batch exactly as it
+/// was: recovery returns every accepted record in order and nothing of the refused one.
+#[test]
+fn staged_records_survive_rotation_batch_overflow_and_a_refused_record() {
+    let check = |segment_bytes: u64, value_len: usize, count: u8| {
+        let directory = tempdir().unwrap();
+        let config = PersistenceConfig {
+            wal_segment_bytes: segment_bytes,
+            ..bulk_config(directory.path())
+        };
+        let limits = ProtocolLimits::default();
+        let (mut sink, _, _) = WalSink::open(config.clone(), 0, limits).unwrap();
+        let mut expected = Vec::new();
+
+        sink.begin_group();
+        for index in 0..count {
+            let key = [b'k', index];
+            let value = vec![index; value_len];
+
+            sink.record(Mutation::SetBytes {
+                key: &key,
+                value: &value,
+            })
+            .unwrap();
+            expected.push(
+                Mutation::SetBytes {
+                    key: &key,
+                    value: &value,
+                }
+                .to_owned(),
+            );
+
+            if index == count / 2 {
+                let refused = vec![0u8; segment_bytes as usize];
+                let error = sink
+                    .record(Mutation::SetBytes {
+                        key: b"refused",
+                        value: &refused,
+                    })
+                    .unwrap_err();
+
+                assert!(error.to_string().contains("segment size"), "{error}");
+            }
+        }
+        sink.end_group().unwrap();
+        sink.flush().unwrap();
+        drop(sink);
+
+        let (_sink, mutations, report) = WalSink::open(config, 0, limits).unwrap();
+        let recovered: Vec<_> = mutations
+            .into_iter()
+            .map(|(_, mutation)| mutation)
+            .collect();
+
+        assert_eq!(recovered, expected);
+        assert_eq!(report.last_sequence, u64::from(count));
+        fs::read_dir(shard_wal_directory(directory.path(), 0))
+            .unwrap()
+            .count()
+    };
+
+    // Small segments: the group rotates several times while records are staged.
+    assert!(check(4096, 64, 100) > 1);
+    // One large segment: the batch passes `WAL_GROUP_BYTES` several times.
+    assert_eq!(check(4 * 1024 * 1024, 4000, 60), 1);
+}
+
+/// A record over the command limit, refused in the middle of a staged batch, leaves the batch
+/// as it was.
+#[test]
+fn a_record_over_the_command_limit_leaves_the_staged_batch_intact() {
+    let directory = tempdir().unwrap();
+    let config = bulk_config(directory.path());
+    let limits = ProtocolLimits {
+        max_command_bytes: 256,
+        ..ProtocolLimits::default()
+    };
+    let (mut sink, _, _) = WalSink::open(config.clone(), 0, limits).unwrap();
+
+    sink.begin_group();
+    sink.record(Mutation::SetBytes {
+        key: b"a",
+        value: b"1",
+    })
+    .unwrap();
+    let error = sink
+        .record(Mutation::SetBytes {
+            key: b"big",
+            value: &[7; 512],
+        })
+        .unwrap_err();
+
+    assert!(error.to_string().contains("command limit"), "{error}");
+    sink.record(Mutation::SetBytes {
+        key: b"b",
+        value: b"2",
+    })
+    .unwrap();
+    sink.end_group().unwrap();
+    sink.flush().unwrap();
+    drop(sink);
+
+    let (_sink, mutations, report) = WalSink::open(config, 0, limits).unwrap();
+    let keys: Vec<_> = mutations
+        .into_iter()
+        .map(|(_, mutation)| match mutation {
+            OwnedMutation::SetBytes { key, .. } => key,
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect();
+
+    assert_eq!(keys, [b"a".to_vec(), b"b".to_vec()]);
+    assert_eq!(report.last_sequence, 2);
 }

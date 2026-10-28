@@ -13,6 +13,8 @@ const table = (words: readonly string[]): ReadonlyMap<string, Buffer> => {
   return m;
 };
 
+/** `EXPIRE` conditions. */
+export const KW_EXPIRE_COND = table(['NX', 'XX', 'GT', 'LT']);
 /** `GEO` distance units. */
 export const KW_GEO_UNIT = table(['M', 'KM', 'FT', 'MI']);
 /** `ASC` / `DESC`. */

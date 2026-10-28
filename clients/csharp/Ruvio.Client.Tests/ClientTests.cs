@@ -337,6 +337,70 @@ public class ClientTests
         Assert.NotNull(client);
     }
 
+    [Theory(Timeout = 15000)]
+    [InlineData(null, "*4\r\n$6\r\nCLIENT\r\n$10\r\nDURABILITY\r\n$8\r\nREPLICAS\r\n$1\r\n2\r\n")]
+    [InlineData(250, "*6\r\n$6\r\nCLIENT\r\n$10\r\nDURABILITY\r\n$8\r\nREPLICAS\r\n$1\r\n2\r\n$7\r\nTIMEOUT\r\n$3\r\n250\r\n")]
+    public async Task DurabilityOptionIsSentAfterAuthOnConnect(int? timeoutMilliseconds, string command)
+    {
+        using var server = new TcpListener(IPAddress.Loopback, 0);
+
+        server.Start();
+        int port = ((IPEndPoint)server.LocalEndpoint!).Port;
+        var connecting = RuvioConnection.ConnectAsync(new RuvioClientOptions
+        {
+            Host = "127.0.0.1",
+            Port = port,
+            Password = "secret",
+            DurabilityReplicas = 2,
+            DurabilityTimeout = timeoutMilliseconds is { } ms ? TimeSpan.FromMilliseconds(ms) : null,
+        });
+
+        using TcpClient accepted = await TestDeadlines.AcceptAsync(server);
+        NetworkStream stream = accepted.GetStream();
+        byte[] auth = Encoding.ASCII.GetBytes("*2\r\n$4\r\nAUTH\r\n$6\r\nsecret\r\n");
+        byte[] expected = Encoding.ASCII.GetBytes(command);
+        var got = new byte[auth.Length];
+
+        await TestDeadlines.ReadExactlyAsync(stream, got);
+        Assert.Equal(auth, got);
+        await stream.WriteAsync(Encoding.ASCII.GetBytes("+OK\r\n"));
+        got = new byte[expected.Length];
+        await TestDeadlines.ReadExactlyAsync(stream, got);
+        Assert.Equal(expected, got);
+        await stream.WriteAsync(Encoding.ASCII.GetBytes("+OK\r\n"));
+        await ReplyStandaloneClusterAsync(stream);
+        await using RuvioConnection connection = await connecting;
+        RuvioClient client = await connection.GetDefaultDatabaseAsync();
+        Assert.NotNull(client);
+    }
+
+    [Fact(Timeout = 15000)]
+    public async Task RefusedDurabilityOptionFailsTheConnect()
+    {
+        using var server = new TcpListener(IPAddress.Loopback, 0);
+
+        server.Start();
+        int port = ((IPEndPoint)server.LocalEndpoint!).Port;
+        var connecting = RuvioConnection.ConnectAsync(new RuvioClientOptions
+        {
+            Host = "127.0.0.1",
+            Port = port,
+            DurabilityReplicas = 1,
+        });
+
+        using TcpClient accepted = await TestDeadlines.AcceptAsync(server);
+        NetworkStream stream = accepted.GetStream();
+        byte[] expected = Encoding.ASCII.GetBytes("*4\r\n$6\r\nCLIENT\r\n$10\r\nDURABILITY\r\n$8\r\nREPLICAS\r\n$1\r\n1\r\n");
+        var got = new byte[expected.Length];
+
+        await TestDeadlines.ReadExactlyAsync(stream, got);
+        Assert.Equal(expected, got);
+        await stream.WriteAsync(Encoding.ASCII.GetBytes("-ERR CLIENT DURABILITY needs replication on this server\r\n"));
+
+        RuvioException error = await Assert.ThrowsAsync<RuvioException>(() => connecting);
+        Assert.Contains("needs replication", error.Message);
+    }
+
     [Fact(Timeout = 15000)]
     public async Task DatabaseOptionIsNotSentForDatabaseZero()
     {

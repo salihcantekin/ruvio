@@ -1,0 +1,532 @@
+{
+  "date": "2026-10-19",
+  "host": {
+    "os": "macOS 26.7.1",
+    "arch": "arm64",
+    "cpu": "Apple M4 Pro",
+    "cores": 12,
+    "memory_gib": 24
+  },
+  "build": {
+    "commit": "28795745",
+    "dirty": true
+  },
+  "redis_version": "Redis server v=8.10.2 sha=00000000:1 malloc=libc bits=64 build=764b3e45065a66fb",
+  "config": {
+    "rounds": 3,
+    "clients": 50,
+    "pipeline": 16
+  },
+  "rows": [
+    {
+      "label": "TRANSFER (enough)",
+      "ruvio": 2586207.0,
+      "redis": 316122.22,
+      "samples": {
+        "ruvio": [
+          2238806.0,
+          2586207.0,
+          2586207.0
+        ],
+        "redis": [
+          316122.22,
+          316122.22,
+          312500.0
+        ]
+      },
+      "ruvio_p50": 0.103,
+      "ruvio_p99": 0.311,
+      "redis_p50": 0.287,
+      "redis_p99": 0.527,
+      "ruvio_p1_rps": 230769.23,
+      "redis_p1_rps": 153452.69
+    },
+    {
+      "label": "TRANSFER (source too low)",
+      "ruvio": 2222222.25,
+      "redis": 626304.81,
+      "samples": {
+        "ruvio": [
+          2205882.25,
+          2222222.25,
+          2290076.5
+        ],
+        "redis": [
+          626304.81,
+          631578.94,
+          625000.0
+        ]
+      },
+      "ruvio_p50": 0.103,
+      "ruvio_p99": 0.303,
+      "redis_p50": 0.135,
+      "redis_p99": 0.383,
+      "ruvio_p1_rps": 253164.55,
+      "redis_p1_rps": 231660.23
+    },
+    {
+      "label": "HTRANSFER (enough)",
+      "ruvio": 1639344.25,
+      "redis": 270758.12,
+      "samples": {
+        "ruvio": [
+          1485148.5,
+          1639344.25,
+          1714285.75
+        ],
+        "redis": [
+          270758.12,
+          275229.34,
+          269299.84
+        ]
+      },
+      "ruvio_p50": 0.111,
+      "ruvio_p99": 0.319,
+      "redis_p50": 0.367,
+      "redis_p99": 0.647,
+      "ruvio_p1_rps": 204778.14,
+      "redis_p1_rps": 121703.85
+    },
+    {
+      "label": "SET IFGT (random keys, half hit)",
+      "ruvio": 2459016.25,
+      "redis": 603621.75,
+      "samples": {
+        "ruvio": [
+          2173913.0,
+          2970297.0,
+          2459016.25
+        ],
+        "redis": [
+          603621.75,
+          604838.75,
+          580270.75
+        ]
+      },
+      "ruvio_p50": 0.111,
+      "ruvio_p99": 0.327,
+      "redis_p50": 0.183,
+      "redis_p99": 0.407,
+      "ruvio_p1_rps": 194174.77,
+      "redis_p1_rps": 195439.73
+    },
+    {
+      "label": "ZPOPBYSCORE COUNT 1 (100000 due)",
+      "ruvio": 1515151.5,
+      "redis": 218340.61,
+      "samples": {
+        "ruvio": [
+          1315789.5,
+          1515151.5,
+          1562499.88
+        ],
+        "redis": [
+          218340.61,
+          215517.25,
+          228310.5
+        ]
+      },
+      "ruvio_p50": 0.103,
+      "ruvio_p99": 0.327,
+      "redis_p50": 0.351,
+      "redis_p99": 0.631,
+      "ruvio_p1_rps": 241545.89,
+      "redis_p1_rps": 127877.23
+    },
+    {
+      "label": "ZPOPBYSCORE COUNT 10 (100000 due)",
+      "ruvio": 357714.28,
+      "redis": 151757.58,
+      "samples": {
+        "ruvio": [
+          385230.75,
+          333866.69,
+          357714.28
+        ],
+        "redis": [
+          151757.58,
+          128410.25,
+          151757.58
+        ]
+      },
+      "ruvio_p50": 0.351,
+      "ruvio_p99": 0.439,
+      "redis_p50": 0.551,
+      "redis_p99": 0.975,
+      "ruvio_p1_rps": 142857.14,
+      "redis_p1_rps": 81967.21
+    },
+    {
+      "label": "ZPOPBYSCORE nothing due",
+      "ruvio": 2189781.0,
+      "redis": 524475.5,
+      "samples": {
+        "ruvio": [
+          2189781.0,
+          2173913.0,
+          2654867.25
+        ],
+        "redis": [
+          524475.5,
+          527240.75,
+          520833.34
+        ]
+      },
+      "ruvio_p50": 0.111,
+      "ruvio_p99": 0.311,
+      "redis_p50": 0.175,
+      "redis_p99": 0.399,
+      "ruvio_p1_rps": 214285.72,
+      "redis_p1_rps": 217391.31
+    },
+    {
+      "label": "ZMOVEDUE COUNT 1 (100000 due)",
+      "ruvio": 1162790.62,
+      "redis": 331125.84,
+      "samples": {
+        "ruvio": [
+          1086956.5,
+          1190476.25,
+          1162790.62
+        ],
+        "redis": [
+          304878.03,
+          331125.84,
+          333333.31
+        ]
+      },
+      "ruvio_p50": 0.111,
+      "ruvio_p99": 0.327,
+      "redis_p50": 0.271,
+      "redis_p99": 0.487,
+      "ruvio_p1_rps": 222222.23,
+      "redis_p1_rps": 154798.75
+    },
+    {
+      "label": "ZMOVEDUE COUNT 10 (100000 due)",
+      "ruvio": 313000.0,
+      "redis": 185481.48,
+      "samples": {
+        "ruvio": [
+          313000.0,
+          313000.0,
+          294588.22
+        ],
+        "redis": [
+          192615.38,
+          185481.48,
+          178857.14
+        ]
+      },
+      "ruvio_p50": 0.399,
+      "ruvio_p99": 0.591,
+      "redis_p50": 0.527,
+      "redis_p99": 1.311,
+      "ruvio_p1_rps": 125000.0,
+      "redis_p1_rps": 81967.21
+    },
+    {
+      "label": "INCR (plain, for scale)",
+      "ruvio": 2173913.0,
+      "redis": 1775147.88,
+      "samples": {
+        "ruvio": [
+          2054794.5,
+          2255639.0,
+          2173913.0
+        ],
+        "redis": [
+          1775147.88,
+          1785714.25,
+          1764705.88
+        ]
+      },
+      "ruvio_p50": 0.191,
+      "ruvio_p99": 0.295,
+      "redis_p50": 0.183,
+      "redis_p99": 0.271,
+      "ruvio_p1_rps": 150375.94,
+      "redis_p1_rps": 153452.69
+    },
+    {
+      "label": "INCR EX 60 (1000 keys, mostly existing)",
+      "ruvio": 1973684.25,
+      "redis": 666666.69,
+      "samples": {
+        "ruvio": [
+          1675977.62,
+          1986755.0,
+          1973684.25
+        ],
+        "redis": [
+          666666.69,
+          662251.62,
+          668151.44
+        ]
+      },
+      "ruvio_p50": 0.183,
+      "ruvio_p99": 0.311,
+      "redis_p50": 0.175,
+      "redis_p99": 0.375,
+      "ruvio_p1_rps": 166204.98,
+      "redis_p1_rps": 181818.17
+    },
+    {
+      "label": "INCR EX 60 (new keys)",
+      "ruvio": 1219512.12,
+      "redis": 439238.62,
+      "samples": {
+        "ruvio": [
+          1153846.25,
+          1219512.12,
+          1260504.12
+        ],
+        "redis": [
+          439238.62,
+          437956.19,
+          439238.62
+        ]
+      },
+      "ruvio_p50": 0.175,
+      "ruvio_p99": 0.343,
+      "redis_p50": 0.255,
+      "redis_p99": 0.439,
+      "ruvio_p1_rps": 178571.44,
+      "redis_p1_rps": 160857.91
+    },
+    {
+      "label": "LIMIT plain (fixed window, allowed)",
+      "ruvio": 1986755.0,
+      "redis": 570342.19,
+      "samples": {
+        "ruvio": [
+          1685393.25,
+          1986755.0,
+          2040816.38
+        ],
+        "redis": [
+          570342.19,
+          567107.75,
+          572519.12
+        ]
+      },
+      "ruvio_p50": 0.175,
+      "ruvio_p99": 0.303,
+      "redis_p50": 0.207,
+      "redis_p99": 0.415,
+      "ruvio_p1_rps": 174927.11,
+      "redis_p1_rps": 166666.66
+    },
+    {
+      "label": "LIMIT SLIDING (allowed)",
+      "ruvio": 1754385.88,
+      "redis": 284360.22,
+      "samples": {
+        "ruvio": [
+          1578947.38,
+          1775147.88,
+          1754385.88
+        ],
+        "redis": [
+          285442.44,
+          282752.12,
+          284360.22
+        ]
+      },
+      "ruvio_p50": 0.183,
+      "ruvio_p99": 0.327,
+      "redis_p50": 0.335,
+      "redis_p99": 0.527,
+      "ruvio_p1_rps": 164383.56,
+      "redis_p1_rps": 130718.95
+    },
+    {
+      "label": "LIMIT SLIDING (mostly refused, max 5)",
+      "ruvio": 2040816.38,
+      "redis": 348432.06,
+      "samples": {
+        "ruvio": [
+          1775147.88,
+          2040816.38,
+          2112676.0
+        ],
+        "redis": [
+          348027.84,
+          350058.34,
+          348432.06
+        ]
+      },
+      "ruvio_p50": 0.183,
+      "ruvio_p99": 0.311,
+      "redis_p50": 0.295,
+      "redis_p99": 0.487,
+      "ruvio_p1_rps": 171919.77,
+      "redis_p1_rps": 145278.45
+    },
+    {
+      "label": "LIMIT TOKENS (allowed)",
+      "ruvio": 1310043.62,
+      "redis": 303643.72,
+      "samples": {
+        "ruvio": [
+          1224489.75,
+          1310043.62,
+          1395348.88
+        ],
+        "redis": [
+          303643.72,
+          303951.38,
+          298210.72
+        ]
+      },
+      "ruvio_p50": 0.183,
+      "ruvio_p99": 0.343,
+      "redis_p50": 0.271,
+      "redis_p99": 0.495,
+      "ruvio_p1_rps": 174927.11,
+      "redis_p1_rps": 150753.77
+    },
+    {
+      "label": "LIMIT TOKENS (mostly refused, capacity 5)",
+      "ruvio": 2127659.5,
+      "redis": 397351.0,
+      "samples": {
+        "ruvio": [
+          1886792.5,
+          2255639.0,
+          2127659.5
+        ],
+        "redis": [
+          397351.0,
+          396825.41,
+          398936.19
+        ]
+      },
+      "ruvio_p50": 0.183,
+      "ruvio_p99": 0.311,
+      "redis_p50": 0.271,
+      "redis_p99": 0.463,
+      "ruvio_p1_rps": 168539.33,
+      "redis_p1_rps": 156657.97
+    },
+    {
+      "label": "RENEW lease",
+      "ruvio": 2142857.25,
+      "redis": 535714.31,
+      "samples": {
+        "ruvio": [
+          1775147.88,
+          2173913.0,
+          2142857.25
+        ],
+        "redis": [
+          535714.31,
+          538599.69,
+          532859.69
+        ]
+      },
+      "ruvio_p50": 0.183,
+      "ruvio_p99": 0.311,
+      "redis_p50": 0.215,
+      "redis_p99": 0.415,
+      "ruvio_p1_rps": 171428.58,
+      "redis_p1_rps": 165745.86
+    },
+    {
+      "label": "RENEW semaphore slot",
+      "ruvio": 1898734.12,
+      "redis": 536672.62,
+      "samples": {
+        "ruvio": [
+          1796407.25,
+          2013422.75,
+          1898734.12
+        ],
+        "redis": [
+          536672.62,
+          534759.38,
+          539568.38
+        ]
+      },
+      "ruvio_p50": 0.183,
+      "ruvio_p99": 0.319,
+      "redis_p50": 0.223,
+      "redis_p99": 0.423,
+      "ruvio_p1_rps": 164835.17,
+      "redis_p1_rps": 163934.42
+    }
+  ],
+  "memory": [
+    {
+      "label": "100,000 counters INCR ... EX (vs INCR + EXPIRE)",
+      "keys": 100000,
+      "ruvio": {
+        "idle_kib": 9856,
+        "loaded_kib": 18848,
+        "delta_kib": 8992
+      },
+      "redis": {
+        "idle_kib": 6880,
+        "loaded_kib": 16832,
+        "delta_kib": 9952
+      }
+    },
+    {
+      "label": "100,000 leases (vs SET ... PX)",
+      "keys": 100000,
+      "ruvio": {
+        "idle_kib": 9856,
+        "loaded_kib": 16640,
+        "delta_kib": 6784
+      },
+      "redis": {
+        "idle_kib": 6864,
+        "loaded_kib": 16848,
+        "delta_kib": 9984
+      }
+    },
+    {
+      "label": "100,000 sliding-window limiters (vs two-counter Lua)",
+      "keys": 100000,
+      "ruvio": {
+        "idle_kib": 9856,
+        "loaded_kib": 20288,
+        "delta_kib": 10432
+      },
+      "redis": {
+        "idle_kib": 6976,
+        "loaded_kib": 17104,
+        "delta_kib": 10128
+      }
+    },
+    {
+      "label": "100,000 token buckets (vs hash + PEXPIRE Lua)",
+      "keys": 100000,
+      "ruvio": {
+        "idle_kib": 9856,
+        "loaded_kib": 20272,
+        "delta_kib": 10416
+      },
+      "redis": {
+        "idle_kib": 6944,
+        "loaded_kib": 20160,
+        "delta_kib": 13216
+      }
+    },
+    {
+      "label": "50,000 one-holder semaphores (vs one-member ZSET)",
+      "keys": 50000,
+      "ruvio": {
+        "idle_kib": 9856,
+        "loaded_kib": 16272,
+        "delta_kib": 6416
+      },
+      "redis": {
+        "idle_kib": 6896,
+        "loaded_kib": 11424,
+        "delta_kib": 4528
+      }
+    }
+  ],
+  "seconds": 127.5
+}

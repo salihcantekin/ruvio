@@ -3,6 +3,8 @@ package io.github.salihcantekin.ruvio.internal;
 
 import io.github.salihcantekin.ruvio.RuvioCodec;
 
+import java.time.Duration;
+
 /**
  * Argument builder for commands with optional parts. Arguments are encoded immediately into a
  * private buffer that is copied into the connection buffer in one {@code arraycopy}. Hot fixed-shape
@@ -167,5 +169,33 @@ public final class Args {
         out.arg(value);
         count++;
         return this;
+    }
+
+    /** The longest accepted time to live in whole seconds; keeps the millisecond form from overflowing. */
+    private static final long MAX_TTL_SECONDS = Long.MAX_VALUE / 1000;
+
+    /**
+     * Adds the time to live of a TTL-on-create command: {@code EX seconds} for a whole number of
+     * seconds, {@code PX milliseconds} otherwise (a sub-millisecond rest rounds up to 1 ms).
+     *
+     * @param ttl the time to live (above zero)
+     * @return this builder
+     * @throws IllegalArgumentException when {@code ttl} is null, zero, negative or too large
+     */
+    public Args ttl(Duration ttl) {
+        if (ttl == null) {
+            throw new IllegalArgumentException("ttl must not be null");
+        }
+        if (ttl.isZero() || ttl.isNegative()) {
+            throw new IllegalArgumentException("ttl must be above zero");
+        }
+        if (ttl.getSeconds() >= MAX_TTL_SECONDS) {
+            throw new IllegalArgumentException("ttl too large");
+        }
+        if (ttl.getNano() == 0) {
+            return w(Cmd.EX).l(ttl.getSeconds());
+        }
+        long millis = ttl.getSeconds() * 1000 + (ttl.getNano() + 999_999) / 1_000_000;
+        return w(Cmd.PX).l(millis);
     }
 }

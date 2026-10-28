@@ -23,14 +23,17 @@ mod arena_table;
 mod bloom;
 mod evict;
 mod expire;
+mod fence;
 mod fill;
 mod hash;
 mod intset;
 pub(crate) mod json_indexing;
+mod limit;
 mod list;
 mod pool;
 mod set;
 mod slab_ops;
+mod slot_watch;
 mod smallbuf;
 mod snapshot;
 mod stream;
@@ -39,7 +42,8 @@ mod string;
 mod tests;
 mod value;
 pub(crate) use fill::FillState;
-pub(crate) use string::SMALL_JSON_EDIT;
+pub(crate) use limit::{LIMIT_SLIDING_MAX, LIMIT_TOKENS_MAX_CAPACITY, LIMIT_TOKENS_MAX_REFILL_MS};
+pub(crate) use string::{ReadMark, SMALL_JSON_EDIT};
 mod zset;
 
 use access::*;
@@ -334,6 +338,10 @@ pub struct KvShard<C = SystemClock, I = AHashIndex> {
     collection_work: AHashSet<(u8, Box<[u8]>)>,
     watches: AHashMap<u64, Vec<(u8, Arc<[u8]>)>>,
     watchers_by_key: Option<AHashMap<u8, AHashMap<Arc<[u8]>, AHashSet<u64>>>>,
+    /// Keys of a slot range written while it is copied to another shard.
+    slot_watch: Option<Box<slot_watch::SlotWatch>>,
+    /// `watchers_by_key` or `slot_watch` is set: one test on every write.
+    observing: bool,
     dirty_watches: AHashSet<u64>,
     /// Tasks to wake when a watch of theirs turns dirty: clients blocked in a command
     /// that is retried when one of its keys changes.
@@ -372,6 +380,16 @@ pub struct KvShard<C = SystemClock, I = AHashIndex> {
     /// `None` until `CHANGES START`. Mutations do not record while this is absent.
     change_log: Option<std::collections::VecDeque<ChangeNote>>,
     change_next: u64,
+    /// Generation in the high bits of new `LEASE` and `SEMAPHORE` tokens.
+    fence_generation: u64,
+    /// Highest token of `fence_generation` this shard granted or applied.
+    fence_last: u64,
+    /// Highest token of a later generation applied before this shard learned it (a log
+    /// replayed before the epoch was read); taken over when that generation is set.
+    fence_ahead: u64,
+    /// Lowest clock reading, in milliseconds, new tokens are taken from: one past the checkpoint
+    /// a restart loaded, whatever the generation.
+    fence_clock_floor: u64,
     /// Log drain round in progress; `None` while every log is dense enough.
     reclaim: Option<Box<ReclaimWalk>>,
 }
@@ -405,6 +423,8 @@ impl Default for KvShard<SystemClock, AHashIndex> {
             collection_work: AHashSet::new(),
             watches: AHashMap::new(),
             watchers_by_key: None,
+            slot_watch: None,
+            observing: false,
             dirty_watches: AHashSet::new(),
             watch_wakers: AHashMap::new(),
             expiration: ExpirationStats::default(),
@@ -431,6 +451,10 @@ impl Default for KvShard<SystemClock, AHashIndex> {
             notify: crate::notify::NotifyState::default(),
             change_log: None,
             change_next: 0,
+            fence_generation: 0,
+            fence_last: 0,
+            fence_ahead: 0,
+            fence_clock_floor: 0,
             reclaim: None,
         }
     }
@@ -463,6 +487,8 @@ impl KvShard<SystemClock, AHashIndex> {
             collection_work: AHashSet::new(),
             watches: AHashMap::new(),
             watchers_by_key: None,
+            slot_watch: None,
+            observing: false,
             dirty_watches: AHashSet::new(),
             watch_wakers: AHashMap::new(),
             expiration: ExpirationStats::default(),
@@ -489,6 +515,10 @@ impl KvShard<SystemClock, AHashIndex> {
             notify: crate::notify::NotifyState::default(),
             change_log: None,
             change_next: 0,
+            fence_generation: 0,
+            fence_last: 0,
+            fence_ahead: 0,
+            fence_clock_floor: 0,
             reclaim: None,
         };
 
@@ -522,6 +552,8 @@ impl<C: Clock> KvShard<C, AHashIndex> {
             collection_work: AHashSet::new(),
             watches: AHashMap::new(),
             watchers_by_key: None,
+            slot_watch: None,
+            observing: false,
             dirty_watches: AHashSet::new(),
             watch_wakers: AHashMap::new(),
             expiration: ExpirationStats::default(),
@@ -548,6 +580,10 @@ impl<C: Clock> KvShard<C, AHashIndex> {
             notify: crate::notify::NotifyState::default(),
             change_log: None,
             change_next: 0,
+            fence_generation: 0,
+            fence_last: 0,
+            fence_ahead: 0,
+            fence_clock_floor: 0,
             reclaim: None,
         };
 
@@ -591,6 +627,8 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
             collection_work: AHashSet::new(),
             watches: AHashMap::new(),
             watchers_by_key: None,
+            slot_watch: None,
+            observing: false,
             dirty_watches: AHashSet::new(),
             watch_wakers: AHashMap::new(),
             expiration: ExpirationStats::default(),
@@ -617,6 +655,10 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
             notify: crate::notify::NotifyState::default(),
             change_log: None,
             change_next: 0,
+            fence_generation: 0,
+            fence_last: 0,
+            fence_ahead: 0,
+            fence_clock_floor: 0,
             reclaim: None,
         };
 
@@ -631,6 +673,14 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         let charge = self.entry_charge(key);
 
         Some(charge.key_bytes + charge.value_bytes + charge.collection_bytes)
+    }
+
+    /// What every lookup of `key` computes first (its hash under the index's fixed
+    /// hasher). It stays valid while the index changes, so a command that looks the key
+    /// up more than once (read, then write) hashes it once.
+    #[inline]
+    pub(crate) fn key_hint(&self, key: &[u8]) -> u64 {
+        self.entries.lookup_hint(key)
     }
 
     fn entry_charge(&self, key: &[u8]) -> EntryCharge {
@@ -723,12 +773,23 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
     /// Inlined so a store with no watched key pays one test, not a call.
     #[inline]
     fn note_mutation(&mut self, key: &[u8]) {
-        if self.watchers_by_key.is_some() {
-            self.note_watched_mutation(key);
+        if self.observing {
+            self.note_observed_mutation(key);
         }
     }
 
     #[inline(never)]
+    fn note_observed_mutation(&mut self, key: &[u8]) {
+        if let Some(watch) = self.slot_watch.as_mut() {
+            watch.note(key);
+        }
+        self.note_watched_mutation(key);
+    }
+
+    fn refresh_observing(&mut self) {
+        self.observing = self.watchers_by_key.is_some() || self.slot_watch.is_some();
+    }
+
     fn note_watched_mutation(&mut self, key: &[u8]) {
         if let Some(connections) = self
             .watchers_by_key
@@ -749,6 +810,9 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
 
     /// Marks every watch on a key of `databases` dirty, as FLUSHDB and SWAPDB do in Redis.
     fn note_database_rewrite(&mut self, databases: &[u8]) {
+        if let Some(watch) = self.slot_watch.as_mut() {
+            watch.note_rewrite();
+        }
         for (conn, keys) in &self.watches {
             if keys.iter().any(|(db, _)| databases.contains(db)) {
                 self.dirty_watches.insert(*conn);
@@ -787,6 +851,7 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
             };
             watched.push((database, owned));
         }
+        self.refresh_observing();
     }
 
     pub(crate) fn unwatch(&mut self, conn: u64) {
@@ -808,6 +873,7 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
             }
             if databases.is_empty() {
                 self.watchers_by_key = None;
+                self.refresh_observing();
             }
         }
         self.dirty_watches.remove(&conn);
@@ -951,11 +1017,15 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
 
     /// Makes `database` the map every key method uses. A map is created on first use.
     /// Parked maps do not change, so their totals are cached until they are entered again.
+    #[inline]
     pub(crate) fn enter(&mut self, database: u8) {
-        if database == self.active {
-            return;
+        if database != self.active {
+            self.switch_database(database);
         }
+    }
 
+    #[inline(never)]
+    fn switch_database(&mut self, database: u8) {
         let next = self
             .slot(database)
             .take()
@@ -1340,6 +1410,55 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         if let Some(sweep) = self.field_sweep.take() {
             drop(sweep);
         }
+    }
+
+    /// Removes every key, in every database, whose hash slot is set in `slots` (indexed by
+    /// slot), without logging it. Recovery uses it for keys of slots another shard owns.
+    pub(crate) fn drop_slots(&mut self, slots: &[bool]) -> usize {
+        let active = self.active;
+        let mut dropped = 0;
+
+        for database in self.database_ids() {
+            self.enter(database);
+            let keys: Vec<Box<[u8]>> = self
+                .entries
+                .entries()
+                .filter(|(key, _)| slots[usize::from(crate::routing::hash_slot(key))])
+                .map(|(key, _)| key.into())
+                .collect();
+
+            // An expired key is removed as expired; either way it is gone.
+            for key in &keys {
+                self.delete_internal(key, true, crate::notify::KeyEvent::Del);
+            }
+            dropped += keys.len();
+        }
+
+        self.enter(active);
+        dropped
+    }
+
+    /// How many keys, in every database, live in a slot marked in `slots`, and the lowest
+    /// such slot. Reads only; walks every key once.
+    pub(crate) fn count_in_slots(&mut self, slots: &[bool]) -> (usize, Option<u16>) {
+        let active = self.active;
+        let mut count = 0;
+        let mut lowest: Option<u16> = None;
+
+        for database in self.database_ids() {
+            self.enter(database);
+            for (key, _) in self.entries.entries() {
+                let slot = crate::routing::hash_slot(key);
+
+                if slots[usize::from(slot)] {
+                    count += 1;
+                    lowest = Some(lowest.map_or(slot, |known| known.min(slot)));
+                }
+            }
+        }
+
+        self.enter(active);
+        (count, lowest)
     }
 
     /// Moves `key` from the active database to `target`. False when the key is missing
@@ -1761,6 +1880,12 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         self.notify.take()
     }
 
+    /// Nothing for `drain_notices` to hand out.
+    #[inline]
+    pub(crate) fn notices_idle(&self) -> bool {
+        self.notify.is_idle()
+    }
+
     /// One borrow for the connection loop: the notices to publish and the keys expiry or
     /// eviction removed for tracking. An idle notify state allocates nothing.
     #[allow(clippy::type_complexity)]
@@ -1814,6 +1939,15 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         }
 
         self.record_access(key);
+    }
+
+    /// Stamps the read that [`Self::value_view_read`] described, once its view is dropped.
+    pub(crate) fn mark_read(&mut self, key: &[u8], mark: ReadMark) {
+        match mark {
+            ReadMark::Missing => {}
+            ReadMark::At(address) => self.record_access_at(address),
+            ReadMark::Key => self.touch(key),
+        }
     }
 }
 

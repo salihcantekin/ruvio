@@ -37,6 +37,8 @@ public final class RuvioAsync<K, V> extends RuvioCommands<K, V> {
     final Link link;
     /** Non-null in cluster mode: every command is routed by its key; {@code link} is then the seed's. */
     final ClusterRouter router;
+    /** A standalone link that follows a failover: the connection keeps each write until its reply arrives so a refused one can be sent again. */
+    private final boolean follow;
 
     RuvioAsync(Link link, RuvioCodec<K> keys, RuvioCodec<V> values) {
         this(link, null, keys, values);
@@ -46,13 +48,17 @@ public final class RuvioAsync<K, V> extends RuvioCommands<K, V> {
         super(keys, values);
         this.link = link;
         this.router = router;
+        this.follow = router == null && link.follows();
         this.routed = router != null;
     }
 
     @Override
     protected RespOut begin() {
         ClusterRouter r = router;
-        return r == null ? link.get().begin() : r.begin();
+        if (r != null) {
+            return r.begin();
+        }
+        return link.get().begin();
     }
 
     @Override
@@ -67,7 +73,11 @@ public final class RuvioAsync<K, V> extends RuvioCommands<K, V> {
     protected <T> CompletableFuture<T> end(RespOut out, Request<T> request) {
         ClusterRouter r = router;
         if (r == null) {
-            out.owner.end(request);
+            if (follow) {
+                out.owner.endKeeping(request);
+            } else {
+                out.owner.end(request);
+            }
         } else {
             r.dispatch(out.frame, (RoutedRequest<T>) request, ClusterRouter.DIRECT);
         }

@@ -5,6 +5,8 @@ export const site = {
   url: "https://ruviodb.com",
   description:
     "Ruvio is a Rust key-value server that speaks the Redis protocol: one process for caching, locks, conditional writes, change feeds and delayed work.",
+  image: "/images/ruvio-social.png",
+  imageAlt: "Ruvio: a Redis-compatible server in Rust",
   github: "https://github.com/salihcantekin/ruvio",
   releases: "https://github.com/salihcantekin/ruvio/releases/latest",
   discussions: "https://github.com/salihcantekin/ruvio/discussions",
@@ -30,7 +32,9 @@ export const footerNav: { title: string; items: NavItem[] }[] = [
       { label: "Use cases", href: "/use-cases/" },
       { label: "Interactive examples", href: "/examples/" },
       { label: "Benchmarks", href: "/benchmarks/" },
+      { label: "Long-run tests", href: "/testing/" },
       { label: "Get started", href: "/get-started/" },
+      { label: "Changelog", href: "/changelog/" },
     ],
   },
   {
@@ -41,6 +45,7 @@ export const footerNav: { title: string; items: NavItem[] }[] = [
       { label: "Commands", href: "/docs/commands/" },
       { label: "Clients", href: "/docs/clients/" },
       { label: "Integrations", href: "/integrations/" },
+      { label: "FAQ", href: "/docs/faq/" },
     ],
   },
   {

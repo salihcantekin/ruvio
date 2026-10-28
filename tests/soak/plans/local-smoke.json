@@ -1,0 +1,32 @@
+{
+  "name": "local-smoke",
+  "seed": 7,
+  "duration_s": 60,
+  "warmup_s": 3,
+  "cluster": { "ping_interval_ms": 200, "down_after_ms": 1000 },
+  "load": {
+    "rate_per_worker": 30,
+    "keys_per_worker": 4,
+    "counters": 1,
+    "appenders": 2,
+    "registers": 1,
+    "readers_per_register": 2,
+    "profiles": { "default": {}, "durable": { "replicas": 1 } }
+  },
+  "faults": {
+    "interval_s": [4, 6],
+    "down_s": [1, 3],
+    "recovery_timeout_s": 30,
+    "sequence": [
+      { "kind": "stall-replica" },
+      { "kind": "kill-host" },
+      { "kind": "kill-coordinator-leader" },
+      { "kind": "kill-primary" },
+      { "kind": "kill-replica" }
+    ],
+    "kinds": ["kill-primary", "kill-replica", "stall-replica", "kill-coordinator-leader", "kill-host"]
+  },
+  "metrics_interval_s": 2,
+  "status_interval_s": 10,
+  "startup_timeout_s": 30
+}

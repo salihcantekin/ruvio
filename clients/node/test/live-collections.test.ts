@@ -118,6 +118,8 @@ test('hashes', { skip: SKIP }, async () => {
     assert.equal(await c.hincrbyfloat('h', 'f3', 0.5), 7.5);
     assert.equal(await c.hsetnx('h', 'f1', 'x'), false);
     assert.equal(await c.hsetnx('h', 'f9', 'x'), true);
+    assert.equal(await c.hmset('hm', { a: '1', b: '2' }), 'OK');
+    assert.deepEqual(await c.hmget('hm', 'a', 'b'), ['1', '2']);
     assert.equal(await c.hstrlen('h', 'f1'), 2);
     assert.equal(await c.hdel('h', 'f9', 'none'), 1);
     const page = await c.hscan('h', 0, { match: 'f*', count: 10 });
@@ -207,6 +209,11 @@ test('sorted sets', { skip: SKIP }, async () => {
     assert.equal(await c.zremrangebyrank('zs', 0, 4), 5);
     assert.equal(await c.zremrangebyscore('zs', '(20', '+inf'), 4);
     assert.deepEqual(await c.zpopmin('zs'), [{ member: 'm5', score: 5 }]);
+    await c.zadd('due', [[1, 'a'], [2, 'b'], [3, 'c'], [9, 'd']]);
+    assert.deepEqual(await c.zpopbyscore('due', 1), [{ member: 'a', score: 1 }]);
+    assert.equal(await c.zmovedue('due', 'ready', 3, 5), 2);
+    assert.deepEqual(await c.lrange('ready', 0, -1), ['b', 'c']);
+    assert.deepEqual(await c.zpopbyscore('due', 3, '-inf', 5), []);
     assert.deepEqual(await c.zpopmax('zs', 2), [{ member: 'm20', score: 20 }, { member: 'm19', score: 19 }]);
     const b = c.duplicate();
     try {
@@ -254,6 +261,36 @@ test('geo', { skip: SKIP }, async () => {
     assert.equal((r as { member: string }[])[0]!.member, 'Catania');
     assert.deepEqual(await c.georadiusbymember('g', 'Palermo', 10, 'km'), ['Palermo']);
     assert.equal(await c.georadiusbymember('g', 'Palermo', 500, 'km', { store: 'gstore' }), 2);
+  } finally {
+    await c.quit();
+  }
+});
+
+test('ttl on create: hash, sorted set, geo', { skip: SKIP }, async () => {
+  const c = await live(2);
+  try {
+    const within = async (key: string) => {
+      const t = await c.pttl(key);
+      assert.ok(t > 90_000 && t <= 100_000, `${key} pttl ${t}`);
+    };
+    assert.equal(await c.hincrby('t:h', 'f', 2, { ttl: 100 }), 2);
+    await within('t:h');
+    await c.hincrby('t:h', 'f', 1, { ttl: 5000 });
+    await within('t:h');
+    assert.equal(await c.zincrby('t:zi', 1.5, 'm', { ttl: 100 }), 1.5);
+    await within('t:zi');
+    await c.zincrby('t:zi', 1, 'm', { ttl: 5000 });
+    await within('t:zi');
+    assert.equal(await c.zadd('t:z', 1, 'a', { ttl: 100 }), 1);
+    await within('t:z');
+    assert.equal(await c.zadd('t:z', [[2, 'b']], { ttl: 5000 }), 1);
+    await within('t:z');
+    assert.equal(await c.zaddIncr('t:z2', 3, 'a', { ttl: 100 }), 3);
+    await within('t:z2');
+    assert.equal(await c.geoadd('t:g', [{ longitude: 13.36, latitude: 38.11, member: 'p' }], { ttl: 100 }), 1);
+    await within('t:g');
+    await c.geoadd('t:g', [{ longitude: 15.08, latitude: 37.5, member: 'q' }], { ttl: 5000 });
+    await within('t:g');
   } finally {
     await c.quit();
   }

@@ -11,6 +11,7 @@ import io.github.salihcantekin.ruvio.internal.Reply;
 import io.github.salihcantekin.ruvio.model.KeyValue;
 import io.github.salihcantekin.ruvio.model.ScanResult;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -94,6 +95,28 @@ public abstract class HashCommands<K, V> extends KeyCommands<K, V> {
             a.k(e.getKey()).v(e.getValue());
         }
         return send(a, Reply.LONG);
+    }
+
+    /**
+     * Sends {@code HMSET key field value [field value ...]}: sets several fields like {@link #hset(Object, Map)} but
+     * the server replies {@code OK} instead of the count of new fields. Redis marks {@code HMSET} deprecated; prefer
+     * {@code hset} in new code.
+     *
+     * <pre>{@code
+     * client.hmset("user:1", Map.of("name", "Ada", "city", "London"));
+     * }</pre>
+     *
+     * @param key the hash key
+     * @param fields the field names and values to set; must not be empty
+     * @return a future that completes with no value once the server has acknowledged the command
+     * @throws RuvioServerException {@code WRONGTYPE} when the key holds a non-hash
+     */
+    public CompletableFuture<Void> hmset(K key, Map<K, V> fields) {
+        Args a = args().w(Cmd.HMSET).k(key);
+        for (Map.Entry<K, V> e : fields.entrySet()) {
+            a.k(e.getKey()).v(e.getValue());
+        }
+        return send(a, Reply.OK);
     }
 
     /**
@@ -210,6 +233,57 @@ public abstract class HashCommands<K, V> extends KeyCommands<K, V> {
     }
 
     /**
+     * Sends {@code HINCRBY key field delta EX|PX ttl}: like {@link #hincrby(Object, Object, long)}, and a hash this call creates
+     * gets a time to live. An existing key keeps its deadline.
+     *
+     * @param key the hash key
+     * @param field the field to change
+     * @param delta the signed amount to add
+     * @param ttl time to live of a newly created key: whole seconds are sent as {@code EX}, anything finer as {@code PX}
+     * @return the field value after the addition
+     * @throws IllegalArgumentException when {@code ttl} is null, zero, negative or too large
+     * @throws RuvioServerException {@code ERR} when the field is not a signed 64-bit integer or the result overflows; {@code WRONGTYPE} when the key holds a non-hash
+     */
+    public CompletableFuture<Long> hincrby(K key, K field, long delta, Duration ttl) {
+        return send(args().w(Cmd.HINCRBY).k(key).k(field).l(delta).ttl(ttl), Reply.LONG);
+    }
+
+    /**
+     * Sends {@code HTRANSFER key from to amount}: moves {@code amount} between two integer fields of one hash
+     * in one step, only when {@code from} holds at least that much. A missing {@code to} field starts at 0 and
+     * field TTLs stay.
+     *
+     * @param key the hash key
+     * @param from the field to subtract from
+     * @param to the field to add to
+     * @param amount the amount to move; must be greater than zero
+     * @return {@code [fromAfter, toAfter]}, or {@code null} when the key or {@code from} is missing or short, or
+     * {@code to} would overflow (nothing is written)
+     * @throws RuvioServerException {@code ERR} when {@code amount} is not positive, the fields are the same or a
+     * field is not an integer; {@code WRONGTYPE} when the key holds a non-hash
+     */
+    public CompletableFuture<List<Long>> htransfer(K key, K from, K to, long amount) {
+        return send(args().w(Cmd.HTRANSFER).k(key).k(from).k(to).l(amount), Reply.LONG_PAIR);
+    }
+
+    /**
+     * Sends {@code HTRANSFER key from to amount MAX max}: {@link #htransfer(Object, Object, Object, long)} that
+     * also refuses when {@code to} would end above {@code max}.
+     *
+     * @param key the hash key
+     * @param from the field to subtract from
+     * @param to the field to add to
+     * @param amount the amount to move; must be greater than zero
+     * @param max the highest value {@code to} may reach
+     * @return {@code [fromAfter, toAfter]}, or {@code null} when nothing was moved
+     * @throws RuvioServerException {@code ERR} when {@code amount} is not positive, the fields are the same or a
+     * field is not an integer; {@code WRONGTYPE} when the key holds a non-hash
+     */
+    public CompletableFuture<List<Long>> htransfer(K key, K from, K to, long amount, long max) {
+        return send(args().w(Cmd.HTRANSFER).k(key).k(from).k(to).l(amount).w(Cmd.MAX).l(max), Reply.LONG_PAIR);
+    }
+
+    /**
      * Sends {@code HINCRBYFLOAT key field delta}: adds a floating-point number to a field. A missing key or field counts as 0.
      *
      * @param key the hash key
@@ -316,7 +390,7 @@ public abstract class HashCommands<K, V> extends KeyCommands<K, V> {
     private CompletableFuture<List<Long>> fieldTtl(byte[] cmd, K key, long time, ExpireCondition condition, K[] fields) {
         Args a = args().w(cmd).k(key).l(time);
         if (condition != null && condition != ExpireCondition.ALWAYS) {
-            a.s(condition.name());
+            a.w(condition.fragment());
         }
         a.w(Cmd.FIELDS).l(fields.length).keys(fields);
         return send(a, Reply.LONG_LIST);

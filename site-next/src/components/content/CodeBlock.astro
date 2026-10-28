@@ -23,13 +23,13 @@ const html = await highlight(code, lang);
   .label { display: flex; gap: 8px; align-items: baseline; min-width: 0; }
   .label b { font-weight: 500; color: var(--code-ink); }
   .label span::before { content: "·"; margin-right: 8px; color: var(--code-dim); }
-  .code-block pre { font-size: 13.5px; line-height: 1.7; }
+  .code-block pre { font-size: 14.5px; line-height: 1.7; }
   .code-block pre:focus-visible { outline: 2px solid var(--c2); outline-offset: -2px; }
   @media (max-width: 600px) {
-    .code-block pre { font-size: 12.5px; padding: 14px 16px 16px; }
+    .code-block pre { font-size: 13.5px; padding: 14px 16px 16px; }
   }
   .copy {
-    font: inherit; font-size: 12px; color: var(--code-dim); background: transparent;
+    font: inherit; font-size: 13px; color: var(--code-dim); background: transparent;
     border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 4px; padding: 3px 9px; cursor: pointer;
   }
   .copy:hover { color: var(--code-ink); border-color: rgba(255, 255, 255, 0.22); }

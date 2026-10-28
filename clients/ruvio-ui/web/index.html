@@ -3,7 +3,17 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#0a0c14" />
+    <meta name="theme-color" content="#0a0c14" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#e9ecf2" media="(prefers-color-scheme: light)" />
+    <script>
+      // Apply the saved theme before first paint (same key as src/theme.js).
+      (function () {
+        var m = "auto";
+        try { m = JSON.parse(localStorage.getItem("ruvio.theme")) || "auto"; } catch (e) {}
+        var light = m === "light" || (m !== "dark" && matchMedia("(prefers-color-scheme: light)").matches);
+        document.documentElement.dataset.theme = light ? "light" : "dark";
+      })();
+    </script>
     <meta name="description" content="Ruvio operator: shard health, data, tasks, messaging, and access control." />
     <link rel="icon" href="/favicon.png" type="image/png" />
     <title>Ruvio Operator</title>

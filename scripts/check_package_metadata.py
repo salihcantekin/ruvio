@@ -130,6 +130,24 @@ for project in sorted(list((ROOT / "clients/csharp").glob("*/*.csproj")) + list(
 node("clients/node/package.json")
 python("clients/python/pyproject.toml")
 maven("clients/java/pom.xml")
+def pins():
+    version = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
+    for path in ("README.md", "docs/SETUP.md"):
+        found = re.findall(r"(?m)^v=(\d+\.\d+\.\d+)$", (ROOT / path).read_text())
+        if not found:
+            fail(path, "has no v=x.y.z download line")
+        for pinned in found:
+            if pinned != version:
+                fail(path, f"download line pins {pinned}, Cargo.toml is {version}; run scripts/release_version.py server --install-pins")
+
+
+    manifest = (ROOT / "deploy/kubernetes.yaml").read_text()
+    for image in re.findall(r"image: salihcantekin/ruvio:(\S+)", manifest):
+        if image != version:
+            fail("deploy/kubernetes.yaml", f"image tag is {image}, Cargo.toml is {version}")
+
+
+pins()
 docker("Dockerfile.linux", "docker/hub/ruvio.md")
 docker("Dockerfile", None)
 docker("clients/ruvio-ui/Dockerfile", "docker/hub/ruvio-ui.md")

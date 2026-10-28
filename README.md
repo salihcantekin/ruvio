@@ -29,6 +29,7 @@
   <a href="https://www.nuget.org/packages/Ruvio.Client"><img alt="NuGet" src="https://img.shields.io/nuget/v/Ruvio.Client?label=NuGet"></a>
   <a href="https://www.npmjs.com/package/ruvio-client"><img alt="npm" src="https://img.shields.io/npm/v/ruvio-client?label=npm"></a>
   <a href="https://pypi.org/project/ruvio-client/"><img alt="PyPI" src="https://img.shields.io/pypi/v/ruvio-client?label=PyPI"></a>
+  <a href="https://aur.archlinux.org/packages/ruvio-bin"><img alt="AUR package" src="https://img.shields.io/aur/version/ruvio-bin?label=AUR"></a>
 </p>
 
 <p align="center">
@@ -52,8 +53,8 @@ The shard that owns a key parses, records, applies, and replies. The hot path do
 | --- | --- |
 | **Owner-per-shard engine** | One owner per shard, no lock on apply. A feature allocates only when a key uses it: twenty thousand leases added about 3.6 MB, twenty thousand versioned 64-byte strings about 7.2 MB, body included. |
 | **Durability you name** | `memory`, `snapshot`, `everysec` or `always`, chosen at startup. A write is checked, appended, then applied. If the log cannot take the record, the key stays as it was and later writes return `MISCONF`. |
-| **Wire compatible** | RESP2 subset; `redis-cli` and existing RESP clients connect. The command list that CI checks is [docs/compatibility-matrix.json](docs/compatibility-matrix.json). |
-| **Six first-party clients** | Rust, C#, Go, Java, Python and Node.js, each with a typed method for every one of the 287 listed commands and cluster routing from one seed address. |
+| **Wire compatible** | RESP2, and RESP3 after `HELLO 3`; `redis-cli` and existing RESP clients connect. The command list that CI checks is [docs/compatibility-matrix.json](docs/compatibility-matrix.json). |
+| **Six first-party clients** | Rust, C#, Go, Java, Python and Node.js, each with a typed method for every one of the 299 listed commands and cluster routing from one seed address. |
 | **Operator UI** | A browser view of one running server: data, command forms, Pub/Sub and ACL users. |
 
 ## Quick start
@@ -70,6 +71,27 @@ redis-cli -h 127.0.0.1 -p 6379 -a change-me PING
 ```
 
 `linux` and `latest` are the same Linux image, as is each version tag, built for linux/amd64 and linux/arm64 (Apple Silicon and other arm64 hosts run it natively). The image default durability is `memory`. A persistent deploy sets `RUVIO_DURABILITY` and keeps the volume.
+
+<details>
+<summary><b>Arch Linux (AUR)</b></summary>
+
+<br>
+
+Install the prebuilt binary package from the Arch User Repository (AUR):
+
+```bash
+yay -S ruvio-bin
+# or
+paru -S ruvio-bin
+```
+
+Start and enable the systemd service:
+
+```bash
+sudo systemctl enable --now ruvio
+```
+
+</details>
 
 <details>
 <summary><b>Prebuilt binary</b> (Linux x64/arm64, macOS arm64, Windows x64)</summary>
@@ -109,18 +131,30 @@ Settings merge in this order: built-in defaults, `ruvio.toml` (template: [`ruvio
 
 ## Built-in building blocks
 
-These commands run on the shard that owns the key. A key that never uses them stores nothing extra. `GET`, `SET`, and `INCR` do not consult them.
+These commands run on the shard that owns the key. [`examples/09_building_blocks_tour.py`](examples/09_building_blocks_tour.py) runs the main ones in a few seconds against a local server; the [use cases](https://ruviodb.com/use-cases/) page shows each job with all six clients. A key that never uses them stores nothing extra. `GET`, `SET`, and `INCR` do not consult them.
 
 | Command | What it replaces a second system for |
 | --- | --- |
-| `LEASE` / `RELEASE` | A fencing token for one key. The shard is the holder. Expiry and `RELEASE` keep the token, so the next grant continues the sequence. The grant is a WAL record. `GET` of a lease is `WRONGTYPE`. |
+| `LEASE` / `RELEASE` | A fencing token for one key. The shard is the holder. Tokens only grow: after expiry, `RELEASE`, `DEL`, a restart, a failover or a slot move, the next grant is larger. The grant is a WAL record. `GET` of a lease is `WRONGTYPE`. |
 | `SEMAPHORE` / `RELEASE` | At most N holders at once, each with its own TTL. A crashed holder frees its slot when its TTL passes. The first holder stays in the object; each further holder is 16 bytes. The key goes away with the last one. |
+| `RENEW` | Extends a `LEASE` or `SEMAPHORE` holder by its token without releasing it, so a long job keeps its slot and its fencing token. |
 | `INCRBY ... MAX` | A counter that never passes a capacity. A refused call returns nil and changes nothing, so no compensating `DECR`. |
 | `SETV` | A conditional string write. The call succeeds only when the caller still has the current version, so two clients cannot both turn 12 into 11. The version exists only on keys written with `SETV`. |
 | `CHANGES` | `CHANGES START` arms an in-memory feed of later `SET`, `SETV`, `LEASE`, and `RELEASE` notes on that shard. Nothing is recorded before `START`. The feed is not the WAL, and it is empty after restart. |
 | `XADD DELAY` | The stream entry is stored now. `XREADGROUP` skips it until the delay passes. `XREAD` can still see it. The hold is a WAL record and a snapshot trailer, and it is written only when a delay is set. |
+| `SET ... IFEQ` / `IFGT` / `IFLT`, `DELEX ... IFEQ` | A compare-and-set, a watermark that only moves forward or a delete that checks the value, without a script. A refused call writes nothing. |
+| `ZPOPBYSCORE` / `ZMOVEDUE` | Take the due members of a sorted set, or move them to a list, in one command: the due-job queue without a scheduler. |
+| `LPUSHCAP` / `RPUSHCAP` | Push to a list and trim it to a length in one call: a capped recent-items list. |
+| `RUVIO HOTKEYS` / `RUVIO BIGKEYS` | Which keys take the traffic and which values are large, sampled; off unless `key_stats` is on. |
+| `LIMIT` | A fixed-window, sliding-window or token-bucket rate limit in one call, with fixed state per key. A refused call writes nothing. |
+| `IDEM` | Request de-duplication on the shard that owns the key: `BEGIN` tells a caller to run, wait or conflict, and a repeat of a finished request gets the saved result. |
+| `FILLGET` / `FILLSET` | One caller refills a missing or stale cache entry while the others get `BUSY` or the stale value. The markers live in memory only. |
+| `TRANSFER` | Moves an amount between two integer strings of one slot in one WAL record, with an optional cap on the destination. |
+| `CHANGES SUBSCRIBE` | A resumable push stream of this shard's WAL, with a cursor to continue from after a disconnect or restart. |
+| `JSON.INDEX` | A field index over JSON documents with a key prefix, so a lookup by field does not scan. |
+| `CLIENT DURABILITY` | Holds this connection's replies until `n` replicas have the writes on disk; `ruvio coordinator` fails over only to a replica that has them. |
 
-`DEL` of a lease starts the next token at 1. `SET` replaces a versioned string with a plain string. `INCR` does not accept a versioned string.
+`SET` replaces a versioned string with a plain string. `INCR` does not accept a versioned string.
 
 ## Performance
 
@@ -128,7 +162,7 @@ These commands run on the shard that owns the key. A key that never uses them st
 | --- | --- | --- |
 | **Against Redis 8.10.2** | 59 of 60 commands at or above 0.97×, geometric mean 1.22× | 4-core Azure x86 VM, one shard, `memory` durability, 50 clients, pipeline 16, 64-byte values, five alternating rounds (2026-10-11) |
 | **Whole machine, 8 shards** | against an 8-node Redis Cluster on the same 8 cores: geometric mean 1.13× over 59 commands at pipeline 16 (55 at or above 0.97×, none below 0.90×), 1.23× at pipeline 64 (`GET` 1.75×, `SET` 2.21×, 29M and 30M req/s), 1.14× with every write logged (`everysec` against AOF `everysec`); memory per shard 0.96× of one Redis | 16-core Azure EPYC 9V74 VM, one process with 8 shards (`port_mode = "per-shard"`), one `redis-benchmark` per shard, three alternating rounds ([record](docs/evidence/2026-10-16-azure-8-shards.md), 2026-10-16) |
-| **Raw throughput** | about 2.61M `SET`/s, 2.74M `GET`/s, 2.88M `INCR`/s | Apple M4 Pro, evented, `memory` durability, one shard, 50 clients, pipeline 16, 64-byte values, fixed key, median of 3 rounds (2026-10-07) |
+| **Raw throughput** | about 2.61M `SET`/s, 2.74M `GET`/s, 2.88M `INCR`/s | Apple silicon Mac, evented, `memory` durability, one shard, 50 clients, pipeline 16, 64-byte values, fixed key, median of 3 rounds (2026-10-07) |
 
 Samples, flags and the rows below 1× are on the [performance page](https://ruviodb.com/benchmarks/); memory results are on the [memory page](https://ruviodb.com/benchmarks/#memory). There is no Garnet measurement.
 
@@ -185,6 +219,7 @@ Releases are cut from `main` by hand ([release workflow](.github/workflows/relea
 | [Ruvio.AspNetCore.DataProtection](https://www.nuget.org/packages/Ruvio.AspNetCore.DataProtection) | Data Protection key-ring storage | ![v](https://img.shields.io/nuget/v/Ruvio.AspNetCore.DataProtection?label=) | ![dl](https://img.shields.io/nuget/dt/Ruvio.AspNetCore.DataProtection?label=) |
 | [Ruvio.AspNetCore.RateLimiting](https://www.nuget.org/packages/Ruvio.AspNetCore.RateLimiting) | Distributed rate limiting | ![v](https://img.shields.io/nuget/v/Ruvio.AspNetCore.RateLimiting?label=) | ![dl](https://img.shields.io/nuget/dt/Ruvio.AspNetCore.RateLimiting?label=) |
 | [Ruvio.AspNetCore.Idempotency](https://www.nuget.org/packages/Ruvio.AspNetCore.Idempotency) | HTTP idempotency | ![v](https://img.shields.io/nuget/v/Ruvio.AspNetCore.Idempotency?label=) | ![dl](https://img.shields.io/nuget/dt/Ruvio.AspNetCore.Idempotency?label=) |
+| [Ruvio.Extensions.Idempotency](https://www.nuget.org/packages/Ruvio.Extensions.Idempotency) | Run work once per key outside HTTP | ![v](https://img.shields.io/nuget/v/Ruvio.Extensions.Idempotency?label=) | ![dl](https://img.shields.io/nuget/dt/Ruvio.Extensions.Idempotency?label=) |
 | [Ruvio.AspNetCore.DistributedLock](https://www.nuget.org/packages/Ruvio.AspNetCore.DistributedLock) | Distributed locks and `[RuvioLock]` | ![v](https://img.shields.io/nuget/v/Ruvio.AspNetCore.DistributedLock?label=) | ![dl](https://img.shields.io/nuget/dt/Ruvio.AspNetCore.DistributedLock?label=) |
 | [ruvio-client (npm)](https://www.npmjs.com/package/ruvio-client) | Node.js SDK | ![v](https://img.shields.io/npm/v/ruvio-client?label=) | ![dl](https://img.shields.io/npm/dm/ruvio-client?label=) |
 | [ruvio-client (PyPI)](https://pypi.org/project/ruvio-client/) | Python SDK | ![v](https://img.shields.io/pypi/v/ruvio-client?label=) | ![dl](https://img.shields.io/pypi/dm/ruvio-client?label=) |
@@ -233,11 +268,11 @@ The differences are about ownership, the durability contract, and how much of th
 | Runtime | C | C++ | .NET, Tsavorite | Rust, in-memory shard + WAL |
 | Wire | RESP2/3, full surface | Redis and Memcached | Redis-compatible | RESP2 subset, listed in CI |
 | Hot path | Shared engine, I/O threads | Single-node throughput | Separate string and object stores | One owner per shard, no lock on apply |
-| Cluster | Bus, migration, failover | Its own scale story | Cluster-capable store | Static 16,384 slots, misrouted keys forwarded, no election |
+| Cluster | Bus, migration, failover | Its own scale story | Cluster-capable store | Static 16,384 slots, misrouted keys forwarded; automatic failover of a primary and its replicas with `ruvio coordinator` |
 | Durability | RDB, AOF, combinations | Snapshots | Tsavorite on disk | `memory`, `snapshot`, `everysec`, `always` |
-| Keep the other when | You need Sentinel, modules, or a command Ruvio does not list | You want that single-node scale claim | You want a .NET stack and Tsavorite as the store | The written subset and the shard contract are enough |
+| Keep the other when | You need modules, the full Sentinel feature set, or a command Ruvio does not list | You want that single-node scale claim | You want a .NET stack and Tsavorite as the store | The written subset and the shard contract are enough |
 
-Not claimed: a cluster bus, online slot migration, failover, replica acknowledgement, or a hardware latency number. Replication copies a WAL tail to a bounded set of replicas. Classic `PUBLISH` reaches subscribers on every shard of one process, not other processes.
+Not claimed: a cluster bus, automatic rebalancing (slot ranges move between the shards of one process with `RUVIO MOVESLOTS`, and between machines when an operator asks `ruvio coordinator`), failover across a multi-node cluster (failover covers one primary and its replicas, through `ruvio coordinator`), or a hardware latency number. Replication copies a WAL tail to a bounded set of replicas. Classic `PUBLISH` reaches subscribers on every shard of one process, not other processes.
 
 ### Docker Desktop and memory density
 
@@ -267,7 +302,8 @@ Docker RSS is not the bare-metal result; the memory detail is in [the string mem
 | [Configuration](https://ruviodb.com/docs/configuration/) | TOML, environment, ACL users |
 | [Commands](https://ruviodb.com/docs/commands/) | The supported surface |
 | [Durability](https://ruviodb.com/docs/recovery/) | Acknowledgement boundaries |
-| [Replication](https://ruviodb.com/docs/recovery/) | WAL tail, no failover |
+| [Replication](https://ruviodb.com/docs/recovery/) | WAL tail, reads from replicas, `REPLICAOF` |
+| [Automatic failover](https://ruviodb.com/docs/coordinator/) | `ruvio coordinator`: Raft-agreed failover, Sentinel-compatible discovery |
 | [Operations](https://ruviodb.com/docs/observability/) | Limits, metrics, shutdown |
 | [Testing and evidence](https://ruviodb.com/docs/testing/) | Test coverage, recorded results, open production evidence gates |
 | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) | What the process does and does not defend |

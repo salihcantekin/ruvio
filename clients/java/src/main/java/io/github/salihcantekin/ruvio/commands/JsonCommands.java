@@ -8,6 +8,7 @@ import io.github.salihcantekin.ruvio.internal.Args;
 import io.github.salihcantekin.ruvio.internal.Cmd;
 import io.github.salihcantekin.ruvio.internal.Reply;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -98,6 +99,22 @@ public abstract class JsonCommands<K, V> extends StreamCommands<K, V> {
     }
 
     /**
+     * Sends {@code JSON.SET key path json EX|PX ttl}: like {@link #jsonSet(Object, String, String)}, and a document this call
+     * creates gets a time to live. An existing key keeps its deadline.
+     *
+     * @param key the JSON key
+     * @param path where to write
+     * @param json the new value as JSON text
+     * @param ttl time to live of a newly created key: whole seconds are sent as {@code EX}, anything finer as {@code PX}
+     * @return {@code true} when written, {@code false} when the target cannot be reached
+     * @throws IllegalArgumentException when {@code ttl} is null, zero, negative or too large
+     * @throws RuvioServerException {@code ERR invalid JSON value} or {@code ERR invalid JSON path}; {@code WRONGTYPE} when the key holds a non-JSON value
+     */
+    public CompletableFuture<Boolean> jsonSet(K key, String path, String json, Duration ttl) {
+        return send(args().w(Cmd.JSON_SET).k(key).s(path).s(json).ttl(ttl), Reply.OK_BOOL);
+    }
+
+    /**
      * Sends {@code JSON.SET key path json NX}: writes only when the path does not exist yet.
      *
      * @param key the JSON key
@@ -111,6 +128,22 @@ public abstract class JsonCommands<K, V> extends StreamCommands<K, V> {
     }
 
     /**
+     * Sends {@code JSON.SET key path json NX EX|PX ttl}: like {@link #jsonSetNx(Object, String, String)}, and a document this call
+     * creates gets a time to live. An existing key keeps its deadline.
+     *
+     * @param key the JSON key
+     * @param path where to write
+     * @param json the new value as JSON text
+     * @param ttl time to live of a newly created key: whole seconds are sent as {@code EX}, anything finer as {@code PX}
+     * @return {@code true} when written, {@code false} when the path already exists (or cannot be reached)
+     * @throws IllegalArgumentException when {@code ttl} is null, zero, negative or too large
+     * @throws RuvioServerException {@code ERR invalid JSON value} or {@code ERR invalid JSON path}; {@code WRONGTYPE} when the key holds a non-JSON value
+     */
+    public CompletableFuture<Boolean> jsonSetNx(K key, String path, String json, Duration ttl) {
+        return send(args().w(Cmd.JSON_SET).k(key).s(path).s(json).w(Cmd.NX).ttl(ttl), Reply.OK_BOOL);
+    }
+
+    /**
      * Sends {@code JSON.SET key path json XX}: writes only when the path already exists.
      *
      * @param key the JSON key
@@ -121,6 +154,22 @@ public abstract class JsonCommands<K, V> extends StreamCommands<K, V> {
      */
     public CompletableFuture<Boolean> jsonSetXx(K key, String path, String json) {
         return send(args().w(Cmd.JSON_SET).k(key).s(path).s(json).w(Cmd.XX), Reply.OK_BOOL);
+    }
+
+    /**
+     * Sends {@code JSON.SET key path json XX EX|PX ttl}: like {@link #jsonSetXx(Object, String, String)}, and a document this call
+     * creates gets a time to live. An existing key keeps its deadline.
+     *
+     * @param key the JSON key
+     * @param path where to write
+     * @param json the new value as JSON text
+     * @param ttl time to live of a newly created key: whole seconds are sent as {@code EX}, anything finer as {@code PX}
+     * @return {@code true} when written, {@code false} when the path does not exist
+     * @throws IllegalArgumentException when {@code ttl} is null, zero, negative or too large
+     * @throws RuvioServerException {@code ERR invalid JSON value} or {@code ERR invalid JSON path}; {@code WRONGTYPE} when the key holds a non-JSON value
+     */
+    public CompletableFuture<Boolean> jsonSetXx(K key, String path, String json, Duration ttl) {
+        return send(args().w(Cmd.JSON_SET).k(key).s(path).s(json).w(Cmd.XX).ttl(ttl), Reply.OK_BOOL);
     }
 
     /**

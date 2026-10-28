@@ -60,6 +60,11 @@ internal static class ClusterKeys
             || rule is { Kind: CommandKeyRules.Range, A: 1, B: 1 }
             || name == "SPUBLISH";
 
+    /// <summary>Whether a command only reads and may go to a replica: flagged readonly (2) and not blocking (16) in the command table.</summary>
+    public static bool Reads(string name) =>
+        CommandKeyRules.Rules.TryGetValue(name, out CommandKeyRules.Rule? rule)
+        && (rule.Flags & 2) != 0 && (rule.Flags & 16) == 0;
+
     /// <summary>The first key of a command without building the key list; null for keyless commands.</summary>
     public static string? First(string name, IReadOnlyList<string> arguments)
     {

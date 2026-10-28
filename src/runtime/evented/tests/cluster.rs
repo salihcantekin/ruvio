@@ -89,10 +89,17 @@ fn evented_cluster_discovery_reports_shards_and_the_advertised_port() {
     assert!(info.contains("cluster_state:ok\r\n"), "{info}");
     assert!(info.contains("cluster_known_nodes:2\r\n"), "{info}");
     assert!(info.contains("cluster_my_epoch:2\r\n"), "{info}");
-    assert!(
-        info.contains("$40\r\n0000000000000000000000000000000000000002\r\n"),
-        "{info}"
-    );
+    // A node's id is the SHA-1 of the address it is announced on: shard 1 is on 17001.
+    let id: String = {
+        use sha1::{Digest, Sha1};
+
+        Sha1::digest(b"127.0.0.1:17001")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    };
+
+    assert!(info.contains(&format!("$40\r\n{id}\r\n")), "{info}");
     assert!(info.ends_with(":3443\r\n+OK\r\n+OK\r\n"), "{info}");
 
     let shards = String::from_utf8(request(left_addr, &resp(&[&[b"CLUSTER", b"SHARDS"]]))).unwrap();
@@ -763,7 +770,7 @@ fn a_publish_the_gate_refuses_reaches_no_other_shard() {
         "{missed}"
     );
 
-    // Inside MULTI a PUBLISH would reach the other shards before DISCARD: refused.
+    // Inside MULTI a PUBLISH is queued and sent only at EXEC: DISCARD sends nothing.
     let queued = String::from_utf8(request(
         left,
         &resp(&[
@@ -775,13 +782,33 @@ fn a_publish_the_gate_refuses_reaches_no_other_shard() {
     ))
     .unwrap();
 
-    assert!(queued.contains("cannot be queued in MULTI"), "{queued}");
+    assert_eq!(queued, "+OK\r\n+OK\r\n+QUEUED\r\n+OK\r\n");
     let missed = subscriber.read(&mut quiet).unwrap_err();
 
     assert!(matches!(
         missed.kind(),
         ErrorKind::TimedOut | ErrorKind::WouldBlock
     ));
+
+    // EXEC sends it, to the subscriber on the other shard too; the reply counts this shard's.
+    assert_eq!(
+        request(
+            left,
+            &resp(&[
+                &[b"AUTH", b"secret"],
+                &[b"MULTI"],
+                &[b"PUBLISH", b"news", b"committed"],
+                &[b"EXEC"],
+            ])
+        ),
+        b"+OK\r\n+OK\r\n+QUEUED\r\n*1\r\n:0\r\n"
+    );
+    subscriber.set_read_timeout(Some(PATIENCE)).unwrap();
+    let expected = crate::pubsub::encode_message(b"news", b"committed");
+    let mut message = vec![0u8; expected.len()];
+
+    subscriber.read_exact(&mut message).unwrap();
+    assert_eq!(message, expected);
 
     // Authenticated and outside MULTI: delivered.
     assert_eq!(
@@ -1652,12 +1679,6 @@ fn rounds_still_publish_after_one_shard_wal_sync_failed() {
         snapshot_interval: Duration::from_millis(50),
         ..PersistenceConfig::default()
     };
-    let generation = || {
-        CheckpointManager::new(persistence.clone(), ProtocolLimits::default())
-            .load()
-            .unwrap()
-            .map_or(0, |checkpoint| checkpoint.generation)
-    };
     let (left_addr, right_addr, stop, left_server, right_server) =
         serve_two_shards_with(|config| config.persistence = persistence.clone());
     let left = key_on_shard(0, "left");
@@ -1684,20 +1705,20 @@ fn rounds_still_publish_after_one_shard_wal_sync_failed() {
         .retain(|(dir, _)| dir != directory.path());
     assert!(!refused.starts_with(b"+"), "{refused:?}");
 
-    let failed_at = generation();
+    let failed_at = published_generation(&persistence);
     let deadline = Instant::now() + PATIENCE;
     let mut last = String::new();
 
     for n in 0.. {
         last = format!("b{n}");
         assert_eq!(set(left_addr, &left, &last), b"+OK\r\n");
-        if generation() > failed_at + 2 || Instant::now() > deadline {
+        if published_generation(&persistence) > failed_at + 2 || Instant::now() > deadline {
             break;
         }
         thread::sleep(Duration::from_millis(50));
     }
     assert!(
-        generation() > failed_at + 2,
+        published_generation(&persistence) > failed_at + 2,
         "no round published after shard 1's WAL failed (generation {failed_at})"
     );
     let killed = tempfile::tempdir().unwrap();
@@ -2345,17 +2366,21 @@ fn checkpoint_failed_round_commit_does_not_compact_the_log_past_a_later_carried_
     wait_for_idle_checkpoints(&[left_addr, right_addr]);
     let published = published_generation(&persistence);
 
-    stop_failing_writes(directory.path());
     // The log resumes; the right shard's next file goes into a round that fails again.
-    let deadline = Instant::now() + PATIENCE;
-    let mut accepted = false;
-
-    while !accepted && Instant::now() < deadline {
-        accepted = request(right_addr, &resp(&[&[b"SET", after.as_bytes(), b"y"]])) == b"+OK\r\n";
-        thread::sleep(Duration::from_millis(50));
-    }
-    assert!(accepted, "the right shard's log did not resume");
+    // Commits fail from before the log resumes: the right shard still owes the snapshot
+    // requests the wait's BGSAVEs raised (its carried copies answer none), and starts a
+    // round for them on its own within a second of resuming, which must not publish.
     let failing = fail_commits(directory.path(), || {
+        stop_failing_writes(directory.path());
+        let deadline = Instant::now() + PATIENCE;
+        let mut accepted = false;
+
+        while !accepted && Instant::now() < deadline {
+            accepted =
+                request(right_addr, &resp(&[&[b"SET", after.as_bytes(), b"y"]])) == b"+OK\r\n";
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(accepted, "the right shard's log did not resume");
         start_bgsave(right_addr);
     });
     assert_eq!(published_generation(&persistence), published);
@@ -2450,4 +2475,208 @@ fn hot_key_set_keeps_absolute_and_kept_deadlines_through_the_log() {
     stop.request();
     join_within(left, PATIENCE).unwrap();
     join_within(right, PATIENCE).unwrap();
+}
+
+/// A hot-key write whose WAL record is refused never reaches the shared store: the writer
+/// gets an error and the other shard still reads the old value (issue #52). Refused here:
+/// a record too large for a segment, and every write while the log is failed.
+#[test]
+fn a_refused_hot_key_write_leaves_the_old_value_for_every_shard() {
+    let directory = tempfile::tempdir().unwrap();
+    let persistence = PersistenceConfig {
+        profile: crate::DurabilityProfile::Everysec,
+        data_dir: directory.path().to_path_buf(),
+        wal_segment_bytes: 64 * 1024,
+        snapshot_interval: Duration::from_secs(3600),
+        ..PersistenceConfig::default()
+    };
+    let (left_addr, right_addr, stop, left_server, right_server) =
+        serve_two_shards_with(|config| {
+            config.persistence = persistence.clone();
+            config.hot_keys = vec![b"lock:*".to_vec()];
+        });
+    let old = b"$3\r\nold\r\n";
+    let large = vec![b'x'; 128 * 1024];
+
+    assert_eq!(
+        request(left_addr, &resp(&[&[b"SET", b"lock:a", b"old"]])),
+        b"+OK\r\n"
+    );
+    let oversized = request(left_addr, &resp(&[&[b"SET", b"lock:a", &large]]));
+
+    assert!(oversized.starts_with(b"-"), "{oversized:?}");
+    assert_eq!(request(right_addr, &resp(&[&[b"GET", b"lock:a"]])), old);
+
+    // The log fails on another key's write and cannot resume while writes keep failing.
+    fail_shard_writes(directory.path(), 0, u32::MAX);
+    let failed = request(left_addr, &resp(&[&[b"SET", b"lock:b", b"x"]]));
+
+    assert!(failed.starts_with(b"-MISCONF"), "{failed:?}");
+    for refused in [
+        &[&b"SET"[..], b"lock:a", b"new"][..],
+        &[b"DEL", b"lock:a"],
+        &[b"FLUSHALL"],
+    ] {
+        let reply = request(left_addr, &resp(&[refused]));
+
+        assert!(reply.starts_with(b"-MISCONF"), "{refused:?}: {reply:?}");
+        assert_eq!(
+            request(right_addr, &resp(&[&[b"GET", b"lock:a"]])),
+            old,
+            "{refused:?}"
+        );
+    }
+    stop_failing_writes(directory.path());
+
+    // The log resumes (after its retry pause) and takes the next write.
+    let deadline = Instant::now() + PATIENCE;
+
+    while request(left_addr, &resp(&[&[b"SET", b"lock:a", b"new"]])) != b"+OK\r\n" {
+        assert!(Instant::now() < deadline, "the log did not resume");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        request(right_addr, &resp(&[&[b"GET", b"lock:a"]])),
+        b"$3\r\nnew\r\n"
+    );
+    stop.request();
+    join_within(left_server, PATIENCE).unwrap();
+    join_within(right_server, PATIENCE).unwrap();
+}
+
+/// A hot-key write whose record was taken but whose log write then failed is in the shared
+/// store, as a grouped shard write is in its shard: it stays readable, its record is kept,
+/// and the log writes it first when it resumes, so it survives a crash after that.
+#[test]
+fn a_hot_key_write_whose_log_write_failed_is_written_when_the_log_resumes() {
+    let directory = tempfile::tempdir().unwrap();
+    let persistence = PersistenceConfig {
+        profile: crate::DurabilityProfile::Everysec,
+        data_dir: directory.path().to_path_buf(),
+        snapshot_interval: Duration::from_secs(3600),
+        ..PersistenceConfig::default()
+    };
+    let start = |persistence: PersistenceConfig| {
+        serve_two_shards_with(move |config| {
+            config.persistence = persistence.clone();
+            config.hot_keys = vec![b"lock:*".to_vec()];
+        })
+    };
+    let (left_addr, right_addr, stop, left_server, right_server) = start(persistence.clone());
+
+    fail_shard_writes(directory.path(), 0, 1);
+    let failed = request(left_addr, &resp(&[&[b"SET", b"lock:a", b"kept"]]));
+
+    stop_failing_writes(directory.path());
+    assert!(failed.starts_with(b"-MISCONF"), "{failed:?}");
+    assert_eq!(
+        request(right_addr, &resp(&[&[b"GET", b"lock:a"]])),
+        b"$4\r\nkept\r\n"
+    );
+    let deadline = Instant::now() + PATIENCE;
+
+    while request(left_addr, &resp(&[&[b"SET", b"lock:poke", b"x"]])) != b"+OK\r\n" {
+        assert!(Instant::now() < deadline, "the log did not resume");
+        thread::sleep(Duration::from_millis(50));
+    }
+    // A copy of the data directory now, as a crash would leave it: no checkpoint since.
+    let killed = tempfile::tempdir().unwrap();
+
+    copy_dir(directory.path(), killed.path());
+    stop.request();
+    join_within(left_server, PATIENCE).unwrap();
+    join_within(right_server, PATIENCE).unwrap();
+
+    let (left_addr, _, stop, left_server, right_server) = start(PersistenceConfig {
+        data_dir: killed.path().to_path_buf(),
+        ..persistence
+    });
+
+    assert_eq!(
+        request(left_addr, &resp(&[&[b"GET", b"lock:a"]])),
+        b"$4\r\nkept\r\n"
+    );
+    stop.request();
+    join_within(left_server, PATIENCE).unwrap();
+    join_within(right_server, PATIENCE).unwrap();
+}
+
+/// One `SCAN` reply on a connection that stays open: a forwarded command answers only a
+/// client that is still connected.
+fn scan_page(address: SocketAddr, args: &[&[u8]]) -> (String, Vec<String>) {
+    use std::io::{BufRead, BufReader, Read};
+
+    let mut stream = StdTcpStream::connect(address).unwrap();
+
+    stream.set_read_timeout(Some(PATIENCE)).unwrap();
+    stream.write_all(&resp(&[args])).unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let bulk = |reader: &mut BufReader<StdTcpStream>| {
+        let mut header = String::new();
+
+        reader.read_line(&mut header).unwrap();
+        let length: usize = header.trim_end()[1..].parse().unwrap();
+        let mut body = vec![0; length + 2];
+
+        reader.read_exact(&mut body).unwrap();
+        String::from_utf8(body[..length].to_vec()).unwrap()
+    };
+
+    reader.read_line(&mut line).unwrap();
+    assert_eq!(line, "*2\r\n");
+    let cursor = bulk(&mut reader);
+
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    let count: usize = line.trim_end()[1..].parse().unwrap();
+    let keys = (0..count).map(|_| bulk(&mut reader)).collect();
+
+    (cursor, keys)
+}
+
+#[test]
+fn evented_scan_with_a_slot_runs_on_the_owner_from_either_shard() {
+    use crate::routing::hash_slot;
+
+    let (left_addr, right_addr, stop, left_server, right_server) = serve_two_shards();
+    let slot = hash_slot(b"tag").to_string();
+
+    for key in ["{tag}a", "{tag}b", "other"] {
+        let set = resp(&[&[b"SET", key.as_bytes(), b"v"]]);
+
+        assert_eq!(request(left_addr, &set), b"+OK\r\n");
+    }
+
+    // One of the two shards owns the slot; the other forwards the command to it.
+    for address in [left_addr, right_addr] {
+        let mut cursor = String::from("0");
+        let mut keys = Vec::new();
+
+        loop {
+            let (next, page) = scan_page(
+                address,
+                &[
+                    b"SCAN",
+                    cursor.as_bytes(),
+                    b"COUNT",
+                    b"1000",
+                    b"SLOT",
+                    slot.as_bytes(),
+                ],
+            );
+
+            keys.extend(page);
+            cursor = next;
+            if cursor == "0" {
+                break;
+            }
+        }
+        keys.sort();
+        assert_eq!(keys, ["{tag}a", "{tag}b"], "from {address}");
+    }
+
+    stop.request();
+    join_within(left_server, PATIENCE).unwrap();
+    join_within(right_server, PATIENCE).unwrap();
 }

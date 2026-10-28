@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import binascii
 import re
+from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from ._command_keys import (
@@ -25,8 +26,15 @@ from .errors import CrossSlotError, ResponseError, RuvioError
 
 SLOT_COUNT = 16384
 
-#: ``-MOVED`` redirects followed per command before the error is returned
+#: ``-MOVED`` / ``-ASK`` redirects followed per command (one budget) before the error is returned
 MAX_REDIRECTS = 3
+
+#: sleeps in seconds before each re-send of a command answered ``-TRYAGAIN``, doubling from 5 ms (635 ms in
+#: all): a slot range moving between nodes is frozen for a few hundred milliseconds
+TRYAGAIN_DELAYS = (0.005, 0.010, 0.020, 0.040, 0.080, 0.160, 0.320)
+
+#: ``ASKING`` as a frame, sent in front of the command an ``-ASK`` redirect names
+ASKING = b"*1\r\n$6\r\nASKING\r\n"
 
 _crc16 = binascii.crc_hqx  # CRC-CCITT with poly 0x1021 and init 0 == CRC16/XMODEM, in C
 
@@ -54,6 +62,47 @@ def key_slot(key: Union[str, bytes]) -> int:
         if c > o + 1:
             key = key[o + 1 : c]
     return _crc16(key, 0) & 0x3FFF
+
+
+# --------------------------------------------------------------------------- read policy
+
+
+class ReadPolicy(str, Enum):
+    """Where a cluster client sends commands that only read.
+
+    ``PRIMARY`` (the default) sends every command to the primary of its slot. ``PREFER_REPLICA`` sends reads
+    to one replica of the shard and falls back to the primary when that replica cannot be used. ``REPLICA``
+    sends reads to a replica only and fails when there is none. Replication is asynchronous, so a read from
+    a replica may miss a recent write, including your own. Plain strings (``"primary"``,
+    ``"prefer-replica"``, ``"replica"``) are accepted wherever a policy is.
+
+    Example:
+        client = ClusterRuvio("127.0.0.1", 7000, read_policy=ReadPolicy.PREFER_REPLICA)
+    """
+
+    PRIMARY = "primary"
+    PREFER_REPLICA = "prefer-replica"
+    REPLICA = "replica"
+
+
+#: internal policy codes kept in the routing state: 0 = primary, tested once per command
+POLICY_PRIMARY = 0
+POLICY_PREFER = 1
+POLICY_REPLICA = 2
+
+
+def policy_code(value: Union[None, str, ReadPolicy]) -> int:
+    """The internal code of a read policy given as a :class:`ReadPolicy` or a string (None = primary)."""
+    if value is None:
+        return POLICY_PRIMARY
+    name = str(getattr(value, "value", value)).lower().replace("_", "-")
+    if name == "primary":
+        return POLICY_PRIMARY
+    if name == "prefer-replica":
+        return POLICY_PREFER
+    if name == "replica":
+        return POLICY_REPLICA
+    raise ValueError(f"unknown read_policy {value!r}: use 'primary', 'prefer-replica' or 'replica'")
 
 
 # --------------------------------------------------------------------------- frames
@@ -127,12 +176,25 @@ SPEC.update({b"CLIENT": _COND, b"SCRIPT": _COND, b"FUNCTION": _COND})
 _FAN_SUB = frozenset(
     (
         (b"CLIENT", b"SETNAME"),
+        (b"CLIENT", b"DURABILITY"),
         (b"SCRIPT", b"LOAD"),
         (b"SCRIPT", b"FLUSH"),
         (b"FUNCTION", b"LOAD"),
         (b"FUNCTION", b"DELETE"),
         (b"FUNCTION", b"FLUSH"),
     )
+)
+
+#: server flag bits of the command table (see scripts/gen_client_keys.py)
+_FLAG_READONLY = 2
+_FLAG_BLOCKING = 16
+
+#: commands that only read and may go to a replica: flagged readonly and not blocking, with ordinary
+#: key routing (fan-out, SCAN, transaction and slot-0 Pub/Sub commands keep their own paths)
+READS = frozenset(
+    n
+    for n, r in _KEY_RULES.items()
+    if r[5] & _FLAG_READONLY and not r[5] & _FLAG_BLOCKING and SPEC.get(n, _KEYS) in (_KEYLESS, _KEYS)
 )
 
 # Fast routing of an ordinary command straight from its encoded frame: one regex match reads the
@@ -148,6 +210,28 @@ def _classify(name: bytes) -> bool:
     if len(_PLAIN) < 4096:
         _PLAIN[name] = plain
     return plain
+
+
+_READ: Dict[bytes, bool] = {}
+
+
+def is_read(data: bytes) -> bool:
+    """Whether an encoded command is a read (see :data:`READS`); the name's spelling is cached."""
+    m = _HEAD(data)
+    if m is None:
+        return False
+    name = m.group(1)
+    read = _READ.get(name)
+    if read is None:
+        read = name.upper() in READS
+        if len(_READ) < 4096:
+            _READ[name] = read
+    return read
+
+
+def all_reads(frames: List[bytes]) -> bool:
+    """Whether every command of a pipeline is a read."""
+    return all(map(is_read, frames))
 
 
 def node_index(data: bytes, table: List[int]) -> Optional[int]:
@@ -462,11 +546,18 @@ CLUSTER_SLOTS = encode("CLUSTER SLOTS", ())
 class Topology:
     """16384-entry slot -> node index table plus the node addresses (in slot order)."""
 
-    __slots__ = ("slots", "nodes")
+    __slots__ = ("slots", "nodes", "replicas")
 
-    def __init__(self, slots: List[int], nodes: List[Tuple[str, int]]) -> None:
+    def __init__(
+        self,
+        slots: List[int],
+        nodes: List[Tuple[str, int]],
+        replicas: Optional[List[List[Tuple[str, int]]]] = None,
+    ) -> None:
         self.slots = slots
         self.nodes = nodes
+        #: per node of ``nodes``: the replicas ``CLUSTER SLOTS`` lists after it
+        self.replicas = replicas if replicas is not None else [[] for _ in nodes]
 
 
 def _text(v: Any) -> str:
@@ -479,6 +570,7 @@ def parse_slots(reply: Any, seed_host: str) -> Optional[Topology]:
         return None
     slots = [-1] * SLOT_COUNT
     nodes: List[Tuple[str, int]] = []
+    replicas: List[List[Tuple[str, int]]] = []
     index: Dict[Tuple[str, int], int] = {}
     try:
         for rng in sorted(reply, key=lambda r: int(r[0])):
@@ -491,17 +583,47 @@ def parse_slots(reply: Any, seed_host: str) -> Optional[Topology]:
             if idx is None:
                 idx = index[addr] = len(nodes)
                 nodes.append(addr)
+                replicas.append([])
+            for extra in rng[3:]:  # replicas follow the primary; one that cannot be read is skipped
+                try:
+                    if not isinstance(extra, list):
+                        continue
+                    rhost = _text(extra[0])
+                    if rhost in ("", "0.0.0.0", "::"):
+                        rhost = seed_host
+                    raddr = (rhost, int(extra[1]))
+                except (IndexError, TypeError, ValueError):
+                    continue
+                if raddr not in replicas[idx]:
+                    replicas[idx].append(raddr)
             for s in range(max(0, first), min(SLOT_COUNT - 1, last) + 1):
                 slots[s] = idx
     except (IndexError, TypeError, ValueError):
         return None
-    return Topology(slots, nodes)
+    return Topology(slots, nodes, replicas)
 
 
 def parse_moved(err: BaseException) -> Optional[Tuple[int, str, int]]:
     """``(slot, host, port)`` of a ``MOVED slot host:port`` error; None for anything else."""
+    return _parse_redirect(err, "MOVED ")
+
+
+def parse_ask(err: BaseException) -> Optional[Tuple[int, str, int]]:
+    """``(slot, host, port)`` of an ``ASK slot host:port`` error; None for anything else."""
+    return _parse_redirect(err, "ASK ")
+
+
+def is_tryagain(err: Any) -> bool:
+    """True for a ``TRYAGAIN`` error reply (a ``ResponseError``; any other value is False)."""
+    if not isinstance(err, BaseException):
+        return False
     msg = err.args[0] if err.args else ""
-    if not isinstance(msg, str) or not msg.startswith("MOVED "):
+    return isinstance(msg, str) and msg.startswith("TRYAGAIN")
+
+
+def _parse_redirect(err: BaseException, prefix: str) -> Optional[Tuple[int, str, int]]:
+    msg = err.args[0] if err.args else ""
+    if not isinstance(msg, str) or not msg.startswith(prefix):
         return None
     parts = msg.split()
     if len(parts) < 3:

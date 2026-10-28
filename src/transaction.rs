@@ -26,6 +26,9 @@ pub struct TxSession {
     refused: Vec<(usize, &'static [u8])>,
     queued_bytes: usize,
     watch_slot: Option<u16>,
+    /// The shard holding this connection's watches; another one owns the slot after a
+    /// slot move, and EXEC then fails as for a changed key.
+    watch_shard: usize,
     watched_count: usize,
     /// The last command parked and was then served by another client's write: `Some` with
     /// that write's last WAL record, if it wrote one (see `take_served_after_park`).
@@ -34,6 +37,17 @@ pub struct TxSession {
     /// process (forwarded there in per-shard mode), so its `WAIT` also waits for that shard's
     /// replicas.
     pub forwarded_shards: u64,
+    /// `CLIENT DURABILITY`: replies wait until this many replicas hold the writes on disk.
+    pub durability: Option<Durability>,
+    /// This shard's last record when the previous replies left under `durability`: a later
+    /// flush with no record past it has nothing new to wait for.
+    pub durable_mark: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Durability {
+    pub replicas: u64,
+    pub timeout_ms: u64,
 }
 
 #[derive(Debug)]
@@ -60,9 +74,12 @@ impl TxSession {
             refused: Vec::new(),
             queued_bytes: 0,
             watch_slot: None,
+            watch_shard: 0,
             watched_count: 0,
             served_after_park: None,
             forwarded_shards: 0,
+            durability: None,
+            durable_mark: 0,
         }
     }
 
@@ -85,12 +102,18 @@ impl TxSession {
         self.watch_slot
     }
 
+    /// The shard that holds this connection's watches, when it has any.
+    pub fn watch_shard(&self) -> Option<usize> {
+        self.watch_slot.map(|_| self.watch_shard)
+    }
+
     pub fn queued(&self) -> &[Command<'static>] {
         &self.queue
     }
 
-    pub fn accept_watch(&mut self, slot: u16, count: usize) {
+    pub fn accept_watch(&mut self, slot: u16, count: usize, shard: usize) {
         self.watch_slot = Some(slot);
+        self.watch_shard = shard;
         self.watched_count = self.watched_count.saturating_add(count);
     }
 
@@ -267,16 +290,24 @@ fn queueable(command: &Command<'_>) -> bool {
             | Command::StreamRead { block: Some(_), .. }
             | Command::StreamGroupRead { block: Some(_), .. }
             | Command::Save
+            | Command::ConfigSet(_)
+            | Command::ConfigRewrite
+            | Command::ReplicaOf { .. }
+            | Command::MoveSlots(_)
+            | Command::Topology(_)
+            | Command::PrimaryLease(_)
+            | Command::Migrate(_)
+            | Command::Role
             | Command::Bgsave
             | Command::Hello { .. }
             | Command::ClientGetName
             | Command::ClientSetName(_)
             | Command::ClientTracking(_)
+            | Command::ClientDurability { .. }
             | Command::Select(_)
             | Command::ShardPublish { .. }
             | Command::ShardSubscribe(_)
             | Command::ShardUnsubscribe(_)
-            | Command::Publish { .. }
             | Command::Subscribe(_)
             | Command::Unsubscribe(_)
             | Command::PSubscribe(_)
@@ -291,8 +322,6 @@ fn queueable(command: &Command<'_>) -> bool {
             | Command::ClusterKeySlot(_)
             | Command::ReadOnly
             | Command::ReadWrite
-            | Command::Eval { .. }
-            | Command::EvalSha { .. }
             | Command::ScriptLoad(_)
             | Command::ScriptExists(_)
             | Command::ScriptFlush
@@ -300,7 +329,6 @@ fn queueable(command: &Command<'_>) -> bool {
             | Command::FunctionLoad { .. }
             | Command::FunctionList
             | Command::FunctionDelete(_)
-            | Command::FCall { .. }
     )
 }
 
@@ -371,7 +399,7 @@ mod tests {
         let mut session = TxSession::new(1);
         let payload = vec![b'x'; 4096];
 
-        session.accept_watch(42, 1);
+        session.accept_watch(42, 1, 0);
         session.prepare(Command::Multi);
         session.prepare(Command::set(owned(b"key"), Cow::Owned(payload)));
         let queued_payload = match &session.queued()[0] {
@@ -403,7 +431,7 @@ mod tests {
     fn discard_clears_the_queue_without_unwatch() {
         let mut session = TxSession::new(1);
 
-        session.accept_watch(1, 1);
+        session.accept_watch(1, 1, 0);
         session.prepare(Command::Multi);
         session.prepare(Command::set(owned(b"a"), owned(b"1")));
         assert!(matches!(

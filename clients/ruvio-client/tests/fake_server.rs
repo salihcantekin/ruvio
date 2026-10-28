@@ -14,10 +14,10 @@ mod common;
 use ruvio_client::__bench::parse;
 use ruvio_client::{
     BitFieldOffset, BitFieldOp, BitFieldOverflow, BitFieldType, BitOperation, BloomInsertOptions,
-    Client, ClientOptions, ClientType, Error, FieldExpireCondition, FillOutcome, GeoFrom, GeoOrder,
-    GeoSearch, GeoUnit, IdemState, InfoSection, JsonIndexType, JsonSetCondition, RespValue,
-    RestoreOptions, SetMode, SortedSetAddOptions, StreamClaimOptions, StreamPendingFilter,
-    StreamReadOptions, StreamTrim, TrimMode,
+    Client, ClientOptions, ClientType, Error, ExpireCondition, FieldExpireCondition, FillOutcome,
+    GeoFrom, GeoOrder, GeoSearch, GeoUnit, IdemState, InfoSection, JsonIndexType, JsonSetCondition,
+    RespValue, RestoreOptions, SetMode, SortedSetAddOptions, StreamClaimOptions,
+    StreamPendingFilter, StreamReadOptions, StreamTrim, TrimMode,
 };
 
 type Requests = Arc<Mutex<Vec<Vec<String>>>>;
@@ -201,6 +201,35 @@ fn optional_integer_commands_map_null_and_reject_garbage() {
 }
 
 #[test]
+fn transfer_commands_send_the_cap_and_decode_the_pair() {
+    let (reply, request) = probe("*2\r\n:6\r\n:4\r\n", |c| c.transfer("a", "b", 4, None));
+    assert_eq!(reply.unwrap(), Some((6, 4)));
+    assert_eq!(request, words(&["TRANSFER", "a", "b", "4"]));
+    let (reply, request) = probe("*2\r\n:6\r\n:4\r\n", |c| c.transfer("a", "b", 4, Some(9)));
+    assert_eq!(reply.unwrap(), Some((6, 4)));
+    assert_eq!(request, words(&["TRANSFER", "a", "b", "4", "MAX", "9"]));
+    let (reply, _) = probe("$-1\r\n", |c| c.transfer("a", "b", 4, None));
+    assert_eq!(reply.unwrap(), None);
+    let (reply, _) = probe("+nope\r\n", |c| c.transfer("a", "b", 4, None));
+    assert!(protocol(reply).contains("TRANSFER returned"));
+    let (reply, _) = probe("*1\r\n:1\r\n", |c| c.transfer("a", "b", 4, None));
+    assert!(protocol(reply).contains("TRANSFER returned"));
+
+    let (reply, request) = probe("*2\r\n:1\r\n:2\r\n", |c| {
+        c.htransfer("h", "f", "g", 1, Some(5))
+    });
+    assert_eq!(reply.unwrap(), Some((1, 2)));
+    assert_eq!(
+        request,
+        words(&["HTRANSFER", "h", "f", "g", "1", "MAX", "5"])
+    );
+    let (reply, _) = probe("$-1\r\n", |c| c.htransfer("h", "f", "g", 1, None));
+    assert_eq!(reply.unwrap(), None);
+    let (reply, _) = probe(":1\r\n", |c| c.htransfer("h", "f", "g", 1, None));
+    assert!(protocol(reply).contains("HTRANSFER returned"));
+}
+
+#[test]
 fn getex_returns_the_string_or_none() {
     let (reply, request) = probe("$1\r\nv\r\n", |c| c.getex("k", 100));
     assert_eq!(reply.unwrap().as_deref(), Some("v"));
@@ -344,6 +373,14 @@ fn set_variants_build_the_right_arguments() {
     assert_eq!(request, words(&["SET", "k", "v", "IFEQ", "old"]));
     let (_, request) = probe("+OK\r\n", |c| c.set_if_eq_keep_ttl("k", "v", "old"));
     assert_eq!(request, words(&["SET", "k", "v", "IFEQ", "old", "KEEPTTL"]));
+    let (reply, request) = probe("+OK\r\n", |c| c.set_if_greater("k", -7, None));
+    assert!(reply.unwrap());
+    assert_eq!(request, words(&["SET", "k", "-7", "IFGT"]));
+    let (reply, request) = probe("$-1\r\n", |c| {
+        c.set_if_less("k", 9, Some(Duration::from_millis(5)))
+    });
+    assert!(!reply.unwrap());
+    assert_eq!(request, words(&["SET", "k", "9", "IFLT", "PX", "5"]));
 }
 
 #[test]
@@ -409,6 +446,33 @@ fn blocking_pops_decode_pairs_and_timeouts() {
     assert!(protocol(reply).starts_with("BRPOP returned"));
     let (reply, _) = probe(":1\r\n", |c| c.blpop_key("k", Duration::ZERO));
     assert!(protocol(reply).starts_with("BLPOP returned"));
+
+    let (reply, request) = probe("*2\r\n$1\r\nm\r\n$1\r\n2\r\n", |c| {
+        c.zpopbyscore("z", "-inf", "(5", 3)
+    });
+    assert_eq!(
+        reply.unwrap(),
+        vec![ruvio_client::SortedSetEntry::new("m", 2.0)]
+    );
+    assert_eq!(
+        request,
+        words(&[
+            "ZPOPBYSCORE",
+            "z",
+            "(5",
+            "MIN",
+            "-inf",
+            "COUNT",
+            "3",
+            "WITHSCORES"
+        ])
+    );
+    let (reply, request) = probe(":2\r\n", |c| c.zmovedue("{t}z", "{t}l", "+inf", 4));
+    assert_eq!(reply.unwrap(), 2);
+    assert_eq!(
+        request,
+        words(&["ZMOVEDUE", "{t}z", "{t}l", "+inf", "COUNT", "4"])
+    );
 
     let triple = "*3\r\n$1\r\nz\r\n$1\r\nm\r\n$3\r\n1.5\r\n";
     let (reply, request) = probe(triple, |c| c.bzpopmin(&["z"], Duration::from_secs(1)));
@@ -995,6 +1059,23 @@ fn simple_admin_commands_send_their_words() {
 }
 
 #[test]
+fn client_durability_sends_replicas_and_optional_timeout() {
+    let (reply, request) = probe("+OK\r\n", |c| c.client_durability(2, None));
+    reply.unwrap();
+    assert_eq!(request, words(&["CLIENT", "DURABILITY", "REPLICAS", "2"]));
+
+    let (reply, request) = probe("+OK\r\n", |c| c.client_durability(1, Some(250)));
+    reply.unwrap();
+    assert_eq!(
+        request,
+        words(&["CLIENT", "DURABILITY", "REPLICAS", "1", "TIMEOUT", "250"])
+    );
+
+    let (reply, _) = probe("-ERR denied\r\n", |c| c.client_durability(1, None));
+    assert!(matches!(reply, Err(Error::Server(m)) if m == "ERR denied"));
+}
+
+#[test]
 fn exec_decodes_results_aborts_and_garbage() {
     let (reply, request) = probe("*2\r\n+OK\r\n:1\r\n", |c| c.exec());
     assert_eq!(
@@ -1170,6 +1251,7 @@ fn bloom_insert_and_info() {
         expansion: Some(2),
         no_create: true,
         non_scaling: true,
+        ..BloomInsertOptions::default()
     };
     let (reply, request) = probe("*2\r\n:1\r\n:0\r\n", |c| {
         c.bf_insert("b", &options, &["x", "y"])
@@ -1330,6 +1412,17 @@ fn idem_begin_decodes_every_state() {
     assert!(!done.unwrap());
     let (done, _) = probe("+OK\r\n", |c| c.idem_complete("k", "fp", "me", b"x"));
     assert!(protocol(done).starts_with("IDEM returned"));
+
+    let (done, request) = probe(":1\r\n", |c| c.idem_abort("k", "fp", "me"));
+    assert!(done.unwrap());
+    assert_eq!(request, words(&["IDEM", "k", "ABORT", "fp", "me"]));
+    let (done, _) = probe(":0\r\n", |c| c.idem_abort("k", "fp", "me"));
+    assert!(!done.unwrap());
+    let (done, _) = probe("+OK\r\n", |c| c.idem_abort("k", "fp", "me"));
+    assert!(protocol(done).starts_with("IDEM returned"));
+    let (raw, request) = probe(":1\r\n", |c| c.idempotency_abort("k", "fp", "me"));
+    assert_eq!(raw.unwrap(), 1);
+    assert_eq!(request, words(&["IDEM", "k", "ABORT", "fp", "me"]));
 }
 
 #[test]
@@ -1728,5 +1821,256 @@ fn typed_keywords_match_the_old_string_requests() {
     assert_eq!(
         request,
         words(&["SCAN", "5", "MATCH", "a*", "COUNT", "10", "TYPE", "zset"])
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// TTL on create and the EXPIRE conditions
+// ---------------------------------------------------------------------------------------------
+
+const MINUTE: Duration = Duration::from_secs(60);
+const HALF_SECOND: Duration = Duration::from_millis(1500);
+
+#[test]
+fn expire_conditions_are_sent_after_the_time() {
+    for (condition, word) in [
+        (ExpireCondition::Nx, "NX"),
+        (ExpireCondition::Xx, "XX"),
+        (ExpireCondition::Gt, "GT"),
+        (ExpireCondition::Lt, "LT"),
+    ] {
+        let (reply, request) = probe(":1\r\n", |c| c.expire_if("k", MINUTE, condition));
+        assert!(reply.unwrap());
+        assert_eq!(request, words(&["EXPIRE", "k", "60", word]));
+
+        let (reply, request) = probe(":0\r\n", |c| c.expire_if("k", HALF_SECOND, condition));
+        assert!(!reply.unwrap());
+        assert_eq!(request, words(&["PEXPIRE", "k", "1500", word]));
+
+        let (_, request) = probe(":1\r\n", |c| c.pexpire_if("k", MINUTE, condition));
+        assert_eq!(request, words(&["PEXPIRE", "k", "60000", word]));
+
+        let (_, request) = probe(":1\r\n", |c| {
+            c.expire_at_if("k", at(1_900_000_000, 0), condition)
+        });
+        assert_eq!(request, words(&["EXPIREAT", "k", "1900000000", word]));
+
+        let (_, request) = probe(":1\r\n", |c| {
+            c.expire_at_if("k", at(1_900_000_000, 250), condition)
+        });
+        assert_eq!(request, words(&["PEXPIREAT", "k", "1900000000250", word]));
+
+        let (_, request) = probe(":1\r\n", |c| {
+            c.pexpire_at_if("k", at(1_900_000_000, 0), condition)
+        });
+        assert_eq!(request, words(&["PEXPIREAT", "k", "1900000000000", word]));
+    }
+
+    let (reply, _) = probe(":1\r\n", |c| {
+        c.expire_at_if(
+            "k",
+            UNIX_EPOCH - Duration::from_secs(1),
+            ExpireCondition::Nx,
+        )
+    });
+    assert!(protocol(reply).contains("epoch"));
+}
+
+#[test]
+fn ttl_on_create_counters_and_bits() {
+    let (reply, request) = probe(":1\r\n", |c| c.incr_with_ttl("k", MINUTE));
+    assert_eq!(reply.unwrap(), 1);
+    assert_eq!(request, words(&["INCR", "k", "EX", "60"]));
+
+    let (_, request) = probe(":1\r\n", |c| c.incr_with_ttl("k", HALF_SECOND));
+    assert_eq!(request, words(&["INCR", "k", "PX", "1500"]));
+
+    let (_, request) = probe(":1\r\n", |c| {
+        c.incr_with_ttl("k", Duration::from_micros(1500))
+    });
+    assert_eq!(request, words(&["INCR", "k", "PX", "2"]));
+
+    let (_, request) = probe(":1\r\n", |c| c.decr_with_ttl("k", MINUTE));
+    assert_eq!(request, words(&["DECR", "k", "EX", "60"]));
+
+    let (_, request) = probe(":1\r\n", |c| c.incr_by_with_ttl("k", -5, MINUTE));
+    assert_eq!(request, words(&["INCRBY", "k", "-5", "EX", "60"]));
+
+    let (_, request) = probe(":1\r\n", |c| c.decr_by_with_ttl("k", 5, HALF_SECOND));
+    assert_eq!(request, words(&["DECRBY", "k", "5", "PX", "1500"]));
+
+    let (reply, request) = probe(":3\r\n", |c| c.incr_by_max_with_ttl("k", 1, 10, MINUTE));
+    assert_eq!(reply.unwrap(), Some(3));
+    assert_eq!(
+        request,
+        words(&["INCRBY", "k", "1", "EX", "60", "MAX", "10"])
+    );
+    let (reply, _) = probe("$-1\r\n", |c| c.incr_by_max_with_ttl("k", 1, 10, MINUTE));
+    assert_eq!(reply.unwrap(), None);
+
+    let (reply, request) = probe("$3\r\n1.5\r\n", |c| {
+        c.incr_by_float_with_ttl("k", 1.5, MINUTE)
+    });
+    assert_eq!(reply.unwrap(), 1.5);
+    assert_eq!(request, words(&["INCRBYFLOAT", "k", "1.5", "EX", "60"]));
+
+    let (reply, request) = probe(":2\r\n", |c| c.hincr_by_with_ttl("k", "f", 2, MINUTE));
+    assert_eq!(reply.unwrap(), 2);
+    assert_eq!(request, words(&["HINCRBY", "k", "f", "2", "EX", "60"]));
+
+    let (reply, request) = probe("$3\r\n2.5\r\n", |c| {
+        c.zincr_by_with_ttl("k", "m", 2.5, HALF_SECOND)
+    });
+    assert_eq!(reply.unwrap(), 2.5);
+    assert_eq!(request, words(&["ZINCRBY", "k", "2.5", "m", "PX", "1500"]));
+
+    let (reply, request) = probe(":0\r\n", |c| c.setbit_with_ttl("k", 7, true, MINUTE));
+    assert!(!reply.unwrap());
+    assert_eq!(request, words(&["SETBIT", "k", "7", "1", "EX", "60"]));
+    let (_, request) = probe(":0\r\n", |c| c.setbit_with_ttl("k", 7, false, MINUTE));
+    assert_eq!(request, words(&["SETBIT", "k", "7", "0", "EX", "60"]));
+}
+
+#[test]
+fn ttl_on_create_is_checked_before_sending() {
+    let (mut client, requests) = scripted(&[":1\r\n"]);
+
+    assert!(protocol(client.incr_with_ttl("k", Duration::ZERO)).contains("greater than zero"));
+    assert!(protocol(client.setbit_with_ttl("k", 1, true, Duration::ZERO)).contains("zero"));
+    assert!(protocol(client.incr_with_ttl("k", Duration::MAX)).contains("too large"));
+    assert!(
+        protocol(client.zadd_with(
+            "k",
+            SortedSetAddOptions {
+                ttl: Some(Duration::ZERO),
+                ..SortedSetAddOptions::default()
+            },
+            &[("a", 1.0)]
+        ))
+        .contains("zero")
+    );
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn ttl_on_create_zadd_geoadd_xadd_json_and_bloom() {
+    let ttl = Some(MINUTE);
+    let options = SortedSetAddOptions {
+        ttl,
+        if_exists: true,
+        greater_than: true,
+        changed: true,
+        ..SortedSetAddOptions::default()
+    };
+    let (reply, request) = probe(":1\r\n", |c| {
+        c.zadd_with("z", options, &[("a", 1.0), ("b", 2.5)])
+    });
+    assert_eq!(reply.unwrap(), 1);
+    assert_eq!(
+        request,
+        words(&[
+            "ZADD", "z", "EX", "60", "XX", "GT", "CH", "1.0", "a", "2.5", "b"
+        ])
+    );
+
+    let (reply, request) = probe("$3\r\n3.0\r\n", |c| c.zadd_incr("z", "a", 2.0, options));
+    assert_eq!(reply.unwrap(), Some(3.0));
+    assert_eq!(
+        request,
+        words(&["ZADD", "z", "EX", "60", "XX", "GT", "CH", "INCR", "2", "a"])
+    );
+
+    let (_, request) = probe(":1\r\n", |c| c.zadd("z", &[("a", 1.0)]));
+    assert_eq!(request, words(&["ZADD", "z", "1.0", "a"]));
+
+    let geo = SortedSetAddOptions {
+        ttl: Some(HALF_SECOND),
+        if_not_exists: true,
+        changed: true,
+        ..SortedSetAddOptions::default()
+    };
+    let (_, request) = probe(":1\r\n", |c| {
+        c.geo_add_with("g", geo, &[(13.5, 38.25, "p")])
+    });
+    assert_eq!(
+        request,
+        words(&[
+            "GEOADD", "g", "PX", "1500", "NX", "CH", "13.5", "38.25", "p"
+        ])
+    );
+
+    let (reply, request) = probe("$3\r\n1-1\r\n", |c| {
+        c.xadd_with_ttl("s", MINUTE, "*", &[("f", "v"), ("g", "w")])
+    });
+    assert_eq!(reply.unwrap(), "1-1");
+    assert_eq!(
+        request,
+        words(&["XADD", "s", "EX", "60", "*", "f", "v", "g", "w"])
+    );
+
+    let trim = StreamTrim::max_len(100).mode(TrimMode::Approximate);
+    let (_, request) = probe("$3\r\n1-1\r\n", |c| {
+        c.xadd_trim_with_ttl("s", HALF_SECOND, &trim, "*", &[("f", "v")])
+    });
+    assert_eq!(
+        request,
+        words(&[
+            "XADD", "s", "PX", "1500", "MAXLEN", "~", "100", "*", "f", "v"
+        ])
+    );
+
+    for (condition, tail) in [
+        (JsonSetCondition::Always, &[][..]),
+        (JsonSetCondition::IfMissing, &["NX"][..]),
+        (JsonSetCondition::IfExists, &["XX"][..]),
+    ] {
+        let (reply, request) = probe("+OK\r\n", |c| {
+            c.json_set_with_ttl("j", "$", "{}", condition, MINUTE)
+        });
+        assert!(reply.unwrap());
+        let mut expected = vec!["JSON.SET", "j", "$", "{}"];
+        expected.extend(tail);
+        expected.extend(["EX", "60"]);
+        assert_eq!(request, words(&expected));
+    }
+    let (reply, _) = probe("$-1\r\n", |c| {
+        c.json_set_with_ttl("j", "$", "{}", JsonSetCondition::IfMissing, MINUTE)
+    });
+    assert!(!reply.unwrap());
+
+    let bloom = BloomInsertOptions {
+        capacity: Some(100),
+        ttl: Some(MINUTE),
+        no_create: true,
+        ..BloomInsertOptions::default()
+    };
+    let (reply, request) = probe("*1\r\n:1\r\n", |c| c.bf_insert("b", &bloom, &["x"]));
+    assert_eq!(reply.unwrap(), [true]);
+    assert_eq!(
+        request,
+        words(&[
+            "BF.INSERT",
+            "b",
+            "EX",
+            "60",
+            "CAPACITY",
+            "100",
+            "NOCREATE",
+            "ITEMS",
+            "x"
+        ])
+    );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn ttl_on_create_json_value() {
+    let (reply, request) = probe("+OK\r\n", |c| {
+        c.json_set_value_with_ttl("j", "$", &[1, 2], JsonSetCondition::Always, HALF_SECOND)
+    });
+    assert!(reply.unwrap());
+    assert_eq!(
+        request,
+        words(&["JSON.SET", "j", "$", "[1,2]", "PX", "1500"])
     );
 }

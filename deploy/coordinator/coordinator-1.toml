@@ -1,0 +1,17 @@
+# Coordinator 1 of deploy/compose.failover.yml. See docs/COORDINATOR.md.
+id = 1
+listen = "0.0.0.0:26400"
+data_dir = "/data/coordinator"
+peers = ["1@coordinator-1:26400", "2@coordinator-2:26400", "3@coordinator-3:26400"]
+# The compose file sets RUVIO_COORDINATOR_SECRET; it overrides this value.
+secret = ""
+ping_interval_ms = 500
+down_after_ms = 3000
+
+[[groups]]
+name = "main"
+members = [
+  { address = "ruvio-1:6379", replication = "ruvio-1:26379" },
+  { address = "ruvio-2:6379", replication = "ruvio-2:26379" },
+  { address = "ruvio-3:6379", replication = "ruvio-3:26379" },
+]

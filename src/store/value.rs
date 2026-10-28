@@ -395,12 +395,6 @@ impl SemaphoreValue {
     }
 }
 
-/// First token of a new semaphore. Later tokens count up from it. Starting from the clock keeps
-/// a token issued before the key expired from matching a holder after it is created again.
-pub(crate) fn first_semaphore_token(now: u64) -> u64 {
-    (now << 20).max(1)
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseValue {
     pub(crate) token: u64,
@@ -422,11 +416,28 @@ pub struct LimitValue {
 pub(crate) enum LimitDecision {
     Allow {
         used: u64,
-        /// `Some` only when this call opens a new window.
+        /// `Some` when this call moves the key's deadline: it opens a window, rolls the
+        /// sliding window, or advances the token bucket.
         window_end: Option<u64>,
         remaining: u64,
+        /// This call creates the key.
+        fresh: bool,
     },
     Reject,
+    /// A refusal from `SLIDING` or `TOKENS`, with the wait until the same call would pass.
+    RejectRetry {
+        retry_after_ms: u64,
+    },
+}
+
+/// Why a `LIMIT` call could not run on the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LimitError {
+    WrongType,
+    /// The key holds a limit created by another mode.
+    Mode,
+    /// The clock and the arguments do not fit the packed state.
+    Range,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1303,7 +1314,7 @@ impl ValueLog {
 
     /// Bytes of a span. The page path is one bounds check on the extent table and one
     /// on the span; large spans and empty reads (offset 0 may name no extent) go cold.
-    #[inline]
+    #[inline(always)]
     pub(super) fn bytes(&self, offset: u32, len: usize) -> &[u8] {
         let start = offset as usize;
         let at = start % EXTENT_BYTES;
@@ -1429,6 +1440,7 @@ impl ValueLog {
         }
     }
 
+    #[inline(always)]
     pub(crate) fn slice(&self, offset: u32, len: u16) -> &[u8] {
         self.bytes(offset, len as usize)
     }

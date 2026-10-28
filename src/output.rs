@@ -7,6 +7,9 @@ pub(crate) struct BoundedOutput {
     bytes: Vec<u8>,
     maximum: usize,
     exceeded: bool,
+    /// Bytes at the front already cleared to leave: sent in part, or passed by an earlier
+    /// durability wait. A later wait that times out refuses only the replies after them.
+    approved: usize,
 }
 
 impl BoundedOutput {
@@ -15,21 +18,35 @@ impl BoundedOutput {
             bytes: Vec::with_capacity(capacity.min(maximum)),
             maximum,
             exceeded: false,
+            approved: 0,
         }
     }
 
     pub(crate) fn clear(&mut self) {
         self.bytes.clear();
         self.exceeded = false;
+        self.approved = 0;
     }
 
     /// Drops the first `count` bytes, which were sent; the limit then counts only the rest.
     pub(crate) fn consume_front(&mut self, count: usize) {
         self.bytes.drain(..count);
+        self.approved = self.approved.saturating_sub(count);
     }
 
     pub(crate) fn truncate_to(&mut self, length: usize) {
         self.bytes.truncate(length);
+        self.approved = self.approved.min(length);
+    }
+
+    /// Where the replies not yet cleared by a durability wait begin.
+    pub(crate) fn approved(&self) -> usize {
+        self.approved.min(self.bytes.len())
+    }
+
+    /// Every byte held now may leave; a later wait looks only at what comes after.
+    pub(crate) fn approve_all(&mut self) {
+        self.approved = self.bytes.len();
     }
 
     pub(crate) fn release_idle(&mut self) {
@@ -52,6 +69,37 @@ impl BoundedOutput {
     pub(crate) fn exceeded(&self) -> bool {
         self.exceeded
     }
+}
+
+const PAIRS: &[u8; 200] = b"0001020304050607080910111213141516171819\
+2021222324252627282930313233343536373839\
+4041424344454647484950515253545556575859\
+6061626364656667686970717273747576777879\
+8081828384858687888990919293949596979899";
+
+/// The decimal digits of `value`, written two at a time at the end of `buffer`.
+pub(crate) fn decimal(mut value: u64, buffer: &mut [u8; 20]) -> &[u8] {
+    let mut at = buffer.len();
+
+    while value >= 100 {
+        let pair = (value % 100) as usize * 2;
+
+        value /= 100;
+        at -= 2;
+        buffer[at..at + 2].copy_from_slice(&PAIRS[pair..pair + 2]);
+    }
+
+    if value >= 10 {
+        let pair = value as usize * 2;
+
+        at -= 2;
+        buffer[at..at + 2].copy_from_slice(&PAIRS[pair..pair + 2]);
+    } else {
+        at -= 1;
+        buffer[at] = b'0' + value as u8;
+    }
+
+    &buffer[at..]
 }
 
 impl Deref for BoundedOutput {
@@ -97,6 +145,35 @@ impl Write for BoundedOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decimal_matches_the_standard_formatting() {
+        let mut buffer = [0u8; 20];
+        let mut samples = vec![
+            0,
+            1,
+            9,
+            10,
+            99,
+            100,
+            101,
+            999,
+            1000,
+            12345,
+            u64::MAX,
+            u64::MAX - 1,
+        ];
+
+        for power in 0..20u32 {
+            let base = 10u64.pow(power);
+
+            samples.extend([base - 1, base, base + 1]);
+        }
+
+        for value in samples {
+            assert_eq!(decimal(value, &mut buffer), value.to_string().as_bytes());
+        }
+    }
 
     #[test]
     fn rejects_writes_before_exceeding_the_limit() {

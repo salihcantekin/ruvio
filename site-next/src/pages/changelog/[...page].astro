@@ -1,0 +1,311 @@
+---
+// /changelog/ and /changelog/2/, /changelog/3/, ...: the history split into pages of PAGE_SIZE entries.
+// The search reads /changelog/entries.json, fetched only when someone types in the search box.
+import Page from "../../layouts/Page.astro";
+import PageIntro from "../../components/PageIntro.astro";
+import { site } from "../../config/site";
+import { PAGE_SIZE, daysHtml, esc, longDate, type Entry } from "../../lib/changelog";
+// Written by scripts/changelog.mjs from the git history on every dev and build run (not committed).
+import data from "../../data/changelog.json";
+
+export function getStaticPaths() {
+  const total = data.available ? (data as { entries: Entry[] }).entries.length : 0;
+  const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  return Array.from({ length: pages }, (_, i) => ({ params: { page: i === 0 ? undefined : String(i + 1) }, props: { n: i + 1, pages } }));
+}
+
+const { n, pages } = Astro.props as { n: number; pages: number };
+const all: Entry[] = data.available ? (data as { entries: Entry[] }).entries : [];
+const slice = all.slice((n - 1) * PAGE_SIZE, n * PAGE_SIZE);
+const releaseNotes: { title: string; date: string | null; items: string[] }[] = n === 1 ? (data.notes ?? []) : [];
+const href = (p: number) => (p === 1 ? "/changelog/" : `/changelog/${p}/`);
+// First, last and two either side of the current page; 0 stands for a gap.
+const pageList = Array.from({ length: pages }, (_, i) => i + 1)
+  .filter((p) => p === 1 || p === pages || Math.abs(p - n) <= 2)
+  .flatMap((p, i, a) => (i > 0 && p - a[i - 1] > 1 ? [0, p] : [p]));
+const range = slice.length ? `${slice.at(-1)!.date} – ${slice[0].date}` : "";
+
+// CHANGELOG.md lines use only `code`, **bold** and [links](url); everything else is escaped.
+const inline = (md: string) =>
+  md
+    .split(/(`[^`]+`)/)
+    .map((part) =>
+      part.startsWith("`") && part.endsWith("`") && part.length > 1
+        ? `<code>${esc(part.slice(1, -1))}</code>`
+        : esc(part)
+            .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+            .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2">$1</a>'),
+    )
+    .join("");
+const isVersion = (t: string) => /^\d/.test(t);
+
+const notes = [
+  { label: "Server", path: "CHANGELOG.md" },
+  { label: "Rust client", path: "clients/ruvio-client/CHANGELOG.md" },
+  { label: "C# client", path: "clients/csharp/CHANGELOG.md" },
+  { label: "Go client", path: "clients/go/CHANGELOG.md" },
+  { label: "Java client", path: "clients/java/CHANGELOG.md" },
+  { label: "Python client", path: "clients/python/CHANGELOG.md" },
+  { label: "Node.js client", path: "clients/node/CHANGELOG.md" },
+  { label: "Operator UI", path: "clients/ruvio-ui/CHANGELOG.md" },
+];
+---
+
+<Page
+  title={n === 1 ? "Changelog" : `Changelog, page ${n}`}
+  description="Every change merged into Ruvio's main and dev branches, by day, read from the git history when the site is built."
+>
+  <PageIntro title="Changelog" kicker="What changed, day by day">
+    What each server release changed, then every change merged into <code>main</code> and <code>dev</code>, read
+    from the repository's history each time the site is built. <code>main</code> is what the releases are cut from;
+    <code>dev</code> is ahead of it.
+  </PageIntro>
+
+  <div class="reading cl">
+    <div class="wrap">
+      {releaseNotes.length > 0 && (
+        <section class="server-notes" aria-labelledby="server-notes-h">
+          <h2 id="server-notes-h" class="section-h">Server release notes</h2>
+          <p class="section-sub">
+            The newest sections of <a href={`${site.github}/blob/main/CHANGELOG.md`}>CHANGELOG.md</a>. "Unreleased" is
+            on <code>dev</code> and goes out with the next version.
+          </p>
+          <div class="versions">
+            {releaseNotes.map((r, i) => (
+              <details class="version panel" open={i < 2}>
+                <summary>
+                  <span class="v-title">{isVersion(r.title) ? `Ruvio ${r.title}` : r.title}</span>
+                  {r.date && <time datetime={r.date}>{longDate(r.date)}</time>}
+                  <span class="v-count">{r.items.length} {r.items.length === 1 ? "change" : "changes"}</span>
+                  {isVersion(r.title) && <a class="v-link" href={`${site.github}/releases/tag/ruvio-${r.title}`}>Release</a>}
+                </summary>
+                <ul>
+                  {r.items.map((item) => <li set:html={inline(item)} />)}
+                </ul>
+              </details>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {n === 1 && (
+        <section class="panel notes" aria-labelledby="notes-h">
+          <h2 id="notes-h">Release notes by package</h2>
+          <div class="note-links">
+            {notes.map((p) => <a class="chip" href={`${site.github}/blob/main/${p.path}`}>{p.label}</a>)}
+            <a class="chip" href={`${site.github}/releases`}>All releases</a>
+          </div>
+        </section>
+      )}
+
+      {data.available ? (
+        <section aria-labelledby="history-h">
+          <h2 id="history-h" class={`section-h${n === 1 ? " history-h" : ""}`}>Every change on main and dev</h2>
+          <div class="toolbar">
+            <div class="seg" role="group" aria-label="Show branch" data-branch-filter>
+              <button type="button" aria-pressed="true" data-show="all">All</button>
+              <button type="button" aria-pressed="false" data-show="main">main</button>
+              <button type="button" aria-pressed="false" data-show="dev">dev only</button>
+            </div>
+            <label class="search">
+              <span class="visually-hidden">Search all changes</span>
+              <input type="search" placeholder={`Search all ${all.length} changes`} autocomplete="off" data-search />
+            </label>
+          </div>
+          <p class="tips" data-paged>
+            Page {n} of {pages}, {range}. Built from <code>main</code> at{" "}
+            <a href={`${site.github}/commit/${data.tips.main}`}>{data.tips.main}</a>
+            {data.tips.dev && <> and <code>dev</code> at <a href={`${site.github}/commit/${data.tips.dev}`}>{data.tips.dev}</a></>}.
+          </p>
+          <p class="tips" data-status hidden aria-live="polite"></p>
+
+          <ol class="days" data-paged set:html={daysHtml(slice)} />
+          <ol class="days" data-results hidden></ol>
+
+          {pages > 1 && (
+            <nav class="pager" aria-label="Changelog pages" data-paged>
+              {n > 1 ? <a class="btn ghost small" href={href(n - 1)} rel="prev">← Newer</a> : <span />}
+              <span class="pages">
+                {pageList.map((p) =>
+                  p === 0 ? <span class="gap">…</span> : p === n ? <span aria-current="page">{p}</span> : <a href={href(p)}>{p}</a>,
+                )}
+              </span>
+              {n < pages ? <a class="btn ghost small" href={href(n + 1)} rel="next">Older →</a> : <span />}
+            </nav>
+          )}
+          <p class="more-history">
+            Older history is on GitHub:{" "}
+            <a href={`${site.github}/commits/main`}>main</a> and <a href={`${site.github}/commits/dev`}>dev</a>.
+          </p>
+        </section>
+      ) : (
+        <section class="panel empty">
+          <p>
+            The history was not available when this copy of the site was built. The commits are on GitHub:
+            <a href={`${site.github}/commits/main`}>main</a> and <a href={`${site.github}/commits/dev`}>dev</a>.
+          </p>
+        </section>
+      )}
+    </div>
+  </div>
+</Page>
+
+<script>
+  import { daysHtml, searchText, type Entry } from "../../lib/changelog";
+
+  const MAX_RESULTS = 200;
+  const $ = <T extends HTMLElement>(s: string) => document.querySelector<T>(s);
+  const group = $("[data-branch-filter]");
+  const input = $<HTMLInputElement>("[data-search]");
+  const results = $("[data-results]");
+  const status = $("[data-status]");
+  let show = "all";
+  let index: Promise<{ e: Entry; t: string }[]> | null = null;
+
+  // Hides entries of the other branch and any day left empty. Without script everything shows.
+  const applyBranch = () =>
+    document.querySelectorAll<HTMLElement>("[data-day]").forEach((day) => {
+      let visible = 0;
+      day.querySelectorAll<HTMLElement>("[data-branch]").forEach((e) => {
+        const on = show === "all" || e.dataset.branch === show;
+        e.hidden = !on;
+        if (on) visible++;
+      });
+      day.hidden = visible === 0;
+    });
+
+  group?.addEventListener("click", (ev) => {
+    const btn = (ev.target as HTMLElement).closest<HTMLButtonElement>("button[data-show]");
+    if (!btn) return;
+    show = btn.dataset.show ?? "all";
+    group.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b === btn)));
+    applyBranch();
+  });
+
+  // The whole history is loaded once, on the first search, not with the page.
+  const load = () =>
+    (index ??= fetch("/changelog/entries.json")
+      .then((r) => r.json() as Promise<Entry[]>)
+      .then((list) => list.map((e) => ({ e, t: searchText(e) }))));
+
+  const setSearching = (on: boolean) => {
+    document.querySelectorAll<HTMLElement>("[data-paged]").forEach((el) => (el.hidden = on));
+    if (results) results.hidden = !on;
+    if (status) status.hidden = !on;
+  };
+
+  let pending = 0;
+  input?.addEventListener("input", async () => {
+    const words = input.value.toLowerCase().split(/\s+/).filter(Boolean);
+    const ticket = ++pending;
+    if (!words.length) { setSearching(false); return; }
+    let list;
+    try { list = await load(); } catch {
+      index = null;
+      if (status) { status.hidden = false; status.textContent = "The search index could not be loaded."; }
+      return;
+    }
+    if (ticket !== pending || !results || !status) return; // a newer keystroke won
+    const hits = list.filter(({ t }) => words.every((w) => t.includes(w))).map(({ e }) => e);
+    results.innerHTML = daysHtml(hits.slice(0, MAX_RESULTS));
+    status.textContent = hits.length === 0
+      ? "No change matches."
+      : `${hits.length} ${hits.length === 1 ? "change matches" : "changes match"}${hits.length > MAX_RESULTS ? `; the newest ${MAX_RESULTS} are shown` : ""}.`;
+    setSearching(true);
+    applyBranch();
+  });
+  input?.addEventListener("focus", () => void load().catch(() => (index = null)), { once: true });
+</script>
+
+<style is:global>
+  /* Global, under .cl: the day lists are written as HTML strings, by the build and by the search. */
+  .cl .section-h { margin: 0; font-size: 24px; }
+  .cl .section-sub { margin: 6px 0 16px; color: var(--mute); font-size: 15.5px; }
+  .cl .section-sub a { color: var(--ink); }
+  .cl .server-notes { margin-bottom: 28px; }
+  .cl .versions { display: grid; gap: 12px; }
+  .cl .version { padding: 0; }
+  .cl .version summary {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; padding: 16px 20px; cursor: pointer; list-style: none;
+  }
+  .cl .version summary::-webkit-details-marker { display: none; }
+  .cl .version summary::before { content: "▸"; color: var(--faint); transition: transform .15s ease; }
+  .cl .version[open] summary::before { transform: rotate(90deg); }
+  .cl .v-title { font-weight: 600; font-size: 18px; color: var(--ink); }
+  .cl .version time, .cl .v-count { font-size: 14.5px; color: var(--faint); }
+  .cl .v-link { margin-left: auto; font-size: 14.5px; color: var(--mute); }
+  .cl .version ul { margin: 0; padding: 0 22px 18px 44px; display: grid; gap: 8px; color: var(--ink-body); font-size: 16px; line-height: 1.6; }
+  .cl .version li code { font-size: 14px; }
+  .cl .version li strong { color: var(--ink); }
+  .cl .history-h { margin-top: 40px; }
+  .cl .notes { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; }
+  .cl .notes h2 { margin: 0; font-size: 18px; }
+  .cl .note-links { display: flex; flex-wrap: wrap; gap: 8px; }
+  .cl .note-links .chip { font-family: var(--f-sans); font-size: 14.5px; text-decoration: none; }
+  .cl .note-links .chip:hover { border-color: color-mix(in srgb, var(--ink) 35%, var(--line)); }
+
+  .cl .toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 20px; margin: 16px 0 10px; }
+  .cl .search { flex: 0 1 340px; min-width: 0; }
+  .cl .search input {
+    width: 100%; font: inherit; font-size: 15.5px; color: var(--ink); background: var(--surface);
+    border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 12px;
+  }
+  .cl .search input:focus { outline: 2px solid color-mix(in srgb, var(--accent) 70%, transparent); outline-offset: 1px; }
+  .cl .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .cl .tips { margin: 0; font-size: 14.5px; color: var(--faint); }
+  .cl .tips a { color: var(--mute); font-family: var(--f-mono); }
+
+  .cl .days { list-style: none; margin: 0; padding: 0; }
+  .cl .day { margin-top: 24px; }
+  .cl .day-h {
+    position: sticky; top: 65px; z-index: 1; margin: 0 0 10px; padding: 8px 0;
+    font-size: 17px; font-weight: 600; color: var(--ink);
+    background: var(--bg); box-shadow: 0 6px 8px -6px var(--bg);
+  }
+  .cl .entries {
+    list-style: none; margin: 0; padding: 0;
+    background: var(--paper); border: 1px solid var(--paper-line); border-radius: var(--radius); overflow: hidden;
+  }
+  .cl .entry {
+    display: grid; grid-template-columns: 92px minmax(0, 1fr) auto; align-items: baseline; gap: 4px 14px;
+    padding: 11px 16px; border-top: 1px solid var(--paper-line); font-size: 16px; color: var(--ink-body);
+  }
+  .cl .entry:first-child { border-top: 0; }
+  .cl [hidden] { display: none !important; }
+  .cl .entry.pr .text, .cl .entry.promote .text { color: var(--ink); font-weight: 500; }
+  .cl .entry.release { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+  .cl .entry.release .text { color: var(--ink); font-weight: 600; text-decoration: none; }
+  .cl .entry.release .text:hover { text-decoration: underline; }
+
+  .cl .badge {
+    justify-self: start; font-family: var(--f-mono); font-size: 12.5px; line-height: 1; padding: 5px 8px;
+    border-radius: 4px; border: 1px solid var(--line); color: var(--mute); white-space: nowrap;
+  }
+  .cl .badge.main { color: var(--ink); border-color: color-mix(in srgb, var(--c2) 60%, var(--line)); }
+  .cl .badge.promote { color: var(--ink); border-color: var(--c1); }
+  .cl .badge.rel { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); }
+
+  .cl .area {
+    display: inline-block; margin-right: 8px; padding: 1px 7px; border-radius: 4px; font-size: 13px; font-weight: 500;
+    color: var(--mute); background: var(--surface-2); vertical-align: 1px;
+  }
+  .cl .meta { display: block; margin-top: 3px; font-size: 14px; font-weight: 400; color: var(--faint); }
+  .cl .meta a { color: var(--mute); }
+  .cl .sha { font-family: var(--f-mono); font-size: 13px; color: var(--faint); text-decoration: none; }
+  .cl a.sha:hover { color: var(--ink); text-decoration: underline; }
+
+  .cl .pager { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 32px; }
+  .cl .pages { display: flex; flex-wrap: wrap; justify-content: center; gap: 4px; font-family: var(--f-mono); font-size: 14.5px; }
+  .cl .pages > * { min-width: 32px; padding: 6px 8px; border-radius: var(--radius-s, 4px); text-align: center; color: var(--mute); text-decoration: none; }
+  .cl .pages a:hover { color: var(--ink); background: var(--surface-2); }
+  .cl .pages [aria-current] { color: var(--bg); background: var(--ink); font-weight: 600; }
+
+  .cl .more-history, .cl .empty p { margin: 28px 0 0; color: var(--mute); font-size: 15.5px; }
+  .cl .empty p { margin: 0; }
+
+  @media (max-width: 640px) {
+    .cl .entry { grid-template-columns: minmax(0, 1fr) auto; }
+    .cl .badge { grid-column: 1 / -1; }
+    .cl .search { flex-basis: 100%; }
+  }
+</style>

@@ -52,6 +52,8 @@ public final class Pipeline<K, V> extends RuvioCommands<K, V> {
     private Group[] active = new Group[4];
     private int activeCount;
     private final ClusterRouter.Sink grouping;
+    /** Under a replica read policy: every command queued since the last flush is a read. */
+    private boolean allReads = true;
 
     Pipeline(Link link, ClusterRouter router, RuvioCodec<K> keys, RuvioCodec<V> values) {
         super(keys, values);
@@ -91,7 +93,14 @@ public final class Pipeline<K, V> extends RuvioCommands<K, V> {
             pending = Arrays.copyOf(pending, count << 1);
         }
         if (router != null) {
-            router.dispatch(frame, (RoutedRequest<T>) request, grouping);
+            RoutedRequest<T> routed = (RoutedRequest<T>) request;
+            if (router.replicaReads()) {
+                // Reads wait in the primary's group; the flush moves them to replicas if nothing in the batch writes.
+                router.dispatchQueued(frame, routed, grouping);
+                allReads &= routed.read;
+            } else {
+                router.dispatch(frame, routed, grouping);
+            }
         }
         pending[count++] = request;
         return request;
@@ -212,18 +221,14 @@ public final class Pipeline<K, V> extends RuvioCommands<K, V> {
     private int flushCluster() {
         int n = count;
         RuntimeException first = null;
+        boolean toReplicas = allReads && router.replicaReads();
+        allReads = true;
         for (int gi = 0; gi < activeCount; gi++) {
             Group g = active[gi];
             try {
-                Connection c = g.node.link.get();
-                RespOut o = c.begin();
-                try {
-                    o.raw(g.out.buf, 0, g.out.pos);
-                } catch (RuntimeException e) {
-                    c.abort();
-                    throw e;
+                if (!toReplicas || !sendToReplica(g)) {
+                    write(g.node, g.out.buf, g.out.pos, g.requests, g.n);
                 }
-                c.endMany(g.requests, g.n);
             } catch (RuntimeException e) {
                 for (int i = 0; i < g.n; i++) {
                     g.requests[i].fail(e);
@@ -243,6 +248,66 @@ public final class Pipeline<K, V> extends RuvioCommands<K, V> {
             throw first;
         }
         return n;
+    }
+
+    private static void write(ClusterNode node, byte[] buf, int len, Request<?>[] requests, int n) {
+        Connection c = node.link.get();
+        RespOut o = c.begin();
+        try {
+            o.raw(buf, 0, len);
+        } catch (RuntimeException e) {
+            c.abort();
+            throw e;
+        }
+        c.endMany(requests, n);
+    }
+
+    /**
+     * Sends the keyed reads of a group to the primary's replica, the rest (keyless commands) to the primary.
+     *
+     * @return {@code false} when the group has no replica to use under {@code PREFER_REPLICA}: nothing was sent
+     */
+    private boolean sendToReplica(Group g) {
+        int reads = 0;
+        for (int i = 0; i < g.n; i++) {
+            if (((RoutedRequest<?>) g.requests[i]).replicaOk) {
+                reads++;
+            }
+        }
+        if (reads == 0) {
+            return false;
+        }
+        ClusterNode replica = router.readNode(g.node);
+        if (replica == null) {
+            return false;
+        }
+        if (reads == g.n) {
+            for (int i = 0; i < g.n; i++) {
+                ((RoutedRequest<?>) g.requests[i]).replica = replica;
+            }
+            write(replica, g.out.buf, g.out.pos, g.requests, g.n);
+            return true;
+        }
+        RespOut onReplica = new RespOut(1024);
+        RespOut onPrimary = new RespOut(1024);
+        Request<?>[] toReplica = new Request<?>[reads];
+        Request<?>[] toPrimary = new Request<?>[g.n - reads];
+        int r = 0;
+        int p = 0;
+        for (int i = 0; i < g.n; i++) {
+            RoutedRequest<?> q = (RoutedRequest<?>) g.requests[i];
+            if (q.replicaOk) {
+                q.replica = replica;
+                onReplica.raw(q.frame, q.frameOff, q.frameLen);
+                toReplica[r++] = q;
+            } else {
+                onPrimary.raw(q.frame, q.frameOff, q.frameLen);
+                toPrimary[p++] = q;
+            }
+        }
+        write(g.node, onPrimary.buf, onPrimary.pos, toPrimary, p);
+        write(replica, onReplica.buf, onReplica.pos, toReplica, r);
+        return true;
     }
 
     /**

@@ -18,11 +18,78 @@ pub const MAX_TRACKED_KEYS: usize = 1_000_000;
 #[derive(Debug)]
 pub struct KeyTracker {
     by_conn: AHashMap<u64, AHashSet<Arc<[u8]>>>,
-    by_key: AHashMap<Arc<[u8]>, Vec<u64>>,
+    by_key: AHashMap<Arc<[u8]>, Readers>,
     /// Tracked keys, oldest first. An entry is live only while it is the very `Arc` that
     /// `by_key` holds; invalidated keys stay behind until they reach the front.
     order: VecDeque<Arc<[u8]>>,
     max_keys: usize,
+}
+
+/// Connections tracking one key. Most keys have a single reader, which is kept inline with no
+/// allocation; a few readers sit in a small vector (removal scans at most
+/// [`SMALL_READERS`]); a hot key with many readers moves to a set, so a connection leaving
+/// costs O(1) instead of a scan of every other reader.
+#[derive(Debug)]
+enum Readers {
+    One(u64),
+    Few(Vec<u64>),
+    Many(Box<AHashSet<u64>>),
+}
+
+const SMALL_READERS: usize = 32;
+
+impl Readers {
+    fn add(&mut self, conn: u64) {
+        match self {
+            Readers::One(only) => {
+                let mut readers = Vec::with_capacity(4);
+
+                readers.push(*only);
+                readers.push(conn);
+                *self = Readers::Few(readers);
+            }
+            Readers::Few(readers) if readers.len() < SMALL_READERS => readers.push(conn),
+            Readers::Few(readers) => {
+                let mut set: AHashSet<u64> = readers.iter().copied().collect();
+
+                set.insert(conn);
+                *self = Readers::Many(Box::new(set));
+            }
+            Readers::Many(set) => {
+                set.insert(conn);
+            }
+        }
+    }
+
+    /// Removes `conn`; true when no reader is left.
+    fn remove(&mut self, conn: u64) -> bool {
+        match self {
+            Readers::One(only) => *only == conn,
+            Readers::Few(readers) => {
+                if let Some(at) = readers.iter().position(|id| *id == conn) {
+                    readers.swap_remove(at);
+
+                    if let [only] = readers.as_slice() {
+                        *self = Readers::One(*only);
+                    }
+                }
+
+                false
+            }
+            Readers::Many(set) => {
+                set.remove(&conn);
+                set.is_empty()
+            }
+        }
+    }
+
+    fn into_vec(self) -> Vec<u64> {
+        match self {
+            Readers::One(only) => vec![only],
+            Readers::Few(readers) => readers,
+            Readers::Many(set) => set.into_iter().collect(),
+        }
+    }
 }
 
 impl Default for KeyTracker {
@@ -135,7 +202,14 @@ impl KeyTracker {
             };
 
             seen.insert(shared.clone());
-            self.by_key.entry(shared).or_default().push(conn);
+            match self.by_key.entry(shared) {
+                std::collections::hash_map::Entry::Occupied(mut readers) => {
+                    readers.get_mut().add(conn);
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(Readers::One(conn));
+                }
+            }
         }
 
         let mut evicted = Vec::new();
@@ -181,12 +255,19 @@ impl KeyTracker {
                 continue;
             };
 
-            conns.retain(|id| *id != conn);
-
-            if conns.is_empty() {
+            if conns.remove(conn) {
                 self.by_key.remove(&*key);
             }
         }
+    }
+
+    /// Tracked keys (tagged with their database) that `select` picks.
+    pub fn tracked_where(&self, select: impl Fn(&[u8]) -> bool) -> Vec<Vec<u8>> {
+        self.by_key
+            .keys()
+            .filter(|key| select(crate::database::untagged(key).1))
+            .map(|key| key.to_vec())
+            .collect()
     }
 
     /// Drops the tracked keys and returns one key list per connection.
@@ -198,7 +279,7 @@ impl KeyTracker {
                 continue;
             };
 
-            for conn in conns {
+            for conn in conns.into_vec() {
                 let empty = if let Some(seen) = self.by_conn.get_mut(&conn) {
                     seen.remove(key.as_slice());
                     seen.is_empty()
@@ -325,7 +406,7 @@ fn write_bulk(out: &mut Vec<u8>, value: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{KeyTracker, encode_invalidate};
+    use super::{KeyTracker, Readers, SMALL_READERS, encode_invalidate};
 
     #[test]
     fn invalidate_push_names_the_key_once_and_forgets_it() {
@@ -400,6 +481,99 @@ mod tests {
         }
 
         assert!(tracker.order.len() <= 2 * tracker.by_key.len() + 1_025);
+    }
+
+    #[test]
+    fn readers_grow_through_every_form_and_shrink_back_as_connections_leave() {
+        let key = vec![b"hot".to_vec()];
+        let mut tracker = KeyTracker::default();
+        let count = SMALL_READERS as u64 + 5;
+
+        for conn in 0..count {
+            tracker.track(conn, &key);
+        }
+
+        assert!(matches!(
+            tracker.by_key.get(b"hot".as_slice()),
+            Some(Readers::Many(_))
+        ));
+
+        // Leave in an order that is neither first-in nor last-in.
+        for conn in (0..count).step_by(2).chain((1..count).step_by(2)) {
+            tracker.forget(conn);
+        }
+
+        assert!(tracker.is_empty());
+        assert!(tracker.by_conn.is_empty());
+
+        tracker.track(1, &key);
+        tracker.track(2, &key);
+        tracker.forget(1);
+        assert!(matches!(
+            tracker.by_key.get(b"hot".as_slice()),
+            Some(Readers::One(2))
+        ));
+
+        let mut invalidated = tracker.invalidate(&key);
+
+        invalidated.sort();
+        assert_eq!(invalidated, vec![(2, key)]);
+        assert!(tracker.is_empty());
+    }
+
+    #[test]
+    fn invalidating_a_hot_key_names_every_reader_once() {
+        let key = vec![b"hot".to_vec()];
+        let mut tracker = KeyTracker::default();
+
+        for conn in 0..100 {
+            tracker.track(conn, &key);
+        }
+
+        let mut readers: Vec<u64> = tracker
+            .invalidate(&key)
+            .into_iter()
+            .map(|(conn, _)| conn)
+            .collect();
+
+        readers.sort_unstable();
+        assert_eq!(readers, (0..100).collect::<Vec<_>>());
+    }
+
+    fn resident_bytes() -> usize {
+        let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
+        let pages: usize = statm.split_whitespace().nth(1).unwrap().parse().unwrap();
+
+        pages * 4096
+    }
+
+    /// Prints the table's memory per tracked key; run by hand with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn measure_memory_per_tracked_key() {
+        let connections: u64 = std::env::var("TRACK_CONNS")
+            .ok()
+            .map_or(1, |v| v.parse().unwrap());
+
+        for label in ["connections per key"] {
+            let keys: Vec<Vec<u8>> = (0..1_000_000u32)
+                .map(|n| format!("user:{n:09}").into_bytes())
+                .collect();
+            let before = resident_bytes();
+            let mut tracker = KeyTracker::with_max_keys(2_000_000);
+
+            for conn in 0..connections {
+                tracker.track(conn, &keys);
+            }
+
+            let after = resident_bytes();
+
+            println!(
+                "{connections} {label}: {} bytes per tracked key (incl. key bytes)",
+                (after - before) / keys.len()
+            );
+            drop(tracker);
+        }
     }
 
     #[test]

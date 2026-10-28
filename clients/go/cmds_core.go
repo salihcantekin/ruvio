@@ -4,6 +4,7 @@ package ruvio
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -97,6 +98,24 @@ func (c *cmds) intNil(ctx context.Context, r *request) (int64, bool, error) {
 	}
 	n, err := v.AsInt64()
 	return n, err == nil, err
+}
+
+// pairNil reads the two-integer reply of TRANSFER and HTRANSFER; a nil reply is ok == false.
+func (c *cmds) pairNil(ctx context.Context, r *request) (first, second int64, ok bool, err error) {
+	v, err := c.ex.exec(ctx, r)
+	if err != nil || v.Kind == KindNil {
+		return 0, 0, false, err
+	}
+	if !v.isAgg() || len(v.Array) != 2 {
+		return 0, 0, false, unexpected(v)
+	}
+	if first, err = v.Array[0].AsInt64(); err != nil {
+		return 0, 0, false, err
+	}
+	if second, err = v.Array[1].AsInt64(); err != nil {
+		return 0, 0, false, err
+	}
+	return first, second, true, nil
 }
 
 func (c *cmds) boolR(ctx context.Context, r *request) (bool, error) {
@@ -297,6 +316,33 @@ func ms(d time.Duration) int64 {
 		m = 1
 	}
 	return m
+}
+
+// ErrInvalidTTL is returned by the WithTTL methods and the TTL option fields when the
+// duration is zero or negative. Nothing is sent to the server in that case.
+var ErrInvalidTTL = errors.New("ruvio: TTL must be a positive duration")
+
+// ttlArg turns a create-time TTL into the option the server expects: EX with whole
+// seconds when ttl is a whole number of seconds, otherwise PX with milliseconds (a
+// positive sub-millisecond duration is rounded up to 1 ms). Zero or negative durations
+// return ErrInvalidTTL.
+func ttlArg(ttl time.Duration) ([]byte, int64, error) {
+	if ttl <= 0 {
+		return nil, 0, ErrInvalidTTL
+	}
+	if ttl%time.Second == 0 {
+		return tEX, int64(ttl / time.Second), nil
+	}
+	return tPX, ms(ttl), nil
+}
+
+// optTTL is ttlArg for an optional TTL field: zero means "no TTL" (nil token, no error)
+// and a negative value is ErrInvalidTTL.
+func optTTL(ttl time.Duration) ([]byte, int64, error) {
+	if ttl == 0 {
+		return nil, 0, nil
+	}
+	return ttlArg(ttl)
 }
 
 // secs converts a timeout to the decimal-seconds argument used by blocking commands.

@@ -17,7 +17,7 @@ body:
     id: hardware
     attributes:
       label: Hardware and operating system
-      placeholder: "2 vCPU EPYC, Ubuntu 24.04; or Apple M4 Pro, macOS 15"
+      placeholder: "2 vCPU EPYC, Ubuntu 24.04; or Apple silicon Mac, macOS 15"
     validations:
       required: true
   - type: textarea

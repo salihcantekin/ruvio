@@ -45,11 +45,17 @@ public sealed class LiveCommandTests(ITestOutputHelper output)
         List<string> commands = matrix.RootElement.GetProperty("commands").EnumerateArray()
             .Select(command => command.GetProperty("name").GetString()!)
             .ToList();
-        List<string> unsent = commands.Where(command => !proxy.Seen.ContainsKey(command)).ToList();
+        List<string> unsent = commands
+            .Where(command => !proxy.Seen.ContainsKey(command))
+            .Where(command => RewritesConfig || command != "CONFIG REWRITE")
+            .ToList();
 
         output.WriteLine($"live: {commands.Count - unsent.Count}/{commands.Count} matrix commands sent and answered");
         Assert.True(unsent.Count == 0, "Matrix commands never sent live: " + string.Join(", ", unsent));
     }
+
+    /// <summary><c>scripts/run_with_servers.sh</c> runs the servers on throwaway config files.</summary>
+    private static bool RewritesConfig => Environment.GetEnvironmentVariable("RUVIO_TEST_CONFIG_REWRITE") == "1";
 
     private static async Task Strings(RuvioClient db)
     {
@@ -76,6 +82,11 @@ public sealed class LiveCommandTests(ITestOutputHelper output)
         Assert.InRange(await db.GetTimeToLiveMillisecondsAsync("cas"), 1, 30000);
         Assert.True(await db.SetIfEqualKeepingTimeToLiveAsync("cas", "3", "2"));
         Assert.InRange(await db.GetTimeToLiveMillisecondsAsync("cas"), 1, 30000);
+        Assert.True(await db.SetIfGreaterAsync("wm", 10));
+        Assert.False(await db.SetIfGreaterAsync("wm", 10));
+        Assert.True(await db.SetIfGreaterAsync("wm", 11, TimeSpan.FromSeconds(30)));
+        Assert.False(await db.SetIfLessAsync("wm", 12));
+        Assert.True(await db.SetIfLessAsync("wm", -1));
         Assert.False(await db.DeleteIfEqualAsync("cas", "2"));
         Assert.True(await db.DeleteIfEqualAsync("cas", "3"));
         Assert.False(await db.DeleteIfEqualAsync("cas", "3"));
@@ -108,6 +119,16 @@ public sealed class LiveCommandTests(ITestOutputHelper output)
         Assert.True(await db.SetAsync("stock", "5"));
         Assert.Equal(2, await db.TakeAsync("stock", 3));
         Assert.Null(await db.TakeAsync("stock", 3));
+
+        Assert.True(await db.SetAsync("{w}a", "10"));
+        Assert.Equal((6L, 4L), await db.TransferAsync("{w}a", "{w}b", 4));
+        Assert.Null(await db.TransferAsync("{w}a", "{w}b", 7));
+        Assert.Null(await db.TransferAsync("{w}a", "{w}b", 3, 6));
+        Assert.Equal((4L, 6L), await db.TransferAsync("{w}a", "{w}b", 2, 6));
+        Assert.Equal(1, await db.SetHashFieldsAsync("th", ("f", "10")));
+        Assert.Equal((6L, 4L), await db.TransferHashFieldAsync("th", "f", "g", 4));
+        Assert.Null(await db.TransferHashFieldAsync("th", "f", "g", 3, 5));
+
         Assert.Equal(1, await db.OnceAsync("once", 10000));
         Assert.Equal(0, await db.OnceAsync("once", 10000));
         Assert.Equal(1, await db.LimitAsync("lim", 2, 10000));
@@ -115,9 +136,14 @@ public sealed class LiveCommandTests(ITestOutputHelper output)
         Assert.Null(await db.LimitAsync("lim", 2, 10000));
         long lease = (await db.LeaseAsync("lease", 10000))!.Value;
         Assert.Null(await db.LeaseAsync("lease", 10000));
+        Assert.Equal(0, await db.RenewAsync("lease", lease + 100, 20000));
+        Assert.Equal(1, await db.RenewAsync("lease", lease, 20000));
         Assert.Equal(1, await db.ReleaseAsync("lease", lease));
+        Assert.Equal(0, await db.RenewAsync("lease", lease, 20000));
         Assert.True(await db.LeaseAsync("lease", 10000) > lease);
         long slot = (await db.AcquireSemaphoreAsync("sem", 1, 10000))!.Value;
+        Assert.Null(await db.AcquireSemaphoreAsync("sem", 1, 10000));
+        Assert.Equal(1, await db.RenewAsync("sem", slot, 20000));
         Assert.Null(await db.AcquireSemaphoreAsync("sem", 1, 10000));
         Assert.Equal(1, await db.ReleaseAsync("sem", slot));
 
@@ -128,6 +154,11 @@ public sealed class LiveCommandTests(ITestOutputHelper output)
         Assert.Equal(IdempotencyState.Completed, replay.State);
         Assert.Equal("done"u8.ToArray(), replay.Result);
         Assert.Equal(IdempotencyState.Conflict, (await db.TryBeginIdempotencyAsync("idem", "other", "you", TimeSpan.FromSeconds(10))).State);
+        Assert.False(await db.AbortIdempotencyAsync("idem", "fp", "me"));
+        Assert.Equal(IdempotencyState.Acquired, (await db.TryBeginIdempotencyAsync("idem-abort", "fp", "me", TimeSpan.FromSeconds(10))).State);
+        Assert.False(await db.AbortIdempotencyAsync("idem-abort", "fp", "you"));
+        Assert.True(await db.AbortIdempotencyAsync("idem-abort", "fp", "me"));
+        Assert.Equal(IdempotencyState.Acquired, (await db.TryBeginIdempotencyAsync("idem-abort", "fp", "retry", TimeSpan.FromSeconds(10))).State);
 
         long cursor = await db.StartChangesAsync();
         Assert.True(await db.SetAsync("changed", "1"));
@@ -284,6 +315,8 @@ public sealed class LiveCommandTests(ITestOutputHelper output)
         Assert.Equal(3, await db.IncrementHashFieldAsync("h", "f", 2));
         Assert.Equal(3.5, await db.IncrementHashFieldByFloatAsync("h", "f", 0.5));
         Assert.False(await db.SetHashFieldIfAbsentAsync("h", "f", "x"));
+        await db.SetHashManyAsync("hm", ("a", "1"), ("b", "2"));
+        Assert.Equal(new string?[] { "1", "2" }, await db.GetHashFieldsAsync("hm", "a", "b"));
         Assert.Equal(3, await db.GetHashFieldLengthAsync("h", "f"));
         Assert.Contains(await db.GetHashRandomFieldAsync("h"), new[] { "f", "g" });
         Assert.Equal(2, (await db.GetHashRandomFieldsAsync("h", 2)).Count);
@@ -356,6 +389,11 @@ public sealed class LiveCommandTests(ITestOutputHelper output)
         Assert.Equal(1, await db.RemoveSortedSetMembersAsync("z", "c"));
         Assert.Equal("b", (await db.PopSortedSetMinAsync("z"))[0].Member);
         Assert.Equal("a", (await db.PopSortedSetMaxAsync("z"))[0].Member);
+        Assert.Equal(4, await db.AddSortedSetAsync("due", ("a", 1), ("b", 2), ("c", 3), ("d", 9)));
+        Assert.Equal("a", (await db.PopSortedSetByScoreAsync("due", "-inf", "1", 5))[0].Member);
+        Assert.Equal(2, await db.MoveDueSortedSetAsync("due", "ready", "3", 5));
+        Assert.Equal(["b", "c"], await db.GetListRangeAsync("ready", 0, -1));
+        Assert.Empty(await db.PopSortedSetByScoreAsync("due", "-inf", "3", 5));
         Assert.True(await db.AddSortedSetAsync("bz", "m", 1));
         Assert.Equal("m", (await db.PopSortedSetMinBlockingAsync("bz", TimeSpan.FromSeconds(1)))!.Value.Entry.Member);
         Assert.True(await db.AddSortedSetAsync("bz", "n", 1));
@@ -547,6 +585,8 @@ public sealed class LiveCommandTests(ITestOutputHelper output)
         Assert.Equal(2, (await db.EvaluateShaAsync(sha, 0)).Integer);
         Assert.Equal([true], await db.ScriptExistsAsync(sha));
         await db.FlushScriptsAsync();
+        Assert.Equal("again", (await db.EvaluateCachedAsync("return ARGV[1]", 0, "again")).AsString());
+        Assert.Equal("again", (await db.EvaluateCachedAsync("return ARGV[1]", 0, "again")).AsString());
         RuvioException notBusy = await Assert.ThrowsAsync<RuvioException>(async () => await db.KillScriptAsync());
         Assert.Contains("NOTBUSY", notBusy.Message, StringComparison.Ordinal);
         await db.LoadFunctionAsync("livefn", "return 7");
@@ -591,6 +631,21 @@ public sealed class LiveCommandTests(ITestOutputHelper output)
         Assert.Contains("# Server", await db.GetInfoAsync(), StringComparison.Ordinal);
         Assert.Contains("ruvio_", await db.GetInfoAsync("server"), StringComparison.Ordinal);
         Assert.Equal(RespKind.Array, (await db.GetConfigAsync("maxmemory")).Kind);
+        await db.SetConfigAsync([("slowlog-max-len", "128")]);
+        Assert.Equal("128", (await db.GetConfigAsync("slowlog-max-len")).Items![1].AsString());
+        await Assert.ThrowsAsync<RuvioException>(async () => await db.SetConfigAsync([("shards", "2")]));
+        Assert.Equal("master", (await db.GetRoleAsync()).Items![0].AsString());
+        // The live server keeps no WAL, so it cannot replicate: these are refused unchanged.
+        await Assert.ThrowsAsync<RuvioException>(async () => await db.ReplicaOfAsync("127.0.0.1", 1));
+        await Assert.ThrowsAsync<RuvioException>(async () => await db.ReplicaOfNoOneAsync());
+        await Assert.ThrowsAsync<RuvioException>(async () => await db.SetDurabilityAsync(1));
+
+        // Only on a throwaway server: CONFIG REWRITE rewrites the server's config file.
+        if (RewritesConfig)
+        {
+            await db.RewriteConfigAsync();
+        }
+
         await db.SaveAsync();
         await db.SaveInBackgroundAsync();
         Assert.True(await db.GetSlowLogLengthAsync() >= 0);
@@ -633,11 +688,72 @@ public sealed class LiveCommandTests(ITestOutputHelper output)
         await ServerAnswers(() => db.ReadOnlyAsync().AsTask());
         await ServerAnswers(() => db.ReadWriteAsync().AsTask());
         Assert.Equal(12182, await db.GetClusterKeySlotAsync("foo"));
+        Assert.True((await db.GetMoveSlotsStatusAsync()).ContainsKey("state"));
 
         Assert.True(await db.SetAsync("flush-me", "1"));
         await db.FlushAllDatabasesAsync();
         Assert.Equal(0, await db.GetDatabaseSizeAsync());
         _ = await connection.GetDatabaseAsync(Db);
+    }
+
+    [LiveFact(Timeout = 60000)]
+    public async Task The_deadline_is_set_only_when_the_call_creates_the_key()
+    {
+        await using RuvioConnection connection = await LiveServer.ConnectAsync(Db);
+        RuvioClient db = await connection.GetDefaultDatabaseAsync();
+        TimeSpan ttl = TimeSpan.FromSeconds(100);
+
+        Assert.Equal(1, await db.IncrementAsync("ttl:incr", ttl));
+        Assert.InRange(await db.GetTimeToLiveAsync("ttl:incr"), 90, 100);
+        Assert.Equal(2, await db.IncrementAsync("ttl:incr", TimeSpan.FromSeconds(5000)));
+        Assert.InRange(await db.GetTimeToLiveAsync("ttl:incr"), 90, 100);
+
+        Assert.Equal(-1, await db.DecrementAsync("ttl:decr", ttl));
+        Assert.Equal(5, await db.IncrementByAsync("ttl:incrby", 5, ttl));
+        Assert.Equal(-5, await db.DecrementByAsync("ttl:decrby", 5, ttl));
+        Assert.Equal(1, await db.IncrementWithLimitAsync("ttl:max", 1, 2, ttl));
+        Assert.Equal(2, await db.IncrementWithLimitAsync("ttl:max", 1, 2, ttl));
+        Assert.Null(await db.IncrementWithLimitAsync("ttl:max", 1, 2, ttl));
+        Assert.Equal(1.5, await db.IncrementByFloatAsync("ttl:float", 1.5, ttl));
+        Assert.Equal(3, await db.IncrementHashFieldAsync("ttl:hash", "n", 3, ttl));
+        Assert.Equal(2.5, await db.IncrementSortedSetAsync("ttl:zset", "m", 2.5, ttl));
+        Assert.False(await db.SetBitAsync("ttl:bit", 7, true, ttl));
+        Assert.Equal(1, await db.AddSortedSetAsync("ttl:zadd", ttl, SortedSetAddFlags.None, ("a", 1)));
+        Assert.Equal(1, await db.AddGeoAsync("ttl:geo", ttl, (13.361389, 38.115556, "palermo")));
+        Assert.NotEmpty(await db.AddStreamEntryAsync("ttl:stream", ttl, "*", ("f", "v")));
+        Assert.True(await db.JsonSetAsync("ttl:json", "$", "{}", SetMode.IfNotExists, ttl));
+        Assert.Equal([true], await db.InsertBloomFilterAsync("ttl:bloom", ["x"], new BloomInsertOptions { Ttl = ttl }));
+
+        foreach (string key in new[] { "ttl:decr", "ttl:incrby", "ttl:decrby", "ttl:max", "ttl:float", "ttl:hash", "ttl:zset", "ttl:bit", "ttl:zadd", "ttl:geo", "ttl:stream", "ttl:json", "ttl:bloom" })
+        {
+            Assert.InRange(await db.GetTimeToLiveAsync(key), 90, 100);
+        }
+
+        Assert.Equal(1, await db.IncrementAsync("ttl:ms", TimeSpan.FromMilliseconds(90_500)));
+        Assert.InRange(await db.GetTimeToLiveMillisecondsAsync("ttl:ms"), 80_000, 90_500);
+    }
+
+    [LiveFact(Timeout = 60000)]
+    public async Task Expire_conditions_decide_whether_the_deadline_changes()
+    {
+        await using RuvioConnection connection = await LiveServer.ConnectAsync(Db);
+        RuvioClient db = await connection.GetDefaultDatabaseAsync();
+
+        Assert.True(await db.SetAsync("exp:key", "v"));
+        Assert.False(await db.ExpireAsync("exp:key", TimeSpan.FromSeconds(100), ExpireCondition.Xx));
+        Assert.True(await db.ExpireAsync("exp:key", TimeSpan.FromSeconds(100), ExpireCondition.Nx));
+        Assert.False(await db.ExpireAsync("exp:key", TimeSpan.FromSeconds(200), ExpireCondition.Nx));
+        Assert.False(await db.ExpireAsync("exp:key", TimeSpan.FromSeconds(50), ExpireCondition.Gt));
+        Assert.True(await db.ExpireAsync("exp:key", TimeSpan.FromSeconds(200), ExpireCondition.Gt));
+        Assert.False(await db.ExpireAsync("exp:key", TimeSpan.FromSeconds(300), ExpireCondition.Lt));
+        Assert.True(await db.ExpireAsync("exp:key", TimeSpan.FromSeconds(150), ExpireCondition.Lt));
+        Assert.InRange(await db.GetTimeToLiveAsync("exp:key"), 140, 150);
+
+        Assert.True(await db.SetAsync("exp:at", "v"));
+        DateTimeOffset soon = DateTimeOffset.UtcNow.AddSeconds(100);
+        Assert.True(await db.ExpireAtAsync("exp:at", soon, ExpireCondition.Nx));
+        Assert.False(await db.ExpireAtAsync("exp:at", soon.AddSeconds(100), ExpireCondition.Lt));
+        Assert.True(await db.ExpireAtAsync("exp:at", soon.AddSeconds(100), ExpireCondition.Gt));
     }
 
     private static async Task ServerAnswers(Func<Task> call)

@@ -122,6 +122,28 @@ public final class RespReader {
         return v;
     }
 
+    /** Longest bulk string a reply may announce (64 MiB, as in the other clients). */
+    static final long MAX_BULK_BYTES = 64L * 1024 * 1024;
+
+    /** Most elements one array, set, push, map or attribute may announce (1,048,576, as in the other clients). */
+    static final long MAX_ELEMENTS = 1L << 20;
+
+    private long bulkHeader() {
+        long v = headerLong();
+        if (v > MAX_BULK_BYTES) {
+            throw new RuvioException("protocol error: bulk length " + v + " is over the limit of " + MAX_BULK_BYTES);
+        }
+        return v;
+    }
+
+    private long countHeader() {
+        long v = headerLong();
+        if (v > MAX_ELEMENTS) {
+            throw new RuvioException("protocol error: element count " + v + " is over the limit of " + MAX_ELEMENTS);
+        }
+        return v;
+    }
+
     /**
      * Reads one line after the type byte as a String (simple string, error, big number).
      *
@@ -166,7 +188,7 @@ public final class RespReader {
 
     /** RESP3 blob error ({@code !<len>\r\n<message>\r\n}); consumes it. */
     private RuvioServerException readBlobError() {
-        long len = headerLong();
+        long len = bulkHeader();
         if (len < 0 || pos + len + 2 > lim) {
             if (len < 0) {
                 throw new RuvioException("protocol error: negative blob error length");
@@ -181,7 +203,7 @@ public final class RespReader {
     /** Skips attribute frames ({@code |}) that precede a reply. */
     private void skipAttributes() {
         while (peek() == '|') {
-            long n = headerLong();
+            long n = countHeader();
             for (long i = 0; i < n * 2; i++) {
                 skip();
             }
@@ -201,7 +223,7 @@ public final class RespReader {
         byte t = peek();
         switch (t) {
             case '$': {
-                long len = headerLong();
+                long len = bulkHeader();
                 if (len < 0) {
                     return -1;
                 }
@@ -222,7 +244,7 @@ public final class RespReader {
                 return start;
             }
             case '=': {
-                long len = headerLong();
+                long len = bulkHeader();
                 int off = pos;
                 if (off + len + 2 > lim) {
                     throw INCOMPLETE;
@@ -382,11 +404,11 @@ public final class RespReader {
         skipAttributes();
         byte t = peek();
         if (t == '*' || t == '~' || t == '>') {
-            long n = headerLong();
+            long n = countHeader();
             return (int) n;
         }
         if (t == '%') {
-            return (int) (headerLong() * 2);
+            return (int) (countHeader() * 2);
         }
         if (t == '_' || t == '$') {
             if (tryNull()) {
@@ -420,7 +442,7 @@ public final class RespReader {
                 return;
             }
             case '$': case '=': case '!': {
-                long len = headerLong();
+                long len = bulkHeader();
                 if (len < 0) {
                     return;
                 }
@@ -431,7 +453,7 @@ public final class RespReader {
                 return;
             }
             case '*': case '~': case '>': case '%': case '|': {
-                long n = headerLong();
+                long n = countHeader();
                 if (t == '%' || t == '|') {
                     n *= 2;
                 }
@@ -485,7 +507,7 @@ public final class RespReader {
                 return null;
             }
             case '*': case '~': case '>': {
-                long n = headerLong();
+                long n = countHeader();
                 if (n < 0) {
                     return null;
                 }
@@ -496,7 +518,7 @@ public final class RespReader {
                 return list;
             }
             case '%': {
-                long n = headerLong();
+                long n = countHeader();
                 Map<Object, Object> map = new LinkedHashMap<>();
                 for (long i = 0; i < n; i++) {
                     Object k = readObject();

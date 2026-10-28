@@ -43,12 +43,18 @@ const TABLE = loadTable();
 /** Option forms that change what Ruvio does, with their dedicated methods. */
 const OPTIONS: [string, string][] = [
   ['SET ... IFEQ', 'set'],
+  ['SET ... IFGT/IFLT', 'set'],
   ['INCRBY ... MAX', 'incrbyMax'],
+  ['LIMIT ... SLIDING', 'limitSliding'],
+  ['LIMIT ... TOKENS', 'limitTokens'],
+  ['LIMIT ... SLIDING WITHRETRY', 'limitSlidingWithRetry'],
+  ['LIMIT ... TOKENS WITHRETRY', 'limitTokensWithRetry'],
   ['FILLGET ... WAIT', 'fillget'],
   ['FILLSET ... SWR', 'fillset'],
   ['GETEX key ms', 'getex'],
   ['DELEX key IFEQ v', 'delex'],
   ['IDEM COMPLETE', 'idemComplete'],
+  ['IDEM ABORT', 'idemAbort'],
   ['JSON.INDEX DROP', 'jsonIndexDrop'],
   ['JSON.INDEX LIST', 'jsonIndexList'],
   ['CHANGES START', 'changesStart'],

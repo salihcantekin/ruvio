@@ -177,12 +177,12 @@ import PageIntro from "../components/PageIntro.astro";
   .ctl { display: flex; flex-wrap: wrap; gap: 8px; }
   .meter { height: 10px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
   .fill { display: block; height: 100%; width: 0; background: var(--c1); transition: width 0.2s linear; }
-  .state { margin: 0; font-family: var(--f-mono); font-size: 13px; color: var(--ink); }
-  .log { margin: 0; min-height: 15.5em; max-height: 15.5em; overflow-y: auto; background: var(--code-bg); color: var(--code-ink); border: 1px solid var(--line); border-radius: var(--radius-s); padding: 12px 14px; font-size: 12.5px; line-height: 1.55; white-space: pre-wrap; }
+  .state { margin: 0; font-family: var(--f-mono); font-size: 14px; color: var(--ink); }
+  .log { margin: 0; min-height: 15.5em; max-height: 15.5em; overflow-y: auto; background: var(--code-bg); color: var(--code-ink); border: 1px solid var(--line); border-radius: var(--radius-s); padding: 12px 14px; font-size: 13.5px; line-height: 1.55; white-space: pre-wrap; }
   .slots { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
   .slots :global(.slot) { border: 1px solid var(--line); border-radius: var(--radius-s); padding: 12px; display: grid; gap: 2px; text-align: center; color: var(--faint); }
-  .slots :global(.slot b) { font-size: 14px; font-weight: 600; }
-  .slots :global(.slot small) { font-size: 12px; }
+  .slots :global(.slot b) { font-size: 15px; font-weight: 600; }
+  .slots :global(.slot small) { font-size: 13px; }
   .slots :global(.slot.on) { border-color: color-mix(in srgb, var(--c1) 60%, var(--line)); color: var(--ink); }
   .slots :global(.slot.dead) { border-style: dashed; border-color: var(--c2); color: var(--mute); }
   @media (max-width: 900px) { .ex { grid-template-columns: minmax(0, 1fr); gap: 24px; } }

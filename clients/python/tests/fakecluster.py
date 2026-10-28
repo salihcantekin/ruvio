@@ -66,6 +66,9 @@ class FakeNode:
                 conn, _ = self._sock.accept()
             except OSError:
                 return
+            if self._closed:
+                conn.close()
+                return
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self._conns.append(conn)
             with self._lock:
@@ -97,10 +100,18 @@ class FakeNode:
     def close(self) -> None:
         self._closed = True
         try:
+            socket.create_connection(("127.0.0.1", self.port), timeout=1).close()  # wakes the blocked accept
+        except OSError:
+            pass
+        try:
             self._sock.close()
         except OSError:
             pass
         for c in self._conns:
+            try:
+                c.shutdown(socket.SHUT_RDWR)  # ends the serving thread, which holds its own reference
+            except OSError:
+                pass
             try:
                 c.close()
             except OSError:

@@ -85,18 +85,64 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
     }
 
     /// `write_bytes`; with `HINTED`, `hint` is the index's `lookup_hint` of `key` and
-    /// saves hashing it again. Without, `hint` is unused and the code is the plain write.
+    /// saves hashing it again. Without, `hint` is unused and the key is hashed once here.
     fn write_bytes_hinted<const HINTED: bool>(&mut self, key: &[u8], value: &[u8], hint: u64) {
-        if self.overwrite_log::<HINTED>(key, value, hint) || self.overwrite_heap(key, value) {
+        // A log-sized value hashes the key once for every lookup below. A long value
+        // starts with the heap lookup, which hashes on its own, and hashes here only
+        // for a new key.
+        let small = value.len() <= LOG_VALUE_MAX;
+        let hint = if HINTED {
+            hint
+        } else if small {
+            self.entries.lookup_hint(key)
+        } else {
+            0
+        };
+
+        if small {
+            // The deadline is gone or kept on purpose, so a raw miss is a new key.
+            let found = match self.entries.lookup_hinted(key, hint) {
+                None => None,
+                Some(IndexRef::Log { offset, len }) => Some(Some((offset, len))),
+                Some(_) => Some(None),
+            };
+
+            match found {
+                None => {
+                    let created = self.alloc_bytes(value);
+
+                    self.insert_new_bytes(key, created, hint);
+
+                    return;
+                }
+                Some(Some((offset, len))) if self.overwrite_log(key, value, offset, len) => {
+                    self.finish_set(key);
+
+                    return;
+                }
+                Some(_) => {}
+            }
+        } else if self.overwrite_heap(key, value) {
             self.finish_set(key);
 
             return;
         }
 
         // The deadline is gone or kept on purpose, so one raw lookup is the live view.
-        let (before, body, exists) = match self.entries.get_key_value(key) {
-            Some((stored_key, hit)) => (charge_of(stored_key, hit), bytes_body_of(hit), true),
-            None => (EntryCharge::default(), None, false),
+        let (before, body) = match self.entries.get_key_value(key) {
+            Some((stored_key, hit)) => (charge_of(stored_key, hit), bytes_body_of(hit)),
+            None => {
+                let hint = if HINTED || small {
+                    hint
+                } else {
+                    self.entries.lookup_hint(key)
+                };
+                let created = self.alloc_bytes(value);
+
+                self.insert_new_bytes(key, created, hint);
+
+                return;
+            }
         };
 
         let previous = if let Some(body) = body {
@@ -109,15 +155,10 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
 
             let _ = self.entries.insert(key, entry);
             None
-        } else if exists {
-            let created = self.alloc_bytes(value);
-
-            self.replace_with_bytes(key, created)
         } else {
             let created = self.alloc_bytes(value);
 
-            self.insert_entry(key, Entry::fresh(Value::Bytes(created)));
-            None
+            self.replace_with_bytes(key, created)
         };
 
         if let Some(previous) = previous {
@@ -458,25 +499,9 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
 
     /// Same-size and smaller log strings stay in the existing span. A larger
     /// short string takes a new span and the key record keeps its place.
-    pub(super) fn overwrite_log<const HINTED: bool>(
-        &mut self,
-        key: &[u8],
-        value: &[u8],
-        hint: u64,
-    ) -> bool {
-        if value.len() > LOG_VALUE_MAX {
-            return false;
-        }
-
-        let found = if HINTED {
-            self.entries.lookup_hinted(key, hint)
-        } else {
-            self.entries.lookup(key)
-        };
-        let Some(IndexRef::Log { offset, len }) = found else {
-            return false;
-        };
-
+    /// `offset` and `len` are the key's log record, just looked up; `value` fits the log.
+    #[inline(always)]
+    fn overwrite_log(&mut self, key: &[u8], value: &[u8], offset: u32, len: u16) -> bool {
         if is_integer(len) {
             return false;
         }
@@ -577,7 +602,7 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         }
 
         if kind.is_none() {
-            return Ok(Some((1, expires_at)));
+            return Ok(Some((self.next_fence_token(0), expires_at)));
         }
 
         let Some(Value::Lease(lease)) = self.object_value(key).ok().flatten() else {
@@ -588,7 +613,7 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
             return Ok(None);
         }
 
-        Ok(Some((lease.token.saturating_add(1), expires_at)))
+        Ok(Some((self.next_fence_token(lease.token), expires_at)))
     }
 
     pub(crate) fn lease_release_plan(
@@ -610,6 +635,37 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         }
     }
 
+    /// `Some((kind, new_deadline))` when `token` is the live lease holder or a live semaphore
+    /// holder of `key`; `None` when it is not held.
+    pub(crate) fn renew_plan(
+        &mut self,
+        key: &[u8],
+        token: u64,
+        ttl_ms: u64,
+    ) -> Result<Option<(ValueKind, u64)>, WrongType> {
+        self.remove_expired(key);
+
+        let now = self.now_unix_millis().get();
+        let expires_at = now.saturating_add(ttl_ms);
+
+        match self.object_value(key)? {
+            Some(Value::Lease(lease)) if lease.token == token && now < lease.expires_at => {
+                Ok(Some((ValueKind::Lease, expires_at)))
+            }
+
+            Some(Value::Semaphore(semaphore))
+                if semaphore
+                    .holders()
+                    .any(|(held, at)| held == token && at > now) =>
+            {
+                Ok(Some((ValueKind::Semaphore, expires_at)))
+            }
+
+            Some(Value::Lease(_) | Value::Semaphore(_)) | None => Ok(None),
+            Some(_) => Err(WrongType),
+        }
+    }
+
     pub(crate) fn lease_put(
         &mut self,
         key: &[u8],
@@ -625,11 +681,15 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
 
         let before = self.entry_charge(key);
 
+        self.note_fence_token(token);
+
+        // The key lives exactly as long as the lease, so it expires like any key with a TTL.
         if kind.is_none() {
             self.insert_entry(
                 key,
                 Entry::fresh(Value::Lease(Box::new(LeaseValue { token, expires_at }))),
             );
+            self.set_deadline(self.active, key, UnixMillis::new(expires_at));
         } else {
             let Some(Value::Lease(lease)) =
                 self.entries.object_mut(key).map(|entry| &mut entry.value)
@@ -639,6 +699,7 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
 
             lease.token = token;
             lease.expires_at = expires_at;
+            self.set_deadline(self.active, key, UnixMillis::new(expires_at));
         }
 
         self.reconcile_entry_charge(before, key);
@@ -664,19 +725,21 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         let expires_at = now.saturating_add(ttl_ms);
 
         match self.object_value(key) {
-            Ok(None) => Ok(Some((first_semaphore_token(now), expires_at, true))),
+            Ok(None) => Ok(Some((self.next_fence_token(0), expires_at, true))),
             Ok(Some(Value::Semaphore(semaphore))) => {
                 let live = semaphore.holders().filter(|(_, at)| *at > now).count() as u64;
+                let after = semaphore.next_token().saturating_sub(1);
 
-                Ok((live < max).then_some((semaphore.next_token(), expires_at, false)))
+                Ok((live < max).then(|| (self.next_fence_token(after), expires_at, false)))
             }
 
             _ => Err(WrongType),
         }
     }
 
-    /// Adds one holder. Expired holders are dropped first. Replay calls this with the recorded
-    /// token, so `next_token` only moves forward.
+    /// Adds one holder. Expired holders are dropped first, and a holder that already has `token`
+    /// is replaced (a renewal). Replay calls this with the recorded token, so `next_token` only
+    /// moves forward.
     pub(crate) fn semaphore_put(
         &mut self,
         key: &[u8],
@@ -685,6 +748,8 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
     ) -> Result<(), WrongType> {
         let now = self.now_unix_millis().get();
         let before = self.entry_charge(key);
+
+        self.note_fence_token(token);
 
         match self.value_kind(key) {
             None => {
@@ -707,7 +772,7 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
 
                 let latest = semaphore.latest();
 
-                semaphore.rewrite(now, None, Some((token, expires_at)));
+                semaphore.rewrite(now, Some(token), Some((token, expires_at)));
 
                 if latest.is_none_or(|latest| expires_at > latest) {
                     self.set_deadline(self.active, key, UnixMillis::new(expires_at));
@@ -764,33 +829,19 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         Ok(())
     }
 
-    pub(crate) fn lease_ttl_ms(&self, key: &[u8]) -> Option<i64> {
-        let Value::Lease(lease) = self.object_value(key).ok().flatten()? else {
-            return None;
-        };
-
-        let now = self.now_unix_millis().get();
-
-        if now >= lease.expires_at {
-            return Some(-1);
-        }
-
-        Some(i64::try_from(lease.expires_at - now).unwrap_or(i64::MAX))
-    }
-
     pub(crate) fn plan_limit(
         &mut self,
         key: &[u8],
         max: u64,
         window_ms: u64,
-    ) -> Result<LimitDecision, WrongType> {
+    ) -> Result<LimitDecision, LimitError> {
         self.remove_expired(key);
 
         let now = self.now_unix_millis().get();
         let kind = self.value_kind(key);
 
         if kind.is_some_and(|kind| kind != ValueKind::Limit) {
-            return Err(WrongType);
+            return Err(LimitError::WrongType);
         }
 
         if kind.is_none() {
@@ -798,13 +849,11 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
                 used: 1,
                 window_end: Some(now.saturating_add(window_ms)),
                 remaining: max.saturating_sub(1),
+                fresh: true,
             });
         }
 
-        let used = match self.object_value(key).ok().flatten() {
-            Some(Value::Limit(limit)) => limit.used,
-            _ => return Err(WrongType),
-        };
+        let used = self.limit_state(key)?;
 
         if used >= max {
             return Ok(LimitDecision::Reject);
@@ -816,6 +865,7 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
             used,
             window_end: None,
             remaining: max.saturating_sub(used),
+            fresh: false,
         })
     }
 
@@ -1184,6 +1234,28 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         previous
     }
 
+    /// Stores a string under `key`, which the caller just found missing; `hint` is the
+    /// index's `lookup_hint` of `key`. The charge comes from the value in hand, so the
+    /// write costs one hash and no lookup after the miss.
+    fn insert_new_bytes(&mut self, key: &[u8], created: BytesValue, hint: u64) {
+        let entry = Entry::fresh(Value::Bytes(created));
+        let after = EntryCharge::for_entry(key, &entry);
+
+        self.entries.insert_absent_hinted(key, hint, entry);
+
+        if self.json_indexes.is_some() {
+            self.json_index_refresh(key);
+        }
+
+        debug_assert_eq!(after, self.entry_charge(key), "new string charge");
+        self.apply_entry_charge(EntryCharge::default(), after, key);
+        self.note_key(key, crate::notify::KeyEvent::Set);
+
+        if self.change_log.is_some() {
+            self.note_change(format!("SET {}", String::from_utf8_lossy(key)));
+        }
+    }
+
     pub(super) fn alloc_bytes(&mut self, value: &[u8]) -> BytesValue {
         if value.len() <= LOG_VALUE_MAX {
             let (offset, len) = self.value_log.alloc(value);
@@ -1224,15 +1296,44 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         // so a string hit pays nothing for it.
         match self.live_unchecked(key) {
             None => Ok(None),
-            Some(IndexRef::Log { offset, len }) => Ok(Some(ByteView::Borrowed(
+            Some(hit) => self.string_view(hit),
+        }
+    }
+
+    /// [`Self::value_view`] for a recency-tracking read: also names the record that
+    /// [`Self::mark_read`] stamps afterwards, any live key whatever its type, as
+    /// [`Self::touch`] would, so the read costs one lookup.
+    pub(crate) fn value_view_read(
+        &self,
+        key: &[u8],
+    ) -> (Result<Option<ByteView<'_>>, WrongType>, ReadMark) {
+        let Some((hit, may_expire, address)) = self.entries.lookup_ttl_at(key) else {
+            return (Ok(None), ReadMark::Missing);
+        };
+
+        if may_expire && self.deadline_passed(self.active, key) {
+            return (Ok(None), ReadMark::Missing);
+        }
+
+        match self.string_view(hit) {
+            Ok(None) => (Ok(None), ReadMark::Missing),
+            view => (view, address.map_or(ReadMark::Key, ReadMark::At)),
+        }
+    }
+
+    /// A live record as a string; `Ok(None)` only for a hash whose fields are all due.
+    #[inline(always)]
+    fn string_view<'a>(&'a self, hit: IndexRef<'a>) -> Result<Option<ByteView<'a>>, WrongType> {
+        match hit {
+            IndexRef::Log { offset, len } => Ok(Some(ByteView::Borrowed(
                 self.value_log.slice(offset, plain_len(len)),
             ))),
-            Some(IndexRef::Integer(value)) => Ok(Some(ByteView::Integer(value))),
-            Some(IndexRef::Heap(bytes)) => Ok(Some(ByteView::Borrowed(bytes))),
-            Some(IndexRef::SetSlab(_) | IndexRef::SortedSlab(_) | IndexRef::CollSlab(_)) => {
+            IndexRef::Integer(value) => Ok(Some(ByteView::Integer(value))),
+            IndexRef::Heap(bytes) => Ok(Some(ByteView::Borrowed(bytes))),
+            IndexRef::SetSlab(_) | IndexRef::SortedSlab(_) | IndexRef::CollSlab(_) => {
                 Err(WrongType)
             }
-            Some(IndexRef::Object(entry)) => match &entry.value {
+            IndexRef::Object(entry) => match &entry.value {
                 Value::Bytes(value) => Ok(Some(value.view(&self.value_log))),
                 Value::Versioned(value) => Ok(Some(value.body.view(&self.value_log))),
                 value @ Value::TimedHash(_) if self.timed_hash_is_dead(value) => Ok(None),
@@ -1252,7 +1353,17 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
 
 impl<C: Clock, I: StorageIndex> KvShard<C, I> {
     pub(crate) fn preview_increment(&self, key: &[u8], delta: i64) -> Result<i64, IncrementError> {
-        let Some(current) = self.current_integer(key)? else {
+        self.preview_increment_hinted(key, delta, self.entries.lookup_hint(key))
+    }
+
+    /// `preview_increment` given `hint` from [`Self::key_hint`].
+    pub(crate) fn preview_increment_hinted(
+        &self,
+        key: &[u8],
+        delta: i64,
+        hint: u64,
+    ) -> Result<i64, IncrementError> {
+        let Some(current) = self.current_integer_hinted(key, hint)? else {
             return Ok(delta);
         };
 
@@ -1276,6 +1387,60 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         }
 
         Ok(Some(current - count))
+    }
+
+    /// `Ok(None)` leaves both keys unchanged: `source` is missing or smaller than `amount`,
+    /// or `destination` would overflow or pass `max`. Otherwise `(source, destination)` after.
+    pub(crate) fn preview_transfer(
+        &self,
+        source: &[u8],
+        destination: &[u8],
+        amount: i64,
+        max: Option<i64>,
+    ) -> Result<Option<(i64, i64)>, IncrementError> {
+        let Some(from) = self.current_integer(source)? else {
+            return Ok(None);
+        };
+
+        let to = self.current_integer(destination)?.unwrap_or(0);
+
+        Ok(transfer_result(from, to, amount, max))
+    }
+
+    /// `preview_transfer` between two fields of one hash.
+    pub(crate) fn preview_hash_transfer(
+        &self,
+        key: &[u8],
+        from: &[u8],
+        to: &[u8],
+        amount: i64,
+        max: Option<i64>,
+    ) -> Result<Option<(i64, i64)>, IncrementError> {
+        let Some(hash) = self.live_hash(key).map_err(|_| IncrementError::WrongType)? else {
+            return Ok(None);
+        };
+
+        let integer = |field: &[u8]| -> Result<Option<i64>, IncrementError> {
+            hash.get(field)
+                .map(|value| {
+                    std::str::from_utf8(value)
+                        .ok()
+                        .and_then(|value| value.parse::<i64>().ok())
+                        .ok_or(IncrementError::NotIntegerOrOverflow)
+                })
+                .transpose()
+        };
+
+        let Some(source) = integer(from)? else {
+            return Ok(None);
+        };
+
+        Ok(transfer_result(
+            source,
+            integer(to)?.unwrap_or(0),
+            amount,
+            max,
+        ))
     }
 
     pub(crate) fn copy_string(&self, key: &[u8]) -> Result<Option<Vec<u8>>, WrongType> {
@@ -1322,9 +1487,13 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
     }
 
     pub(super) fn current_integer(&self, key: &[u8]) -> Result<Option<i64>, IncrementError> {
+        self.current_integer_hinted(key, self.entries.lookup_hint(key))
+    }
+
+    fn current_integer_hinted(&self, key: &[u8], hint: u64) -> Result<Option<i64>, IncrementError> {
         let Some(hit) = self
             .entries
-            .lookup(key)
+            .lookup_hinted(key, hint)
             .filter(|_| !self.key_is_expired(key))
         else {
             return Ok(None);
@@ -1379,8 +1548,18 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
     }
 
     pub(crate) fn set_integer(&mut self, key: &[u8], value: i64) -> Result<(), WrongType> {
+        self.set_integer_hinted(key, value, self.entries.lookup_hint(key))
+    }
+
+    /// `set_integer` given `hint` from [`Self::key_hint`].
+    pub(crate) fn set_integer_hinted(
+        &mut self,
+        key: &[u8],
+        value: i64,
+        hint: u64,
+    ) -> Result<(), WrongType> {
         if (self.expiration.keys_with_ttl == 0 || !self.key_is_expired(key))
-            && self.entries.write_integer(key, value)
+            && self.entries.write_integer_hinted(key, value, hint)
         {
             self.note_mutation(key);
             self.note_write(key);
@@ -1437,10 +1616,35 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
     }
 
     pub fn increment(&mut self, key: &[u8], delta: i64) -> Result<i64, IncrementError> {
-        let updated = self.preview_increment(key, delta)?;
+        let hint = self.key_hint(key);
+        let updated = self.preview_increment_hinted(key, delta, hint)?;
 
-        self.set_integer(key, updated)
+        self.set_integer_hinted(key, updated, hint)
             .map_err(|_| IncrementError::WrongType)?;
         Ok(updated)
     }
+}
+
+/// The balances after moving `amount`, or `None` when `from` is short or `to` would
+/// overflow or pass `max`.
+fn transfer_result(from: i64, to: i64, amount: i64, max: Option<i64>) -> Option<(i64, i64)> {
+    let from = from.checked_sub(amount).filter(|left| *left >= 0)?;
+    let to = to.checked_add(amount)?;
+
+    if max.is_some_and(|max| to > max) {
+        return None;
+    }
+
+    Some((from, to))
+}
+
+/// What [`KvShard::value_view_read`] found for [`KvShard::mark_read`] to stamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadMark {
+    /// No live key: nothing to stamp.
+    Missing,
+    /// The record at this index address.
+    At(u32),
+    /// A live key in an index without addresses: stamped by key.
+    Key,
 }

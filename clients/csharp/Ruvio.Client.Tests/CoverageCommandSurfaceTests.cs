@@ -30,6 +30,9 @@ public partial class CommandSurfaceTests
         Assert.True(await Exchange(session, db.SetIfEqualAsync("k", "new", "old"), "+OK\r\n", "SET", "k", "new", "IFEQ", "old"));
         Assert.False(await Exchange(session, db.SetIfEqualAsync("k", "new", "old", TimeSpan.FromSeconds(2)), "$-1\r\n",
             "SET", "k", "new", "IFEQ", "old", "PX", "2000"));
+        Assert.True(await Exchange(session, db.SetIfGreaterAsync("k", -7), "+OK\r\n", "SET", "k", "-7", "IFGT"));
+        Assert.False(await Exchange(session, db.SetIfLessAsync("k", 9, TimeSpan.FromSeconds(2)), "$-1\r\n",
+            "SET", "k", "9", "IFLT", "PX", "2000"));
         Assert.True(await Exchange(session, db.SetIfEqualKeepingTimeToLiveAsync("k", "n", "o"), "+OK\r\n", "SET", "k", "n", "IFEQ", "o", "KEEPTTL"));
         Assert.True(await Exchange(session, db.DeleteIfEqualAsync("k", "tok"), ":1\r\n", "DELEX", "k", "IFEQ", "tok"));
         await Exchange(session, db.SetExpireAsync("k", 10, "v"), "+OK\r\n", "SETEX", "k", "10", "v");

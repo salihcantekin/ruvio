@@ -63,6 +63,12 @@ func TestLiveSortedSets(t *testing.T) {
 	eq(t, mz(c.ZPopMin(ctx, "p", 0)), []Z{{"x", 1}})
 	eq(t, mz(c.ZPopMax(ctx, "p", 5)), []Z{{"w", 3}, {"y", 2}})
 	eq(t, len(mz(c.ZPopMin(ctx, "p", 1))), 0)
+
+	c.ZAdd(ctx, "due", Z{"a", 1}, Z{"b", 2}, Z{"c", 3}, Z{"d", 9})
+	eq(t, mz(c.ZPopByScore(ctx, "due", "-inf", "1", 5)), []Z{{"a", 1}})
+	eq(t, mi(c.ZMoveDue(ctx, "due", "ready", "3", 5)), int64(2))
+	eq(t, ms(c.LRange(ctx, "ready", 0, -1)), []string{"b", "c"})
+	eq(t, len(mz(c.ZPopByScore(ctx, "due", "-inf", "3", 5))), 0)
 	go func() {
 		time.Sleep(30 * time.Millisecond)
 		c.ZAdd(ctx, "bz", Z{"m", 7}, Z{"n", 8})

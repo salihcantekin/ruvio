@@ -69,6 +69,12 @@ public readonly record struct BloomFilterInfo(long Capacity, long Size, long Fil
 /// <summary><c>BF.INSERT</c> options. The creation options apply only when the key is new.</summary>
 public sealed class BloomInsertOptions
 {
+    /// <summary>
+    /// <c>EX</c> or <c>PX</c>: a time to live for a new filter, set only when the call creates the key. A filter that already exists keeps its deadline.
+    /// Whole seconds are sent as <c>EX</c>, otherwise <c>PX</c> in milliseconds. Must be positive.
+    /// </summary>
+    public TimeSpan? Ttl { get; init; }
+
     /// <summary><c>CAPACITY</c> of a new filter.</summary>
     public long? Capacity { get; init; }
 
@@ -90,6 +96,12 @@ public sealed class BloomInsertOptions
 /// <param name="Remaining">The allowance left after this call; 0 when it was refused.</param>
 public readonly record struct RateLimitResult(bool Allowed, long Remaining);
 
+/// <summary>The answer of the <c>WITHRETRY</c> forms of <c>LIMIT ... SLIDING</c> and <c>LIMIT ... TOKENS</c>.</summary>
+/// <param name="Allowed">True when this call was let through.</param>
+/// <param name="Remaining">The allowance left after this call; 0 when it was refused.</param>
+/// <param name="RetryAfterMs">Milliseconds until the same call would pass; 0 when it was let through. Fit for a <c>Retry-After</c> header.</param>
+public readonly record struct LimitOutcome(bool Allowed, long Remaining, long RetryAfterMs);
+
 /// <summary>What <c>IDEM key BEGIN</c> decided.</summary>
 public enum IdempotencyState
 {
@@ -109,7 +121,11 @@ public enum IdempotencyState
 /// <summary>The answer of <c>IDEM key BEGIN</c>.</summary>
 /// <param name="State">What the server decided.</param>
 /// <param name="Result">The stored result bytes for <see cref="IdempotencyState.Completed"/>; otherwise null.</param>
-public readonly record struct IdempotencyBegin(IdempotencyState State, byte[]? Result);
+public readonly record struct IdempotencyBegin(IdempotencyState State, byte[]? Result)
+{
+    /// <summary>The stored result decoded as UTF-8, for a result that was written as text; null otherwise.</summary>
+    public string? ResultText => Result is null ? null : System.Text.Encoding.UTF8.GetString(Result);
+}
 
 /// <summary>Options for the <c>GetOrCreateAsync</c> cache-aside helper.</summary>
 public sealed class GetOrCreateOptions

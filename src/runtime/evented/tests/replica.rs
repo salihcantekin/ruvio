@@ -32,6 +32,7 @@ fn evented_skewed_replica_promotion_keeps_expired_deadlines_expired() {
             listen: Some(replication),
             primary: None,
             primary_name: None,
+            ..Default::default()
         };
     });
     let (replica_address, replica_stop, replica) = serve_with(|config| {
@@ -41,6 +42,7 @@ fn evented_skewed_replica_promotion_keeps_expired_deadlines_expired() {
             listen: None,
             primary: Some(replication),
             primary_name: None,
+            ..Default::default()
         };
     });
     // One batch reads the clock once: the GET sees the value however slow the runner is,
@@ -80,6 +82,7 @@ fn evented_skewed_replica_promotion_keeps_expired_deadlines_expired() {
             listen: Some(replication),
             primary: None,
             primary_name: None,
+            ..Default::default()
         };
     });
     assert_eq!(
@@ -111,6 +114,7 @@ fn evented_replica_installs_a_compacted_checkpoint() {
             listen: Some(replication),
             primary: None,
             primary_name: None,
+            ..Default::default()
         };
     });
 
@@ -159,6 +163,7 @@ fn evented_replica_installs_a_compacted_checkpoint() {
             listen: None,
             primary: Some(replication),
             primary_name: None,
+            ..Default::default()
         };
     });
 
@@ -202,6 +207,7 @@ fn replica_replays_json_root_then_path_and_ttl_in_one_transaction() {
             listen: Some(replication),
             primary: None,
             primary_name: None,
+            ..Default::default()
         };
     });
     let (replica_address, replica_stop, replica) = serve_with(|config| {
@@ -211,6 +217,7 @@ fn replica_replays_json_root_then_path_and_ttl_in_one_transaction() {
             listen: None,
             primary: Some(replication),
             primary_name: None,
+            ..Default::default()
         };
     });
     let document = serde_json::to_vec(&serde_json::json!({
@@ -566,6 +573,7 @@ fn resync_expired_json(compacted: bool, busy: bool) {
             listen: Some(replication),
             primary: None,
             primary_name: None,
+            ..Default::default()
         };
     });
     let original = serde_json::to_vec(&serde_json::json!({
@@ -655,7 +663,10 @@ fn resync_expired_json(compacted: bool, busy: bool) {
     crate::replication::record_upstream_history(
         replica_dir.path(),
         0,
-        &crate::replication::load_or_create_history(primary_dir.path()).unwrap(),
+        &crate::replication::Origin {
+            history: crate::replication::load_or_create_history(primary_dir.path()).unwrap(),
+            epoch: 0,
+        },
     )
     .unwrap();
     let writes = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -688,6 +699,7 @@ fn resync_expired_json(compacted: bool, busy: bool) {
             listen: None,
             primary: Some(replication),
             primary_name: None,
+            ..Default::default()
         };
     });
     wait_until("the snapshot resync", || {
@@ -753,6 +765,7 @@ fn an_idle_replica_applies_a_burst_without_waiting_for_its_timers() {
             listen: Some(replication),
             primary: None,
             primary_name: None,
+            ..Default::default()
         };
     });
     let (_replica_address, replica_stop, replica) = serve_with(|config| {
@@ -762,6 +775,7 @@ fn an_idle_replica_applies_a_burst_without_waiting_for_its_timers() {
             listen: None,
             primary: Some(replication),
             primary_name: None,
+            ..Default::default()
         };
     });
 
@@ -789,6 +803,99 @@ fn an_idle_replica_applies_a_burst_without_waiting_for_its_timers() {
         "idle replica applied {records} records in {:?}",
         started.elapsed()
     );
+
+    primary_stop.request();
+    replica_stop.request();
+    join_within(primary, PATIENCE).unwrap();
+    join_within(replica, PATIENCE).unwrap();
+}
+
+#[test]
+fn a_replica_keeps_applying_writes_after_a_copied_publish() {
+    let primary_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let ports = crate::test_ports::reserve();
+    let replication = ports.address_at(0);
+    let persistence = |directory: &std::path::Path| PersistenceConfig {
+        profile: crate::DurabilityProfile::Everysec,
+        data_dir: directory.to_path_buf(),
+        ..PersistenceConfig::default()
+    };
+    let (primary_address, primary_stop, primary) = serve_with(|config| {
+        config.persistence = persistence(primary_dir.path());
+        config.replication = crate::config::ReplicationConfig {
+            role: crate::config::ReplicationRole::Primary,
+            listen: Some(replication),
+            primary: None,
+            primary_name: None,
+            ..Default::default()
+        };
+    });
+    let (replica_address, replica_stop, replica) = serve_with(|config| {
+        config.persistence = persistence(replica_dir.path());
+        config.replication = crate::config::ReplicationConfig {
+            role: crate::config::ReplicationRole::Replica,
+            listen: None,
+            primary: Some(replication),
+            primary_name: None,
+            ..Default::default()
+        };
+    });
+    let limits = ProtocolLimits::default();
+    let replica_holds = |sequence: u64| {
+        matches!(
+            crate::persistence::read_frames(replica_dir.path(), 0, sequence - 1, sequence, limits),
+            Ok(crate::persistence::FrameRead::Frames(frames)) if frames.len() == 1
+        )
+    };
+
+    // The replica must be connected before the publish, or the primary copies it to no one.
+    let first = request_within(
+        primary_address,
+        &resp(&[&[b"SET", b"first", b"v"]]),
+        PATIENCE,
+    );
+    assert_eq!(first, b"+OK\r\n");
+    wait_until("the replica to apply the first write", || replica_holds(1));
+
+    // A subscriber on the replica gets the message the primary copies.
+    let mut subscriber = StdTcpStream::connect(replica_address).unwrap();
+    subscriber.set_read_timeout(Some(PATIENCE)).unwrap();
+    subscriber
+        .write_all(&resp(&[&[b"SUBSCRIBE", b"news"]]))
+        .unwrap();
+    let mut seen = Vec::new();
+    let mut read_until = |subscriber: &mut StdTcpStream, needle: &[u8]| {
+        let mut chunk = [0; 512];
+        while !seen.windows(needle.len()).any(|window| window == needle) {
+            let read = subscriber.read(&mut chunk).unwrap();
+            assert_ne!(read, 0, "the replica closed the subscriber");
+            seen.extend_from_slice(&chunk[..read]);
+        }
+    };
+    read_until(&mut subscriber, b"$4\r\nnews\r\n:1\r\n");
+
+    let published = request_within(
+        primary_address,
+        &resp(&[&[b"PUBLISH", b"news", b"hello"]]),
+        PATIENCE,
+    );
+    assert_eq!(published, b":0\r\n");
+    read_until(&mut subscriber, b"$5\r\nhello\r\n");
+
+    // More writes than the replica's queue holds: a publish frame left in the queue's
+    // accounting would fill it and stop the replica here.
+    let records = 2 * crate::replication::QUEUE_FRAMES as u64;
+    let mut burst = Vec::new();
+    for index in 0..records {
+        burst.extend_from_slice(&resp(&[&[b"SET", format!("k{index}").as_bytes(), b"v"]]));
+    }
+    let replies = request_within(primary_address, &burst, Duration::from_secs(20));
+    assert_eq!(replies.len(), records as usize * b"+OK\r\n".len());
+
+    wait_until("the replica to apply every write after the publish", || {
+        replica_holds(records + 1)
+    });
 
     primary_stop.request();
     replica_stop.request();
@@ -872,6 +979,7 @@ fn replica_whose_log_sync_failed_reports_the_link_down() {
             listen: Some(replication),
             primary: None,
             primary_name: None,
+            ..Default::default()
         };
     });
     let (replica_address, replica_stop, replica) = serve_with(|config| {
@@ -881,6 +989,7 @@ fn replica_whose_log_sync_failed_reports_the_link_down() {
             listen: None,
             primary: Some(replication),
             primary_name: None,
+            ..Default::default()
         };
     });
     let status = |address| {
@@ -952,13 +1061,19 @@ fn replica_follows_a_new_link_that_resends_queued_frames_and_resyncs_on_a_gap() 
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let replication = listener.local_addr().unwrap();
-    let history = [5; crate::replication::HISTORY_LEN];
+    let history = crate::replication::Origin {
+        history: [5; crate::replication::HISTORY_LEN],
+        epoch: 0,
+    };
     let ok = |next| {
-        crate::replication::encode_reply_with_history(
+        let mut reply = crate::replication::encode_reply_with_history(
             crate::replication::HandshakeStatus::Ok,
             next,
             &history,
-        )
+        );
+
+        reply.extend_from_slice(&crate::replication::encode_address(None));
+        reply
     };
     let (replica_address, replica_stop, replica) = serve_with(|config| {
         config.persistence = PersistenceConfig {
@@ -971,6 +1086,7 @@ fn replica_follows_a_new_link_that_resends_queued_frames_and_resyncs_on_a_gap() 
             listen: None,
             primary: Some(replication),
             primary_name: None,
+            ..Default::default()
         };
     });
     let applied = || info_field(replica_address, "wal_last_sequence").unwrap_or(0);
@@ -1048,4 +1164,128 @@ fn a_replication_port_past_65535_is_refused_instead_of_wrapping() {
             .port(),
         20_003
     );
+}
+
+#[test]
+fn a_durable_connection_waits_for_its_replica_and_is_refused_without_one() {
+    let primary_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let ports = crate::test_ports::reserve();
+    let replication = ports.address_at(0);
+    let persistence = |directory: &std::path::Path| PersistenceConfig {
+        profile: crate::DurabilityProfile::Everysec,
+        data_dir: directory.to_path_buf(),
+        ..PersistenceConfig::default()
+    };
+    let (primary_address, primary_stop, primary) = serve_with(|config| {
+        config.persistence = persistence(primary_dir.path());
+        config.replication = crate::config::ReplicationConfig {
+            role: crate::config::ReplicationRole::Primary,
+            listen: Some(replication),
+            ..Default::default()
+        };
+    });
+    let (replica_address, replica_stop, replica) = serve_with(|config| {
+        config.persistence = persistence(replica_dir.path());
+        config.replication = crate::config::ReplicationConfig {
+            role: crate::config::ReplicationRole::Replica,
+            primary: Some(replication),
+            ..Default::default()
+        };
+    });
+
+    wait_for_info(primary_address, "replication_replicas", |count| count == 1);
+    let started = Instant::now();
+
+    assert_eq!(
+        request(
+            primary_address,
+            &resp(&[
+                &[
+                    b"CLIENT",
+                    b"DURABILITY",
+                    b"REPLICAS",
+                    b"1",
+                    b"TIMEOUT",
+                    b"10000"
+                ],
+                &[b"SET", b"kept", b"1"],
+            ]),
+        ),
+        b"+OK\r\n+OK\r\n"
+    );
+    eprintln!("durable SET answered in {:?}", started.elapsed());
+    // The replica holds it on disk, and both sides know it was committed.
+    let committed = wait_for_info(primary_address, "replication_committed_sequence", |seq| {
+        seq > 0
+    });
+
+    wait_for_info(replica_address, "replication_committed_sequence", |seq| {
+        seq >= committed
+    });
+    assert!(
+        info_field(replica_address, "wal_durable_sequence").unwrap() >= committed,
+        "the replica acknowledged a record it had not synced"
+    );
+
+    let mut client = connect_bounded(primary_address);
+    let mut line = |payload: &[u8]| {
+        client.write_all(payload).unwrap();
+        let mut reply = Vec::new();
+        let mut byte = [0u8; 1];
+
+        while !reply.ends_with(b"\r\n") {
+            client.read_exact(&mut byte).unwrap();
+            reply.push(byte[0]);
+        }
+        reply
+    };
+
+    assert_eq!(
+        line(&resp(&[&[
+            b"CLIENT",
+            b"DURABILITY",
+            b"REPLICAS",
+            b"1",
+            b"TIMEOUT",
+            b"100"
+        ]])),
+        b"+OK\r\n"
+    );
+    // Without a replica the write is applied and its reply refused.
+    replica_stop.request();
+    join_within(replica, PATIENCE).unwrap();
+    wait_for_info(primary_address, "replication_replicas", |count| count == 0);
+
+    assert_eq!(
+        line(&resp(&[&[b"SET", b"lost", b"1"]])),
+        b"-NOREPLICAS Not enough good replicas to write.\r\n"
+    );
+    // No replica holds that write yet: a read on this connection is held back too.
+    assert_eq!(
+        line(&resp(&[&[b"EXISTS", b"lost"]])),
+        b"-NOREPLICAS Not enough good replicas to write.\r\n"
+    );
+
+    primary_stop.request();
+    join_within(primary, PATIENCE).unwrap();
+}
+
+#[test]
+fn client_durability_needs_replication() {
+    let (address, stop, server) = serve_on_ephemeral();
+
+    assert_eq!(
+        request(
+            address,
+            &resp(&[
+                &[b"CLIENT", b"DURABILITY", b"REPLICAS", b"1"],
+                &[b"CLIENT", b"DURABILITY", b"REPLICAS", b"0"],
+            ]),
+        ),
+        b"-ERR CLIENT DURABILITY needs replication on this server\r\n+OK\r\n"
+    );
+
+    stop.request();
+    join_within(server, PATIENCE).unwrap();
 }

@@ -103,7 +103,7 @@ public class EdgeTests
 
         context.SetEndpoint(new Endpoint(_ => Task.CompletedTask,
             new EndpointMetadataCollection(new RuvioRateLimitAttribute("p", 5, 60)), "t"));
-        await new RuvioRateLimitingMiddleware(_ => Task.CompletedTask).InvokeAsync(context);
+        await MiddlewareTests.Create(_ => Task.CompletedTask, provider).InvokeAsync(context);
         Assert.Equal(1, ((MiddlewareTests.Stub)client).Calls);
     }
 
@@ -119,7 +119,7 @@ public class EdgeTests
         context.SetEndpoint(new Endpoint(_ => Task.CompletedTask,
             new EndpointMetadataCollection(new RuvioRateLimitAttribute("p", 5, 60)), "t"));
         await Assert.ThrowsAsync<InvalidOperationException>(
-            () => new RuvioRateLimitingMiddleware(_ => throw new Exception("must not run")).InvokeAsync(context));
+            () => MiddlewareTests.Create(_ => throw new Exception("must not run"), provider).InvokeAsync(context));
     }
 
     [Fact]
@@ -140,7 +140,7 @@ public class EdgeTests
 
             context.SetEndpoint(new Endpoint(_ => Task.CompletedTask,
                 new EndpointMetadataCollection(new RuvioRateLimitAttribute("p", permits, window)), "t"));
-            await new RuvioRateLimitingMiddleware(_ => Task.CompletedTask).InvokeAsync(context);
+            await MiddlewareTests.Create(_ => Task.CompletedTask, provider).InvokeAsync(context);
 
             return context;
         }
@@ -152,8 +152,8 @@ public class EdgeTests
         Assert.Equal(3_600_000, stub.Window);
         Assert.Equal(200, (await Run(4)).Response.StatusCode);
         Assert.Equal(200, (await Run(0, permits: 1)).Response.StatusCode);
-        await Assert.ThrowsAsync<RuvioException>(() => Run(1, permits: 1));
-        await Assert.ThrowsAsync<RuvioException>(() => Run(-1));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => Run(1, permits: 1));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => Run(-1));
 
         // A window near the int limit must not overflow the millisecond conversion.
         await Run(0, permits: 1, window: int.MaxValue);

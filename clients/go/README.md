@@ -29,10 +29,10 @@ Import path `github.com/salihcantekin/ruvio/clients/go` (package `ruvio`).
 - One `Client` multiplexes all concurrent callers over **one TCP connection**: frames that
   queue up while a write is in flight are coalesced into a single write, and replies are
   matched to callers through a FIFO.
-- A typed method for **every command in `docs/compatibility-matrix.json` (287/287)** plus the
+- A typed method for **every command in `docs/compatibility-matrix.json` (299/299)** plus the
   options that change what Ruvio does (`SET ... IFEQ`, `INCRBY ... MAX`, `FILLGET ... WAIT`,
   `FILLSET ... SWR`, `GETEX` ms, `DELEX key IFEQ`, `LPUSHCAP/RPUSHCAP`, `BF.*`, `JSON.*` incl.
-  `JSON.INDEX`/`JSON.FIND`, `IDEM BEGIN/COMPLETE`, `LEASE/RELEASE`, `SEMAPHORE`, `ONCE`, `TAKE`,
+  `JSON.INDEX`/`JSON.FIND`, `IDEM BEGIN/COMPLETE/ABORT`, `LEASE/RELEASE`, `SEMAPHORE`, `ONCE`, `TAKE`, `TRANSFER/HTRANSFER`,
   `SETV`, `CHANGES`, `LIMIT`, `XADD ... DELAY`).
 - `context.Context` on every call; pipelines; `MULTI/EXEC` transactions with `WATCH`;
   Pub/Sub; RESP3 (`Options.Protocol = 3`) with push frames for `CLIENT TRACKING`.
@@ -41,11 +41,16 @@ Import path `github.com/salihcantekin/ruvio/clients/go` (package `ruvio`).
   "seen before".
 
 - **Cluster routing** (`Options.Cluster`): `CLUSTER SLOTS` slot table, one lazily connected
-  multiplexed connection per node, `-MOVED` handling, cross-slot `MGET/MSET/DEL/...`
+  multiplexed connection per node, `-MOVED`, `-ASK` and `-TRYAGAIN` handling, cross-slot `MGET/MSET/DEL/...`
   split and re-assembled. A standalone server is detected and handled as before. See
   [Cluster](#cluster).
 
-Connecting sends nothing unless configured (`AUTH`, `SELECT`, `CLIENT SETNAME`, `HELLO 3`).
+Connecting sends nothing unless configured (`AUTH`, `SELECT`, `CLIENT SETNAME`, `HELLO 3`, `CLIENT DURABILITY`).
+
+`Options.DurabilityReplicas` (with an optional `DurabilityTimeout`) sends `CLIENT DURABILITY REPLICAS n [TIMEOUT ms]`
+on every connection the client opens, cluster nodes and reconnects included, so a reply is held until `n` replicas have
+the writes on disk; a late replica turns the replies into `-NOREPLICAS`, and a server without replication refuses the
+connect. `ClientDurability(ctx, replicas, timeout)` sets it on one connection (timeout 0 sends no `TIMEOUT`).
 
 ## Install
 
@@ -70,6 +75,7 @@ v, ok, err := c.Get(ctx, "greeting")           // ok=false when the key is missi
 
 ok, err = c.SetArgs(ctx, "k", "v", ruvio.SetOptions{NX: true, TTL: 30 * time.Second})
 ok, err = c.SetIfEq(ctx, "k", "v2", "v", ruvio.SetOptions{})   // Ruvio IFEQ
+ok, err = c.SetIfGreater(ctx, "watermark", 1700000000, ruvio.SetOptions{}) // Ruvio IFGT: keep the highest number
 n, ok, err := c.IncrByMax(ctx, "quota", 1, 100)                 // nil (ok=false) past 100
 
 // anything else: the escape hatch (string, []byte, ints, floats, bool)
@@ -114,6 +120,21 @@ for m := range ps.Channel() { fmt.Println(m.Kind, m.Channel, m.Payload) }
 
 `Tx.Multi` / `Tx.Queue` / `Tx.ExecQueued` / `Tx.Discard` give the explicit step-by-step form.
 
+### TTL on create
+
+A counter or a first write often needs a deadline that is set once, when the key appears, and not moved by later writes. The `...WithTTL` methods and the `TTL` option fields do this in one command. The deadline is set only when the call creates the key; a key that already exists keeps its deadline.
+
+```go
+n, err := c.IncrWithTTL(ctx, "rate:ada", time.Minute)             // INCR rate:ada EX 60
+_, err = c.IncrByWithTTL(ctx, "hits", 5, 1500*time.Millisecond)   // INCRBY hits 5 PX 1500
+_, err = c.ZAddArgs(ctx, "board", ruvio.ZAddOptions{TTL: time.Hour}, ruvio.Z{Member: "ada", Score: 10})
+err = c.JSONSetWithTTL(ctx, "user:1", "$", `{"name":"Ada"}`, time.Hour)
+```
+
+Whole seconds are sent as `EX`, anything else as `PX` in milliseconds. A zero or negative duration returns `ErrInvalidTTL` and nothing is sent. Available on `Incr`, `Decr`, `IncrBy`, `DecrBy`, `IncrByMax`, `IncrByFloat`, `HIncrBy`, `ZIncrBy`, `SetBit` and `JSONSet`/`JSONSetMode` as `...WithTTL` methods, and on `ZAddOptions`, `GeoAddOptions`, `XAddArgs` and `BFInsertOptions` as a `TTL` field.
+
+`ExpireIf`, `PExpireIf`, `ExpireAtIf` and `PExpireAtIf` take an `ExpireCondition` (`ExpireNx`, `ExpireXx`, `ExpireGt`, `ExpireLt`). A key without a deadline counts as having an infinite one, and a failed condition returns `false`.
+
 ### Typed keywords
 
 String-typed constants encode through pre-built RESP fragments (no per-call allocation); plain string literals still compile.
@@ -133,13 +154,94 @@ n, _ = c.ZCount(ctx, "board", ruvio.ScoreExclusive(5), ruvio.ScorePosInf)
 | `AcquireLease`, `WithLease` | `LEASE`/`RELEASE` | Fencing token grows with every grant. |
 | `AcquirePermit`, `WithPermit` | `SEMAPHORE`/`RELEASE` | One of `max` slots, each with its own TTL. |
 | `RateLimit(key, max, window)` | `LIMIT` | Returns `(allowed, remaining)`. |
+| `LimitSliding(key, max, window)`, `LimitTokens(key, capacity, refill, cost)` | `LIMIT ... SLIDING`, `LIMIT ... TOKENS` | Return `(remaining, allowed)`. |
+| `LimitSlidingWithRetry(...)`, `LimitTokensWithRetry(...)` | `LIMIT ... WITHRETRY` | Return a `LimitOutcome` with `Allowed`, `Remaining` and `RetryAfter`. |
 | `GetOrCreate`, `GetOrCreateJSON[T]` | `FILLGET`/`FILLSET` | One factory run across callers. On `BUSY` it polls plain `FILLGET` with 2..50 ms backoff, because `FILLGET ... WAIT` would park the shared connection. `Stale` enables SWR: stale readers return the old value and one refreshes in the background. |
-| `Idempotent(key, fingerprint, ttl, fn)` | `IDEM BEGIN/COMPLETE` | Returns the stored result to repeats; `ErrIdemPending` / `ErrIdemConflict`. Not exactly-once for external effects. |
+| `Idempotent(key, fingerprint, ttl, fn, opts...)` | `IDEM BEGIN/COMPLETE` | Returns the stored result to repeats; `ErrIdemPending` / `ErrIdemConflict`. A failed `fn` leaves the record pending until `ttl`; pass `WithAbortOnError()` to send `IDEM ABORT` instead (off by default), so a retry runs `fn` again at once and `fn`'s error is still returned. Use it only when a failed `fn` did not take effect or is safe to run again. Not exactly-once for external effects. |
+| `IdemAbort(key, fingerprint, owner)` | `IDEM ABORT` | `true` when it removed the pending record of that owner and fingerprint; `false` for a missing key, a completed record (its result is never removed) or another owner. Abort only when the work did not take effect or is safe to run again; a retry after an abort runs it again. |
 | `ScanIter`, `HScanIter`, `SScanIter`, `ZScanIter` (+ `Scanner.All` → `iter.Seq2` on Go 1.23+) | `SCAN`, `HSCAN`, `SSCAN`, `ZSCAN` | Lazy, one page per round trip. |
 | `JSONSetValue`, `JSONGetValue`, `JSONGetAs[T]` | `JSON.SET`/`JSON.GET` + `encoding/json` | |
 | `PushRecent`, `Recent` | `LPUSHCAP`, `LRANGE` | Capped "recent items" list. |
 | `SeenBefore`, `MaybeSeen` | `BF.MADD`, `BF.MEXISTS` | One round trip per batch. |
 | `KeySlot(key)` | local CRC16 | `{hashtag}` aware; matches `CLUSTER KEYSLOT`. |
+
+## Seed addresses
+
+```go
+c, err := ruvio.Connect(ctx, ruvio.Options{
+    Seeds: []string{"10.0.0.5:6379", "10.0.0.6:6379", "[::1]:6379"},
+})
+```
+
+`Seeds` (`host:port`, IPv6 in brackets) replaces `Addr` when it is not empty; with no seeds
+`Addr` works as before. Connecting tries the seeds in order, one connect attempt each, and keeps
+the first that answers. A seed that cannot be reached is skipped, a refused `AUTH` or `SELECT`
+stops at once, and when none answers the last connect error is returned. After the connection
+drops, the next command reconnects by trying every seed once, starting with the one after the
+address that dropped; the command that hit the drop still fails. Dedicated and Pub/Sub
+connections start at the address of the last successful connection. A custom `Options.Dial`
+receives the seed being tried. With `Cluster: true`, `CLUSTER SLOTS` comes from the first
+reachable seed; when a node cannot be opened again, the slot map is reloaded from the nodes
+that still have a connection and then from the other known nodes and the seeds, and the
+command goes to the owner the new map names. No cost is added to the per-command path.
+
+### Retry policies of your own
+
+`ruvio.IsTransient` and `ruvio.MayHaveRun` sort what a call returns, for a retry policy of your own
+(failsafe-go, a loop). The client already follows `MOVED`/`ASK`, waits out `TRYAGAIN` during a slot move and
+finds a new primary after a failover; these judge what still reaches you.
+
+- `IsTransient(err)`: trying again later can succeed. True for a failed or closed connection, a network error,
+  `context.DeadlineExceeded` and `LOADING`, `MASTERDOWN`, `CLUSTERDOWN`, `TRYAGAIN`, `READONLY` and `NOREPLICAS`;
+  false for `WRONGTYPE`, `OOM`, syntax errors, `ErrProtocol` and `context.Canceled` (your own cancellation).
+- `MayHaveRun(err)`: the failed call may have changed data. False only for a server error reply (the server
+  refused the command), except `NOREPLICAS`: the write was applied and only the replica confirmation timed out.
+  A failed connection or a timeout may have run.
+
+Repeat a write only when it is safe to repeat or did not run:
+
+```go
+for attempt := 0; ; attempt++ {
+	visits, err := client.Incr(ctx, "visits")
+	// INCR is not safe to repeat: retry it only when it surely did not run.
+	if err == nil || attempt == 3 || !ruvio.IsTransient(err) || ruvio.MayHaveRun(err) {
+		return visits, err
+	}
+}
+```
+
+For a read, `IsTransient` alone is enough.
+
+### Following a failover
+
+With two or more `Seeds` a standalone client finds the primary again after a failover. After
+the connection drops, the reconnect asks the seeds `ROLE` and connects to the one that answers
+`master` (a replica's reported primary is tried too); if none does, the usual seed order
+applies. When a command is answered `READONLY` (the node was demoted) the client does the same,
+avoiding the node that answered while it still says `master` (once it says it is a replica, a
+later round takes it when it is promoted), and sends that command once more on the new connection:
+`READONLY` is sent before the command runs, so the retry cannot apply it twice. A second
+`READONLY` is returned, and nothing is sent again after a transaction opened with `Do("MULTI")`
+on the shared connection, or after an I/O error. Up to 8 rounds run with waits of 100 ms
+doubling to 2 s (7.1 s at most, bounded by the call's context); when none finds a primary the
+`READONLY` error is returned and the connection stays. Pipelines, `Conn`, `Tx` and blocking
+commands run on their own connection and return `READONLY` as is. Nothing is sent while the
+connection is healthy, a single address behaves as before, and a cluster client never does
+this. `Options.DisableFollowPrimary` turns it off.
+
+With `Options.SentinelMaster` set, `Seeds` (or `Addr`) are coordinator addresses: the client
+asks `SENTINEL get-master-addr-by-name <name>`, checks the answer with `ROLE`, and connects
+there, on the first connect (which fails with an error wrapping `ErrProtocol` when no
+coordinator names a primary), on reconnect and after `READONLY`. The same `AUTH` credentials
+go to coordinators and data nodes. The rules are the same in every client
+([docs/CLIENT_BEHAVIOR.md](../../docs/CLIENT_BEHAVIOR.md#following-a-failover)).
+
+```go
+c, err := ruvio.Connect(ctx, ruvio.Options{
+    Seeds:          []string{"10.0.0.9:26379"},
+    SentinelMaster: "main",
+})
+```
 
 ## Cluster
 
@@ -176,12 +278,17 @@ by `TestRoutingCoversMatrix`; the key table is in `cluster_keys.go`):
 `-MOVED slot host:port`: the slot is patched in the table at once and the command is sent
 again to the named node (the server did not run it, so this is safe). The whole table is
 reloaded with `CLUSTER SLOTS` only when the named node is unknown or from the second `MOVED` for
-the same command. A command follows at most **3** redirects; a fourth `MOVED` is returned to
-the caller as `*Error`.
+the same command. `-ASK slot host:port`: `ASKING` and the command are sent to the named node in
+one write and its reply is returned; the table is not changed, so the next command for the slot
+still goes to the table's owner. `-MOVED` and `-ASK` share one budget: a command follows at
+most **3** redirects; a fourth is returned to the caller as `*Error`. `-TRYAGAIN` (a slot is
+being handed over; nothing ran) sends the command again, routed by the current table, up to 7
+times after waits of 5, 10, 20, 40, 80, 160 and 320 ms (635 ms in all; a cancelled context ends the
+wait); the seventh retry's `-TRYAGAIN` is returned as `*Error`. The budgets are separate.
 
 Pipelines: commands are grouped by node, each group is one pipelined write, groups run
-concurrently, replies come back in the caller's order; `MOVED` replies inside a pipeline are
-repaired one by one, with the same 3-redirect limit. `MGET`, `MSET`, `DEL`, `UNLINK`, `EXISTS`
+concurrently, replies come back in the caller's order; `MOVED`, `ASK` and `TRYAGAIN` replies inside a pipeline are
+repaired one by one, with the same limits. `MGET`, `MSET`, `DEL`, `UNLINK`, `EXISTS`
 and `TOUCH` whose keys span slots are split exactly like the plain command: one command per
 slot, each sent in its place in its node's write, and the merged reply (`MGET` in key order,
 counts summed, `MSET` OK) sits at the command's index; an error in one part becomes that
@@ -200,6 +307,32 @@ Pub/Sub: `Subscribe/PSubscribe` run on the seed node, so `Publish` (keyless, see
 them. `SSubscribe` opens one extra connection per node owning a channel's slot (opened on
 demand, one `SSUBSCRIBE` per slot); `SPublish` routes by channel. Messages from all nodes
 arrive on the one `Channel()`. Losing any of these connections closes the subscription.
+
+### Reads from replicas
+
+`Options.ReadPolicy` (type `ReadPolicy`) chooses where a cluster client sends reads. Replicas
+come from `CLUSTER SLOTS`, which lists them after each primary; a standalone connection
+ignores the option.
+
+| Value | Reads go to |
+|---|---|
+| `ReadPrimary` (default) | the slot's primary, as before; no replica connection is opened |
+| `ReadPreferReplica` | one replica of the slot's shard, the primary when it has none or the replica is unusable |
+| `ReadReplica` | a replica only; with none known or usable the read fails (the error says "no replica") |
+
+Replication is asynchronous, so a read from a replica can miss recent writes, including your
+own. A command is a read when the server's command table flags it `readonly` and not blocking
+(`GET`, `HGETALL`, `ZRANGE`, ...); the parts of a split `MGET` or `EXISTS` are reads, those of
+`DEL` or `MSET` are writes. Writes, keyless commands, transactions, Pub/Sub, `SCAN`, fan-out
+and blocking commands always go to the primaries. A pipeline goes to replicas only when every
+command in it is a read; otherwise it is routed as with `ReadPrimary`.
+
+When the slot map is loaded, each primary gets one replica picked at random, kept until the
+next load; each connection to it sends `READONLY` first. A replica that cannot be connected,
+or answers a read with `LOADING`, is skipped until the next load: `ReadPreferReplica` sends the
+read to the primary (for `LOADING`, again), `ReadReplica` returns the error. A replica socket
+that drops after a command was sent fails that command, which is not sent again. A `LOADING`
+reply inside a pipeline is returned as that command's error.
 
 Helpers (lock, lease, semaphore, rate limit, `GetOrCreate`, idempotency, scan iterators, JSON,
 capped lists, Bloom) only issue single-key commands and work unchanged.
@@ -283,6 +416,23 @@ Run them yourself:
 RUVIO_TEST_ADDR=127.0.0.1:6461 go test -run '^$' -bench . -benchmem -benchtime=1s
 ```
 
+## TLS
+
+Plain TCP is the default. Set `Options.TLS` to a `*tls.Config` to wrap every connection the client opens (shared, dedicated, Pub/Sub, cluster nodes, replicas, failover probes) in TLS. The server certificate chain and host name are verified against `RootCAs` (the system roots when nil), and `ServerName` defaults to the host of the address being dialed.
+
+```go
+pem, _ := os.ReadFile("ca.pem")
+roots := x509.NewCertPool()
+roots.AppendCertsFromPEM(pem)
+
+c, err := ruvio.Connect(ctx, ruvio.Options{
+	Addr: "cache.internal:6379",
+	TLS:  &tls.Config{RootCAs: roots},
+})
+```
+
+`RootCAs` trusts a private CA, `Certificates` answers a server that demands mutual TLS (`tls_client_auth`), `ServerName` is the name the certificate carries when you dial by IP address, and `InsecureSkipVerify` accepts any certificate and removes the protection against someone in the middle (throwaway tests only). The handshake is part of the connect, so a refused certificate fails `Connect`. `Options.TLS` does not apply when `Options.Dial` is set: return your own `*tls.Conn` from `Dial` then. Measured: the live TLS tests (`tls_live_test.go`); the latency TLS adds: not measured.
+
 ## Tests
 
 ```sh
@@ -306,6 +456,10 @@ shards, cross-slot `MGET/MSET/DEL` order (plain and in pipelines), pipeline orde
 transactions, helpers, blocking, `SCAN`, Pub/Sub, scripts, concurrency, standalone fallback
 with `Cluster: true`) skip without their server variables.
 
+`follow_test.go` (scripted nodes) and `follow_live_test.go` (the failover pair
+`scripts/run_with_servers.sh` starts: `RUVIO_FAILOVER_ADDRS`, `RUVIO_FAILOVER_REPLICATION`)
+cover following a failover; the live test skips without the variables.
+
 The live suite exercises every command family against a real server (strings, keys,
 bitmaps/HLL, Ruvio extensions, lists, sets, hashes incl. field TTLs, sorted sets, geo,
 streams incl. consumer groups and `DELAY`, JSON incl. `JSON.INDEX/FIND` (database 0, own
@@ -316,9 +470,10 @@ client tracking, pipelines, transactions, every helper). `TestCoverage` reads
 ## Not done / not verified
 
 - Cluster, verified against a 3-shard per-shard-port Ruvio server and a scripted fake server:
-  topology, routing, split, pipelines, `MOVED`, transactions, Pub/Sub, helpers, fallback.
-  **Not done / not verified:** replicas and `READONLY` reads (the client routes to the slot's
-  primary only; `READONLY`/`READWRITE` just send the command), `-ASK` (the server has no live
+  topology, routing, split, pipelines, `MOVED`, `ASK`, `TRYAGAIN`, transactions, Pub/Sub, helpers, fallback.
+  Reads from replicas (`Options.ReadPolicy`) are verified with scripted fake nodes and a live
+  2-shard primary with its replica. **Not done / not verified:** replicas that change address
+  between slot map loads while a read is in flight, `-ASK` and `-TRYAGAIN` against a live server (only scripted fake nodes; the server has no live
   slot migration), `RENAME`/`COPY`/`SMOVE`/`LMOVE` across slots (fail with `ErrCrossSlot`; no
   copy-and-delete emulation), split `MSETNX`/`BITOP`/`SUNION`... (all-or-nothing or
   non-decomposable commands fail across slots), automatic topology refresh in the background
@@ -345,4 +500,4 @@ Server deviations found while testing (Ruvio 0.3.0), handled or documented by th
 - A blocked `XREAD`/`XREADGROUP` that is woken by a later `XADD` replies
   `[[stream, [id, fields]]]` instead of `[[stream, [[id, fields]]]]`; the client accepts both.
 - `ZRANGE key max min BYSCORE REV` takes the high bound first, as Redis does (the server fixed this on `dev`; older builds expected `min max`).
-- Scripts must use `ruvio.call`; `redis.call` is undefined.
+- Scripts call commands with `ruvio.call`; `redis.call` is an alias of it.

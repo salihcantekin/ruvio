@@ -15,7 +15,8 @@ pub struct SessionCtx<'a> {
     pub rate: &'a mut CommandRateLimiter,
     pub security: &'a SecurityConfig,
     pub cluster: bool,
-    pub replica: bool,
+    /// The error a write gets on this shard (a replica, or a replaced primary).
+    pub write_refusal: Option<&'static [u8]>,
     pub replication: bool,
     pub databases: usize,
 }
@@ -57,6 +58,7 @@ fn admit<'a>(ctx: &mut SessionCtx<'_>, command: &Command<'a>) -> SessionAction<'
                 | Command::ClientGetName
                 | Command::ClientSetName(_)
                 | Command::ClientTracking(_)
+                | Command::ClientDurability { .. }
                 | Command::Select(_)
         )
     {
@@ -78,8 +80,10 @@ fn admit<'a>(ctx: &mut SessionCtx<'_>, command: &Command<'a>) -> SessionAction<'
         return SessionAction::Reply(Response::Error(b"NOAUTH Authentication required."));
     }
 
-    if ctx.replica && crate::protocol::command_mutates_store(command) {
-        return SessionAction::Reply(Response::Error(crate::replication::READONLY_LINE));
+    if let Some(refusal) = ctx.write_refusal
+        && crate::protocol::command_mutates_store(command)
+    {
+        return SessionAction::Reply(Response::Error(refusal));
     }
 
     if ctx.replication && crate::protocol::command_stays_process_local(command) {
@@ -208,6 +212,11 @@ fn admit<'a>(ctx: &mut SessionCtx<'_>, command: &Command<'a>) -> SessionAction<'
         return SessionAction::Reply(Response::Simple(b"OK"));
     }
 
+    // CLIENT SETINFO: library name and version are accepted and not kept.
+    if matches!(command, Command::ClientSetInfo) {
+        return SessionAction::Reply(Response::Simple(b"OK"));
+    }
+
     // CLIENT ID: the connection id, answered here because only the session knows it.
     if matches!(command, Command::ClientId) {
         return SessionAction::Reply(Response::Integer(ctx.tx.id as i64));
@@ -229,6 +238,27 @@ fn admit<'a>(ctx: &mut SessionCtx<'_>, command: &Command<'a>) -> SessionAction<'
         }
 
         ctx.tx.tracking = *on;
+
+        return SessionAction::Reply(Response::Simple(b"OK"));
+    }
+
+    if let Command::ClientDurability {
+        replicas,
+        timeout_ms,
+    } = *command
+    {
+        if replicas > 0 && !ctx.replication {
+            return SessionAction::Reply(Response::Error(
+                b"ERR CLIENT DURABILITY needs replication on this server",
+            ));
+        }
+
+        ctx.tx.durability = (replicas > 0).then_some(crate::transaction::Durability {
+            replicas,
+            timeout_ms,
+        });
+        // The first replies under it wait for every record written before them.
+        ctx.tx.durable_mark = 0;
 
         return SessionAction::Reply(Response::Simple(b"OK"));
     }
@@ -342,7 +372,7 @@ mod tests {
             rate,
             security,
             cluster: false,
-            replica: false,
+            write_refusal: None,
             replication: false,
             databases: crate::database::DEFAULT_DATABASES,
         }
@@ -361,7 +391,7 @@ mod tests {
         let mut session = ctx(&security, &mut auth, &mut tx, &mut permit, &mut rate);
         let noauth = SessionAction::Reply(Response::Error(b"NOAUTH Authentication required."));
 
-        session.replica = true;
+        session.write_refusal = Some(crate::replication::READONLY_LINE);
         assert_eq!(
             gate(
                 &mut session,
@@ -847,7 +877,7 @@ mod tests {
         let mut rate = CommandRateLimiter::new(0);
         let mut session = ctx(&security, &mut auth, &mut tx, &mut permit, &mut rate);
 
-        session.replica = true;
+        session.write_refusal = Some(crate::replication::READONLY_LINE);
         let readonly = SessionAction::Reply(Response::Error(crate::replication::READONLY_LINE));
 
         assert_eq!(
@@ -878,7 +908,7 @@ mod tests {
         );
         assert_ne!(gate(&mut session, &Command::Ping(None)), readonly);
         assert_ne!(gate(&mut session, &Command::Save), readonly);
-        session.replica = false;
+        session.write_refusal = None;
         assert_eq!(
             gate(
                 &mut session,

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 // RESP request encoder: writes frames straight into a reusable slab Buffer.
 
+import { mayBlock } from './blocking.js';
+
 /** A command argument for {@link Commands.call}: strings are sent as UTF-8, Buffers as raw bytes, numbers and bigints as ASCII digits. */
 export type Arg = string | Buffer | number | bigint;
 
@@ -14,6 +16,8 @@ export interface Cmd {
   readonly name: string;
   /** `*N\r\n` + frag, cached per total argument count. */
   readonly pre: (Uint8Array | undefined)[];
+  /** @internal The command may carry a blocking wait (see `blocking.ts`); set by {@link cmd}. */
+  readonly block?: boolean;
 }
 
 /**
@@ -32,7 +36,8 @@ export interface Cmd {
 export function cmd(...words: string[]): Cmd {
   let s = '';
   for (const w of words) s += '$' + Buffer.byteLength(w) + '\r\n' + w + '\r\n';
-  return { frag: Buffer.from(s, 'latin1'), words: words.length, name: words.join(' '), pre: [] };
+  const name = words.join(' ');
+  return { frag: Buffer.from(s, 'latin1'), words: words.length, name, pre: [], block: mayBlock(words[0] ?? '') };
 }
 
 const SLAB = 64 * 1024;
@@ -83,6 +88,13 @@ export class Encoder {
   frameStart = 0;
   /** Receives completed byte ranges (the socket). Absent for pipeline-local encoders. */
   sink: ((chunk: Buffer) => void) | null;
+  /**
+   * @internal Sees a completed frame `buf[s..e)` that may hold a blocking command (the command timeout adds
+   * its wait). Only frames begun with a {@link Cmd} whose `block` is set reach it, so other commands cost nothing.
+   */
+  onFrame: ((buf: Uint8Array, s: number, e: number) => void) | null = null;
+  /** @internal A command begun since the last {@link endFrame} (or {@link take}) may block. */
+  mayBlock = false;
 
   constructor(sink: ((chunk: Buffer) => void) | null = null, size = SLAB) {
     this.buf = Buffer.allocUnsafe(size) as BufferFast;
@@ -135,6 +147,7 @@ export class Encoder {
 
   /** Takes the encoded bytes (pipeline-local encoders) and resets. */
   take(): Buffer {
+    this.mayBlock = false;
     const out = this.buf.subarray(this.start, this.pos);
     this.buf = Buffer.allocUnsafe(SLAB) as BufferFast;
     this.start = this.frameStart = this.pos = 0;
@@ -154,12 +167,17 @@ export class Encoder {
 
   /** Marks the current frame complete. */
   endFrame(): void {
+    if (this.mayBlock && this.onFrame !== null) {
+      this.mayBlock = false;
+      this.onFrame(this.buf, this.frameStart, this.pos);
+    }
     this.frameStart = this.pos;
     this.partial = false;
   }
 
   /** Writes `*count\r\n` and the pre-encoded command words (one cached copy for common arities). */
   begin(c: Cmd, argc: number): void {
+    if (c.block === true) this.mayBlock = true;
     let pre = argc < 8 ? c.pre[argc] : undefined;
     if (pre === undefined) {
       const total = c.words + argc;
@@ -217,7 +235,7 @@ export class Encoder {
     else if (typeof a === 'number') this.num(a);
     else if (a instanceof Uint8Array) this.bytes(a as Buffer);
     else if (typeof a === 'bigint') this.ascii(a.toString());
-    else throw new TypeError('ruvio: unsupported argument type ' + typeof a);
+    else throw (a as unknown) instanceof Error ? a : new TypeError('ruvio: unsupported argument type ' + typeof a);
   }
 
   /** Writes a string argument as UTF-8 without measuring it first (write, then fix header). */

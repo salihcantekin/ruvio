@@ -130,7 +130,7 @@ public partial interface IRuvioClient
     ValueTask<int?> GetInt32Async(string key, CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Sends <c>GET</c> and parses the value as a 64-bit decimal integer, such as a counter written by <see cref="IncrementAsync"/>.
+    /// Sends <c>GET</c> and parses the value as a 64-bit decimal integer, such as a counter written by <see cref="IncrementAsync(string, CancellationToken)"/>.
     /// </summary>
     /// <param name="key">The key.</param>
     /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
@@ -353,6 +353,56 @@ public partial interface IRuvioClient
     /// </example>
     ValueTask<long?> LimitAsync(string key, long max, long windowMs, CancellationToken cancellationToken = default);
 
+    /// <summary>Sends <c>LIMIT key max windowMs SLIDING</c>, a sliding-window rate limiter on a single key.</summary>
+    /// <param name="key">The key.</param>
+    /// <param name="max">Calls allowed per window, from 1 to 2147483647.</param>
+    /// <param name="windowMs">Window length in milliseconds. Must be positive.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
+    /// <returns>The allowance left after this call, or <see langword="null"/> when it does not fit. A refused call is not counted.</returns>
+    /// <exception cref="RuvioException">The key holds another type (<c>WRONGTYPE</c>), the key was created by another <c>LIMIT</c> mode, or an argument is out of range.</exception>
+    /// <remarks>The previous window counts for the part of it that still overlaps the last <paramref name="windowMs"/>, so a burst at a window edge is not doubled. The key keeps two counters, not one entry per call.</remarks>
+    /// <example>
+    /// <code>
+    /// long? left = await db.LimitSlidingAsync("rate:user:42", 100, 60_000);
+    /// </code>
+    /// </example>
+    ValueTask<long?> LimitSlidingAsync(string key, long max, long windowMs, CancellationToken cancellationToken = default);
+
+    /// <summary>Sends <c>LIMIT key capacity refillMs TOKENS COST cost</c>, a token bucket on a single key.</summary>
+    /// <param name="key">The key.</param>
+    /// <param name="capacity">Bucket size, from 1 to 1000000.</param>
+    /// <param name="refillMs">Time to refill an empty bucket in milliseconds, up to 4294967295.</param>
+    /// <param name="cost">Tokens this call takes, from 1 to <paramref name="capacity"/>.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
+    /// <returns>The tokens left after this call, or <see langword="null"/> when the bucket holds too few. Nothing is taken then.</returns>
+    /// <exception cref="RuvioException">The key holds another type (<c>WRONGTYPE</c>), the key was created by another <c>LIMIT</c> mode, or an argument is out of range.</exception>
+    /// <remarks>The key keeps one timestamp and disappears when the bucket is full again.</remarks>
+    /// <example>
+    /// <code>
+    /// long? left = await db.LimitTokensAsync("rate:api:7", 10, 1_000, 2); // 10 per second, this call takes 2
+    /// </code>
+    /// </example>
+    ValueTask<long?> LimitTokensAsync(string key, long capacity, long refillMs, long cost = 1, CancellationToken cancellationToken = default);
+
+    /// <summary>Sends <c>LIMIT key max windowMs SLIDING WITHRETRY</c>: <see cref="LimitSlidingAsync"/> that also says how long to wait.</summary>
+    /// <param name="key">The key.</param>
+    /// <param name="max">Calls allowed per window, from 1 to 2147483647.</param>
+    /// <param name="windowMs">Window length in milliseconds. Must be positive.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
+    /// <returns>A <see cref="LimitOutcome"/> with the wait until the same call would pass.</returns>
+    /// <exception cref="RuvioException">As <see cref="LimitSlidingAsync"/>.</exception>
+    ValueTask<LimitOutcome> LimitSlidingWithRetryAsync(string key, long max, long windowMs, CancellationToken cancellationToken = default);
+
+    /// <summary>Sends <c>LIMIT key capacity refillMs TOKENS COST cost WITHRETRY</c>: <see cref="LimitTokensAsync"/> that also says how long to wait.</summary>
+    /// <param name="key">The key.</param>
+    /// <param name="capacity">Bucket size, from 1 to 1000000.</param>
+    /// <param name="refillMs">Time to refill an empty bucket in milliseconds, up to 4294967295.</param>
+    /// <param name="cost">Tokens this call takes, from 1 to <paramref name="capacity"/>.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
+    /// <returns>A <see cref="LimitOutcome"/> with the wait until the same call would pass.</returns>
+    /// <exception cref="RuvioException">As <see cref="LimitTokensAsync"/>.</exception>
+    ValueTask<LimitOutcome> LimitTokensWithRetryAsync(string key, long capacity, long refillMs, long cost = 1, CancellationToken cancellationToken = default);
+
     /// <summary>
     /// Sends <c>ONCE key ttlMs</c>, Ruvio's "first caller wins" marker with an expiry. Use it to run something at most once per period.
     /// </summary>
@@ -422,6 +472,43 @@ public partial interface IRuvioClient
     /// </example>
     ValueTask<long?> TakeAsync(string key, long count, CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Sends <c>TRANSFER source destination amount [MAX max]</c>: moves an amount between two integer keys in one step, only when <paramref name="source"/> holds at least that much. A missing <paramref name="destination"/> starts at 0. Both writes are one WAL record.
+    /// </summary>
+    /// <param name="source">The key to subtract from.</param>
+    /// <param name="destination">The key to add to. On a sharded server it must share a slot with <paramref name="source"/>; a hash tag such as <c>{user:42}</c> puts them together.</param>
+    /// <param name="amount">Amount to move. Must be positive.</param>
+    /// <param name="max">Optional ceiling for <paramref name="destination"/> after the move.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
+    /// <returns>The balances after the move, or <see langword="null"/> when <paramref name="source"/> is missing or short, or <paramref name="destination"/> would overflow or pass <paramref name="max"/> (nothing is written).</returns>
+    /// <exception cref="RuvioException">A key holds a value of another type (<c>WRONGTYPE</c>); a value is not an integer; <paramref name="amount"/> is not positive; the two keys are the same; the keys are in different slots (<c>CROSSSLOT</c>).</exception>
+    /// <remarks>Native Ruvio command. The check and both writes are atomic, so concurrent callers cannot overdraw.</remarks>
+    /// <example>
+    /// <code>
+    /// var moved = await db.TransferAsync("{user:42}:wallet", "{user:42}:escrow", 30);
+    /// if (moved is null) { /* not enough balance */ }
+    /// </code>
+    /// </example>
+    ValueTask<(long Source, long Destination)?> TransferAsync(string source, string destination, long amount, long? max = null, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Sends <c>HTRANSFER key from to amount [MAX max]</c>: <see cref="TransferAsync"/> between two integer fields of one hash. A missing <paramref name="to"/> field starts at 0 and field TTLs stay.
+    /// </summary>
+    /// <param name="key">The hash key.</param>
+    /// <param name="from">The field to subtract from.</param>
+    /// <param name="to">The field to add to.</param>
+    /// <param name="amount">Amount to move. Must be positive.</param>
+    /// <param name="max">Optional ceiling for the <paramref name="to"/> field after the move.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
+    /// <returns>The balances after the move, or <see langword="null"/> when the key or <paramref name="from"/> is missing or short, or <paramref name="to"/> would overflow or pass <paramref name="max"/> (nothing is written).</returns>
+    /// <exception cref="RuvioException">The key holds a value of another type (<c>WRONGTYPE</c>); a field is not an integer; <paramref name="amount"/> is not positive; the two fields are the same.</exception>
+    /// <example>
+    /// <code>
+    /// var moved = await db.TransferHashFieldAsync("account:7", "available", "held", 30);
+    /// </code>
+    /// </example>
+    ValueTask<(long From, long To)?> TransferHashFieldAsync(string key, string from, string to, long amount, long? max = null, CancellationToken cancellationToken = default);
+
     /// <summary>Sends <c>GETEX key ttlMs</c>: reads a string and sets its expiry in one step ("sliding" expiry).</summary>
     /// <param name="key">The key.</param>
     /// <param name="ttlMs">New time to live from now, in milliseconds. Must be positive. (Ruvio takes milliseconds here, not Redis's <c>EX</c>/<c>PX</c> options.)</param>
@@ -482,6 +569,17 @@ public partial interface IRuvioClient
     /// </code>
     /// </example>
     ValueTask<long?> IncrementWithLimitAsync(string key, long delta, long limit, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Sends <c>RENEW key token ttl</c>: moves the deadline of a lease from <see cref="LeaseAsync"/> or a semaphore slot from <see cref="AcquireSemaphoreAsync"/> to now + <paramref name="ttlMilliseconds"/>. The token does not change and no holder is created.
+    /// </summary>
+    /// <param name="key">The key.</param>
+    /// <param name="token">The token that acquire returned.</param>
+    /// <param name="ttlMilliseconds">The new lifetime in milliseconds (positive). It replaces the remaining time.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
+    /// <returns>1 when the token held the lease or slot and its deadline moved; 0 when it no longer held it (expired, released or taken by someone else), in which case nothing changes.</returns>
+    /// <exception cref="RuvioException">The server refuses the command, for example the key holds another type.</exception>
+    ValueTask<long> RenewAsync(string key, long token, long ttlMilliseconds, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Sends <c>RELEASE key token</c>: gives back a lease from <see cref="LeaseAsync"/> or a semaphore slot from <see cref="AcquireSemaphoreAsync"/>.
@@ -1507,6 +1605,18 @@ public partial interface IRuvioClient
     /// </example>
     ValueTask<long> SetHashFieldsAsync(string key, params (string Field, string Value)[] fields);
 
+    /// <summary>Sends <c>HMSET</c>: writes fields like <see cref="SetHashFieldsAsync"/> but the server replies <c>OK</c> instead of the count of new fields.</summary>
+    /// <param name="key">The key.</param>
+    /// <param name="fields">The field/value pairs to write.</param>
+    /// <exception cref="RuvioException">The key holds a value of another type (<c>WRONGTYPE</c>), or the server refuses the command.</exception>
+    /// <remarks>Redis marks <c>HMSET</c> deprecated; prefer <see cref="SetHashFieldsAsync"/> in new code.</remarks>
+    /// <example>
+    /// <code>
+    /// await db.SetHashManyAsync("user:1", ("name", "Ada"), ("city", "London"));
+    /// </code>
+    /// </example>
+    ValueTask SetHashManyAsync(string key, params (string Field, string Value)[] fields);
+
     /// <summary>Sends <c>HGET</c>.</summary>
     /// <param name="key">The key.</param>
     /// <param name="field">The hash field name.</param>
@@ -1942,6 +2052,36 @@ public partial interface IRuvioClient
     /// </code>
     /// </example>
     ValueTask<IReadOnlyList<SortedSetEntry>> PopSortedSetMinAsync(string key, long count = 1, CancellationToken cancellationToken = default);
+
+    /// <summary>Sends <c>ZPOPBYSCORE</c>: removes and returns the members that are due, lowest score first. With scores set to due times this takes the jobs that are ready.</summary>
+    /// <param name="key">The key.</param>
+    /// <param name="min">Lowest score: a number, <c>-inf</c>, or <c>(5</c> for exclusive.</param>
+    /// <param name="max">Highest score: a number, <c>+inf</c>, or <c>(5</c> for exclusive.</param>
+    /// <param name="count">How many to pop, 1 to 10000.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
+    /// <returns>The removed members with scores, lowest first. Empty when nothing is due.</returns>
+    /// <exception cref="RuvioException">The key holds a value of another type (<c>WRONGTYPE</c>), or the server refuses the command.</exception>
+    /// <example>
+    /// <code>
+    /// var jobs = await db.PopSortedSetByScoreAsync("scheduled", "-inf", nowUnixSeconds.ToString(), 100);
+    /// </code>
+    /// </example>
+    ValueTask<IReadOnlyList<SortedSetEntry>> PopSortedSetByScoreAsync(string key, string min, string max, long count = 1, CancellationToken cancellationToken = default);
+
+    /// <summary>Sends <c>ZMOVEDUE</c>: moves the members that are due from a sorted set to the tail of a list, lowest score first. Clients blocked on the list are served first. Both keys must hash to the same slot on a sharded server.</summary>
+    /// <param name="source">The sorted set to take members from.</param>
+    /// <param name="destination">The list that receives them.</param>
+    /// <param name="max">Highest score: a number, <c>+inf</c>, or <c>(5</c> for exclusive.</param>
+    /// <param name="count">How many to move, 1 to 10000.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
+    /// <returns>How many members were moved.</returns>
+    /// <exception cref="RuvioException">A key holds a value of another type (<c>WRONGTYPE</c>), the keys are in different slots (<c>CROSSSLOT</c>), or the server refuses the command.</exception>
+    /// <example>
+    /// <code>
+    /// long moved = await db.MoveDueSortedSetAsync("{q}scheduled", "{q}ready", nowUnixSeconds.ToString(), 100);
+    /// </code>
+    /// </example>
+    ValueTask<long> MoveDueSortedSetAsync(string source, string destination, string max, long count = 1, CancellationToken cancellationToken = default);
 
     /// <summary>Sends <c>ZPOPMAX</c>: removes and returns the highest-scored members.</summary>
     /// <param name="key">The key.</param>
@@ -3249,17 +3389,82 @@ public partial interface IRuvioClient
     /// </example>
     ValueTask SetTrackingAsync(bool enabled, CancellationToken cancellationToken = default);
 
+    /// <summary>Sends <c>CLIENT DURABILITY REPLICAS n [TIMEOUT ms]</c>: holds this connection's replies until <paramref name="replicas"/> replicas have the writes on disk.</summary>
+    /// <param name="replicas">How many replicas must have the writes; zero turns the wait off.</param>
+    /// <param name="timeout">How long to wait before the replies become <c>NOREPLICAS</c> errors (the writes stay applied); null keeps the server's default of 5 seconds.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
+    /// <exception cref="RuvioException">The server has no replication, or the connection is inside <c>MULTI</c>.</exception>
+    /// <remarks>The setting belongs to the connection. <see cref="RuvioClientOptions.DurabilityReplicas"/> sets it on every connection the client opens.</remarks>
+    /// <example>
+    /// <code>
+    /// await db.SetDurabilityAsync(1, TimeSpan.FromSeconds(5));
+    /// </code>
+    /// </example>
+    ValueTask SetDurabilityAsync(int replicas, TimeSpan? timeout = null, CancellationToken cancellationToken = default);
+
     /// <summary>Sends <c>CONFIG GET</c>.</summary>
     /// <param name="parameter">A setting name or glob, for example <c>databases</c> or <c>*</c>.</param>
     /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
     /// <returns>The raw reply: a flat list of name, value pairs. <c>requirepass</c> is redacted.</returns>
-    /// <remarks><c>CONFIG SET</c> is not supported; change settings in the configuration file or environment.</remarks>
     /// <example>
     /// <code>
     /// RespValue databases = await db.GetConfigAsync("databases");
     /// </code>
     /// </example>
     ValueTask<RespValue> GetConfigAsync(string parameter, CancellationToken cancellationToken = default);
+
+    /// <summary>Sends <c>CONFIG SET</c>: changes live settings on every shard of the server before it answers.</summary>
+    /// <param name="settings">Setting names, as <c>CONFIG GET</c> shows them, and their new values.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
+    /// <remarks>All pairs apply or none: an unknown or restart-only name, or an invalid value, throws and changes nothing. The change is not written to the configuration file (see <see cref="RewriteConfigAsync"/>) and is not replicated.</remarks>
+    /// <example>
+    /// <code>
+    /// await db.SetConfigAsync([("maxmemory", "1073741824"), ("maxmemory-policy", "allkeys-lru")]);
+    /// </code>
+    /// </example>
+    ValueTask SetConfigAsync(IReadOnlyList<(string Name, string Value)> settings, CancellationToken cancellationToken = default);
+
+    /// <summary>Sends <c>CONFIG REWRITE</c>: writes the live settings into the configuration file the server started from.</summary>
+    /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
+    /// <remarks>Fails when the server runs without a configuration file.</remarks>
+    /// <example>
+    /// <code>
+    /// await db.RewriteConfigAsync();
+    /// </code>
+    /// </example>
+    ValueTask RewriteConfigAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>Sends <c>REPLICAOF host port</c>: every shard of the server follows the primary at <paramref name="host"/>:<paramref name="port"/> (shard <c>i</c> dials <c>port + i</c>).</summary>
+    /// <param name="host">The primary's host.</param>
+    /// <param name="port">The primary's base replication port.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
+    /// <remarks>Writes are refused at once. A shard continues from its own log when the new primary's history allows it, otherwise it takes a full copy. Lasts until the server restarts.</remarks>
+    /// <example>
+    /// <code>
+    /// await db.ReplicaOfAsync("10.0.0.5", 26379);
+    /// </code>
+    /// </example>
+    ValueTask ReplicaOfAsync(string host, int port, CancellationToken cancellationToken = default);
+
+    /// <summary>Sends <c>REPLICAOF NO ONE</c>: promotes a replica in place, one epoch above its old primary.</summary>
+    /// <param name="force">Adds <c>FORCE</c>: promote even when a shard has not finished copying its primary, which may lose writes.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
+    /// <example>
+    /// <code>
+    /// await db.ReplicaOfNoOneAsync();
+    /// </code>
+    /// </example>
+    ValueTask ReplicaOfNoOneAsync(bool force = false, CancellationToken cancellationToken = default);
+
+    /// <summary>Sends <c>ROLE</c> for the shard this connection is on.</summary>
+    /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
+    /// <returns>The raw reply: <c>["master", sequence, []]</c> on a primary, <c>["slave", host, port, "connect"|"connected", sequence]</c> on a replica.</returns>
+    /// <example>
+    /// <code>
+    /// RespValue role = await db.GetRoleAsync();
+    /// </code>
+    /// </example>
+    ValueTask<RespValue> GetRoleAsync(CancellationToken cancellationToken = default);
 
     /// <summary>Sends <c>FLUSHDB</c>: deletes every key of the selected database.</summary>
     /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
@@ -3840,7 +4045,7 @@ public partial interface IRuvioClient
         => RespRead.RequiredText(ExecuteAsync(new string[] { "CLIENT", "LIST", "TYPE", Keywords.Word(type) }, cancellationToken), "CLIENT LIST");
 
     /// <summary>Sends <c>CLIENT KILL ID id</c>.</summary>
-    /// <param name="id">The connection id from <see cref="GetClientIdAsync"/> or <see cref="GetClientListAsync"/>.</param>
+    /// <param name="id">The connection id from <see cref="GetClientIdAsync"/> or <see cref="GetClientListAsync(CancellationToken)"/>.</param>
     /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
     /// <returns>The number of connections closed (0 or 1).</returns>
     /// <remarks>Reaches only the shard that got the command.</remarks>

@@ -1,0 +1,76 @@
+# Three Ruvio data nodes and three coordinators that fail the group over automatically.
+# Needs an image with `ruvio coordinator` (the release after 0.3.4, or RUVIO_IMAGE set to one built
+# from this repository); see docs/COORDINATOR.md.
+# Only shard 0 of ruvio-1..3 is published, on 127.0.0.1:6381-6383; the coordinators' Sentinel API on
+# 127.0.0.1:26401-26403. Set RUVIO_COORDINATOR_SECRET (coordinators) and RUVIO_REPLICATION_PASSWORD
+# (replication between data nodes) before `up`; clients need no password here.
+#
+#   export RUVIO_COORDINATOR_SECRET=change-me RUVIO_REPLICATION_PASSWORD=change-me-too
+#   docker compose -f deploy/compose.failover.yml up -d
+#   redis-cli -p 26401 AUTH change-me
+#   redis-cli -p 26401 SENTINEL get-master-addr-by-name main
+#   docker compose -f deploy/compose.failover.yml stop ruvio-1     # watch ruvio-2 or ruvio-3 take over
+name: ruvio-failover
+x-node: &node
+  image: ${RUVIO_IMAGE:-salihcantekin/ruvio:latest}
+  restart: unless-stopped
+  command: ["--shards", "1", "--durability", "everysec"]
+x-node-env: &node-env
+  RUVIO_ALLOW_UNAUTHENTICATED: "true"
+  RUVIO_REPLICATION_LISTEN: 0.0.0.0:26379
+  # A replication listener on a public address needs a password.
+  RUVIO_REPLICATION_PASSWORD: ${RUVIO_REPLICATION_PASSWORD:?set RUVIO_REPLICATION_PASSWORD}
+  # A primary cut off from its replicas stops taking writes after 10 s.
+  RUVIO_MIN_REPLICAS_TO_WRITE: "1"
+  RUVIO_MIN_REPLICAS_MAX_LAG: "10"
+x-coordinator: &coordinator
+  image: ${RUVIO_IMAGE:-salihcantekin/ruvio:latest}
+  restart: unless-stopped
+  environment:
+    RUVIO_COORDINATOR_SECRET: ${RUVIO_COORDINATOR_SECRET:?set RUVIO_COORDINATOR_SECRET}
+services:
+  ruvio-1:
+    <<: *node
+    environment:
+      <<: *node-env
+      RUVIO_REPLICATION_ROLE: primary
+    ports: ["127.0.0.1:6381:6379"]
+    volumes: ["ruvio-1:/data"]
+  ruvio-2:
+    <<: *node
+    environment:
+      <<: *node-env
+      RUVIO_REPLICATION_ROLE: replica
+      RUVIO_REPLICATION_PRIMARY: ruvio-1:26379
+    ports: ["127.0.0.1:6382:6379"]
+    volumes: ["ruvio-2:/data"]
+  ruvio-3:
+    <<: *node
+    environment:
+      <<: *node-env
+      RUVIO_REPLICATION_ROLE: replica
+      RUVIO_REPLICATION_PRIMARY: ruvio-1:26379
+    ports: ["127.0.0.1:6383:6379"]
+    volumes: ["ruvio-3:/data"]
+  coordinator-1:
+    <<: *coordinator
+    command: ["coordinator", "--config", "/etc/ruvio/coordinator.toml"]
+    ports: ["127.0.0.1:26401:26400"]
+    volumes: ["./coordinator/coordinator-1.toml:/etc/ruvio/coordinator.toml:ro", "coordinator-1:/data"]
+  coordinator-2:
+    <<: *coordinator
+    command: ["coordinator", "--config", "/etc/ruvio/coordinator.toml"]
+    ports: ["127.0.0.1:26402:26400"]
+    volumes: ["./coordinator/coordinator-2.toml:/etc/ruvio/coordinator.toml:ro", "coordinator-2:/data"]
+  coordinator-3:
+    <<: *coordinator
+    command: ["coordinator", "--config", "/etc/ruvio/coordinator.toml"]
+    ports: ["127.0.0.1:26403:26400"]
+    volumes: ["./coordinator/coordinator-3.toml:/etc/ruvio/coordinator.toml:ro", "coordinator-3:/data"]
+volumes:
+  ruvio-1:
+  ruvio-2:
+  ruvio-3:
+  coordinator-1:
+  coordinator-2:
+  coordinator-3:

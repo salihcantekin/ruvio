@@ -74,6 +74,7 @@ export const GROUPS = [
       { src: "docs/PORTABILITY.md", label: "Portability" },
       { src: "docs/SUPPORT_MATRIX.md", label: "Support matrix" },
       { src: "docs/IMPORT.md", label: "Import from Redis" },
+      { src: "docs/FAQ.md", label: "FAQ" },
     ],
   },
   {
@@ -81,6 +82,7 @@ export const GROUPS = [
     items: [
       { src: "docs/ARCHITECTURE.md", label: "Architecture" },
       { src: "docs/CONNECTION_MODEL.md", label: "Connection model" },
+      { src: "docs/CLUSTER.md", label: "Cluster and failover" },
       { src: "docs/DATA_TYPES.md", label: "Data types" },
       { src: "docs/LOGICAL_DATABASES.md", label: "Logical databases" },
       { src: "docs/STORAGE_LAYOUT.md", label: "Storage layout" },
@@ -92,8 +94,10 @@ export const GROUPS = [
     label: "Operate",
     items: [
       { src: "docs/RECOVERY.md", label: "Recovery and backup" },
+      { src: "docs/COORDINATOR.md", label: "Automatic failover" },
       { src: "docs/RESILIENCE.md", label: "Resilience tests" },
       { src: "docs/OBSERVABILITY.md", label: "Observability" },
+      { src: "docs/LIMITS.md", label: "Limits" },
       { src: "docs/THREAT_MODEL.md", label: "Threat model" },
       { src: "docs/SUPPLY_CHAIN.md", label: "Supply chain" },
     ],
@@ -195,5 +199,10 @@ export function starlightSidebar() {
     if (item.label) entry.label = item.label;
     return entry;
   };
-  return [{ label: "Overview", slug: "docs" }, ...allGroups().map((g) => ({ label: g.label, items: g.items.map(toEntry) }))];
+  // Pages outside the docs that belong in the menu, by group: the changelog is a marketing page at /changelog/.
+  const extra = { Reference: [{ label: "Changelog", link: "/changelog/" }] };
+  return [
+    { label: "Overview", slug: "docs" },
+    ...allGroups().map((g) => ({ label: g.label, items: [...g.items.map(toEntry), ...(extra[g.label] ?? [])] })),
+  ];
 }

@@ -1,7 +1,7 @@
 # MIT License - Copyright (c) 2026 Salih Cantekin. See LICENSE.
 """asyncio client: ``from ruvio.asyncio import Ruvio``.
 
-Exports :class:`Ruvio`, :class:`ClusterRuvio`, :class:`Pipeline`, :class:`PubSub` and :class:`Lock`. Every
+Exports :class:`Ruvio`, :class:`ClusterRuvio`, :class:`ReadPolicy`, :class:`Pipeline`, :class:`PubSub` and :class:`Lock`. Every
 command method returns an awaitable (``await client.get("k")``); one client is safe to share between
 coroutines.
 
@@ -17,7 +17,8 @@ Example:
     asyncio.run(main())
 """
 
+from .._cluster import ReadPolicy
 from .client import Lock, Pipeline, PubSub, Ruvio
 from .cluster import ClusterRuvio
 
-__all__ = ["Ruvio", "ClusterRuvio", "Pipeline", "PubSub", "Lock"]
+__all__ = ["Ruvio", "ClusterRuvio", "ReadPolicy", "Pipeline", "PubSub", "Lock"]

@@ -6,22 +6,33 @@ import MemoryDumbbell from "../components/charts/MemoryDumbbell.astro";
 import CommandMosaic from "../components/charts/CommandMosaic.astro";
 import RecoveryScale from "../components/charts/RecoveryScale.astro";
 import ScaleBars from "../components/charts/ScaleBars.astro";
-import { platforms, commands, families, fmtOps, fmtX, pct, serverVersion, scale, scaleDeep, scaleEverysec } from "../data/bench";
+import { platforms, scripted, commands, families, fmtOps, fmtX, pct, serverVersion, scale, scaleDeep, scaleEverysec } from "../data/bench";
 import { clients, site } from "../config/site";
 import CodeBlock from "../components/content/CodeBlock.astro";
 
 const jobs = [
   { title: "Caches without stampedes", cmds: ["FILLGET", "FILLSET"], text: "When a hot key expires, one caller refills it while the others wait or get the stale copy.", href: "/use-cases/#cache" },
-  { title: "Locks and leases", cmds: ["LEASE", "RELEASE", "SEMAPHORE"], text: "A named lease returns a fencing token; a semaphore caps holders, each with its own expiry.", href: "/use-cases/#locks" },
+  { title: "Locks and leases", cmds: ["LEASE", "RENEW", "SEMAPHORE"], text: "A named lease returns a fencing token, RENEW keeps a long job's slot, and a semaphore caps holders, each with its own expiry.", href: "/use-cases/#locks" },
   { title: "Conditional writes", cmds: ["SETV", "TAKE", "IDEM"], text: "Versioned writes, stock that cannot go negative, and request replays that return the stored answer.", href: "/use-cases/#versions" },
-  { title: "Rate limits", cmds: ["LIMIT"], text: "A fixed window per key in one call, returning what is left of the allowance.", href: "/use-cases/#rate-limits" },
+  { title: "Rate limits", cmds: ["LIMIT", "SLIDING", "TOKENS"], text: "Fixed window, sliding window or token bucket per key in one call, returning what is left of the allowance.", href: "/use-cases/#rate-limits" },
+  { title: "Balances and counters", cmds: ["TRANSFER", "HTRANSFER", "INCR … EX"], text: "Move an amount between two keys only when the source holds enough, and give a new counter its deadline in the same call.", href: "/use-cases/#balances" },
+  { title: "Due jobs", cmds: ["ZPOPBYSCORE", "ZMOVEDUE"], text: "Take the members of a sorted set whose time has come, or move them to a work list, in one command.", href: "/use-cases/#delayed" },
   { title: "Change feeds", cmds: ["CHANGES"], text: "Read the writes on a shard from a cursor instead of polling keys.", href: "/use-cases/#changes" },
   { title: "Delayed jobs", cmds: ["XADD … DELAY"], text: "A stream entry stays hidden from consumer groups until its delay passes.", href: "/use-cases/#delayed" },
 ];
 
 // The whole-machine section: the commands most applications run, three servers each.
 const popular = ["GET", "SET", "DEL (missing key)", "SETEX", "HSET (existing field)", "HGET", "LPUSH", "ZADD (existing member, same score)", "EXPIRE (key with TTL)", "PUBLISH (no subscribers)"];
+const scriptedPick = ["TRANSFER (enough)", "SET IFGT (random keys, half hit)", "ZPOPBYSCORE COUNT 1", "LIMIT SLIDING (allowed)", "INCR EX 60 (new keys)", "RENEW lease"].map((n) => scripted.rows.find((r) => r.label === n)!);
 const deepGet = scaleDeep.row("GET"), deepSet = scaleDeep.row("SET");
+// The largest gains of one command over the same job as a Lua script, one row per command.
+const topScripted = Object.values(
+  scripted.rows.reduce<Record<string, (typeof scripted.rows)[number]>>((acc, r) => {
+    const name = r.label.replace(/ \(.*\)$/, "").replace(/ COUNT \d+$/, "");
+    if (!/for scale/.test(r.label) && (!acc[name] || acc[name].ratio < r.ratio)) acc[name] = r;
+    return acc;
+  }, {}),
+).sort((a, b) => b.ratio - a.ratio).slice(0, 4);
 
 const steps = [
   { name: "Parse", text: "The connection's shard reads the request." },
@@ -53,6 +64,8 @@ $ redis-cli -a change-me
           <a class="btn ghost" href="/docs/">Read the docs</a>
         </div>
         <ul class="facts">
+          <li><a class="fact-link" href="/benchmarks/#peak"><b>{Math.round(deepGet.ruvio / 1e6)}M</b> GET/SET per second on {scale.shards} shards</a></li>
+          <li><a class="fact-link" href="#scripts">Up to <b>{fmtX(topScripted[0].ratio)}</b> a Lua script, as one command</a></li>
           <li>{commands.length} commands</li>
           <li>{clients.length} first-party clients</li>
           <li>Linux, macOS and Windows builds</li>
@@ -81,6 +94,41 @@ $ redis-cli -a change-me
           </a>
         ))}
       </div>
+    </div>
+  </section>
+
+  <section class="section band" id="scripts">
+    <div class="wrap">
+      <div class="head-row">
+        <div>
+          <p class="kicker">One command instead of a script</p>
+          <h2 class="title">The jobs you would script on Redis are single commands</h2>
+          <p class="lede">Each row is a Ruvio command next to the Lua script that does the same job on Redis {scripted.redisVersion}. Same machine, same load, one request at a time per connection for the latency.</p>
+        </div>
+        <a class="btn ghost" href="/benchmarks/#scripted">All commands and memory</a>
+      </div>
+      <div class="kpis script-kpis">
+        {topScripted.map((r) => (
+          <div><b>{fmtX(r.ratio)}</b><span><code>{r.label.replace(/ \(.*\)$/, "")}</code> against the same job as a Lua script</span></div>
+        ))}
+      </div>
+      <div class="scroll-x">
+        <table class="res">
+          <thead><tr><th>Ruvio command</th><th class="num">Ruvio ops/s</th><th class="num">Redis Lua ops/s</th><th class="num">Ratio</th><th class="num">p99 ms</th></tr></thead>
+          <tbody>
+            {scriptedPick.map((r) => (
+              <tr>
+                <td>{r.label.replace(/ \(.*\)$/, "")}</td>
+                <td class="num">{fmtOps(r.ruvio)}</td>
+                <td class="num dim">{fmtOps(r.redis)}</td>
+                <td class="num">{fmtX(r.ratio)}</td>
+                <td class="num dim">{r.ruvioP99.toFixed(2)} / {r.redisP99.toFixed(2)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p class="source">Source: <a href={`${site.github}/blob/main/${scripted.file}`}>{scripted.file}</a> · {scripted.machine}, in-memory, 1 shard · macOS only, not yet measured on x86 · <a href="/benchmarks/#scripted">how it is measured</a></p>
     </div>
   </section>
 
@@ -159,16 +207,17 @@ $ redis-cli -a change-me
       </div>
       <div class="kpis">
         <div><b>{fmtX(scale.geomeanCluster)}</b><span>geometric mean throughput against the {scale.shards}-node Redis Cluster, {scale.rows.length - 1} commands, pipeline {scale.pipeline}</span></div>
-        <div><b>{fmtX(deepGet.vsCluster)}<em> GET</em></b><span>and {fmtX(deepSet.vsCluster)} SET against the cluster once the client keeps up (pipeline {scaleDeep.pipeline}): {fmtOps(deepGet.ruvio)} and {fmtOps(deepSet.ruvio)} req/s</span></div>
+        <div><b>{Math.round(deepGet.ruvio / 1e6)}M<em> GET/SET</em></b><span>requests per second on {scale.shards} shards once the client keeps up (pipeline {scaleDeep.pipeline}): GET {fmtOps(deepGet.ruvio)}, SET {fmtOps(deepSet.ruvio)}; {fmtX(deepGet.vsCluster)} and {fmtX(deepSet.vsCluster)} the {scale.shards}-node Redis Cluster. <a href="/benchmarks/#peak">What the number means</a></span></div>
         <div><b>{Math.round(deepGet.ruvio / deepGet.redis1)}<em>×</em></b><span>the GETs of one Redis process: one core serves {fmtOps(deepGet.redis1)} req/s, the {scale.shards} shards {fmtOps(deepGet.ruvio)}</span></div>
         <div><b>{fmtX(scale.memGeomeanPerShard)}</b><span>memory per shard against one Redis across {scale.memory.length} data shapes; {fmtX(scaleEverysec.geomeanCluster)} throughput with every write logged (everysec, same as Redis AOF)</span></div>
       </div>
       <div class="scale-chart"><ScaleBars scale={scale} names={popular} /></div>
-      <p class="source">Source: <a href={`${site.github}/blob/main/${scale.file}`}>{scale.file}</a>, <a href={`${site.github}/blob/main/${scaleDeep.file}`}>pipeline {scaleDeep.pipeline}</a> and <a href={`${site.github}/blob/main/${scaleEverysec.file}`}>everysec</a> · Azure F16as_v6, AMD EPYC 9V74, 16 cores · {scale.clients} clients per shard, {scale.rounds} alternating rounds · <a href="/benchmarks/#scale">how it is measured</a></p>
+      <p class="source">Source: <a href={`${site.github}/blob/main/${scale.file}`}>{scale.file}</a>, <a href={`${site.github}/blob/main/${scaleDeep.file}`}>pipeline {scaleDeep.pipeline}</a> and <a href={`${site.github}/blob/main/${scaleEverysec.file}`}>everysec</a> · Azure VM F16as_v6 (AMD EPYC 9V74, virtualized), 16 cores · {scale.clients} clients per shard, {scale.rounds} alternating rounds · <a href="/benchmarks/#scale">how it is measured</a></p>
     </div>
   </section>
 
-  <section class="section" id="architecture">
+
+  <section class="section band" id="architecture">
     <div class="wrap arch">
       <div>
         <p class="kicker">Architecture</p>
@@ -240,6 +289,13 @@ $ redis-cli -a change-me
 </script>
 
 <style>
+  .scroll-x { overflow-x: auto; }
+  .res { width: 100%; border-collapse: collapse; font-size: 15px; }
+  .res th { text-align: left; font-family: var(--f-mono); font-size: 12.5px; font-weight: 500; color: var(--faint); padding: 10px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  .res td { padding: 8px 12px; border-bottom: 1px solid var(--line); }
+  .res .num { text-align: right; font-family: var(--f-mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .res .dim { color: var(--mute); }
+
   .hero { position: relative; isolation: isolate; overflow: hidden; border-bottom: 1px solid var(--line); }
   .hero::before {
     content: ""; position: absolute; inset: 0; z-index: -1;
@@ -252,10 +308,13 @@ $ redis-cli -a change-me
   .hero-in { display: grid; grid-template-columns: minmax(0, 1.08fr) minmax(0, 0.92fr); gap: 56px; align-items: center; padding-block: 88px 112px; }
   .hero-in > * { min-width: 0; }
   .hero h1 { font-size: clamp(36px, 4.8vw, 60px); line-height: 1.06; margin: 0 0 22px; max-width: 17ch; }
-  .hero-lede { font-size: 18.5px; color: var(--mute); max-width: 46ch; margin: 0 0 30px; }
+  .hero-lede { font-size: 19.5px; color: var(--mute); max-width: 46ch; margin: 0 0 30px; }
   .hero-lede code { font-size: 0.9em; }
   .ctas { display: flex; flex-wrap: wrap; gap: 12px; }
-  .facts { display: flex; flex-wrap: wrap; gap: 8px 24px; margin: 30px 0 0; padding: 0; list-style: none; font-size: 14px; color: var(--mute); }
+  .script-kpis { margin-bottom: 24px; }
+  .facts { display: flex; flex-wrap: wrap; gap: 8px 24px; margin: 30px 0 0; padding: 0; list-style: none; font-size: 15px; color: var(--mute); }
+  .fact-link b { color: var(--ink); font-weight: 600; }
+  .fact-link:hover { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
   .facts li::before { content: ""; display: inline-block; width: 4px; height: 4px; background: var(--mute); margin-right: 9px; vertical-align: 3px; }
 
   .job .chips { margin-bottom: 4px; }
@@ -265,13 +324,14 @@ $ redis-cli -a change-me
   .speed > * { min-width: 0; }
   .chart { position: relative; }
   .lists { display: grid; gap: 26px; }
-  .lists h3 { margin: 0 0 8px; font-size: 13px; font-weight: 600; color: var(--mute); letter-spacing: 0; }
+  .lists h3 { margin: 0 0 8px; font-size: 14px; font-weight: 600; color: var(--mute); letter-spacing: 0; }
   .lists ol { list-style: none; margin: 0; padding: 0; }
   .lists li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 14px; padding: 9px 0; border-bottom: 1px solid var(--line); }
-  .lists .n { font-weight: 600; font-size: 14.5px; overflow-wrap: anywhere; }
+  .lists li:hover { background: var(--row-hover); }
+  .lists .n { font-weight: 600; font-size: 15.5px; overflow-wrap: anywhere; }
   .lists .x { font-family: var(--f-mono); font-weight: 500; font-variant-numeric: tabular-nums; }
   .lists .x.lo { color: var(--mute); }
-  .lists .ops { grid-column: 1 / -1; font-family: var(--f-mono); font-size: 12px; color: var(--faint); }
+  .lists .ops { grid-column: 1 / -1; font-family: var(--f-mono); font-size: 13px; color: var(--faint); }
 
   .arch { display: grid; grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr); gap: 48px; align-items: center; }
   .more-link { margin: 18px 0 0; font-weight: 600; }
@@ -281,20 +341,20 @@ $ redis-cli -a change-me
   .shard.focus { opacity: 1; border-color: color-mix(in srgb, var(--c1) 60%, var(--line)); }
   .shard-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 12px; }
   .shard-head span { font-weight: 600; }
-  .shard-head small { font-size: 12px; color: var(--faint); }
+  .shard-head small { font-size: 13px; color: var(--faint); }
   .shard ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 0; counter-reset: s; }
   .shard li { position: relative; padding: 0 0 14px 22px; display: grid; gap: 2px; }
   .shard li::before { content: ""; position: absolute; left: 3px; top: 7px; width: 8px; height: 8px; border-radius: 50%; background: var(--c3); }
   .shard.focus li::before { background: var(--c1); }
   .shard li:not(:last-child)::after { content: ""; position: absolute; left: 6.5px; top: 18px; bottom: 2px; width: 1px; background: var(--line); }
-  .shard li b { font-size: 14px; }
-  .shard li span { font-size: 12.5px; color: var(--mute); line-height: 1.45; }
+  .shard li b { font-size: 15px; }
+  .shard li span { font-size: 13.5px; color: var(--mute); line-height: 1.45; }
 
   .client-row { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; margin-top: 40px; }
   .client { display: grid; gap: 4px; padding: 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); min-width: 0; }
   .client:hover { border-color: color-mix(in srgb, var(--ink) 30%, var(--line)); }
-  .client code { font-size: 11.5px; color: var(--mute); overflow-wrap: anywhere; }
-  .client small { font-size: 12px; color: var(--faint); }
+  .client code { font-size: 12.5px; color: var(--mute); overflow-wrap: anywhere; }
+  .client small { font-size: 13px; color: var(--faint); }
 
   .cta { border-top: 1px solid var(--line); background: linear-gradient(180deg, var(--bg), var(--sky-1)); }
   .cta-in { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 24px; padding-block: 64px; }

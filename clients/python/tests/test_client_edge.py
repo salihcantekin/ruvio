@@ -131,6 +131,31 @@ def test_sync_handshake_runs_on_every_connect(node_factory):
     c.close()
 
 
+def test_sync_durability_option_is_sent_after_the_handshake(node_factory):
+    n = node_factory()
+    c = ruvio.Ruvio(*host_port(n), db=4, client_name="nm", durability_replicas=1, durability_timeout_ms=250)
+    c.ping()
+    assert n.log[1:3] == [["CLIENT", "SETNAME", "nm"], ["CLIENT", "DURABILITY", "REPLICAS", "1", "TIMEOUT", "250"]]
+    c.close()
+    c.ping()  # a reconnect sends it again
+    assert n.log[-2] == ["CLIENT", "DURABILITY", "REPLICAS", "1", "TIMEOUT", "250"]
+    plain = node_factory()
+    d = ruvio.Ruvio(*host_port(plain), durability_replicas=2)
+    d.ping()
+    assert plain.log[0] == ["CLIENT", "DURABILITY", "REPLICAS", "2"]
+    off = node_factory()
+    ruvio.Ruvio(*host_port(off)).ping()
+    assert off.commands("CLIENT") == []  # not set: nothing is sent
+
+
+def test_sync_durability_refused_on_connect_fails_the_connect(node_factory):
+    n = node_factory({"CLIENT DURABILITY": err("ERR CLIENT DURABILITY needs replication on this server")})
+    c = ruvio.Ruvio(*host_port(n), durability_replicas=1)
+    with pytest.raises(ResponseError, match="needs replication"):
+        c.ping()
+    assert c._conn.sock is None
+
+
 def test_sync_handshake_error_closes_the_socket(node_factory):
     n = node_factory({"AUTH": err("WRONGPASS invalid username-password pair")})
     c = ruvio.Ruvio(*host_port(n), password="bad")
@@ -242,6 +267,90 @@ def test_sync_timeout_closes_the_socket_and_the_next_command_reconnects(node_fac
     assert c.ping() is not None
     assert n.connections == 2
     c.close()
+
+
+def test_sync_socket_timeout_defaults_to_thirty_seconds():
+    assert ruvio.Ruvio()._conn.opts.socket_timeout == 30.0
+    assert ruvio.Ruvio(socket_timeout=None)._conn.opts.socket_timeout is None
+
+
+def test_sync_blocking_command_waits_its_own_timeout_on_top(node_factory):
+    def blpop(node, args):
+        time.sleep(1.0)  # an empty list: nil when BLPOP's 1 s runs out
+        return b"*-1\r\n"
+
+    n = node_factory({"BLPOP": blpop})
+    c = ruvio.Ruvio(*host_port(n), socket_timeout=0.2)
+    started = time.monotonic()
+    assert c.blpop("k", 1) is None
+    assert 0.9 <= time.monotonic() - started < 3
+    assert c._conn.sock.gettimeout() == 0.2  # the plain limit is back
+    assert len(c.pipeline().blpop("k", 1).execute()) == 1  # a pipeline gets the wait too
+    assert c._conn.sock.gettimeout() == 0.2
+    c.close()
+
+
+def _enc(*args):
+    return b"*%d\r\n" % len(args) + b"".join(b"$%d\r\n%s\r\n" % (len(a), a.encode()) for a in args)
+
+
+@pytest.mark.parametrize(
+    "args,want",
+    [
+        (("GET", "k"), 0.0),
+        (("SET", "k", "v"), 0.0),
+        (("blpop", "a", "b", "1"), 1.0),
+        (("BLPOP", "k", "0"), -1.0),
+        (("BLPOP", "k", "0.5"), 0.5),
+        (("BLPOP", "k", "soon"), -1.0),
+        (("BLPOP", "k", "-1"), -1.0),
+        (("BRPOP", "k", "2"), 2.0),
+        (("BZPOPMIN", "k", "1.5"), 1.5),
+        (("BZPOPMAX", "k", "3"), 3.0),
+        (("BRPOPLPUSH", "a", "b", "4"), 4.0),
+        (("BLMOVE", "a", "b", "LEFT", "RIGHT", "0.25"), 0.25),
+        (("BLMPOP", "2", "2", "a", "b", "LEFT"), 2.0),
+        (("BZMPOP", "0", "1", "z", "MIN"), -1.0),
+        (("XREAD", "STREAMS", "s", "$"), 0.0),
+        (("XREAD", "COUNT", "1", "BLOCK", "700", "STREAMS", "s", "$"), 0.7),
+        (("XREAD", "BLOCK", "0", "STREAMS", "s", "$"), -1.0),
+        (("XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"), 0.0),
+        (("XREADGROUP", "GROUP", "BLOCK", "c", "STREAMS", "s", ">"), 0.0),
+        (("XREADGROUP", "GROUP", "g", "c", "BLOCK", "50", "STREAMS", "s", ">"), 0.05),
+        (("WAIT", "1", "100"), 0.1),
+        (("WAIT", "1", "0"), -1.0),
+        (("WAITAOF", "1", "0", "200"), 0.2),
+        (("FILLGET", "k", "1000"), 0.0),
+        (("FILLGET", "k", "1000", "WAIT", "300"), 0.3),
+        (("FILLGET", "k", "1000", "WAIT", "0"), -1.0),
+        (("MONITOR",), -1.0),
+        (("SUBSCRIBE", "news"), -1.0),
+        (("PSUBSCRIBE", "n*"), -1.0),
+        (("SSUBSCRIBE", "news"), -1.0),
+        (("PUBLISH", "news", "x"), 0.0),
+        (("BLPOP",), -1.0),
+    ],
+)
+def test_blocking_wait_table(args, want):
+    from ruvio._blocking import FOREVER, blocking_wait, frames_wait
+
+    assert FOREVER == -1.0
+    assert blocking_wait(_enc(*args)) == want
+    assert frames_wait(_enc(*args)) == want
+
+
+def test_blocking_wait_pipelines():
+    from ruvio._blocking import FOREVER, blocking_wait, frames_wait, pipeline_wait
+
+    frames = [_enc("GET", "k"), _enc("BLPOP", "k", "2"), _enc("XREAD", "BLOCK", "100", "STREAMS", "s", "$")]
+    assert pipeline_wait(frames) == 2.0
+    assert frames_wait(b"".join(frames)) == 2.0
+    assert pipeline_wait([_enc("BLPOP", "k", "2"), _enc("BLPOP", "k", "0")]) == FOREVER
+    assert frames_wait(_enc("BLPOP", "k", "2") + _enc("BLPOP", "k", "0")) == FOREVER
+    assert pipeline_wait([_enc("GET", "k")]) == 0.0
+    assert blocking_wait(b"garbage") == 0.0
+    assert frames_wait(b"garbage") == 0.0
+    assert blocking_wait(ruvio._resp.encode("BLPOP", ("k", 1.5))) == 1.5
 
 
 def test_sync_server_closes_connection_mid_command(node_factory):
@@ -696,6 +805,26 @@ def test_sync_pubsub_connection_loss_and_resubscribe(node_factory):
 
 
 # --------------------------------------------------------------------------- asyncio: connecting
+
+
+async def test_async_durability_option_is_sent_after_the_handshake(node_factory):
+    n = node_factory()
+    c = ruvio.asyncio.Ruvio(*host_port(n), client_name="nm", durability_replicas=1, durability_timeout_ms=250)
+    await c.ping()
+    assert n.log[:2] == [["CLIENT", "SETNAME", "nm"], ["CLIENT", "DURABILITY", "REPLICAS", "1", "TIMEOUT", "250"]]
+    await c.aclose()
+    await c.ping()
+    assert n.log[-2] == ["CLIENT", "DURABILITY", "REPLICAS", "1", "TIMEOUT", "250"]
+    plain = node_factory()
+    d = ruvio.asyncio.Ruvio(*host_port(plain), durability_replicas=2)
+    await d.ping()
+    assert plain.log[0] == ["CLIENT", "DURABILITY", "REPLICAS", "2"]
+    await d.aclose()
+    refused = node_factory({"CLIENT DURABILITY": err("ERR CLIENT DURABILITY needs replication on this server")})
+    e = ruvio.asyncio.Ruvio(*host_port(refused), durability_replicas=1)
+    with pytest.raises(ResponseError, match="needs replication"):
+        await e.ping()
+    await c.aclose()
 
 
 async def test_async_handshake_and_reconnect(node_factory):

@@ -1,8 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
-    <Version>0.1.1</Version>
-    <Description>Distributed mutual-exclusion locks for Ruvio, plus an ASP.NET Core [RuvioLock] endpoint attribute that serialises requests per resource, cancels them when the lock is lost and reports metrics.</Description>
+    <Version>0.2.0</Version>
+    <Description>Distributed mutual-exclusion locks for Ruvio with optional fencing tokens, a one-instance hosted service, plus an ASP.NET Core [RuvioLock] endpoint attribute that serialises requests per resource, cancels them when the lock is lost and reports metrics.</Description>
     <PackageId>Ruvio.AspNetCore.DistributedLock</PackageId>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageTags>ruvio;aspnetcore;lock;distributed-lock;leader-election</PackageTags>
@@ -12,6 +12,9 @@
   </PropertyGroup>
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <Compile Include="../Common/RuvioStartupChecks.cs" Link="Common/RuvioStartupChecks.cs" />
+    <Compile Include="../Common/RuvioOutageLog.cs" Link="Common/RuvioOutageLog.cs" />
+    <Compile Include="../Common/RuvioEndpointCheck.cs" Link="Common/RuvioEndpointCheck.cs" />
         <ProjectReference Include="../../../clients/csharp/Ruvio.Client/Ruvio.Client.csproj" />
     <None Include="README.md" Pack="true" PackagePath="/" />
     <None Include="../../../brand/ruvio-icon-square.png" Pack="true" PackagePath="ruvio-icon.png" />

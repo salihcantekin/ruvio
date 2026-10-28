@@ -51,6 +51,11 @@ impl SlowLog {
         self.entries.iter().take(count)
     }
 
+    /// Drops the oldest entries past `max_len` (`CONFIG SET slowlog-max-len`).
+    pub fn trim(&mut self, max_len: usize) {
+        self.entries.truncate(max_len);
+    }
+
     pub fn reset(&mut self) {
         self.entries.clear();
     }

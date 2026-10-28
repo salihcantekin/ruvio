@@ -22,6 +22,13 @@ test('strings', { skip: SKIP }, async () => {
     // SET IFEQ
     assert.equal(await c.set('s', 'z', { ifEq: 'nope' }), null);
     assert.equal(await c.set('s', 'z', { ifEq: 'y', px: 5000 }), 'OK');
+    // SET IFGT / IFLT
+    assert.equal(await c.set('wm', 10, { ifGt: true }), 'OK');
+    assert.equal(await c.set('wm', 10, { ifGt: true }), null);
+    assert.equal(await c.set('wm', 11, { ifGt: true, px: 5000 }), 'OK');
+    assert.equal(await c.set('wm', 12, { ifLt: true }), null);
+    assert.equal(await c.set('wm', -1, { ifLt: true }), 'OK');
+    assert.equal(await c.get('wm'), '-1');
     assert.equal(await c.get('s'), 'z');
     // binary safety
     const bin = Buffer.from([0, 1, 2, 255, 13, 10]);
@@ -80,6 +87,16 @@ test('strings', { skip: SKIP }, async () => {
     assert.equal(await c.take('stock', 3), 7);
     assert.equal(await c.take('stock', 30), null);
     assert.equal(await c.take('nostock', 1), null);
+
+    await c.set('{w}a', 10);
+    assert.deepEqual(await c.transfer('{w}a', '{w}b', 4), [6, 4]);
+    assert.equal(await c.transfer('{w}a', '{w}b', 7), null);
+    assert.equal(await c.transfer('{w}a', '{w}b', 3, 6), null);
+    assert.deepEqual(await c.transfer('{w}a', '{w}b', 2, 6), [4, 6]);
+    await assert.rejects(c.transfer('{w}a', '{w}a', 1));
+    await c.hset('th', { f: 10 });
+    assert.deepEqual(await c.htransfer('th', 'f', 'g', 4), [6, 4]);
+    assert.equal(await c.htransfer('th', 'f', 'g', 3, 5), null);
     // errors
     await c.hset('h', 'f', 'v');
     const e = await rejects(c.get('h'));
@@ -148,6 +165,13 @@ test('LIMIT, ONCE, LEASE, SEMAPHORE, RELEASE, IDEM, CHANGES and their helpers', 
     assert.equal(await c.limit('lim', 2, 5000), null);
     assert.deepEqual(await c.rateLimit('rl', 1, 5000), { allowed: true, remaining: 0 });
     assert.deepEqual(await c.rateLimit('rl', 1, 5000), { allowed: false, remaining: 0 });
+    assert.equal(await c.limitSliding('sl', 2, 60000), 1);
+    assert.equal(await c.limitSliding('sl', 2, 60000), 0);
+    const refused = await c.limitSlidingWithRetry('sl', 2, 60000);
+    assert.ok(!refused.allowed && refused.remaining === 0 && refused.retryAfterMs > 0);
+    assert.equal(await c.limitTokens('tk', 5, 60000, 2), 3);
+    assert.deepEqual(await c.limitTokensWithRetry('tk', 5, 60000, 3), { allowed: true, remaining: 0, retryAfterMs: 0 });
+    assert.equal(await c.limitTokens('tk', 5, 60000), null);
 
     assert.equal(await c.once('o', 5000), true);
     assert.equal(await c.once('o', 5000), false);
@@ -156,7 +180,10 @@ test('LIMIT, ONCE, LEASE, SEMAPHORE, RELEASE, IDEM, CHANGES and their helpers', 
     assert.equal(typeof t1, 'number');
     assert.equal(await c.lease('le', 5000), null);
     assert.equal(await c.release('le', t1! + 100), false);
+    assert.equal(await c.renew('le', t1! + 100, 5000), false);
+    assert.equal(await c.renew('le', t1!, 9000), true);
     assert.equal(await c.release('le', t1!), true);
+    assert.equal(await c.renew('le', t1!, 9000), false);
     const lease = await c.acquireLease('le', 5000);
     assert.ok(lease && lease.token > t1!);
     assert.equal(await c.acquireLease('le', 5000), null);
@@ -170,6 +197,8 @@ test('LIMIT, ONCE, LEASE, SEMAPHORE, RELEASE, IDEM, CHANGES and their helpers', 
     const s1 = await c.semaphore('sem', 2, 5000);
     const s2 = await c.semaphore('sem', 2, 5000);
     assert.ok(s1 && s2 && s1 !== s2);
+    assert.equal(await c.semaphore('sem', 2, 5000), null);
+    assert.equal(await c.renew('sem', s1!, 9000), true);
     assert.equal(await c.semaphore('sem', 2, 5000), null);
     assert.equal(await c.release('sem', s1!), true);
     const permit = await c.acquireSemaphore('sem', 2, 5000);
@@ -197,6 +226,24 @@ test('LIMIT, ONCE, LEASE, SEMAPHORE, RELEASE, IDEM, CHANGES and their helpers', 
     assert.deepEqual(r2, { result: 'charged', replayed: true });
     assert.equal(calls, 1);
     await assert.rejects(c.idempotent('idem2', 'fp-other', 10000, () => 'x'), { name: 'IdempotencyConflictError' });
+
+    // ABORT frees a pending record, never a completed one, and only for its owner
+    assert.equal((await c.idemBegin('idem-abort', 'fp', 'o1', 10000)).state, 'acquired');
+    assert.equal(await c.idemAbort('idem-abort', 'fp', 'o2'), false);
+    assert.equal(await c.idemAbort('idem-abort', 'other', 'o1'), false);
+    assert.equal(await c.idemAbort('idem-abort', 'fp', 'o1'), true);
+    assert.equal((await c.idemBegin('idem-abort', 'fp', 'o2', 10000)).state, 'acquired');
+    assert.equal(await c.idemComplete('idem-abort', 'fp', 'o2', 'kept'), 1);
+    assert.equal(await c.idemAbort('idem-abort', 'fp', 'o2'), false);
+    assert.deepEqual(await c.idemBegin('idem-abort', 'fp', 'o3', 10000), { state: 'completed', result: 'kept' });
+    // the helper flag frees the key after a failing fn; without it the key stays pending
+    const boom = async (): Promise<string> => {
+      throw new Error('boom');
+    };
+    await assert.rejects(c.idempotent('idem-flag', 'fp', 10000, boom, { abortOnError: true }), { message: 'boom' });
+    assert.deepEqual(await c.idempotent('idem-flag', 'fp', 10000, () => 'again'), { result: 'again', replayed: false });
+    await assert.rejects(c.idempotent('idem-keep', 'fp', 10000, boom), { message: 'boom' });
+    await assert.rejects(c.idempotent('idem-keep', 'fp', 10000, () => 'x'), { name: 'IdempotencyPendingError' });
 
     // CHANGES
     const cur = await c.changesStart();
@@ -348,6 +395,61 @@ test('bitmaps and hyperloglog', { skip: SKIP }, async () => {
     assert.equal(await c.pfcount('hll', 'hll2'), 4);
     assert.equal(await c.pfmerge('hll3', 'hll', 'hll2'), 'OK');
     assert.equal(await c.pfcount('hll3'), 4);
+  } finally {
+    await c.quit();
+  }
+});
+
+test('ttl on create: the deadline is set once and kept', { skip: SKIP }, async () => {
+  const c = await live(1);
+  try {
+    const within = async (key: string, lo: number, hi: number) => {
+      const t = await c.pttl(key);
+      assert.ok(t > lo && t <= hi, `${key} pttl ${t}`);
+    };
+    await c.incr('t:incr', { ttl: 100 });
+    await within('t:incr', 90_000, 100_000);
+    await c.incr('t:incr', { ttl: 5000 }); // existing key keeps its deadline
+    await within('t:incr', 90_000, 100_000);
+    await c.decr('t:decr', { ttl: 100 });
+    await within('t:decr', 90_000, 100_000);
+    assert.equal(await c.incrby('t:by', 3, { ttl: 100 }), 3);
+    assert.equal(await c.decrby('t:dby', 3, { ttl: 0.5 }), -3);
+    await within('t:dby', 0, 500);
+    assert.equal(await c.incrbyMax('t:max', 2, 10, { ttl: 100 }), 2);
+    await within('t:max', 90_000, 100_000);
+    assert.equal(await c.incrbyfloat('t:f', 1.5, { ttl: 100 }), 1.5);
+    await within('t:f', 90_000, 100_000);
+    assert.equal(await c.setbit('t:bit', 7, 1, { ttl: 100 }), 0);
+    await within('t:bit', 90_000, 100_000);
+    await c.setbit('t:bit', 8, 1, { ttl: 5000 });
+    await within('t:bit', 90_000, 100_000);
+    // a non-positive TTL never reaches the server
+    assert.ok((await rejects(c.incr('t:bad', { ttl: 0 }))) instanceof RangeError);
+    assert.equal(await c.exists('t:bad'), 0);
+  } finally {
+    await c.quit();
+  }
+});
+
+test('EXPIRE conditions', { skip: SKIP }, async () => {
+  const c = await live(1);
+  try {
+    await c.set('e', 'v');
+    assert.equal(await c.expire('e', 100, 'XX'), false); // no deadline yet
+    assert.equal(await c.expire('e', 100, 'LT'), true); // no deadline counts as infinite
+    assert.equal(await c.expire('e', 100, 'NX'), false); // has a deadline now
+    assert.equal(await c.expire('e', 50, 'GT'), false);
+    assert.equal(await c.expire('e', 200, 'GT'), true);
+    assert.equal(await c.pexpire('e', 300_000, 'GT'), true);
+    assert.equal(await c.pexpire('e', 400_000, 'LT'), false);
+    const now = Date.now();
+    assert.equal(await c.pexpireat('e', now + 100_000, 'LT'), true);
+    assert.equal(await c.expireat('e', Math.floor(now / 1000) + 500, 'LT'), false);
+    assert.equal(await c.expireat('e', Math.floor(now / 1000) + 50, 'LT'), true);
+    assert.equal(await c.expire('missing', 10, 'NX'), false);
+    const t = await c.pttl('e');
+    assert.ok(t > 0 && t <= 51_000, `pttl ${t}`);
   } finally {
     await c.quit();
   }

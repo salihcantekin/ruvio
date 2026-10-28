@@ -67,6 +67,83 @@ public class RegistrationTests
     }
 
     [Fact]
+    public void AddRuvioClientKeepsTlsOffUnlessAskedFor()
+    {
+        RuvioClientOptions options = Bind(new Dictionary<string, string?>
+        {
+            ["TlsServerName"] = "cache.internal",
+        });
+
+        Assert.Null(options.Tls);
+    }
+
+    [Fact]
+    public void AddRuvioClientBindsTheTlsSettings()
+    {
+        string caFile = Path.Combine(Path.GetTempPath(), $"ruvio-ca-{Guid.NewGuid():N}.pem");
+
+        try
+        {
+            using var key = System.Security.Cryptography.ECDsa.Create();
+            var request = new System.Security.Cryptography.X509Certificates.CertificateRequest(
+                "CN=test ca",
+                key,
+                System.Security.Cryptography.HashAlgorithmName.SHA256);
+            using var ca = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
+
+            File.WriteAllText(caFile, ca.ExportCertificatePem());
+
+            RuvioClientOptions options = Bind(new Dictionary<string, string?>
+            {
+                ["Tls"] = "true",
+                ["TlsServerName"] = "cache.internal",
+                ["TlsCaFile"] = caFile,
+                ["TlsInsecureSkipVerify"] = "false",
+            });
+
+            Assert.NotNull(options.Tls);
+            Assert.Equal("cache.internal", options.Tls.ServerName);
+            Assert.False(options.Tls.InsecureSkipVerify);
+            Assert.Single(options.Tls.TrustedCertificates!);
+            Assert.Null(options.Tls.ClientCertificates);
+        }
+        finally
+        {
+            File.Delete(caFile);
+        }
+    }
+
+    private static RuvioClientOptions Bind(Dictionary<string, string?> values)
+    {
+        IConfiguration configuration = new ConfigurationBuilder().AddInMemoryCollection(values).Build();
+        var services = new ServiceCollection();
+
+        services.AddRuvioClient(configuration);
+        using ServiceProvider provider = services.BuildServiceProvider();
+
+        return provider.GetRequiredService<IOptions<RuvioClientOptions>>().Value;
+    }
+
+    [Fact]
+    public void AddRuvioClientBindsTheSeedList()
+    {
+        IConfiguration configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["Seeds:0"] = "10.1.2.3:6379",
+                ["Seeds:1"] = "[::1]:6380",
+            })
+            .Build();
+        var services = new ServiceCollection();
+
+        services.AddRuvioClient(configuration);
+        using ServiceProvider provider = services.BuildServiceProvider();
+        RuvioClientOptions options = provider.GetRequiredService<IOptions<RuvioClientOptions>>().Value;
+
+        Assert.Equal(["10.1.2.3:6379", "[::1]:6380"], options.Seeds);
+    }
+
+    [Fact]
     public void AddRuvioClientBindsReconnectSettings()
     {
         IConfiguration configuration = new ConfigurationBuilder()

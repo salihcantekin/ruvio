@@ -211,9 +211,21 @@ public class CacheEdgeTests
         Assert.Equal("hit"u8.ToArray(), await cache.GetOrCreateAsync("k", factory, new()));
         Assert.Equal(0, built);
 
-        script.Replies.Enqueue(Fill("STALE", Envelope(0, 0, "stale"), Resp.Int(5)));
+        // STALE without a token: another caller refreshes it, this one gets the stale value at once.
+        script.Replies.Enqueue(Fill("STALE", Envelope(0, 0, "stale"), Resp.Null()));
         Assert.Equal("stale"u8.ToArray(), await cache.GetOrCreateAsync("k", factory, new()));
         Assert.Equal(0, built);
+
+        // STALE with a token: this caller refreshes it and stores the new value with FILLSET under that token.
+        script.Commands.Clear();
+        script.Replies.Enqueue(Fill("STALE", Envelope(0, 0, "stale"), Resp.Int(5)));
+        script.Replies.Enqueue(Resp.Int(1));
+        script.Replies.Enqueue(Resp.Int(1));
+        Assert.Equal(new byte[] { 7 }, await cache.GetOrCreateAsync("k", factory, new()));
+        Assert.Equal(1, built);
+        Assert.Equal(["FILLGET", "FILLSET", "PERSIST"], script.Commands.Select(c => c[0]));
+        Assert.Equal("5", script.Commands[1][4]);
+        built = 0;
 
         // An expired hit falls through; the state is not FILL, so the value is stored with a plain SET.
         script.Commands.Clear();

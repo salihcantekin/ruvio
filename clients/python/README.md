@@ -27,11 +27,11 @@ dependencies and needs Python 3.9 or newer. It ships type information (`py.typed
 - `ruvio.Ruvio` is the synchronous client. It uses one socket and a reusable `recv_into` buffer.
 - `ruvio.asyncio.Ruvio` is the asyncio client. It keeps one multiplexed, pipelined connection
   that all coroutines share.
-- There is a typed method for each of the **287** commands in `docs/compatibility-matrix.json`.
+- There is a typed method for each of the **299** commands in `docs/compatibility-matrix.json`.
   The methods also cover the options that change Ruvio's behaviour: `SET … IFEQ`,
   `INCRBY … MAX`, `FILLGET … WAIT`, `FILLSET … SWR`, `GETEX` in milliseconds,
   `DELEX key IFEQ v`, `LPUSHCAP`/`RPUSHCAP`, `BF.*`, `JSON.*` (including `JSON.INDEX` and
-  `JSON.FIND`), `IDEM BEGIN/COMPLETE`, `LEASE`/`RELEASE`, `SEMAPHORE`, `ONCE`, `TAKE`, `SETV`,
+  `JSON.FIND`), `IDEM BEGIN/COMPLETE/ABORT`, `LEASE`/`RELEASE`, `SEMAPHORE`, `ONCE`, `TAKE`, `TRANSFER`/`HTRANSFER`, `SETV`,
   `CHANGES`, `LIMIT` and `XADD … DELAY`.
 - Pipelines, MULTI/EXEC transactions, Pub/Sub on a dedicated connection, and RESP3 through
   `HELLO 3`, including push messages.
@@ -57,6 +57,7 @@ r = ruvio.Ruvio("127.0.0.1", 6379, db=0)        # or ruvio.Ruvio.from_url("ruvio
 r.set("greeting", "hello", px=60_000)            # True
 r.get("greeting")                                # 'hello'  (None when missing)
 r.set("greeting", "hi", ifeq="hello")            # Ruvio: write only if the value matches
+r.set("watermark", 1700000000, ifgt=True)         # Ruvio: write only if greater than the stored number (iflt for smaller)
 r.incrby("stock", 5, max=100)                    # Ruvio: None (nothing written) past the limit
 r.delex("greeting", "hi")                        # Ruvio: delete only if the value matches
 r.raw.get("greeting")                            # bytes, on the same connection
@@ -88,14 +89,16 @@ you want `bytes`.
 Server errors raise `ruvio.ResponseError` or a more specific class: `WrongTypeError`,
 `NoScriptError`, `NoGroupError`, `BusyError`, `ExecAbortError` or `MovedError`. Each one has
 a `.code` such as `"WRONGTYPE"`. Socket problems raise `ruvio.ConnectionError` or
-`ruvio.TimeoutError`.
+`ruvio.TimeoutError`. `socket_timeout` is 30 seconds by default on the sync and the asyncio client (`None` waits
+forever; on expiry the waiting commands fail and the connection is closed, and the next command opens it again); a blocking command such as `blpop(key, 5)` gets its own wait on top, and `0` (wait forever)
+has no limit. See [Timeouts](../README.md#timeouts).
 
 For any other command, `execute_command("CMD", arg, …)` sends it as written and returns the
 raw reply.
 
 ### Typed keyword constants
 
-Keyword arguments have `str` enums: `GeoUnit` (`m`, `km`, `ft`, `mi`), `GeoOrder`, `InsertPosition`, `ListSide`, `BitOperation`, `BitUnit`, `Aggregate`, `KeyType` (for `SCAN TYPE`), and for `BITFIELD` `BitFieldOp`, `Overflow`, `signed(bits)` / `unsigned(bits)`. A member is a `str`, so plain strings keep working and send the same bytes; the encoder uses each member's pre-encoded bytes, with no per-call cost.
+Keyword arguments have `str` enums: `GeoUnit` (`m`, `km`, `ft`, `mi`), `GeoOrder`, `InsertPosition`, `ListSide`, `ExpireCondition`, `BitOperation`, `BitUnit`, `Aggregate`, `KeyType` (for `SCAN TYPE`), and for `BITFIELD` `BitFieldOp`, `Overflow`, `signed(bits)` / `unsigned(bits)`. A member is a `str`, so plain strings keep working and send the same bytes; the encoder uses each member's pre-encoded bytes, with no per-call cost.
 
 ```python
 from ruvio import GeoUnit, GeoOrder, KeyType, ListSide
@@ -112,6 +115,22 @@ from ruvio import StreamTrim, TrimMode
 
 r.xadd("events", {"type": "signup"}, trim=StreamTrim.maxlen(10_000, TrimMode.APPROXIMATE))  # MAXLEN ~ 10000
 r.xtrim("events", trim=StreamTrim.minid("1700000000000-0"))                                 # MINID = ...
+```
+
+### TTL on create
+
+Commands that can create a key take an optional keyword-only `ttl` (seconds as `int` or `float`, or a `timedelta`): `incr`, `decr`, `incrby`, `decrby`, `incrbyfloat`, `hincrby`, `zincrby`, `setbit`, `zadd`, `geoadd`, `xadd`, `json_set`, `json_set_obj` and `bf_insert`. The deadline is set only when the call creates the key; an existing key keeps the deadline it has. Whole seconds are sent as `EX`, a sub-second part as `PX`. Zero, negative or non-numeric values raise before anything is sent.
+
+```python
+r.incr("rate:user:7", ttl=60)                      # the 60 s window starts on the first call
+r.incrby("quota:day", 1, max=100, ttl=86400)       # counter with a ceiling and a daily window
+r.zadd("recent", {"a": 1}, ttl=timedelta(hours=1))
+```
+
+`expire`, `pexpire`, `expireat` and `pexpireat` take `condition=` (`ExpireCondition.NX`, `XX`, `GT` or `LT`, or the string). A key without a deadline counts as infinite; a failed condition returns `False`.
+
+```python
+r.expire("session", 3600, condition=ExpireCondition.NX)   # only when the key has no deadline yet
 ```
 
 ### Pipelines and transactions
@@ -159,8 +178,11 @@ to `on_push=callback` and never reach a command's reply.
 | `r.lease_scope(key, ttl_ms)` | `LEASE` / `RELEASE` | Yields the fencing token and releases it on exit |
 | `r.semaphore_scope(key, max, ttl_ms)` | `SEMAPHORE` / `RELEASE` | Raises `LockError` when full |
 | `r.rate_limit(key, max, window_ms)` | `LIMIT` | `(allowed, remaining)` |
+| `r.limit_sliding(key, max, window_ms)`, `r.limit_tokens(key, capacity, refill_ms, cost=1)` | `LIMIT ... SLIDING`, `LIMIT ... TOKENS` | remaining, or `None` |
+| `r.limit_sliding_with_retry(...)`, `r.limit_tokens_with_retry(...)` | `LIMIT ... WITHRETRY` | `(allowed, remaining, retry_after_ms)` |
 | `r.get_or_create(key, factory, ttl_ms, fill_ms=…, swr_ms=…)` | `FILLGET` / `FILLSET` | Exactly one caller runs `factory` (sync or async). Waiters poll plain `FILLGET` with backoff from 5 ms up to 100 ms instead of `WAIT`, which would park the shared connection |
-| `r.idempotent(key, fingerprint, ttl_ms, fn)` | `IDEM BEGIN` / `COMPLETE` | `("executed", result)`, `("completed", stored)`, `("pending", None)` or `("conflict", None)` |
+| `r.idempotent(key, fingerprint, ttl_ms, fn, abort_on_error=False)` | `IDEM BEGIN` / `COMPLETE` (+ `ABORT`) | `("executed", result)`, `("completed", stored)`, `("pending", None)` or `("conflict", None)`. If `fn` raises the record stays pending until `ttl_ms`; with `abort_on_error=True` it sends `IDEM ABORT` first, so a retry runs `fn` again at once, and the original exception still propagates (a failed abort is ignored). Use it only when a failed `fn` did not take effect or is safe to run again |
+| `r.idem_abort(key, fingerprint, owner)` | `IDEM ABORT` | `True` when the pending record of that owner and fingerprint was removed; `False` for a missing key, a completed record (its result is never removed) or another owner. Abort only when the work did not take effect or is safe to run again; a retry after an abort runs it again |
 | `r.scan_iter()` / `hscan_iter` / `sscan_iter` / `zscan_iter` | `SCAN` family | Lazy and driven by the cursor; async iterators on the asyncio client |
 | `r.json_set_obj` / `json_get_obj` / `json_mget_obj` | `JSON.SET` / `JSON.GET` / `JSON.MGET` | Uses the standard `json` module |
 | `r.push_recent(key, value, keep)` | `LPUSHCAP` | Newest first, keeps at most `keep` items |
@@ -262,6 +284,13 @@ Behaviour worth knowing:
   the table points that one slot at it; a node that is not in the table, or a second `MOVED` for
   the same command, re-reads `CLUSTER SLOTS`. `MOVED` means the command was not executed, so
   following it is safe.
+- **`-ASK`**: `ASKING` and the command are sent in one write to the node the reply names (a node
+  that is not in the table gets a connection), and its reply is returned. The slot table is not
+  changed, so the next command for that slot still goes to the table's owner. `ASK` and `MOVED`
+  share the budget of 3 redirects per command; an error reply to `ASKING` is the result.
+- **`-TRYAGAIN`**: the command is sent again, routed by the current table, at most **7 times**,
+  after 5, 10, 20, 40, 80, 160 and 320 ms (635 ms in all; `asyncio.sleep` in the asyncio client); an
+  eighth `TRYAGAIN` is raised. Redirects during the retries are followed with their own budget.
 - **No replay after transport failures.** A dropped node socket fails the command that saw it
   (`ConnectionError`), is closed, and is reopened by the next command for that node. Other nodes
   are not affected. A pipeline/split call that touched several nodes still reads every healthy
@@ -294,6 +323,143 @@ Short benchmark (`RUVIO_TEST_ADDR` plain 1-shard server vs `RUVIO_CLUSTER_ADDR` 
 coroutine: the node connection's pending-reply future is returned directly, and only a `MOVED`
 reply is intercepted.
 
+## Reads from replicas
+
+`read_policy=` on a cluster client (sync and asyncio) sends reads to a replica of the key's shard. It takes
+`ReadPolicy.PRIMARY` (default: nothing changes), `ReadPolicy.PREFER_REPLICA` or `ReadPolicy.REPLICA`, or the
+strings `"primary"`, `"prefer-replica"` and `"replica"`. A standalone server ignores it.
+
+```python
+from ruvio import ClusterRuvio, ReadPolicy
+
+client = ClusterRuvio("127.0.0.1", 7000, read_policy=ReadPolicy.PREFER_REPLICA)
+client.set("user:1", "Ada")   # primary
+client.get("user:1")          # a replica; may not have the write yet
+```
+
+- Replication is asynchronous: a read from a replica may miss a recent write, including your own.
+- A read is a command the server flags read-only and not blocking (`GET`, `MGET`, `EXISTS`, `HGETALL`,
+  `ZRANGE` ...). Writes, keyless commands, transactions (`MULTI`/`EXEC`/`WATCH`), blocking commands, scripts,
+  Pub/Sub, `SCAN` and the commands sent to every node stay on the primaries. A multi-key command split over
+  several slots decides per part: `MGET` and `EXISTS` parts read from replicas, `DEL` and `MSET` parts go to primaries.
+- A pipeline goes to replicas only when every command in it is a read; a pipeline with a write is routed as before.
+- When the slot table loads, the client picks one replica per shard at random and keeps it until the next load.
+  Each replica connection sends `READONLY` right after it opens. With the default policy no replica connection
+  is opened and routing does one extra comparison.
+- A replica that cannot be connected, or answers `LOADING` (still copying its primary), is skipped until the
+  next slot table load. `PREFER_REPLICA` then reads from the primary (a `LOADING` read is sent again there);
+  `REPLICA` raises (`ConnectionError`, or the `LOADING` `ResponseError`), and a `RuvioError` saying "no replica"
+  when none is known. A socket that drops after a command was sent fails the command, as for every node.
+
+## Durable replies
+
+`durability_replicas=n` (and optionally `durability_timeout_ms=`) on `Ruvio`, `asyncio.Ruvio` and the cluster
+clients sends `CLIENT DURABILITY REPLICAS n [TIMEOUT ms]` right after the handshake of every connection,
+reconnects included. The server then holds each reply until `n` replicas have the writes on disk; on a timeout
+(default 5000 ms) the replies of that batch are `-NOREPLICAS` errors and the writes stay applied. A server
+without replication refuses it and the connect fails. Without the option nothing is sent.
+`client.client_durability(n, timeout_ms=None)` sets it on the current connection only (`0` turns it off).
+
+```python
+r = Ruvio("127.0.0.1", 6379, durability_replicas=1, durability_timeout_ms=5000)
+```
+
+## Seed addresses
+
+`seeds=` takes the place of `host`/`port` (both clients, plain and `cluster=True`): `"host:port"` strings
+(IPv6 as `"[::1]:6379"`) or `(host, port)` tuples. Without it nothing changes.
+
+```python
+from ruvio import Ruvio
+
+client = Ruvio(seeds=["10.0.0.1:6379", ("10.0.0.2", 6379), "[::1]:6379"])
+```
+
+- Connecting tries the seeds in order, one connect attempt each, and keeps the first that answers. A seed
+  that cannot be reached is skipped; a refused `AUTH` or `SELECT` raises at once. When none answers, the
+  last `ConnectionError` is raised.
+- After a dropped connection the command that hit the drop still raises. The next reconnect tries every seed
+  once, starting with the seed after the one that dropped and ending with it. A `pubsub()` session opened
+  later starts at the address the command connection is on.
+- With `cluster=True`, `CLUSTER SLOTS` comes from the first reachable seed. A table reload asks the nodes that
+  have an open socket first; when none answers it opens every other known node and then every seed, one
+  connect attempt each, until one returns a table. A node that cannot be opened triggers that reload and the
+  command goes to the owner the new table names (a keyless command to the first reachable node of the new
+  table). Pipelines, fan-out commands and transactions do not trigger the reload on their own; they fail as
+  before and the next single-key or keyless command reloads. Seeds are never asked while the known nodes answer.
+
+## Retry policies of your own
+
+`ruvio.is_transient` and `ruvio.may_have_run` sort what a call raises, for a retry policy of your own
+(tenacity, a loop). The client already follows `MOVED`/`ASK`, waits out `TRYAGAIN` during a slot move and
+finds a new primary after a failover; these judge what still reaches you.
+
+- `is_transient(e)`: trying again later can succeed. True for `ConnectionError` and `TimeoutError` and for
+  `LOADING`, `MASTERDOWN`, `CLUSTERDOWN`, `TRYAGAIN`, `READONLY` and `NOREPLICAS`; false for `WRONGTYPE`, `OOM`,
+  syntax errors, `ProtocolError` and a cancelled task.
+- `may_have_run(e)`: the failed call may have changed data. False only for a server error reply (the server
+  refused the command), except `NOREPLICAS`: the write was applied and only the replica confirmation timed out.
+  A failed connection or a timeout may have run.
+
+Repeat a write only when it is safe to repeat or did not run:
+
+```python
+from tenacity import retry, retry_if_exception, stop_after_attempt
+from ruvio import is_transient, may_have_run
+
+# incr is not safe to repeat: retry it only when it surely did not run.
+@retry(retry=retry_if_exception(lambda e: is_transient(e) and not may_have_run(e)), stop=stop_after_attempt(3))
+def visit(r):
+    return r.incr("visits")
+```
+
+For a read, `is_transient` alone is enough.
+
+## Following a failover
+
+A standalone client with two or more `seeds`, or with `sentinel_master`, finds the primary again after a
+failover instead of staying on a node that is now a replica. It is on by default (`follow_primary=True`), in
+both clients, and does nothing with one seed and no `sentinel_master`. A cluster client keeps its
+`MOVED`/`ASK` rules and does not use it. The contract is in [docs/CLIENT_BEHAVIOR.md](../../docs/CLIENT_BEHAVIOR.md).
+
+```python
+client = Ruvio(seeds=["10.0.0.1:6379", "10.0.0.2:6379"])                     # asks ROLE
+client = Ruvio(seeds=["10.0.0.9:26379"], sentinel_master="main")             # asks the coordinator
+```
+
+- **Reconnect.** After a dropped connection the next connect asks the seeds (starting with the one after the one
+  that dropped) which node answers `ROLE` with `master`, following the primary address a replica reports, and
+  connects to it. When none is found, or it cannot be opened, the seed order above applies. The command that hit
+  the drop still raises. The first connect keeps the seed order; with `sentinel_master` it asks the coordinators
+  (`SENTINEL get-master-addr-by-name`, confirmed with `ROLE`) and raises `ProtocolError` when none names a primary.
+- **`READONLY`.** A command answered `READONLY` (the text is `READONLY` alone or followed by a space) makes the
+  client search for the primary, up to 8 rounds with waits of 100 ms doubling to 2 s (7.1 s in all; the asyncio
+  client waits without blocking other tasks), move to it and send the refused command once more. The node that
+  answered is skipped only while it still says `master`; once it says it is a replica, a later round takes it when
+  it is promoted. The retry's reply
+  goes to the caller, a second `READONLY` included; there is never a third send. When no primary is found the
+  `READONLY` error is raised and the connection stays where it was.
+- **Not resent.** A command inside a transaction opened with `multi()` (the connection still moves, so the next
+  command works), a command of a pipeline (its `READONLY` is that command's result), and any other error.
+- **Cost.** A healthy connection sends nothing extra; the error text of a reply is looked at only where error
+  replies are already inspected. The only extra sockets are short probes (`AUTH` as configured, one command, one
+  reply, bounded by the smaller of `connect_timeout` and `socket_timeout`). While following is active the asyncio
+  client keeps each command's encoded frame on its pending entry (a reference, no copy); command methods still
+  return the connection's future, and a `READONLY` reply is answered from the reader by one shared task.
+- `follow_primary=False` restores the plain seed behavior: `READONLY` is returned as an error and no `ROLE` is
+  sent. The Python clients have no connection-lost or connection-restored hooks, so nothing is reported.
+
+## TLS
+
+Plain TCP is the default. `tls=True` wraps every socket the client opens (the sync and the asyncio client, cluster nodes, replicas, Pub/Sub and failover probes) in TLS. The server certificate chain and host name are verified against the system roots.
+
+```python
+client = ruvio.Ruvio("cache.internal", 6379, tls=True, tls_ca_file="ca.pem")
+client = ruvio.Ruvio.from_url("ruvios://cache.internal:6379")   # rediss:// is the same
+```
+
+`tls_ca_file` (PEM) trusts your private CA instead of the system roots. `tls_cert_file` and `tls_key_file` (PEM) answer a server that demands mutual TLS (`tls_client_auth`). `tls_server_name` is the name the certificate carries when you connect by IP address. Pass a ready `ssl.SSLContext` as `tls=` to control everything yourself. `tls_insecure_skip_verify=True` accepts any certificate and skips the host name check, which removes the protection against someone in the middle: use it for a throwaway test only. The handshake is part of the connect (bounded by `connect_timeout`), so a refused certificate raises `ruvio.ConnectionError`. A TLS option without `tls=True`, or `tls` with `unix_socket_path`, raises `ValueError`. Measured: the live TLS tests (`tests/test_tls_live.py`, sync and asyncio); the latency TLS adds: not measured.
+
 ## Tests
 
 ```bash
@@ -313,7 +479,7 @@ RUVIO_TEST_FLUSHALL=1 ...                                               # also r
   has no typed method on the sync or the async client. It also fails when a typed method is
   never called by a live test.
 - `tests/test_cluster_unit.py` needs no Ruvio server: slot vectors and hashtags, key
-  extraction through the typed methods, a check that **all 287 matrix commands have a routing
+  extraction through the typed methods, a check that **all 299 matrix commands have a routing
   rule**, topology / `MOVED` / scan-cursor parsing, and the router against scripted fake servers
   (`tests/fakecluster.py`) on both clients: owner-only routing, fail-fast `CROSSSLOT` (no byte
   sent), split reassembly order, `MOVED` patch / refresh / unknown node / at most 3 redirects, no
@@ -329,6 +495,15 @@ RUVIO_TEST_FLUSHALL=1 ...                                               # also r
   `BLPOP`, pub/sub and sharded pub/sub, losing one node's connection. The standalone fallback
   test uses `RUVIO_TEST_ADDR` (plain server). Cluster mode has only database 0, so the older
   live suites (database 11) are not run on the cluster.
+- `tests/test_replica_reads_live.py` needs `RUVIO_REPLICATED_ADDR` (a 2-shard primary) and `RUVIO_REPLICA_ADDR` (its
+  2-shard replica, shard i on port + i); `scripts/run_with_servers.sh` starts both. Without them it is skipped.
+- `tests/test_multi_node_live.py` needs `RUVIO_MULTINODE_A_ADDR`, `RUVIO_MULTINODE_B_ADDR` and
+  `RUVIO_MULTINODE_STALE_ADDR` (a two-node cluster and a node with an older map, started by
+  `scripts/run_with_servers.sh`) and checks that the client follows `MOVED`. Without them it is skipped.
+- `tests/test_failover_live.py` needs `RUVIO_FAILOVER_ADDRS` and `RUVIO_FAILOVER_REPLICATION` (a primary and a replica, comma
+  separated, primary first, and their replication addresses); `scripts/run_with_servers.sh` starts them. It swaps the roles
+  with `REPLICAOF` and checks that the client follows, that `follow_primary=False` gets `READONLY`, and that a reconnect lands
+  on the primary. Without them it is skipped. `tests/test_follow_failover.py` covers the rules against scripted nodes.
 - Without `RUVIO_TEST_ADDR` the live tests are skipped. Live tests use database 11 and run
   `FLUSHDB`. `test_keys` also uses database 12. `JSON.INDEX` only works in database 0, so
   that test uses unique keys there and cleans up after itself.
@@ -341,8 +516,9 @@ RUVIO_TEST_FLUSHALL=1 ...                                               # also r
   `MULTI`/`EXEC` sent one by one are refused (use `pipeline(transaction=True)`); a
   cross-slot `RENAME`/`COPY`/`SMOVE`/`LMOVE`/... is refused rather than emulated by
   copying; `CLUSTER NODES/SHARDS/INFO/MYID` and `CHANGES` go to the seed only; `SCRIPT EXISTS`
-  and `SCRIPT KILL` ask the seed only; there is no `ASK` handling (the server does not
-  migrate slots); no replica reads (`READONLY` is sent to the seed only); a cluster whose
+  and `SCRIPT KILL` ask the seed only; `ASK` and `TRYAGAIN` are handled
+  as described above, but only against scripted servers, since the server does not
+  migrate slots across nodes; no replica reads (`READONLY` is sent to the seed only); a cluster whose
   advertised host is unreachable from the client is not handled. Not verified: a server
   topology that changes while the client runs (`MOVED` recovery was verified by corrupting the
   client's table, not by moving slots on a server), clusters with more than 3 nodes, AUTH on

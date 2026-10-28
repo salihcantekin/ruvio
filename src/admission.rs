@@ -42,6 +42,9 @@ pub(crate) fn note_protocol_error() {
 
 #[derive(Debug, Default)]
 struct ConnectionCounts {
+    /// Kept under the same lock as the counts, so `CONFIG SET` can change them while
+    /// connections come and go.
+    limits: ConnectionLimits,
     global: usize,
     by_ip: HashMap<IpAddr, usize>,
     by_user: HashMap<Vec<u8>, usize>,
@@ -49,23 +52,29 @@ struct ConnectionCounts {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ConnectionLimiter {
-    limits: ConnectionLimits,
     counts: Arc<Mutex<ConnectionCounts>>,
 }
 
 impl ConnectionLimiter {
     pub(crate) fn new(limits: ConnectionLimits) -> Self {
         Self {
-            limits,
-            counts: Arc::new(Mutex::new(ConnectionCounts::default())),
+            counts: Arc::new(Mutex::new(ConnectionCounts {
+                limits,
+                ..ConnectionCounts::default()
+            })),
         }
+    }
+
+    /// New limits for the next accept and login; connections already open stay.
+    pub(crate) fn set_limits(&self, limits: ConnectionLimits) {
+        lock_counts(&self.counts).limits = limits;
     }
 
     pub(crate) fn try_acquire(&self, ip: IpAddr) -> Option<ConnectionPermit> {
         let mut counts = lock_counts(&self.counts);
         let per_ip = counts.by_ip.get(&ip).copied().unwrap_or(0);
 
-        if counts.global >= self.limits.max_global || per_ip >= self.limits.max_per_ip {
+        if counts.global >= counts.limits.max_global || per_ip >= counts.limits.max_per_ip {
             REJECTED.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -97,7 +106,7 @@ impl ConnectionPermit {
         }
 
         let mut counts = lock_counts(&self.limiter.counts);
-        let max = self.limiter.limits.max_per_user;
+        let max = counts.limits.max_per_user;
 
         if max > 0 {
             let current = counts.by_user.get(&key).copied().unwrap_or(0);

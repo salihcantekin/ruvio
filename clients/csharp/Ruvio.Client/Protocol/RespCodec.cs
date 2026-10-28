@@ -460,6 +460,16 @@ internal sealed class RespReader : IDisposable
         ReplyStarted = false;
     }
 
+    /// <summary>True when bytes of the next reply are already buffered.</summary>
+    internal bool HasBuffered => _start < _end;
+
+    /// <summary>
+    /// Waits until at least one byte is buffered, without taking it. A cancelled wait leaves the
+    /// reader where it was, so the next read starts the same reply.
+    /// </summary>
+    internal ValueTask WaitForDataAsync(CancellationToken cancellationToken) =>
+        _start < _end ? default : EnsureAsync(1, cancellationToken);
+
     internal ValueTask<RespValue> ReadAsync(CancellationToken cancellationToken)
     {
         // Completed scalar replies need only their owned response data, not parser Tasks.

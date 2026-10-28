@@ -5,8 +5,9 @@ document is the Milestone 6 threat model for standalone operation. It covers
 the RESP parser, persistence files, administrative commands, cluster
 discovery, and denial-of-service paths.
 
-Cluster membership, a cluster bus, and failover are not implemented. Those
-surfaces are listed so they are not mistaken for existing controls. WAL tail
+There is no cluster bus. Failover and slot moves between machines are done by
+`ruvio coordinator` (see the coordinator sections below); the surfaces that
+still have no control are listed so they are not mistaken for one. WAL tail
 replication is a separate listener, described under Replication port.
 
 Snapshot date: 2026-09-27. Revisit this file when a wire, persistence, or
@@ -39,7 +40,7 @@ topology.
 
 ## Attackers
 
-- Unauthenticated network client on the RESP or metrics port.
+- Unauthenticated network client on the RESP port.
 - Authenticated client with a restricted ACL user.
 - Local process that can read or write the data directory but does not hold
   `LOCK`.
@@ -60,7 +61,7 @@ not consume past a truncated frame.
 | Bulk-string or array length bombs | `ProtocolLimits` (`max_command_bytes`, `max_key_bytes`, `max_value_bytes`, `max_arguments`) checked before allocation | `protocol::rejects_oversized_bulk_strings_before_allocating`, `enforces_key_and_value_limits_in_every_parser` |
 | Pipeline / connection buffer growth | `max_pipeline_commands`, `max_connection_buffer_bytes`, idle and read timeouts | `server::applies_configured_protocol_limits`, `limits_inactive_partial_frame_reads` |
 | Truncated or garbage frames | Incremental parse returns incomplete; consume is bounded; a framing error closes the connection | `every_truncated_*_frame_is_incomplete`, `parsers_bound_consume_on_small_garbage_frames`, `parsers_never_panic_or_consume_past_arbitrary_input` |
-| Unknown name, wrong arity, or unsupported subcommand | The frame is consumed and answered with `-ERR`. The socket stays open. `CONFIG SET`, `CLUSTER MEET`, `SHUTDOWN`, `DEBUG`, and `MONITOR` are in this class. `FLUSHDB`, `FLUSHALL`, and `SWAPDB` exist and are in the ACL `@dangerous` category. `ACL SETUSER` changes only the in-memory user list | `protocol::rejects_mutating_admin_and_cluster_verbs`, `server::rejected_admin_verbs_reply_and_keep_the_connection`, `evented::evented_rejected_admin_verbs_reply_and_keep_the_connection` |
+| Unknown name, wrong arity, or unsupported subcommand | The frame is consumed and answered with `-ERR`. The socket stays open. `CONFIG RESETSTAT`, `CLUSTER MEET`, `SHUTDOWN`, `DEBUG`, and `MONITOR` are in this class; `CONFIG SET` of a restart-only or unknown name is refused the same way. `FLUSHDB`, `FLUSHALL`, and `SWAPDB` exist and are in the ACL `@dangerous` category. `ACL SETUSER` changes only the in-memory user list | `protocol::rejects_mutating_admin_and_cluster_verbs`, `server::rejected_admin_verbs_reply_and_keep_the_connection`, `evented::evented_rejected_admin_verbs_reply_and_keep_the_connection` |
 | Binary keys and values | Values are length-prefixed bytes; they are never interpreted as paths or Lua source unless the command is `EVAL` | store binary round-trips |
 
 The library crate forbids `unsafe`. Hot-path parse borrows the connection
@@ -90,7 +91,9 @@ Residual:
 
 - No encryption at rest. Anyone who can read the data directory reads every
   key. Protect the directory with host permissions and, if needed, volume
-  encryption.
+  encryption. New WAL segments, snapshot files and a data directory the server
+  creates are owner-only (`0600` / `0700`); a directory or file that already
+  exists keeps its mode, so check a mounted volume's permissions once.
 - Restore trusts a source that passes checksums. An attacker who can write a
   well-formed WAL can plant values. Treat backup provenance as an operational
   control.
@@ -106,7 +109,11 @@ disk I/O. They sit in ACL categories `admin`, `slow`, and `dangerous`.
 | --- | --- | --- |
 | `AUTH` | Selects a user | Constant-time compare; `NOAUTH` until success; not allowed inside `MULTI` |
 | `ACL WHOAMI/USERS/LIST/GETUSER/CAT/SETUSER` | Introspect or change users | `SETUSER` updates the in-memory directory only. `SAVE`/`LOAD` do not parse. Passwords stay redacted |
-| `CONFIG GET` | Lists settings | `requirepass` is `***`. `CONFIG SET` is an error reply and the connection stays open |
+| `CONFIG GET` | Lists settings | `requirepass` is `***` |
+| `CONFIG SET` | Changes live settings on every shard: memory limits and eviction policy, slowlog and key statistics, connection limits and timeouts, script limits, `requirepass` | ACL `@admin @dangerous`; a `+config` grant includes it, as in Redis (`-config\|set` denies it alone). Restart-only settings (bind address, shards, data directory, durability, TLS files, protected mode, ACL file, replication) are refused, so it cannot open a listener, move data or turn TLS or protected mode off. One bad pair changes nothing. Not logged, not replicated, refused inside `MULTI` and scripts. Values are redacted in `SLOWLOG` when the name contains `pass`, `secret` or `token`. `requirepass` changes the default user's password; open connections stay logged in, and with no `replication_password` the replication port keeps the old one until restart |
+| `CONFIG REWRITE` | Writes the live settings into the config file the server started from | ACL `@admin @dangerous`. Owner-only atomic write through the `--write-config` path; it may write a secret that came from the environment into the file. Restart-only keys keep the file's values |
+| `REPLICAOF` | Makes every shard follow another primary (`host port`), or promotes a replica in place (`NO ONE`) | ACL `@admin @slow @dangerous`. Pointed at a server the caller controls, the shards replace their data with that server's copy; the replication password (`replication_password` or `requirepass`) must match there. Not replicated, refused in `MULTI` and scripts, lasts until restart. Deny `replicaof` to every user that does not operate the deployment. |
+| `ROLE` | Shows the shard's role, its log sequence, on a primary the client address of each replica that announced one, and on a replica the primary address it dials | ACL `@admin @fast @dangerous`. |
 | `INFO` / `INFO prometheus` | Counters and memory | No secrets. ACL `@admin` can deny it |
 | `SAVE` / `BGSAVE` | Checkpoint + WAL compact | Persistence `MISCONF` on failure; `BGSAVE` is in-process, not a fork |
 | `SCRIPT LOAD/EXISTS/FLUSH/KILL` | Script cache | Size and count caps. `SCRIPT KILL` returns `NOTBUSY` because eval is synchronous |
@@ -117,6 +124,11 @@ Default ACL until `requirepass` or a `default` user with a password is
 `on nopass ~* +@all`. A public listener in that state is an intentional
 misconfiguration; protected mode rejects non-loopback peers when no password
 is set.
+
+Key patterns (`~tenant:*`) scope commands that name their keys. Commands that list or
+wipe the keyspace (`KEYS`, `SCAN`, `RANDOMKEY`, `FLUSHDB`, `FLUSHALL`, `SWAPDB`) need `allkeys`;
+a pattern-limited user gets `NOPERM`. Pub/Sub channels are not scoped by key patterns, so do
+not give `+@all` to a tenant that must not see other tenants' messages.
 
 `CONFIG GET` still returns filesystem paths (`data-dir`, `tls-cert`,
 `tls-key`). Restrict `@admin` for tenants that must not see host layout.
@@ -147,13 +159,30 @@ Tests: `protocol::parses_cluster_discovery_commands`,
 
 ## Replication port
 
-The replication port is a separate listener from RESP and from metrics. Role
+The replication port is a separate listener from RESP. Role
 `off` does not open it. A primary binds `replication.listen`, loopback by
 default in the sample configuration (`127.0.0.1`). The handshake uses
 `replication_password` when set, otherwise `requirepass`, compared in constant
 time (`security::constant_time_eq`). A public replication listen without
 either secret refuses to start. A failed handshake sends a status and no WAL
-bytes. Failover is not implemented, and this port is not a cluster bus.
+bytes. With `replication.tls = false` (default) the stream is not encrypted and
+`tls_cert` alone does not apply to it: the replication password and every
+written value cross the network in the clear, so the port belongs on a private
+network or a tunnel. With `replication.tls = true` the link is TLS: the replica
+verifies the primary against `replication.tls_ca` and may present a client
+certificate. Failover is not implemented,
+and this port is not a cluster bus.
+
+A replica's handshake carries the client address it announces, and the primary
+lists that address in `CLUSTER SLOTS`, `CLUSTER SHARDS`, `CLUSTER NODES`, `ROLE`
+and `INFO replication`, where cluster clients with a replica read policy send
+reads. Whoever knows the replication password can therefore steer those reads to
+an address of their choice, so treat that password like `requirepass`. The
+announced host is replaced by the connection's address only when it is a
+loopback name from another machine. A host that is not a host name or an IP
+address (letters, digits and `. - _ : % [ ]`, at most 255 characters) is not
+listed, so a peer cannot add lines or fields to `CLUSTER NODES` or `INFO`.
+`replication.announced = false` keeps a replica out of the answers.
 
 ## Denial of service
 
@@ -215,10 +244,8 @@ the default quota).
   Plaintext clients are closed. `tls_client_ca` checks a presented client
   certificate. `tls_client_auth` requires one. A plaintext listener does not
   ask for a certificate.
-- HTTP `/metrics` is optional and scrape-only. Loopback with an empty
-  `metrics_token` is open. Any other bind requires `Authorization: Bearer`
-  matching `metrics_token` (`RUVIO_METRICS_TOKEN`). Startup refuses a public
-  metrics bind without that token.
+- There is no HTTP metrics endpoint yet; metrics are read with `INFO prometheus`
+  over the RESP port, under its ACL.
 
 ## Residual risks (accepted for this milestone)
 
@@ -229,9 +256,35 @@ the default quota).
 3. No signed SLSA provenance on release artifacts yet. Checksums and a
    CycloneDX SBOM are produced; see `docs/SUPPLY_CHAIN.md`.
 4. Experimental static cluster discovery is not an authenticated cluster.
-5. Unauthenticated metrics HTTP on loopback when no token is set. A public
-   metrics bind requires `metrics_token`.
-6. `CONFIG GET` path disclosure to anyone allowed `config` (`@admin`).
+5. (Removed: there is no HTTP metrics endpoint.)
+6. `CONFIG GET` path disclosure to anyone allowed `config` (`@admin`). Anyone
+   allowed `config` can also raise memory and connection limits or change the
+   default password with `CONFIG SET`; deny `config|set` and `config|rewrite`
+   to users that only read settings.
+7. Anyone allowed `replicaof` (`@admin`) can point the server at another
+   primary and have its data replaced by that primary's copy, or promote a
+   replica next to a running primary. Deny `replicaof` to users that do not
+   operate the deployment.
+8. The coordinator port (`ruvio coordinator`) carries Raft votes and the
+   Sentinel API. With `secret` unset anyone who reaches it can read the
+   topology and take part in failover decisions; with it set, calls without the
+   secret are refused and clients must `AUTH`. Without `tls_cert` the secret
+   and the Raft traffic are sent in clear text, and without `node_tls` so are
+   the coordinators' commands and `auth` password to the data nodes: set both
+   (with `tls_ca`) or keep coordinators on a private network. The coordinators'
+   data-node user
+   (`auth`) needs only `ROLE`, `INFO`, `CONFIG GET` and `REPLICAOF` (and `RUVIO`
+   for a multi-node cluster or `primary_lease_ms`).
+9. Anyone allowed `ruvio|lease` (`@admin`) can renew a primary's lease with
+   `primary-lease` on, keeping an old primary taking writes after the
+   coordinators replaced it, or flood `RUVIO LEASE BEGIN`: a node keeps the
+   last 64 BEGIN tokens of all connections together, so the coordinators'
+   grants then name forgotten tokens and the lease runs out (writes stop).
+   A grant's coordinator id and coordinator count (`voters`) are taken as
+   sent, not checked against the coordinators' `secret`: such a user can
+   grant under several made-up ids to hold a majority alone, or name up to
+   255 coordinators so that no majority is reached until that grant ends (at
+   most 60 seconds per grant). Allow it only to the coordinators' user.
 
 ## Operator checklist
 
@@ -246,5 +299,4 @@ the default quota).
    mean unlimited.
 5. Protect the data directory and TLS key with host permissions. Treat
    backups as secret material.
-6. Keep metrics and RESP binds off the public internet unless a scrape
-   identity sits in front.
+6. Keep the RESP bind off the public internet.

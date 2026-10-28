@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
+using Microsoft.Extensions.Logging;
 using Ruvio.Client;
 
 namespace Ruvio.AspNetCore.Idempotency;
@@ -13,8 +14,18 @@ internal static class IdempotencyStore
     private static readonly Histogram<double> StorageDuration = Meter.CreateHistogram<double>(
         "ruvio.idempotency.storage_duration", "ms");
 
+    private static readonly Counter<long> Outages = Meter.CreateCounter<long>("ruvio.idempotency.outage");
+
+    internal static void RecordOutage(RuvioOutageMode mode, string reason, string stage) =>
+        Outages.Add(1, new TagList
+        {
+            { "mode", mode == RuvioOutageMode.FailOpen ? "fail_open" : "fail_closed" },
+            { "reason", reason },
+            { "stage", stage },
+        });
+
     internal static async Task<(string State, string? Result)> AcquireAsync(
-        IRuvioClient client, string key, string fingerprint, string owner, TimeSpan ttl, CancellationToken token)
+        IRuvioClient client, string key, string fingerprint, string owner, TimeSpan ttl, CancellationToken token, bool count = true)
     {
         long started = Stopwatch.GetTimestamp();
         var reply = await MeasureStorageAsync("begin", started,
@@ -30,14 +41,16 @@ internal static class IdempotencyStore
 
         if (state == "completed" && items.Count == 2 && items[1].Kind == RespKind.Bulk)
         {
-            RecordState(state);
+            if (count)
+                RecordState(state);
 
             return (state, items[1].AsString());
         }
 
         if (items.Count == 1 && state is "acquired" or "pending" or "conflict")
         {
-            RecordState(state);
+            if (count)
+                RecordState(state);
 
             return (state, null);
         }
@@ -55,6 +68,36 @@ internal static class IdempotencyStore
         if (!await MeasureStorageAsync("complete", started,
             client.CompleteIdempotencyAsync(key, fingerprint, owner, result, token)).ConfigureAwait(false))
             throw new InvalidOperationException("Idempotency ownership was lost or completion failed; outcome is uncertain.");
+    }
+
+    /// <summary>
+    /// Gives up the pending record after the handler threw. A failure here is counted and swallowed so the handler's
+    /// own exception reaches the caller; the record then stays pending until its retention ends, as without the option.
+    /// </summary>
+    private static int abortUnsupportedLogged;
+
+    internal static async Task AbortAsync(IRuvioClient client, string key, string fingerprint, string owner, ILogger? logger = null)
+    {
+        long started = Stopwatch.GetTimestamp();
+
+        try
+        {
+            if (await MeasureStorageAsync("abort", started,
+                client.AbortIdempotencyAsync(key, fingerprint, owner, CancellationToken.None)).ConfigureAwait(false))
+                RecordState("aborted");
+        }
+        catch (RuvioException exception) when (exception.IsServerReply)
+        {
+            // Already counted with outcome "error"; a server from before IDEM ABORT answers an unknown-subcommand error.
+            if (Interlocked.Exchange(ref abortUnsupportedLogged, 1) == 0)
+            {
+                logger?.LogWarning(exception, "The Ruvio server rejected IDEM ABORT; it is older than this package needs, so AbortOnException has no effect and failed requests stay pending until their retention ends.");
+            }
+        }
+        catch (Exception)
+        {
+            // Already counted with outcome "error" by MeasureStorageAsync.
+        }
     }
 
     /// <summary>Records the outcome of a storage call that has already started; no delegate is allocated.</summary>
@@ -83,6 +126,6 @@ internal static class IdempotencyStore
         }
     }
 
-    private static void RecordState(string state)
+    internal static void RecordState(string state)
         => States.Add(1, new TagList { { "state", state } });
 }

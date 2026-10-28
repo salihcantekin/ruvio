@@ -89,7 +89,7 @@ public readonly record struct ScanPage(long Cursor, IReadOnlyList<string> Keys);
 /// <summary>One <c>HSCAN</c> page.</summary>
 public readonly record struct HashScanPage(long Cursor, IReadOnlyDictionary<string, string> Fields);
 
-/// <summary>One stream entry.</summary>
+/// <summary>One stream entry. Fields retain their order and may contain repeated names.</summary>
 public readonly record struct StreamEntry(string Id, IReadOnlyList<KeyValuePair<string, string>> Fields);
 
 /// <summary>Entries read from one stream key.</summary>
@@ -160,6 +160,9 @@ public enum FillState
 /// <param name="Token">The fill token for <see cref="FillState.Fill"/>, or for <see cref="FillState.Stale"/> when this caller refreshes.</param>
 public readonly record struct FillResult(FillState State, byte[]? Value, long? Token)
 {
+    /// <summary>The stored value decoded as UTF-8; null when there is no value.</summary>
+    public string? Text => Value is null ? null : System.Text.Encoding.UTF8.GetString(Value);
+
     /// <summary>Reads a <c>FILLGET</c> reply. Throws <see cref="RuvioException"/> for any other shape.</summary>
     public static FillResult FromReply(RespValue reply)
     {
@@ -184,3 +187,9 @@ public readonly record struct FillResult(FillState State, byte[]? Value, long? T
         };
     }
 }
+
+/// <summary>The answer to <c>FILLGET</c> with the stored value decoded from JSON.</summary>
+/// <param name="State">What the server decided for this caller.</param>
+/// <param name="Value">The decoded value for <see cref="FillState.Hit"/> and <see cref="FillState.Stale"/>; otherwise default.</param>
+/// <param name="Token">The fill token for <see cref="FillState.Fill"/>, or for <see cref="FillState.Stale"/> when this caller refreshes.</param>
+public readonly record struct FillResult<T>(FillState State, T? Value, long? Token);

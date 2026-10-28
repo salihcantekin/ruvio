@@ -101,6 +101,7 @@ fn eligible_outside_multi(command: WalGroupCommand<'_, '_>) -> bool {
             Command::Limit { .. }
                 | Command::IdempotencyBegin { .. }
                 | Command::IdempotencyComplete { .. }
+                | Command::IdempotencyAbort { .. }
                 | Command::Get { .. }
                 | Command::Set { .. }
                 | Command::GetEx { .. }
@@ -121,6 +122,7 @@ fn eligible_outside_multi(command: WalGroupCommand<'_, '_>) -> bool {
                 | Command::Exists { .. }
                 | Command::Type { .. }
                 | Command::Del { .. }
+                | Command::CreateTtl { .. }
                 | Command::Expire { .. }
                 | Command::PExpireAt { .. }
                 | Command::Ttl { .. }
@@ -144,6 +146,7 @@ fn eligible_outside_multi(command: WalGroupCommand<'_, '_>) -> bool {
                 | Command::SetAlgebra { .. }
                 | Command::SetMove { .. }
                 | Command::HashSet { .. }
+                | Command::HashMSet { .. }
                 | Command::HashDelete { .. }
                 | Command::HashGet { .. }
                 | Command::HashMGet { .. }
@@ -168,6 +171,8 @@ fn eligible_outside_multi(command: WalGroupCommand<'_, '_>) -> bool {
                 | Command::SortedSetScore { .. }
                 | Command::SortedSetRank { .. }
                 | Command::SortedSetPop { .. }
+                | Command::SortedSetPopByScore { .. }
+                | Command::SortedSetMoveDue { .. }
                 | Command::SortedSetRemoveRange { .. }
                 | Command::GeoAdd { .. }
                 | Command::GeoDist { .. }
@@ -182,6 +187,7 @@ fn eligible_outside_multi(command: WalGroupCommand<'_, '_>) -> bool {
                 | Command::BloomInfo { .. }
                 | Command::BloomCard { .. }
                 | Command::SetIfEq { .. }
+                | Command::SetIfCmp { .. }
                 | Command::DelIfEq { .. }
                 | Command::ListPushCapped { .. }
                 | Command::JsonGet { .. }
@@ -436,7 +442,7 @@ impl<'a> OpenWalGroup<'a> {
 
             return Ok(Some(DurabilityWait {
                 barrier,
-                write_timeout: self.state.published_config.timeouts.write,
+                write_timeout: self.state.live.write_timeout.get(),
             }));
         }
         let (totals, sync_result) = {

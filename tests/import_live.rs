@@ -114,6 +114,47 @@ fn existing_keys_are_skipped_unless_replace_and_dry_run_writes_nothing() {
 }
 
 #[test]
+fn replace_swaps_in_the_copy_with_its_ttl_and_leaves_no_staging_key() {
+    let (from, to) = (Server::start(), Server::start());
+    let mut source = Client::connect(&from.address);
+    let mut target = Client::connect(&to.address);
+
+    source.call(&["SET", "ttl", "new"]);
+    source.call(&["PEXPIRE", "ttl", "600000"]);
+    source.call(&["RPUSH", "kind", "x", "y"]);
+    source.call(&["SET", "post:{7}:body", "tagged"]);
+    source.call(&["SET", "odd{}key", "braces"]);
+    target.call(&["SET", "ttl", "old"]);
+    target.call(&["SET", "kind", "was-a-string"]);
+    target.call(&["SET", "post:{7}:body", "old"]);
+    target.call(&["SET", "odd{}key", "old"]);
+
+    let report = run(
+        &ImportOptions {
+            replace: true,
+            ..options(&from, &to)
+        },
+        &mut |_| {},
+    )
+    .unwrap();
+
+    assert_eq!(report.copied, 4);
+    assert_eq!(target.call(&["GET", "ttl"]), "new");
+
+    let ttl: i64 = target.call(&["PTTL", "ttl"]).parse().unwrap();
+
+    assert!(ttl > 0 && ttl <= 600_000, "TTL lost by the swap: {ttl}");
+    assert_eq!(target.call(&["TYPE", "kind"]), "list");
+    assert_eq!(target.call(&["GET", "post:{7}:body"]), "tagged");
+    assert_eq!(target.call(&["GET", "odd{}key"]), "braces");
+    assert_eq!(
+        target.call(&["DBSIZE"]),
+        "4",
+        "a staging key was left behind"
+    );
+}
+
+#[test]
 fn pattern_limits_the_keys_and_an_empty_source_is_fine() {
     let (from, to) = (Server::start(), Server::start());
     let mut source = Client::connect(&from.address);

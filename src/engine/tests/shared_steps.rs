@@ -258,13 +258,49 @@ const CASES: &[(&str, &[&[&str]])] = &[
         "limit",
         &[&["LIMIT", "k", "5", "60000"], &["LIMIT", "k", "5", "60000"]],
     ),
+    (
+        "limit",
+        &[
+            &["LIMIT", "k", "5", "60000", "SLIDING"],
+            &["LIMIT", "k", "5", "60000", "SLIDING", "WITHRETRY"],
+        ],
+    ),
+    (
+        "limit",
+        &[
+            &["LIMIT", "k", "5", "60000", "TOKENS", "COST", "2"],
+            &["LIMIT", "k", "5", "60000", "TOKENS", "WITHRETRY"],
+        ],
+    ),
     ("idem", &[&["IDEM", "k", "BEGIN", "fp", "owner", "5000"]]),
     ("once", &[&["ONCE", "k", "5000"]]),
     ("take", &[&["TAKE", "s", "3"]]),
+    ("transfer", &[&["TRANSFER", "s", "d", "4"]]),
+    (
+        "transfer",
+        &[&["SET", "d", "7"], &["TRANSFER", "s", "d", "4"]],
+    ),
+    ("htransfer", &[&["HTRANSFER", "h", "f", "g", "1"]]),
+    (
+        "htransfer",
+        &[
+            &["HEXPIRE", "h", "100", "FIELDS", "1", "f"],
+            &["HTRANSFER", "h", "f", "g", "1"],
+        ],
+    ),
     ("getex", &[&["GETEX", "s", "100000"]]),
     (
         "release",
         &[&["LEASE", "k", "5000"], &["RELEASE", "k", "$LAST"]],
+    ),
+    (
+        "renew",
+        &[
+            &["SEMAPHORE", "sem", "2", "5000"],
+            &["RENEW", "sem", "$LAST", "9000"],
+            &["LEASE", "k", "5000"],
+            &["RENEW", "k", "$LAST", "9000"],
+        ],
     ),
     ("setv", &[&["SETV", "k", "x"]]),
     ("mset", &[&["MSET", "s", "x", "d", "y"]]),
@@ -300,6 +336,7 @@ const CASES: &[(&str, &[&[&str]])] = &[
     ("hincrby", &[&["HINCRBY", "h", "f", "2"]]),
     ("hsetnx", &[&["HSETNX", "h", "n", "1"]]),
     ("hset", &[&["HSET", "h", "f", "x"]]),
+    ("hmset", &[&["HMSET", "h", "f", "x", "g", "y"]]),
     ("hdel", &[&["HDEL", "h", "f"]]),
     ("hexpire", &[&["HEXPIRE", "h", "100", "FIELDS", "1", "f"]]),
     (
@@ -326,6 +363,8 @@ const CASES: &[(&str, &[&[&str]])] = &[
     ("zincrby", &[&["ZINCRBY", "z", "2", "a"]]),
     ("zpopmin", &[&["ZPOPMIN", "z"]]),
     ("zpopmax", &[&["ZPOPMAX", "z"]]),
+    ("zpopbyscore", &[&["ZPOPBYSCORE", "z", "10", "COUNT", "2"]]),
+    ("zmovedue", &[&["ZMOVEDUE", "z", "l", "10", "COUNT", "2"]]),
     ("bzpopmin", &[&["BZPOPMIN", "z", "0"]]),
     ("bzpopmax", &[&["BZPOPMAX", "z", "0"]]),
     ("zremrangebyrank", &[&["ZREMRANGEBYRANK", "z", "0", "0"]]),

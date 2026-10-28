@@ -20,6 +20,31 @@ public final class TxPool implements AutoCloseable {
      */
     public TxPool(Link link) {
         this.link = link;
+        if (link.follows()) {
+            link.onMove(this::dropIdle);
+        }
+    }
+
+    /** A moved link: the idle sockets point to the old node. */
+    private void dropIdle() {
+        synchronized (this) {
+            for (Connection c : idle) {
+                c.close();
+            }
+            idle.clear();
+        }
+    }
+
+    /**
+     * A transaction's connection was refused with {@code READONLY}: the link looks for the primary, so the next
+     * transaction is opened there. Does nothing for a link that does not follow.
+     *
+     * @param c the connection that answered
+     */
+    public void refused(Connection c) {
+        if (link.follows() && c != null) {
+            link.followAfterRefusal(c);
+        }
     }
 
     /**

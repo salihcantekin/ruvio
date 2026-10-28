@@ -25,7 +25,8 @@ const tabsFor = (c: UseCase): CodeTab[] => [
   <PageIntro title="Use cases" kicker="Coordination in one command">
     Ruvio speaks RESP, so any Redis client can talk to it. What sets it apart is a set of commands that finish a
     coordination job on the shard that owns the key, in one call. Below are the jobs people reach for, with the
-    commands as you would type them in <code>redis-cli</code> and a link to the reference.
+    commands as you would type them in <code>redis-cli</code> and a link to the reference. To see the main ones run in a few seconds against a local server, use the
+    <a href="https://github.com/salihcantekin/ruvio/blob/main/examples/09_building_blocks_tour.py">building blocks tour</a>.
   </PageIntro>
 
   <div class="reading">
@@ -114,17 +115,17 @@ const tabsFor = (c: UseCase): CodeTab[] => [
   .case { scroll-margin-top: 88px; }
   .case-head { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 18px; align-items: start; margin-bottom: 22px; }
   .case-no {
-    font-family: var(--f-mono); font-size: 13px; font-weight: 500; color: var(--c1);
+    font-family: var(--f-mono); font-size: 14px; font-weight: 500; color: var(--c1);
     padding: 4px 8px; border: 1px solid color-mix(in srgb, var(--c1) 45%, var(--paper-line)); border-radius: 4px; margin-top: 4px;
   }
   .case h2 { margin: 0 0 6px; font-size: 24px; line-height: 1.25; }
-  .problem { margin: 0; color: var(--ink); font-size: 17px; line-height: 1.6; max-width: 62ch; }
+  .problem { margin: 0; color: var(--ink); font-size: 18px; line-height: 1.6; max-width: 62ch; }
   .case-grid { display: grid; gap: 20px; }
   /* Client snippets are longer than the redis-cli lines: the code gets the full width and scrolls
      sideways instead of breaking identifiers mid-word. */
-  .case-grid :global(pre) { font-size: 13px; white-space: pre; overflow-x: auto; }
+  .case-grid :global(pre) { font-size: 14px; white-space: pre; overflow-x: auto; }
   .case-grid > :first-child { max-width: 72ch; }
-  .refs { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 16px; font-size: 14px; }
+  .refs { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 16px; font-size: 15px; }
   .refs span { color: var(--faint); }
   .lede a { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--accent); }
   .next-row { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 24px 40px; }

@@ -1,12 +1,17 @@
+using System.Buffers;
 using System.IO.Pipelines;
 using Microsoft.AspNetCore.Http.Features;
 
 namespace Ruvio.AspNetCore.Idempotency;
 
-// A fixed-capacity buffer also bounds BodyWriter.GetMemory; overflow is sticky even if a handler catches it.
+// A bounded buffer also bounds BodyWriter.GetMemory; overflow is sticky even if a handler catches it.
+// Storage is rented from the shared pool and grows only as the handler writes, so a small response never pays
+// for the limit. Release() hands it back (cleared: responses can be sensitive); the buffer is empty afterwards.
 internal sealed class BoundedBuffer(int limit) : Stream
 {
-    private readonly byte[] bytes = new byte[limit];
+    private const int InitialCapacity = 1024;
+
+    private byte[] bytes = [];
     private int length;
 
     public bool Failed { get; private set; }
@@ -22,9 +27,42 @@ internal sealed class BoundedBuffer(int limit) : Stream
     {
         ArgumentOutOfRangeException.ThrowIfNegative(sizeHint);
 
-        Check(Math.Max(1, sizeHint));
+        int needed = Math.Max(1, sizeHint);
 
-        return bytes.AsMemory(length);
+        Check(needed);
+        Grow(length + needed);
+
+        // Never hand out room past the limit, even when the pool rented a larger array.
+        return bytes.AsMemory(length, Math.Min(bytes.Length, limit) - length);
+    }
+
+    // Every byte up to the limit is reachable, so callers check the limit first and the pooled array is never
+    // trusted for its own length (the pool may hand out a larger one).
+    private void Grow(int required)
+    {
+        if (required <= bytes.Length)
+            return;
+
+        int target = Math.Min(limit, Math.Max(required, Math.Max(InitialCapacity, bytes.Length * 2)));
+        byte[] larger = ArrayPool<byte>.Shared.Rent(target);
+
+        bytes.AsSpan(0, length).CopyTo(larger);
+        ReleaseArray();
+        bytes = larger;
+    }
+
+    private void ReleaseArray()
+    {
+        if (bytes.Length != 0)
+            ArrayPool<byte>.Shared.Return(bytes, clearArray: true);
+
+        bytes = [];
+    }
+
+    internal void Release()
+    {
+        ReleaseArray();
+        length = 0;
     }
 
     internal void Advance(int count)
@@ -32,12 +70,14 @@ internal sealed class BoundedBuffer(int limit) : Stream
         ArgumentOutOfRangeException.ThrowIfNegative(count);
 
         Check(count);
+        // Advance without a prior GetMemory/GetSpan only moves the cursor over bytes the caller wrote elsewhere.
+        Grow(length + count);
         length += count;
     }
 
     private void Check(int count)
     {
-        if (Failed || count > bytes.Length - length)
+        if (Failed || count > limit - length)
         {
             Failed = true;
             throw new IOException("The idempotency response body limit was exceeded.");
@@ -47,6 +87,7 @@ internal sealed class BoundedBuffer(int limit) : Stream
     public override void Write(ReadOnlySpan<byte> buffer)
     {
         Check(buffer.Length);
+        Grow(length + buffer.Length);
         buffer.CopyTo(bytes.AsSpan(length));
         length += buffer.Length;
     }
@@ -55,6 +96,7 @@ internal sealed class BoundedBuffer(int limit) : Stream
     public override void WriteByte(byte value)
     {
         Check(1);
+        Grow(length + 1);
         bytes[length++] = value;
     }
 
@@ -86,6 +128,10 @@ internal sealed class BoundedResponseBody(int limit) : IHttpResponseBodyFeature
     internal BoundedBuffer Buffer { get; } = new(limit);
 
     private PipeWriter? writer;
+
+    /// <summary>Returns the rented storage; call once the response has been delivered or discarded.</summary>
+    internal void Release() => Buffer.Release();
+
     public Stream Stream => Buffer;
     public PipeWriter Writer => writer ??= new BufferWriter(Buffer);
 

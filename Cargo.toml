@@ -25,8 +25,10 @@ exclude = [
 undocumented_unsafe_blocks = "warn"
 
 [features]
-default = ["mimalloc-allocator"]
+default = ["mimalloc-allocator", "coordinator"]
 mimalloc-allocator = ["dep:mimalloc"]
+# `ruvio coordinator`: automatic failover. Only that mode links the Raft library.
+coordinator = ["dep:openraft"]
 
 [dependencies]
 ahash = "0.8"
@@ -48,6 +50,8 @@ tokio = { version = "1", default-features = false, features = ["net", "rt", "tim
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
 # Already built for tokio; named here for TCP keepalive timing and the listen backlog.
 socket2 = "0.6"
+# Pinned: the API may change before 1.0. `storage-v2` opens the log and state machine traits.
+openraft = { version = "=0.9.25", default-features = false, features = ["serde", "storage-v2"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

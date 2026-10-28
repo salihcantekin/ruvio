@@ -4,8 +4,11 @@ package ruvio
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
+	"fmt"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,11 +19,20 @@ import (
 //
 // The connection settings are applied, in this order, on every connection the client
 // opens (the shared one, dedicated ones and Pub/Sub ones, also after a reconnect):
-// HELLO 3 / AUTH, SELECT, then CLIENT SETNAME.
+// HELLO 3 / AUTH, SELECT, CLIENT SETNAME, then CLIENT DURABILITY.
 type Options struct {
 	// Addr is host:port. Default 127.0.0.1:6379. With Cluster it is the seed: the
 	// address of any shard.
 	Addr string
+	// Seeds is a list of host:port addresses (IPv6 as "[::1]:6379") used in place of
+	// Addr when not empty. Connecting tries them in order, one attempt each, and keeps the
+	// first that answers; a seed that cannot be reached is skipped, while a refused AUTH
+	// or SELECT stops at once. After the connection drops, the next command's reconnect
+	// tries every seed once, starting with the one after the address that dropped. With
+	// Cluster, CLUSTER SLOTS comes from the first reachable seed and the seeds are asked
+	// again when no known node answers a slot map reload. A malformed entry makes every
+	// command fail with an error that names it. Default empty.
+	Seeds []string
 	// Username and Password send AUTH on every new connection when Password is set.
 	// An empty Username authenticates the default user.
 	Username string
@@ -31,16 +43,43 @@ type Options struct {
 	DB int
 	// ClientName sends CLIENT SETNAME on every new connection.
 	ClientName string
+	// DurabilityReplicas, when above 0, sends CLIENT DURABILITY REPLICAS n on every new
+	// connection: the server holds that connection's replies until n replicas have the
+	// writes on disk, and a connect fails if the server refuses it (for example without
+	// replication). Default 0: nothing is sent.
+	DurabilityReplicas int
+	// DurabilityTimeout is the TIMEOUT sent with DurabilityReplicas (whole milliseconds).
+	// Default 0: no TIMEOUT is sent and the server uses its own (5 seconds).
+	DurabilityTimeout time.Duration
 	// Protocol 3 sends HELLO 3 on connect; 0 or 2 stays on RESP2 (nothing is sent).
 	// RESP3 is needed for ClientTracking and OnPush.
 	Protocol int
 	// DialTimeout bounds connecting and the handshake when the context has no
 	// deadline. Default 5 seconds.
 	DialTimeout time.Duration
+	// CommandTimeout bounds one command, from sending it to reading its reply, when its
+	// context has no deadline; the command then fails with context.DeadlineExceeded and
+	// the connection stays usable. Default (0) 30 seconds; a negative value means no
+	// limit, so a half-open peer blocks a call made with context.Background() until the
+	// connection drops. A blocking command gets its own wait on top (BLPop with 5s may
+	// take 5s plus this), and one that waits forever (timeout 0) has no limit. Pub/Sub
+	// connections are not bounded.
+	CommandTimeout time.Duration
 	// Dial overrides the dialer (for TLS, unix sockets, tests). The network argument
-	// is always "tcp" and addr is Options.Addr (or the node address in cluster
-	// mode). Return a *tls.Conn here when the server requires TLS.
+	// is always "tcp" and addr is the address being tried: Options.Addr, the seed (with
+	// Seeds) or the node address in cluster mode. Set Options.TLS instead of dialing TLS here, unless you need your own dialer.
 	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	// TLS, when not nil, wraps every connection the default dialer opens (first connect,
+	// reconnects, pooled and dedicated connections, cluster nodes, replicas and failover
+	// probes) in TLS. The server's certificate chain and host name are verified against
+	// the config's RootCAs (the system roots when nil) unless the config sets
+	// InsecureSkipVerify, which removes the protection TLS gives against someone in the
+	// middle and is meant for throwaway tests. ServerName defaults to the host of the
+	// address being dialed. Set RootCAs for a private CA and Certificates for a server
+	// that demands client certificates. The handshake is part of the connect, so a refused
+	// certificate fails the connect. It does not apply when Dial is set: return your own
+	// *tls.Conn from Dial then. Default nil: plain TCP.
+	TLS *tls.Config
 	// MaxIdleDedicated is how many dedicated connections (blocking commands,
 	// transactions) are kept for reuse. Default 4.
 	MaxIdleDedicated int
@@ -53,7 +92,49 @@ type Options struct {
 	// (connected lazily). A seed that answers "cluster mode is disabled" is a standalone
 	// server: the client then behaves exactly as without this option.
 	Cluster bool
+	// ReadPolicy is where a cluster client sends read-only commands; see ReadPolicy. A
+	// standalone connection ignores it. Default ReadPrimary.
+	ReadPolicy ReadPolicy
+	// DisableFollowPrimary turns off following a failover. By default a standalone client
+	// with several Seeds (or a SentinelMaster) asks ROLE to find the node that is the
+	// primary: when it reconnects, and after a command is refused with READONLY, in which
+	// case the command is sent once more on the connection to the primary. With one address
+	// and no SentinelMaster nothing changes, and a cluster client never follows. While the
+	// connection is healthy nothing extra is sent. Dedicated connections (Conn, Tx, blocking
+	// commands) and the commands of a pipeline are not moved by a READONLY reply.
+	DisableFollowPrimary bool
+	// SentinelMaster is a master name: Seeds (or Addr) are then coordinators, not data
+	// nodes. The client asks them "SENTINEL get-master-addr-by-name <name>", checks the
+	// named node with ROLE, and connects to it, on the first connect, after a reconnect and
+	// after READONLY. The first connect fails with an error that wraps ErrProtocol and names
+	// the master when no coordinator names a primary. AUTH credentials go to coordinators
+	// and data nodes alike. Ignored with Cluster or DisableFollowPrimary. Default empty.
+	SentinelMaster string
 }
+
+// ReadPolicy is where a cluster client sends read-only commands: those the server flags
+// readonly and not blocking, such as GET, HGETALL or ZRANGE, including the per-slot parts
+// of a split MGET or EXISTS. The replicas of each shard come from CLUSTER SLOTS, which lists
+// them after the primary.
+//
+// Replication is asynchronous: a read from a replica may miss recent writes, including the
+// caller's own. Writes, transactions, blocking commands, Pub/Sub, keyless and fan-out
+// commands, and any pipeline that holds a command that is not a read always go to the
+// primaries.
+type ReadPolicy uint8
+
+const (
+	// ReadPrimary sends every command to the primary of its slot. This is the default.
+	ReadPrimary ReadPolicy = iota
+	// ReadPreferReplica sends reads to one replica of the slot's shard, picked at random
+	// when the slot map is loaded, and to the primary when the shard has none or the
+	// replica cannot be connected or answers LOADING. Such a replica is skipped until the
+	// next slot map load.
+	ReadPreferReplica
+	// ReadReplica sends reads to a replica only: with none known or usable the read fails,
+	// and a LOADING reply is returned as the error.
+	ReadReplica
+)
 
 // Client is a connection to one Ruvio server (or, with Options.Cluster, to a whole
 // sharded server). It is safe for concurrent use by many goroutines and meant to be
@@ -73,12 +154,39 @@ type Client struct {
 	db     atomic.Int64
 
 	cl *cluster // non-nil when Options.Cluster is set
+
+	// addrs is the list of addresses to dial: Options.Seeds, or Options.Addr alone. at is
+	// the index of the address of the last successful dial, where a dedicated or Pub/Sub
+	// connection starts. cfgErr is set when Options.Seeds has a malformed entry.
+	addrs  []string
+	at     atomic.Int32
+	cfgErr error
+
+	// follow is set when the client runs the failover rules (see Options.DisableFollowPrimary);
+	// sentinel when addrs are coordinators and the data node comes from them. nodes is the
+	// list the dial index points into: addrs plus the primaries found by following (copy on
+	// write, guarded by nodesMu), or just the last primary in sentinel mode.
+	follow   bool
+	sentinel bool
+	nodes    atomic.Pointer[[]string]
+	nodesMu  sync.Mutex
+	inMulti  atomic.Bool // a MULTI sent with Client.Do is open on the shared connection
+	done     chan struct{}
+
+	// rounds and the wait between them after a READONLY reply (tests shorten them).
+	followRounds   int
+	followDelay    time.Duration
+	followMaxDelay time.Duration
+
+	// readOnly marks a replica chosen for reads: READONLY is sent on every connection
+	// it opens.
+	readOnly bool
 }
 
 // NewClient returns a Client without connecting. The first command opens the connection,
 // and if the connection later drops, the next command opens a new one (there is no
 // reconnect option; the command that found the drop fails and is not retried). Defaults:
-// Addr "127.0.0.1:6379", DialTimeout 5s, MaxIdleDedicated 4. Use Connect to fail fast on
+// Addr "127.0.0.1:6379", DialTimeout 5s, CommandTimeout 30s, MaxIdleDedicated 4. Use Connect to fail fast on
 // a wrong address or password.
 func NewClient(opts Options) *Client {
 	if opts.Addr == "" {
@@ -90,13 +198,63 @@ func NewClient(opts Options) *Client {
 	if opts.MaxIdleDedicated == 0 {
 		opts.MaxIdleDedicated = 4
 	}
+	if opts.CommandTimeout == 0 {
+		opts.CommandTimeout = defaultCommandTimeout
+	}
 	c := &Client{opts: opts}
+	if len(opts.Seeds) > 0 {
+		c.cfgErr = checkSeeds(opts.Seeds)
+		c.addrs = append([]string(nil), opts.Seeds...)
+		c.opts.Addr = c.addrs[0]
+		c.opts.Seeds = c.addrs
+	} else {
+		c.addrs = []string{opts.Addr}
+	}
+	c.done = make(chan struct{})
+	c.followRounds, c.followDelay, c.followMaxDelay = followRounds, followDelay, followMaxDelay
+	c.follow = !opts.DisableFollowPrimary && (len(c.addrs) > 1 || opts.SentinelMaster != "")
+	c.sentinel = c.follow && !opts.Cluster && opts.SentinelMaster != ""
+	if !c.sentinel {
+		c.nodes.Store(&c.addrs)
+	}
 	c.db.Store(int64(opts.DB))
 	c.cmds.ex = c
 	if opts.Cluster {
 		c.cl = newCluster(c)
 	}
 	return c
+}
+
+// checkSeeds reports the first entry of seeds that is not host:port with a port from 1 to
+// 65535.
+func checkSeeds(seeds []string) error {
+	for _, s := range seeds {
+		host, port, err := net.SplitHostPort(s)
+		if err == nil && host == "" {
+			err = errors.New("empty host")
+		}
+		if err == nil {
+			if n, perr := strconv.Atoi(port); perr != nil || n < 1 || n > 65535 {
+				err = errors.New("bad port")
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("ruvio: invalid seed %q: %w", s, err)
+		}
+	}
+	return nil
+}
+
+// connectError is a failure to open a connection (the address could not be reached or
+// the handshake broke off), as opposed to a server reply. It prints as the error it wraps.
+type connectError struct{ err error }
+
+func (e *connectError) Error() string { return e.err.Error() }
+func (e *connectError) Unwrap() error { return e.err }
+
+func isConnectError(err error) bool {
+	var ce *connectError
+	return errors.As(err, &ce)
 }
 
 // Connect is NewClient followed by Ping. It returns the connect, authentication or
@@ -123,6 +281,7 @@ func (c *Client) Close() error {
 	if c.closed.Swap(true) {
 		return nil
 	}
+	close(c.done)
 	if cn := c.cur.Swap(nil); cn != nil {
 		cn.close()
 	}
@@ -150,7 +309,13 @@ func (c *Client) shared(ctx context.Context) (*conn, error) {
 	if cn := c.cur.Load(); cn != nil && !cn.dead.Load() {
 		return cn, nil
 	}
-	cn, err := c.dial(ctx, c.opts.OnPush)
+	// A dropped connection moves on to the address after the one that dropped.
+	start := int(c.at.Load())
+	old := c.cur.Load()
+	if old != nil {
+		start = int(old.addr) + 1
+	}
+	cn, err := c.dialShared(ctx, start, old != nil)
 	if err != nil {
 		return nil, err
 	}
@@ -158,35 +323,95 @@ func (c *Client) shared(ctx context.Context) (*conn, error) {
 	return cn, nil
 }
 
+// dial opens a connection starting at the address the last successful dial used.
 func (c *Client) dial(ctx context.Context, onPush func(Value)) (*conn, error) {
+	return c.dialAt(ctx, onPush, int(c.at.Load()))
+}
+
+// dialAt tries the addresses in order from start, wrapping around, one attempt each. An
+// address that cannot be reached is skipped; a refused handshake step is returned at once.
+// With one address (the default) this is a single attempt. In cluster mode the seed client
+// is one node and never moves to another address; the cluster asks the other seeds itself.
+func (c *Client) dialAt(ctx context.Context, onPush func(Value), start int) (*conn, error) {
+	if c.cfgErr != nil {
+		return nil, c.cfgErr
+	}
+	if c.cl != nil && !c.cl.standalone.Load() {
+		return c.dialAddr(ctx, onPush, 0, c.opts.Addr)
+	}
+	nodes := c.nodeList()
+	n := len(nodes)
+	if n == 0 { // sentinel mode, no primary known yet
+		return c.dialPrimary(ctx, onPush)
+	}
+	if n == 1 {
+		return c.dialAddr(ctx, onPush, 0, nodes[0])
+	}
+	start %= n
+	var last error
+	for step := 0; step < n; step++ {
+		i := (start + step) % n
+		cn, err := c.dialAddr(ctx, onPush, i, nodes[i])
+		if err == nil {
+			return cn, nil
+		}
+		if !isConnectError(err) || ctx.Err() != nil {
+			return nil, err
+		}
+		last = err
+	}
+	return nil, last
+}
+
+// transport opens the network connection to addr: Options.Dial when set, otherwise TCP, wrapped in TLS
+// when Options.TLS is set.
+func (c *Client) transport(ctx context.Context, addr string) (net.Conn, error) {
+	if c.opts.Dial != nil {
+		return c.opts.Dial(ctx, "tcp", addr)
+	}
+	if c.opts.TLS != nil {
+		d := tls.Dialer{Config: c.opts.TLS}
+		return d.DialContext(ctx, "tcp", addr)
+	}
+	var d net.Dialer
+	return d.DialContext(ctx, "tcp", addr)
+}
+
+func (c *Client) dialAddr(ctx context.Context, onPush func(Value), idx int, addr string) (*conn, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, c.opts.DialTimeout)
 		defer cancel()
 	}
-	var nc net.Conn
-	var err error
-	if c.opts.Dial != nil {
-		nc, err = c.opts.Dial(ctx, "tcp", c.opts.Addr)
-	} else {
-		var d net.Dialer
-		nc, err = d.DialContext(ctx, "tcp", c.opts.Addr)
-	}
+	nc, err := c.transport(ctx, addr)
 	if err != nil {
-		return nil, err
+		return nil, &connectError{err}
 	}
 	if tc, ok := nc.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 	}
 	cn := newConn(nc, onPush)
+	cn.timeout = c.opts.CommandTimeout
+	cn.addr = int32(idx)
 	if onPush != nil || c.opts.Protocol == 3 {
 		cn.keepReading() // push frames can arrive with no call pending
 	}
 	if err := c.handshake(ctx, cn); err != nil {
 		cn.close()
-		return nil, err
+		if isServerErr(err) {
+			return nil, err
+		}
+		return nil, &connectError{err}
 	}
+	c.at.Store(int32(idx))
 	return cn, nil
+}
+
+func durabilityReq(o Options) *request {
+	if o.DurabilityTimeout > 0 {
+		return newCmd(6, cCLIENT).t(tDURABILITY).t(tREPLICAS).i(int64(o.DurabilityReplicas)).t(tTIMEOUT).i(ms(o.DurabilityTimeout))
+	}
+	return newCmd(4, cCLIENT).t(tDURABILITY).t(tREPLICAS).i(int64(o.DurabilityReplicas))
 }
 
 func (c *Client) handshake(ctx context.Context, cn *conn) error {
@@ -228,6 +453,16 @@ func (c *Client) handshake(ctx context.Context, cn *conn) error {
 			return err
 		}
 	}
+	if o.DurabilityReplicas > 0 {
+		if _, err := cn.exec(ctx, durabilityReq(o)); err != nil {
+			return err
+		}
+	}
+	if c.readOnly {
+		if _, err := cn.exec(ctx, newCmd(1, cREADONLY)); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -244,6 +479,9 @@ func (c *Client) execLocal(ctx context.Context, r *request) (Value, error) {
 	if err != nil {
 		putReq(r)
 		return Value{}, err
+	}
+	if c.follow && c.following() {
+		return c.execFollow(ctx, cn, r)
 	}
 	return cn.exec(ctx, r)
 }
@@ -327,7 +565,11 @@ func (c *Client) release(cn *conn) {
 //	v, err := c.Do(ctx, "OBJECT", "ENCODING", "mykey")
 //	s := v.Str()
 func (c *Client) Do(ctx context.Context, args ...any) (Value, error) {
-	return c.cmds.Do(ctx, args...)
+	v, err := c.cmds.Do(ctx, args...)
+	if c.follow {
+		c.trackMulti(args, v, err)
+	}
+	return v, err
 }
 
 // Stats are transport counters of the shared connection. Because frames that queue up

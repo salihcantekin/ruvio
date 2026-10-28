@@ -82,7 +82,7 @@ fn every_current_mutating_command_crosses_the_boundary() {
     let mut shard = KvShard::new();
     let mut sink = RecordingSink::default();
     let commands = [
-        Command::ListPush(owned(b"list"), vec![owned(b"item")]),
+        Command::ListPush(owned(b"list"), vec![owned(b"item")].into()),
         Command::ListPop {
             key: owned(b"list"),
             count: None,
@@ -91,7 +91,7 @@ fn every_current_mutating_command_crosses_the_boundary() {
         Command::SetRemove(owned(b"set"), vec![owned(b"member")]),
         Command::SortedSetAdd {
             key: owned(b"scores"),
-            pairs: vec![(1.5, owned(b"member"))],
+            pairs: vec![(1.5, owned(b"member"))].into(),
             options: SortedSetAddOptions::default(),
         },
         Command::BloomReserve(owned(b"seen"), 0.01, 100, 2),
@@ -99,6 +99,7 @@ fn every_current_mutating_command_crosses_the_boundary() {
         Command::Del(vec![owned(b"scores"), owned(b"seen")].into()),
         Command::set(owned(b"ttl"), owned(b"value")),
         Command::Expire {
+            condition: crate::protocol::ExpireCondition::Always,
             key: owned(b"ttl"),
             milliseconds: 5_000,
         },
@@ -112,7 +113,7 @@ fn every_current_mutating_command_crosses_the_boundary() {
             destination: owned(b"n"),
         },
         Command::Del(vec![owned(b"n")].into()),
-        Command::ListPushBack(owned(b"tail"), vec![owned(b"a"), owned(b"b")]),
+        Command::ListPushBack(owned(b"tail"), vec![owned(b"a"), owned(b"b")].into()),
         Command::ListTrim(owned(b"tail"), 1, 1),
         Command::ListPopBack {
             key: owned(b"tail"),
@@ -140,7 +141,7 @@ fn every_current_mutating_command_crosses_the_boundary() {
         },
         Command::SortedSetAdd {
             key: owned(b"z"),
-            pairs: vec![(1.0, owned(b"a"))],
+            pairs: vec![(1.0, owned(b"a"))].into(),
             options: SortedSetAddOptions::default(),
         },
         Command::SortedSetIncr {

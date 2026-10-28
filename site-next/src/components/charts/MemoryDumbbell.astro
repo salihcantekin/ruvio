@@ -50,6 +50,7 @@ const savedText = (s: number) => (s > 0.005 ? `−${Math.round(s * 100)}%` : s <
   .ticks span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
   .ticks span:first-child { transform: none; }
   .row { padding: 7px 0; border-radius: 4px; outline: none; }
+  .row:hover, .row.is-on { background: var(--row-hover); }
   .row.is-on .lab { color: var(--ink); }
   .row.is-on .track { background-color: var(--surface-2); }
   .lab { font-size: 14px; color: var(--mute); min-width: 0; }

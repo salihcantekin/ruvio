@@ -215,6 +215,10 @@ public class TransportEdgeTests
                 }
             }
         });
+        // On .NET 8, MeterListener.Dispose unsubscribes from the instruments only when this callback is set. Without it
+        // the listener kept recording every later command of the test run into the list above, and the allocation tests
+        // saw that list grow.
+        meterListener.MeasurementsCompleted = (_, _) => { };
         meterListener.Start();
 
         using var server = new FakeServer();
@@ -243,6 +247,104 @@ public class TransportEdgeTests
             Assert.Contains("write", measurements);
             Assert.Contains("reply", measurements);
         }
+
+        // No other test listens to these instruments, so they must be off once this listener is gone.
+        meterListener.Dispose();
+        Assert.False(RuvioSocket.PhaseMetricsEnabled, "the disposed listener still records socket phases");
+    }
+
+    [Fact(Timeout = 15000)]
+    public async Task EachCommandGetsAClientSpanAndADurationWithItsOutcome()
+    {
+        using var parentSource = new ActivitySource("Ruvio.Client.Tests.Commands");
+        var spans = new List<Activity>();
+        var durations = new List<(string? Name, string? Outcome)>();
+        using var activityListener = new ActivityListener
+        {
+            ShouldListenTo = source => source.Name is "Ruvio.Client" or "Ruvio.Client.Tests.Commands",
+            Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllData,
+            ActivityStopped = activity => { lock (spans) { spans.Add(activity); } },
+        };
+
+        ActivitySource.AddActivityListener(activityListener);
+        using var meterListener = new MeterListener();
+        meterListener.InstrumentPublished = (instrument, listener) =>
+        {
+            if (instrument.Meter.Name == "Ruvio.Client" && instrument.Name == "ruvio_client_command_duration_milliseconds")
+            {
+                listener.EnableMeasurementEvents(instrument);
+            }
+        };
+        meterListener.SetMeasurementEventCallback<double>((_, _, tags, _) =>
+        {
+            string? name = null, outcome = null;
+
+            foreach (KeyValuePair<string, object?> tag in tags)
+            {
+                if (tag.Key == "db.operation.name")
+                    name = (string?)tag.Value;
+                else if (tag.Key == "outcome")
+                    outcome = (string?)tag.Value;
+            }
+
+            lock (durations) { durations.Add((name, outcome)); }
+        });
+        meterListener.MeasurementsCompleted = (_, _) => { };
+        meterListener.Start();
+
+        using var server = new FakeServer();
+        Task<RuvioConnection> connecting = RuvioConnection.ConnectAsync(server.Options(o => o.Reconnect = false));
+        using FakeConn conn = await server.AcceptAsync();
+        await using RuvioConnection connection = await connecting;
+        RuvioClient client = await connection.GetDefaultDatabaseAsync();
+        Activity parent = parentSource.StartActivity("request")!;
+
+        ValueTask<byte[]?> get = client.GetAsync("secret-key");
+        await conn.Expect("GET", "secret-key");
+        await conn.Reply("$1\r\nv\r\n");
+        Assert.Equal("v"u8.ToArray(), await get);
+
+        ValueTask<RespValue> set = client.ExecuteAsync("SET", "secret-key", "secret-value");
+        await conn.Expect("SET", "secret-key", "secret-value");
+        await conn.Reply("-ERR boom\r\n");
+        await Assert.ThrowsAsync<RuvioException>(async () => await set);
+
+        ValueTask<RespValue> binary = client.ExecuteBinaryAsync(new ReadOnlyMemory<byte>[] { "DEL"u8.ToArray(), "k"u8.ToArray() });
+        await conn.Expect("DEL", "k");
+        await conn.Reply(":1\r\n");
+        Assert.Equal(1, (await binary).Integer);
+        parent.Dispose();
+
+        List<Activity> commands;
+
+        lock (spans)
+        {
+            commands = spans.Where(span => span.Kind == ActivityKind.Client && span.ParentSpanId == parent.SpanId).ToList();
+            Assert.Equal(["GET", "SET", "DEL"], commands.Select(span => span.OperationName));
+
+            // The socket phases nest under the command that caused them.
+            Assert.Contains(spans, span => span.OperationName == "socket.reply" && span.ParentSpanId == commands[0].SpanId);
+        }
+
+        Assert.All(commands, span =>
+        {
+            Assert.Equal("ruvio", span.GetTagItem("db.system"));
+            Assert.Equal(span.OperationName, span.GetTagItem("db.operation.name"));
+            Assert.Equal("0", span.GetTagItem("db.namespace"));
+            Assert.DoesNotContain(span.TagObjects, tag => tag.Value is string text && text.Contains("secret"));
+        });
+        Assert.Equal(ActivityStatusCode.Unset, commands[0].Status);
+        Assert.Equal(ActivityStatusCode.Error, commands[1].Status);
+        Assert.Equal(typeof(RuvioException).FullName, commands[1].GetTagItem("error.type"));
+
+        lock (durations)
+        {
+            Assert.Contains(("GET", "ok"), durations);
+            Assert.Contains(("SET", "error"), durations);
+            Assert.Contains(("DEL", "ok"), durations);
+        }
+
+        meterListener.Dispose();
     }
 
     [Fact(Timeout = 15000)]

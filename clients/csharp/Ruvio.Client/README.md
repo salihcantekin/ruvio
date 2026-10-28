@@ -62,13 +62,13 @@ keys must share one slot, or the call fails with `CROSSSLOT` before anything is 
 Cluster transactions are deliberately not supported by this API; unsupported commands fail
 explicitly. Existing string APIs are unchanged.
 
-RESP2 client for [Ruvio](https://ruviodb.com/). Connecting does not send `CLIENT SETINFO` or `HELLO`. The typed methods cover every command in `docs/compatibility-matrix.json` (287/287) and the options that change what Ruvio does; `MatrixCoverageTests` fails when a matrix command has no typed method, and `LiveCommandTests` sends every one of them to a real server. `FLUSHDB ASYNC` (it runs synchronously) and `HELLO AUTH`/`SETNAME` have no typed form. Anything else can go through `ExecuteAsync` with the same argument lists as `redis-cli`.
+RESP2 client for [Ruvio](https://ruviodb.com/). Connecting does not send `CLIENT SETINFO` or `HELLO`. The typed methods cover every command in `docs/compatibility-matrix.json` (299/299) and the options that change what Ruvio does; `MatrixCoverageTests` fails when a matrix command has no typed method, and `LiveCommandTests` sends every one of them to a real server. `FLUSHDB ASYNC` (it runs synchronously) and `HELLO AUTH`/`SETNAME` have no typed form. Anything else can go through `ExecuteAsync` with the same argument lists as `redis-cli`.
 
 ## Command coverage
 
 `Ruvio.Client.Tests/MatrixCoverageTests.cs` reads `docs/compatibility-matrix.json` and maps each command
 to the method that sends it (`SELECT` maps to `RuvioConnection.GetDatabaseAsync`). `LiveCommandTests`
-runs every command family against a live server through a recording TCP proxy and fails unless all 287
+runs every command family against a live server through a recording TCP proxy and fails unless all 291
 matrix commands were sent by their typed methods and answered. Set `RUVIO_TEST_ADDR=host:port` to run the
 live tests; without it they are skipped. They use databases 12, 13 and 14 (`FLUSHDB`), create and delete
 uniquely-prefixed keys in database 0 for `JSON.INDEX`, and end with `FLUSHALL`: use a disposable server.
@@ -82,6 +82,7 @@ Ruvio-specific commands and options added in this pass:
 | Command / option | Method |
 |---|---|
 | `SET key value IFEQ expected [PX ms \| KEEPTTL]` | `SetIfEqualAsync(key, value, expected, expiry?)`, `SetIfEqualKeepingTimeToLiveAsync` |
+| `SET key value IFGT \| IFLT [PX ms]` | `SetIfGreaterAsync(key, long, expiry?)`, `SetIfLessAsync(key, long, expiry?)`; false when the stored number was not greater / smaller |
 | `DELEX key IFEQ value` | `DeleteIfEqualAsync` |
 | `LPUSHCAP` / `RPUSHCAP` | `PushListLeftCappedAsync` / `PushListRightCappedAsync(key, cap, values)` |
 | `BF.RESERVE ... EXPANSION n \| NONSCALING` | `ReserveBloomFilterAsync(key, error, capacity, expansion, nonScaling)` |
@@ -90,6 +91,7 @@ Ruvio-specific commands and options added in this pass:
 | `JSON.INDEX CREATE/DROP/LIST`, `JSON.FIND` | `JsonCreateIndexAsync(name, prefix, path, JsonIndexType)`, `JsonDropIndexAsync`, `JsonListIndexesAsync`, `JsonFindAsync(index, value, count?, after?)` |
 | `JSON.OBJLEN`, `JSON.STRAPPEND`, `JSON.NUMMULTBY`, `JSON.ARRINSERT`, `JSON.ARRPOP`, `JSON.ARRTRIM`, `JSON.ARRINDEX`, `JSON.FORGET`, `JMERGE` | `JsonObjectLengthAsync`, `JsonStringAppendAsync`, `JsonMultiplyAsync`, `JsonArrayInsertAsync`, `JsonArrayPopAsync`, `JsonArrayTrimAsync`, `JsonArrayIndexAsync`, `JsonForgetAsync`, `JMergeAsync` |
 | `IDEM key BEGIN` (typed) | `TryBeginIdempotencyAsync` returns `IdempotencyBegin(State, Result)` |
+| `IDEM key ABORT` (typed) | `AbortIdempotencyAsync` returns `true` when it removed a pending record |
 | `RUVIO`, `RUVIO OWNER` | `RuvioAsync`, `GetRuvioOwnerAsync` |
 
 Redis-compatible commands added: `SETEX`/`PSETEX` (`SetExpireAsync`, `SetExpireMillisecondsAsync`), `SETNX`
@@ -139,6 +141,8 @@ await using RuvioLease? slot = await db.TryAcquireSemaphoreAsync("sem:export", m
 
 // Rate limit (LIMIT): (Allowed, Remaining); a refused call is not counted.
 RateLimitResult decision = await db.RateLimitAsync("rl:ada", max: 100, TimeSpan.FromMinutes(1));
+// Smoother: sliding window, or a token bucket that says how long to wait.
+LimitOutcome bucket = await db.LimitTokensWithRetryAsync("api:key-7", 10, 1_000, 2);
 
 // Cache-aside with stampede protection (FILLGET/FILLSET): one builder across all processes.
 string page = await db.GetOrCreateAsync("cache:home", TimeSpan.FromMinutes(5), ct => RenderAsync(ct));
@@ -242,7 +246,7 @@ An optional third argument selects concurrency 1/16/128; for example,
 `--socket-phases 16479 5 16`. `wallMicrosecondsPerOperation` is elapsed wall
 time divided by completed operations, not concurrent request latency.
 
-On local Apple M4 Pro/.NET 8.0.18 loopback, initial means were about 30 us total,
+On local Apple silicon Mac/.NET 8.0.18 loopback, initial means were about 30 us total,
 0.04–0.05 us encode, 0.26–0.34 us queue, 2.7–2.8 us write and 28.5–28.7 us reply.
 The dominant interval includes reply waiting, parsing and async scheduling;
 these data do not isolate wire latency.
@@ -278,7 +282,7 @@ The second mode explicitly submits prebuilt groups of 16 commands through
 count and average bytes per write. It is an explicit pipeline experiment, not
 automatic batching of independent calls.
 
-Local instrumented .NET 8.0.18/M4 Pro comparison (256-byte values, one shared
+Local instrumented .NET 8.0.18/Apple silicon comparison (256-byte values, one shared
 loopback connection, identical SET values, one warmup and five measured seconds):
 
 | Operation | Concurrent calls ops/s | Pipeline ops/s | Writes/op, calls → pipeline | Client CPU us/op, calls → pipeline |
@@ -350,7 +354,7 @@ arrays are still created at the call site when applicable: this removes the
 client's second, flattened array, not all allocations in the operation.
 
 `KeyedCommandBenchmarks` measures construction plus encoding with preallocated
-input pairs. On Apple M4 Pro / .NET 8.0.18 (three warmups, five measured
+input pairs. On Apple silicon Mac / .NET 8.0.18 (three warmups, five measured
 iterations), one-pair HSET changed from 89.49 to 67.19 ns and 56 to 0 allocated
 bytes; two pairs from 126.59 to 97.32 ns and 72 to 0 bytes. Three pairs use the
 array fallback (162.83 vs 164.50 ns, 88 bytes in both). These measurements exclude
@@ -370,7 +374,7 @@ To measure the inline encoder without network or server costs:
 dotnet run -c Release --project clients/csharp/Ruvio.Client.Benchmarks -- --filter '*InlineCommandBenchmarks*' --job short
 ```
 
-On Apple M4 Pro / .NET 8.0.18, a local five-iteration comparison reduced encoding
+On Apple silicon Mac / .NET 8.0.18, a local five-iteration comparison reduced encoding
 time from 34.28 to 25.55 ns for GET, 45.99 to 37.26 ns for SET, 34.59 to 25.64 ns
 for INCR, and 21.79 to 14.92 ns for PING, with no measured managed allocation in
 either version. An unlisted inline CUSTOM command increased from 33.95 to
@@ -471,10 +475,29 @@ Address? a = await client.JsonGetValueAsync<Address>("user:1", "$.addr");
 
 `JsonMergeValueAsync` and `JsonArrayAppendValueAsync` work the same way. The overloads that take `JsonSerializerOptions` use reflection (marked for trimming); pass a `JsonTypeInfo<T>` for trimmed or AOT apps.
 
+## Tracing and metrics
+
+Every command sent through the typed methods, `ExecuteAsync` or `ExecuteBinaryAsync` gets an OpenTelemetry client
+span named after it and a duration on the `ruvio_client_command_duration_milliseconds` histogram. The client reports
+through `System.Diagnostics`, so no OpenTelemetry package is needed, and nothing is recorded until you listen:
+
+```csharp
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracing => tracing.AddSource("Ruvio.Client"))
+    .WithMetrics(metrics => metrics.AddMeter("Ruvio.Client"));
+```
+
+Keys and values are never recorded. Without a listener a command costs one check and no allocation. The full list
+of spans, tags and instruments is in [Observability](../../../docs/OBSERVABILITY.md#net-client).
+
 ## Connecting
 
 Native idempotency is exposed as `BeginIdempotencyAsync(key, fingerprint, owner,
 ttlMs)` and `CompleteIdempotencyAsync(key, fingerprint, owner, result)`.
+`AbortIdempotencyAsync(key, fingerprint, owner)` gives up a pending record of this
+owner (`IDEM key ABORT ...`), so the next begin acquires it at once instead of
+waiting for retention to end; it returns `false` for a completed record or another
+owner's. Abort only when the work did not take effect or is safe to run again.
 Begin returns a RESP array (`acquired`, `pending`, `conflict`, or `completed` plus
 result bytes); complete returns a boolean acknowledgment. The completion helper
 takes text; `ExecuteBinaryAsync` supports arbitrary binary tokens/results with
@@ -484,7 +507,7 @@ nor completion renews retention, and no ambiguous write is automatically retried
 See [the native contract](../../../docs/IDEM.md) before using it for
 external side effects.
 
-Give the client one address. On connect it sends `CLUSTER SLOTS`. A standalone server replies with an error and the client keeps that one socket. A sharded server returns the slot map; the client then opens one socket per shard and sends each command to the shard that owns the key. A `MOVED` reply points that slot at the node it names and the command is sent there; the whole map is read again only when that node is unknown, or on the command's second and third `MOVED`. A fourth `MOVED` is returned as the error. Multi-key reads and writes (`MGET`, `MSET`, `DEL`, `UNLINK`, `EXISTS`, `TOUCH`) are split by slot and merged, in a pipeline too: the merged reply sits at that command's index. Any other command whose keys span slots (`RENAME`, `RENAMENX`, `COPY`, `SMOVE`, `LMOVE`, `SINTERSTORE`, `BITOP`, `EVAL`, ...) fails with a `CROSSSLOT` `RuvioException` before anything is sent; use a hash tag such as `{user:1}` to keep related keys in one slot. `FLUSHDB`, `FLUSHALL`, and `DBSIZE` go to every shard.
+Give the client one address. On connect it sends `CLUSTER SLOTS`. A standalone server replies with an error and the client keeps that one socket. A sharded server returns the slot map; the client then opens one socket per shard and sends each command to the shard that owns the key. A `MOVED` reply points that slot at the node it names and the command is sent there; the whole map is read again only when that node is unknown, or on the command's second and third `MOVED`. A fourth `MOVED` is returned as the error. An `ASK` reply sends `ASKING` and the command together to the node it names and returns that reply; the slot map is not changed, so the next command for the slot goes to its owner again. `MOVED` and `ASK` share one budget of three redirects per command. A `TRYAGAIN` reply sends the command again, routed by the current map, after 5, 10, 20, 40, 80, 160 and 320 ms (635 ms in all); the eighth `TRYAGAIN` is returned as the error. Multi-key reads and writes (`MGET`, `MSET`, `DEL`, `UNLINK`, `EXISTS`, `TOUCH`) are split by slot and merged, in a pipeline too: the merged reply sits at that command's index. Any other command whose keys span slots (`RENAME`, `RENAMENX`, `COPY`, `SMOVE`, `LMOVE`, `SINTERSTORE`, `BITOP`, `EVAL`, ...) fails with a `CROSSSLOT` `RuvioException` before anything is sent; use a hash tag such as `{user:1}` to keep related keys in one slot. `FLUSHDB`, `FLUSHALL`, and `DBSIZE` go to every shard.
 
 ```csharp
 await using var clusterConnection = await RuvioConnection.ConnectAsync("127.0.0.1", 6379);
@@ -495,6 +518,57 @@ IReadOnlyList<string?> values = await cluster.GetManyAsync("session:ada", "somek
 ```
 
 `RuvioClient.GetHashSlot(key)` is the same 0–16383 slot Ruvio uses, including `{hash tags}`. Set `RuvioClientOptions.DiscoverCluster` to `false` to stay on the seed socket.
+
+### Seed addresses
+
+`RuvioClientOptions.Seeds` is a list of `host:port` strings (an IPv6 host in brackets, `[::1]:6379`). It is empty by default; when it is not empty it replaces `Host` and `Port`, which keep working unchanged when no seeds are given. An empty host or a bad port is an `ArgumentException` / `ArgumentOutOfRangeException`.
+
+```csharp
+await using var connection = await RuvioConnection.ConnectAsync(new RuvioClientOptions
+{
+    Seeds = ["10.0.0.5:6379", "10.0.0.6:6379", "10.0.0.7:6379"],
+});
+```
+
+Connect tries the seeds in order, one attempt each, and keeps the first that answers. A seed that cannot be reached (refused, timed out) is skipped; a refused `AUTH` stops at once; when none answers, the last connect error is thrown. On a standalone server, each reconnect attempt tries every seed once, starting with the one after the address that dropped and ending with it, and `ReconnectDelay` / `ReconnectBaseDelay` run between attempts. The command that hit the drop still fails. A subscriber socket opened later starts at the address the command socket is on, and `ConnectionLost` / `ConnectionRestored` report the actual address.
+
+On a cluster, `CLUSTER SLOTS` comes from the first reachable seed. A slot map reload (after a `MOVED` to an unknown node, or when a node cannot be opened again) asks the nodes with an open socket first; when none answers, it opens every other known node and then every seed, one attempt each, until one returns a slot map. The command goes to the owner the new map names, and a command without a key goes to the first reachable node of the new map. Seeds are never asked while the known nodes answer. A pipeline that hits a node that cannot be opened fails; the next command reloads the map.
+
+### Following a failover
+
+With two or more seeds a standalone client finds the primary again after a failover. On a reconnect it asks the seeds `ROLE` and connects to the one that answers `master` (a replica's reported primary is tried too); if none does it falls back to the first seed that answers. When a command is answered `READONLY` (the node was demoted) it does the same and sends that command once more to the new primary (the node that answered is skipped only while it still says `master`; once it says it is a replica, a later round takes it when it is promoted): `READONLY` is sent before the command runs, so the retry cannot apply it twice. It is not sent again inside a transaction the client opened, or in a pipeline, and a second `READONLY` is returned as the `RuvioException`. The rounds wait with the reconnect backoff (`MaxReconnectAttempts`, `ReconnectBaseDelay`, `ReconnectMaxDelay`); with `Reconnect = false` there is one round. Nothing is sent while the connection is healthy, and a single address behaves as before. A cluster client keeps its `MOVED`/`ASK` rules. `FollowPrimary = false` turns it off.
+
+With `SentinelMaster` set the seeds are coordinator (or Sentinel) addresses: the client asks `SENTINEL get-master-addr-by-name <name>`, checks the answer with `ROLE`, and connects there, at connect time, on reconnect and after `READONLY`. Connect throws a `RuvioException` naming the master when no coordinator names a primary. The same `AUTH` credentials go to the coordinators and the data node. The rules are the same in every client ([docs/CLIENT_BEHAVIOR.md](../../../docs/CLIENT_BEHAVIOR.md#following-a-failover)).
+
+```csharp
+var options = new RuvioClientOptions { Seeds = ["10.0.0.5:6379", "10.0.0.6:6379"] };
+// Or with coordinators: the seeds are their addresses.
+var viaSentinel = new RuvioClientOptions { Seeds = ["10.0.0.9:26379"], SentinelMaster = "main" };
+```
+
+`FailoverLiveTests` needs the pair `scripts/run_with_servers.sh` starts (`RUVIO_FAILOVER_ADDRS`, `RUVIO_FAILOVER_REPLICATION`) and returns early without it; `FollowFailoverTests` uses scripted nodes and needs nothing.
+
+### Reads from replicas
+
+`RuvioClientOptions.DurabilityReplicas` (with an optional `DurabilityTimeout`) makes every connection the client opens send `CLIENT DURABILITY REPLICAS n [TIMEOUT ms]` right after `AUTH`, so the server holds that connection's replies until `n` replicas have the writes on disk; a write the replicas do not confirm in time fails with `NOREPLICAS` and stays applied. A server without replication refuses it and the connect fails. The default sends nothing. `SetDurabilityAsync(replicas, timeout)` sets or clears it on one connection.
+
+`RuvioClientOptions.ReadPolicy` (`ReadPolicy.Primary`, `PreferReplica` or `Replica`) chooses where a cluster client sends reads. A standalone connection ignores it. `CLUSTER SLOTS` lists each shard's replicas after its primary; when the slot map is loaded, the client picks one replica per shard at random and keeps it until the next load. Each replica socket sends `READONLY` once, right after it is opened.
+
+```csharp
+await using var connection = await RuvioConnection.ConnectAsync(new RuvioClientOptions
+{
+    Host = "10.0.0.5",
+    ReadPolicy = ReadPolicy.PreferReplica,
+});
+```
+
+- `Primary` (the default): every command goes to the slot's primary, and no replica socket is opened.
+- `PreferReplica`: a read goes to the shard's replica when one is known and reachable, otherwise to the primary.
+- `Replica`: a read goes to the shard's replica; with none known or reachable it throws a `RuvioException` ("no replica ...").
+
+Replication is asynchronous: a read from a replica may miss recent writes, including your own. A command is a read when the server flags it `readonly` and not blocking (`GET`, `MGET`, `EXISTS`, `HGETALL`, `ZRANGE`, ...). Writes, commands without a key, transactions, Pub/Sub, `SCAN` and the commands that go to every shard, and blocking commands go to the primaries as before. The parts of a split `MGET` or `EXISTS` are reads; the parts of `DEL` or `MSET` are writes. A pipeline goes to replicas only when every command in it is a read; otherwise the whole pipeline is routed as before.
+
+A replica that cannot be opened, or that answers a read with `LOADING` (it is still copying its primary), is skipped until the next slot map load. Under `PreferReplica` the command goes to the primary (a `LOADING` read is sent again there); under `Replica` the open error is thrown, or the `LOADING` error is returned as a `RuvioException`. A socket that drops after a command was sent still fails that command; it is not sent again.
 
 ### Concurrent commands
 
@@ -530,7 +604,7 @@ after admission so caller-owned memory can be reused after cancellation.
 blocking I/O and a reader thread of its own: the caller that owns the writer writes its
 frames synchronously, and the thread reads the replies and completes the callers, who
 resume on the thread pool. This skips the runtime's async socket engine and one thread-pool
-hand-off per round trip. On a 4-shard local server (Apple M4 Pro) it cut user CPU per
+hand-off per round trip. On a 4-shard local server (Apple silicon Mac) it cut user CPU per
 request by about 45% for 16-command pipelines on one socket and by 25-35% for pipelines
 split over the shards; Linux was not measured. The cost is one thread per socket (one per
 shard in a cluster), and a write that fills the socket buffer blocks its caller until the
@@ -626,6 +700,75 @@ default `IRuvioClient`; both share the same DI lifetime boundary.
 
 `FlushDatabaseAsync`, `FlushAllDatabasesAsync`, `SwapDatabasesAsync`, and `MoveKeyAsync` send `FLUSHDB`, `FLUSHALL`, `SWAPDB`, and `MOVE`. See `docs/LOGICAL_DATABASES.md`.
 
+## When Ruvio is unreachable
+
+The client throws when it cannot reach Ruvio (`SocketException`, `IOException`, `TimeoutException`, or a `RuvioException` with
+`IsServerReply == false`). Applications that sit on top of it, such as the .NET integrations (caching, rate limiting,
+idempotency, locks, output caching), often want to decide what to do instead of failing the request. The client ships the
+pieces for that:
+
+- `RuvioOutageMode` (`Throw`, `FailClosed`, `FailOpen`) and `RuvioOutageOptions`, the `Outage` option of each integration.
+  `RuvioOutageOptions.IsOutage(exception, token)` tells an outage (unreachable server, dropped connection, timeout,
+  open circuit, `LOADING`, `MASTERDOWN`, `CLUSTERDOWN`) from a server error reply like `WRONGTYPE`, which is never an outage.
+- `RuvioCircuitBreaker`: after `FailureThreshold` outage failures in a row it opens and `TryAcquire()` returns false for
+  `BreakDuration`; then one trial call goes through and its outcome closes or reopens the circuit. Healthy, it costs a volatile read.
+  Its `StateChanged` event reports each change (previous and new state, and how long an opened circuit stays open)
+  outside the breaker's lock; a throwing handler is ignored. Changes are also counted in `ruvio_client_circuit_transitions`.
+
+```csharp
+var outage = new RuvioOutageOptions(RuvioOutageMode.FailOpen)
+{
+    CircuitBreaker = new RuvioCircuitBreakerOptions { FailureThreshold = 5, BreakDuration = TimeSpan.FromSeconds(30) },
+};
+
+if (!outage.TryEnter())
+    return Fallback();                                   // the circuit is open: Ruvio is not called
+
+try
+{
+    var value = await client.GetAsync(key, token);
+    outage.Succeeded();
+    return value;
+}
+catch (Exception error) when (outage.Failed(error, token) && outage.Mode == RuvioOutageMode.FailOpen)
+{
+    return Fallback();                                   // Ruvio is away; other errors still propagate
+}
+```
+
+See [the integrations README](../../../integrations/dotnet/README.md#when-ruvio-is-unreachable) for what each package does.
+
+### Retry policies of your own (Polly and others)
+
+`RuvioErrors` sorts what a call throws, so a retry or circuit-breaker policy from any library (Polly,
+`Microsoft.Extensions.Resilience`, a plain loop) handles the right errors. The client needs no extra package for it.
+
+- `RuvioErrors.IsTransient(exception, token)`: trying again later can succeed. True for an outage (as `IsOutage`)
+  and for `TRYAGAIN`, `READONLY` and `NOREPLICAS`; false for `WRONGTYPE`, `OOM`, syntax errors and the caller's own
+  cancellation.
+- `RuvioErrors.MayHaveRun(exception)`: the failed call may have changed data. False only for an open circuit and a
+  server error reply (the server refused the command), except `NOREPLICAS`: the write was applied and only the replica
+  confirmation timed out. A dropped connection or a timeout may have run, even with `ClosedBeforeReply`.
+
+The client already follows `MOVED`/`ASK`, waits out `TRYAGAIN` during a slot move and finds a new primary after a
+failover; these helpers judge what still reaches you. Repeat a write only when it is safe to repeat or did not run:
+
+```csharp
+// Polly v8. INCR is not safe to repeat, so it is retried only when it surely did not run.
+var pipeline = new ResiliencePipelineBuilder()
+    .AddRetry(new RetryStrategyOptions
+    {
+        ShouldHandle = args => ValueTask.FromResult(args.Outcome.Exception is { } e
+            && RuvioErrors.IsTransient(e) && !RuvioErrors.MayHaveRun(e)),
+        MaxRetryAttempts = 3,
+    })
+    .Build();
+
+long visits = await pipeline.ExecuteAsync(async token => await db.IncrementAsync("visits"), cancellationToken);
+```
+
+For a read, `ShouldHandle` can use `RuvioErrors.IsTransient(e)` alone.
+
 ## Options
 
 | Command | Methods |
@@ -664,6 +807,23 @@ Subscribe opens a **second TCP socket**. `GET` / `SET` / `PUBLISH` stay on the c
 A dropped socket is opened again before the next command, including a shard socket in cluster mode. The command that discovers the drop fails and is never sent again, so a write is not applied twice; that includes reads and pipelines. `RuvioException.ClosedBeforeReply` tells you no byte of the reply arrived, so the caller can resend a read. Pub/Sub channels are subscribed again on the new socket. `ConnectionLost` and `ConnectionRestored` report that, and `ConnectionFailed` still fires on the drop. Set `RuvioClientOptions.Reconnect` to false and call `ReconnectAsync` yourself, or set `ReconnectDelay` to own the wait. `ReconnectDelay` returning null stops the retry.
 
 A password is sent as `AUTH` only when `RuvioClientOptions.Password` is set. One client runs commands one at a time. `ExecuteManyAsync` pipelines several commands on that connection. A server error reply leaves the connection usable. A broken read or write closes it.
+
+## TLS
+
+Plain TCP is the default. Set `RuvioClientOptions.Tls` to turn TLS on for every socket the client opens (reconnects, shards, replicas and Pub/Sub included). The certificate chain is checked against the system trust store and must name the host you connect to.
+
+```csharp
+var roots = new X509Certificate2Collection();
+roots.ImportFromPemFile("ca.pem");
+
+await using var connection = await RuvioConnection.ConnectAsync(new RuvioClientOptions
+{
+    Host = "cache.internal",
+    Tls = new RuvioTlsOptions { TrustedCertificates = roots },
+});
+```
+
+`TrustedCertificates` trusts only your private CA (revocation is not checked then); leave it null for a certificate from a public CA. `ClientCertificates` answers a server that demands mutual TLS. `ServerName` is the name the certificate carries, when you connect by IP address. `InsecureSkipVerify` accepts any certificate and removes the protection against someone in the middle; use it for a throwaway test only. The handshake is part of the connect: a refused certificate throws `AuthenticationException`. With TLS on, `DedicatedReaderThread` has no effect. Measured: the live TLS tests (`TlsLiveTests`); the latency TLS adds: not measured.
 
 ## Changes
 

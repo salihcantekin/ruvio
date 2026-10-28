@@ -8,6 +8,7 @@ internal sealed class RuvioLock : IRuvioLock
     private readonly IRuvioClient client;
     private readonly string key;
     private readonly string token;
+    private readonly long? fencingToken;
     private readonly TimeSpan lease;
     private readonly TimeProvider time;
     private readonly CancellationTokenSource lost = new();
@@ -17,11 +18,13 @@ internal sealed class RuvioLock : IRuvioLock
     private TimeSpan currentLease;
     private int state; // 0 held, 1 lost, 2 released
 
-    internal RuvioLock(IRuvioClient client, RuvioLockOptions options, string resource, string key, string token, TimeSpan lease)
+    internal RuvioLock(IRuvioClient client, RuvioLockOptions options, string resource, string key, string token, TimeSpan lease,
+        long? fencingToken = null)
     {
         this.client = client;
         this.key = key;
         this.token = token;
+        this.fencingToken = fencingToken;
         this.lease = lease;
         time = options.TimeProvider;
         renewedAt = time.GetTimestamp();
@@ -36,6 +39,8 @@ internal sealed class RuvioLock : IRuvioLock
 
     public CancellationToken LockLost => lost.Token;
 
+    public long? FencingToken => fencingToken;
+
     public async ValueTask<bool> ExtendAsync(TimeSpan? newLease = null, CancellationToken cancellationToken = default)
     {
         if (!IsHeld)
@@ -45,12 +50,15 @@ internal sealed class RuvioLock : IRuvioLock
 
         TimeSpan requested = newLease ?? lease;
         string leaseText = RuvioLockProvider.LeaseMilliseconds(requested).ToString(CultureInfo.InvariantCulture);
-        IReadOnlyList<string> command = ["SET", key, token, "IFEQ", token, "PX", leaseText];
+        // A fenced lock is a server lease: RENEW answers 0 once the token no longer holds it.
+        IReadOnlyList<string> command = fencingToken is null
+            ? ["SET", key, token, "IFEQ", token, "PX", leaseText]
+            : ["RENEW", key, token, leaseText];
         RespValue reply = await client.ExecuteAsync(command, cancellationToken).ConfigureAwait(false);
 
         RuvioLockProvider.Check(reply);
 
-        if (reply.Kind == RespKind.Null)
+        if (reply.Kind == RespKind.Null || (fencingToken is not null && reply.Integer == 0))
         {
             MarkLost();
 
@@ -75,9 +83,9 @@ internal sealed class RuvioLock : IRuvioLock
             return false;
         }
 
-        // DELEX removes the key only while it still holds our token, so a lock that expired and was
-        // taken by another owner is left alone.
-        IReadOnlyList<string> command = ["DELEX", key, "IFEQ", token];
+        // DELEX (or RELEASE for a lease) removes the lock only while it still holds our token, so a lock
+        // that expired and was taken by another owner is left alone.
+        IReadOnlyList<string> command = fencingToken is null ? ["DELEX", key, "IFEQ", token] : ["RELEASE", key, token];
         RespValue reply = await client.ExecuteAsync(command, cancellationToken).ConfigureAwait(false);
 
         RuvioLockProvider.Check(reply);
@@ -92,9 +100,9 @@ internal sealed class RuvioLock : IRuvioLock
             await ReleaseAsync().ConfigureAwait(false);
         }
 
-        catch (RuvioException)
+        catch (Exception exception) when (exception is not OperationCanceledException)
         {
-            // The lease expires on its own; a failed release must not hide the guarded work's result.
+            // The lease expires on its own; a failed release (server error, timeout, socket error) must not hide the guarded work's result.
         }
 
         stopRenewing.Dispose();
@@ -129,7 +137,7 @@ internal sealed class RuvioLock : IRuvioLock
                     await ExtendAsync(null, stop).ConfigureAwait(false);
                 }
 
-                catch (Exception exception) when (exception is RuvioException or IOException or ObjectDisposedException)
+                catch (Exception exception) when (exception is not OperationCanceledException)
                 {
                     if (time.GetElapsedTime(Volatile.Read(ref renewedAt)) >= currentLease)
                     {

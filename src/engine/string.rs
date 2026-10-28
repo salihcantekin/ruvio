@@ -125,6 +125,39 @@ pub(super) fn set_if_eq_key<'a, C: Clock, I: StorageIndex, S: MutationSink>(
     }
 }
 
+/// `SET key value IFGT|IFLT`: writes when the key is missing or `number` is greater/smaller than
+/// the stored integer. A stored string that is not an integer is an error and nothing is written.
+pub(super) fn set_if_cmp_key<'a, C: Clock, I: StorageIndex, S: MutationSink>(
+    shard: &'a mut KvShard<C, I>,
+    sink: &mut S,
+    key: crate::protocol::Bytes<'a>,
+    value: crate::protocol::Bytes<'a>,
+    number: i64,
+    greater: bool,
+    options: SetOptions,
+) -> Result<Response<'a>, S::Error> {
+    let current = match shard.value_view(&key) {
+        Ok(Some(ByteView::Integer(current))) => Some(current),
+        Ok(Some(ByteView::Borrowed(bytes))) => match crate::protocol::redis_integer(bytes) {
+            Some(current) => Some(current),
+            None => {
+                return Ok(Response::Error(
+                    b"ERR value is not an integer or out of range",
+                ));
+            }
+        },
+        Ok(None) => None,
+        Err(_) => return Ok(wrong_type()),
+    };
+
+    match current {
+        Some(current) if (number > current) != greater || number == current => {
+            Ok(Response::Bulk(None))
+        }
+        _ => set_key(shard, sink, key, value, options),
+    }
+}
+
 /// `DELEX key IFEQ expected`: 1 when the string matched and was deleted, otherwise 0.
 pub(super) fn del_if_eq_key<'a, C: Clock, I: StorageIndex, S: MutationSink>(
     shard: &'a mut KvShard<C, I>,

@@ -170,12 +170,12 @@ pub(super) fn reply_hot_store(
         return Ok(false);
     }
 
-    // A write holds this shard's log from applying it to the shared store until it is
-    // logged, so a hot partition read in between finds its record here when it syncs the
-    // logs (see `ClusterCheckpointCoordinator::hot_writes_durable`). The lock is this
-    // shard's own and uncontended but for that sync; a write that turns out to change
-    // nothing (`SET NX` on a present key, `DEL` of a missing one) still takes it, since
-    // only the store's own lock decides that.
+    // A write holds this shard's log while it is recorded and applied to the shared store,
+    // so a hot partition read meanwhile finds its record here when it syncs the logs (see
+    // `ClusterCheckpointCoordinator::hot_writes_durable`). The lock is this shard's own and
+    // uncontended but for that sync; a write that turns out to change nothing (`SET NX` on
+    // a present key, `DEL` of a missing one) still takes it, since only the store's own
+    // lock decides that.
     let handled = crate::hot_store::dispatch(&state.published_config.hot_keys, command);
 
     if handled == crate::hot_store::HotDispatch::PassThrough {
@@ -191,8 +191,8 @@ pub(super) fn reply_hot_store(
             .unwrap_or_else(|error| error.into_inner())
     });
 
-    // A failed log refuses the write before it reaches the shared store, where every
-    // shard would read it and the hot partition would publish it.
+    // A failed log refuses the write, even one that would change nothing, as a shard
+    // write is refused.
     if let Some(sink) = wal.as_deref_mut()
         && let Err(error) = sink.ready_for_record()
     {
@@ -202,12 +202,49 @@ pub(super) fn reply_hot_store(
         return Ok(true);
     }
 
-    match crate::hot_store::reply_dispatched(
-        state.hot_store.as_deref(),
-        handled,
-        state.store.borrow().now_unix_millis(),
-        command,
-    ) {
+    let now = state.store.borrow().now_unix_millis();
+    let hot = state.hot_store.as_deref();
+    // The write is recorded before the shared store applies it, under the store's lock: a
+    // refused record leaves the key as it was for every shard. The record is only staged
+    // there; it is written (and under `always` synced) once that lock is released, as a
+    // grouped shard write is.
+    let dispatched = match wal.as_deref_mut() {
+        Some(sink) => {
+            crate::mutation::MutationSink::select_database(sink, 0);
+            let before = sink.last_sequence();
+
+            sink.begin_group();
+            let mut dispatched =
+                crate::hot_store::reply_dispatched(hot, sink, handled, now, command);
+            let written = sink.end_hot_write(before);
+
+            if sink.last_sequence() != before {
+                sink.note_hot_record();
+            }
+            // Applied and kept for recovery, but not written: the writer gets the error.
+            if let Err(error) = written
+                && let Some(Ok((_, wrote))) = dispatched
+            {
+                if wrote {
+                    bump_mutations(state);
+                }
+                dispatched = Some(Err(error));
+            }
+            dispatched
+        }
+        None => crate::hot_store::reply_dispatched(
+            hot,
+            &mut crate::mutation::NoopMutationSink,
+            handled,
+            now,
+            command,
+        )
+        .map(|dispatched| dispatched.map_err(|never| match never {})),
+    };
+
+    drop(wal.take());
+
+    match dispatched {
         None => Ok(false),
         Some(Ok((response, wrote))) => {
             let applied = crate::tracking::response_applied(&response);
@@ -215,35 +252,6 @@ pub(super) fn reply_hot_store(
             if wrote {
                 // Counts toward the next checkpoint like any other write.
                 bump_mutations(state);
-                let now = state.store.borrow().now_unix_millis();
-                let recorded = match wal.as_deref_mut() {
-                    Some(wal) => {
-                        let hot = state.hot_store.as_deref();
-                        let recorded = crate::hot_store::record_applied_hot_command(
-                            wal,
-                            now,
-                            |key| hot.and_then(|hot| hot.deadline(key)),
-                            command,
-                        );
-
-                        // The write is in the shared store either way: a refused one keeps
-                        // the hot partition out until restart.
-                        match recorded {
-                            Ok(()) => wal.note_hot_record(),
-                            Err(_) => wal.note_hot_refused(),
-                        }
-                        recorded
-                    }
-                    None => Ok(()),
-                };
-
-                drop(wal.take());
-
-                if let Err(error) = recorded {
-                    write_response(output, Response::Error(refused_write(&error)))?;
-
-                    return Ok(true);
-                }
             }
 
             write_response_in(output, response, version)?;
@@ -261,8 +269,8 @@ pub(super) fn reply_hot_store(
             Ok(true)
         }
 
-        Some(Err(_)) => {
-            write_response(output, Response::Error(b"MISCONF persistence error"))?;
+        Some(Err(error)) => {
+            write_response(output, Response::Error(refused_write(&error)))?;
             Ok(true)
         }
     }
@@ -278,25 +286,23 @@ pub(super) fn flush_hot_store(state: &ShardState) -> bool {
         return true;
     };
 
-    let now = state.store.borrow().now_unix_millis();
     let mut wal = state
         .persistence
         .lock()
         .unwrap_or_else(|error| error.into_inner());
 
-    // As for a hot write (see `reply_hot_store`): refused before the store changes while
-    // the log is failed, and a refused delete keeps the hot partition out.
-    if wal.ready_for_record().is_err() {
-        return false;
-    }
-    let flushed = crate::hot_store::flush(hot, &mut wal, now);
+    // As for a hot write (see `reply_hot_store`): staged before the store changes, so a
+    // refused delete removes nothing, and written once the store's lock is released.
+    let start = wal.last_sequence();
 
-    match flushed {
-        Ok(true) => wal.note_hot_record(),
-        Ok(false) => {}
-        Err(_) => wal.note_hot_refused(),
+    wal.begin_group();
+    let flushed = crate::hot_store::flush(hot, &mut wal);
+    let written = wal.end_hot_write(start);
+
+    if matches!(flushed, Ok(true)) {
+        wal.note_hot_record();
     }
-    flushed.is_ok()
+    flushed.is_ok() && written.is_ok()
 }
 
 pub(super) fn bump_mutations(state: &ShardState) {
