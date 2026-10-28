@@ -59,7 +59,7 @@ public class CacheEdgeTests
         Assert.Throws<ArgumentNullException>(() => new RuvioDistributedCache(DispatchProxy.Create<IRuvioClient, Script>(), null!));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task KeysAreValidatedBeforeAnyCommandIsSent()
     {
         var (cache, script) = Make(o => o.MaxKeyBytes = 40);
@@ -89,7 +89,7 @@ public class CacheEdgeTests
         Assert.Equal(["GET", "SET", "GET", "DEL"], script.Commands.Select(c => c[0]));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task GetRejectsErrorWrongKindAndMalformedEnvelopes()
     {
         var (cache, script) = Make();
@@ -106,7 +106,7 @@ public class CacheEdgeTests
         }
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task GetDeletesExpiredEntriesAndRenewsSlidingOnes()
     {
         var (cache, script) = Make();
@@ -139,7 +139,7 @@ public class CacheEdgeTests
         await Assert.ThrowsAsync<RuvioException>(() => cache.GetAsync("k"));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task SetValidatesValuesAndExpirations()
     {
         var (cache, script) = Make(o => o.MaxValueBytes = 4);
@@ -164,7 +164,7 @@ public class CacheEdgeTests
         Assert.Equal(3, script.Commands[0].Length);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task RemoveAcceptsOnlyZeroOrOne()
     {
         var (cache, script) = Make();
@@ -182,7 +182,7 @@ public class CacheEdgeTests
     private static RespValue Fill(string state, params RespValue[] rest)
         => Resp.Array([Resp.Bulk(state), .. rest]);
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task FillGetRepliesMustHaveAKnownShape()
     {
         var (cache, script) = Make();
@@ -200,7 +200,7 @@ public class CacheEdgeTests
         await Assert.ThrowsAsync<OperationCanceledException>(() => cache.GetOrCreateAsync("k", factory, new(), new CancellationToken(true)));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task FillHitReturnsTheStoredValueAndStaleOrExpiredHitsRebuild()
     {
         var (cache, script) = Make();
@@ -237,7 +237,7 @@ public class CacheEdgeTests
         Assert.Equal(["FILLGET", "EVAL", "SET"], script.Commands.Select(c => c[0]));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task FillBuilderStoresWithATtlAndPersistsEntriesWithoutExpiry()
     {
         var (cache, script) = Make();
@@ -270,7 +270,7 @@ public class CacheEdgeTests
         await Assert.ThrowsAsync<RuvioException>(() => cache.GetOrCreateAsync("k", factory, new()));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task FillWaitersPollBusyMarkersThenTakeTheResultOrGiveUp()
     {
         var (cache, script) = Make(o => o.FillWait = TimeSpan.FromMilliseconds(30));
@@ -289,7 +289,7 @@ public class CacheEdgeTests
         Assert.Equal("SET", script.Commands[^1][0]);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task ExtensionFallsBackToGetThenFactoryThenSetForOtherCaches()
     {
         var fake = new MemoryCache();

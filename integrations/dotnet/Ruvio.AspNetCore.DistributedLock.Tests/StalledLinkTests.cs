@@ -7,7 +7,7 @@ namespace Ruvio.AspNetCore.DistributedLock.Tests;
 /// <summary>A stalled link makes the client throw TimeoutException; renewal and release must treat it as a failed call.</summary>
 public class StalledLinkTests
 {
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task TimeoutOnRenewMarksTheLockLostAndDisposeDoesNotThrow()
     {
         var client = DispatchProxy.Create<IRuvioClient, OfflineLockTests.ScriptClient>();
@@ -31,7 +31,7 @@ public class StalledLinkTests
         await held.DisposeAsync();
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task TimeoutOnReleaseIsSwallowedByDispose()
     {
         var client = DispatchProxy.Create<IRuvioClient, OfflineLockTests.ScriptClient>();

@@ -48,7 +48,7 @@ public class ValidationTests
             new RuvioDistributedCache(client, Options.Create(new RuvioCacheOptions { InstanceName = " " })));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task NullSizeUnicodeAndExpirationValidationPrecedesIo()
     {
         var cache = Cache(new RuvioCacheOptions { MaxValueBytes = 1, MaxKeyBytes = 30 });
@@ -74,7 +74,7 @@ public class ValidationTests
             cache.SetAsync("k", [], new() { AbsoluteExpirationRelativeToNow = TimeSpan.MaxValue }));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task CancellationPreventsDispatchForEveryOperation()
     {
         var cache = Cache();
@@ -87,7 +87,7 @@ public class ValidationTests
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => cache.RemoveAsync("", canceled.Token));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task FailureIsPropagatedOnceAndCancellationIsForwarded()
     {
         IRuvioClient client = DispatchProxy.Create<IRuvioClient, RejectingClient>();

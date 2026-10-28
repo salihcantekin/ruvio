@@ -11,7 +11,7 @@ namespace Ruvio.AspNetCore.OutputCaching.Tests;
 /// <summary>What the package checks before the server takes a request.</summary>
 public sealed class StartupCheckTests
 {
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task MissingKeyedClientFailsStartAndNamesTheKey()
     {
         await using WebApplication app = App(static services =>
@@ -22,7 +22,7 @@ public sealed class StartupCheckTests
         Assert.Contains("AddKeyedRuvioClient(\"pages\"", error.Message);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task RegisteredClientIsNotResolvedAtStart()
     {
         await using WebApplication app = App(static services =>

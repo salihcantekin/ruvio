@@ -11,7 +11,7 @@ namespace Ruvio.AspNetCore.DistributedLock.Tests;
 /// <summary>What the package checks before the server takes a request.</summary>
 public sealed class StartupCheckTests
 {
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task MissingClientFailsStartAndNamesTheFix()
     {
         await using WebApplication app = App(static services => { });
@@ -21,7 +21,7 @@ public sealed class StartupCheckTests
         Assert.Contains("services.AddRuvioClient", error.Message);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task RegisteredClientIsNotResolvedAtStart()
     {
         await using WebApplication app = App(Client, map: static app => app.MapPost("/ok", [RuvioLock("job")] () => "ok"));
@@ -30,7 +30,7 @@ public sealed class StartupCheckTests
         await app.StopAsync();
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task OutOfRangeAttributeFailsStart()
     {
         await using WebApplication app = App(Client, map: static app =>

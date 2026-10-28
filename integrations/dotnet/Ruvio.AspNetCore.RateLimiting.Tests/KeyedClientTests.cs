@@ -8,7 +8,7 @@ namespace Ruvio.AspNetCore.RateLimiting.Tests;
 
 public class KeyedClientTests
 {
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task ClientKeySelectsTheKeyedClientPerRequest()
     {
         var keyed = DispatchProxy.Create<IRuvioClient, MiddlewareTests.Stub>();

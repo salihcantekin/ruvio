@@ -10,7 +10,7 @@ namespace Ruvio.Extensions.Caching.Tests;
 
 public class WireTests
 {
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task BinarySetUsesOneEvalWithOneNamespacedKeyAndNoBase64()
     {
         await using var wire = await Wire.Open();
@@ -36,7 +36,7 @@ public class WireTests
         await setting;
     }
 
-    [Theory]
+    [Theory(Timeout = 30000)]
     [InlineData(true)]
     [InlineData(false)]
     public async Task SetComputesTheEarlierAbsoluteDeadlineBeforeDispatch(bool explicitEarlier)
@@ -66,7 +66,7 @@ public class WireTests
         await setting;
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task GetPreservesInvalidUtf8EmptyAndNullAndRefreshDoesNotReturnValue()
     {
         await using var wire = await Wire.Open();
@@ -96,7 +96,7 @@ public class WireTests
         await removing;
     }
 
-    [Theory]
+    [Theory(Timeout = 30000)]
     [InlineData("-ERR script failure\r\n")]
     [InlineData("+not-a-cache-value\r\n")]
     public async Task ErrorsAndUnexpectedRepliesNeverBecomeMisses(string response)
