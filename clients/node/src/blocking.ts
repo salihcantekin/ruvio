@@ -77,7 +77,9 @@ function argText(b: Uint8Array): string {
 
 function seconds(b: Uint8Array): number {
   const t = argText(b);
-  const v = /^[+]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(t) ? Number(t) : NaN;
+  // Each alternative matches the digits before a dot once, so the check is linear in the
+  // (already bounded) argument length.
+  const v = /^\+?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(t) ? Number(t) : NaN;
   return v > 0 && Number.isFinite(v) ? v * 1000 : WAIT_FOREVER;
 }
 

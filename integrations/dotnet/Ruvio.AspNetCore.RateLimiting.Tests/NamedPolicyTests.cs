@@ -53,7 +53,7 @@ public class NamedPolicyTests
         Assert.Equal("api", found.Policy);
     }
 
-    [Theory]
+    [Theory(Timeout = 30000)]
     [InlineData(RuvioRateLimitAlgorithm.FixedWindow, nameof(IRuvioClient.LimitAsync))]
     [InlineData(RuvioRateLimitAlgorithm.SlidingWindow, nameof(IRuvioClient.LimitSlidingWithRetryAsync))]
     [InlineData(RuvioRateLimitAlgorithm.TokenBucket, nameof(IRuvioClient.LimitTokensWithRetryAsync))]
@@ -75,7 +75,7 @@ public class NamedPolicyTests
         Assert.Equal(algorithm == RuvioRateLimitAlgorithm.FixedWindow ? "30" : "2", context.Response.Headers.RetryAfter.ToString());
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task NamedAndInlinePoliciesWithTheSameNameShareAKey()
     {
         var client = DispatchProxy.Create<IRuvioClient, MiddlewareTests.Stub>();
@@ -92,7 +92,7 @@ public class NamedPolicyTests
         Assert.Equal(2, stub.Calls);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task UnknownPolicyFailsBeforeCallingRuvio()
     {
         var client = DispatchProxy.Create<IRuvioClient, MiddlewareTests.Stub>();

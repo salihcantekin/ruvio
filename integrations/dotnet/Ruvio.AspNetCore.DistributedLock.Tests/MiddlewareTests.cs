@@ -32,7 +32,7 @@ public class MiddlewareTests
         Assert.Throws<ArgumentOutOfRangeException>(() => new RuvioLockAttribute("x", 0));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task SecondRequestIsRejectedWith409WhileTheFirstRunsAndTheLockIsFreedAfter()
     {
         if (await Live.ConnectAsync() is not { } live)
@@ -40,12 +40,13 @@ public class MiddlewareTests
 
         await using RuvioConnection connection = live.Connection;
         using ServiceProvider services = live.Services();
-        var gate = new TaskCompletionSource();
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         int runs = 0;
-        var middleware = new RuvioLockMiddleware(async _ => { runs++; await gate.Task; });
+        var middleware = new RuvioLockMiddleware(async _ => { runs++; started.TrySetResult(); await gate.Task.WaitAsync(TimeSpan.FromSeconds(20)); });
 
         Task first = middleware.InvokeAsync(live.Context(services, "export"));
-        await Task.Delay(100);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(10));
         DefaultHttpContext second = live.Context(services, "export");
         await middleware.InvokeAsync(second);
 
@@ -61,7 +62,7 @@ public class MiddlewareTests
         Assert.Equal(200, third.Response.StatusCode);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task TheLockIsReleasedWhenTheEndpointThrows()
     {
         if (await Live.ConnectAsync() is not { } live)
@@ -78,7 +79,7 @@ public class MiddlewareTests
         Assert.Equal(200, next.Response.StatusCode);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task TemplatedNamesLockPerValueAndAMissingValueIsA400()
     {
         if (await Live.ConnectAsync() is not { } live)
@@ -86,12 +87,18 @@ public class MiddlewareTests
 
         await using RuvioConnection connection = live.Connection;
         using ServiceProvider services = live.Services();
-        var gate = new TaskCompletionSource();
-        var middleware = new RuvioLockMiddleware(async _ => await gate.Task);
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var otherStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var middleware = new RuvioLockMiddleware(async context =>
+        {
+            (context.Request.RouteValues["id"] as string == "1" ? firstStarted : otherStarted).TrySetResult();
+            await gate.Task.WaitAsync(TimeSpan.FromSeconds(20));
+        });
 
         DefaultHttpContext a = live.Context(services, "order:{id}", route: ("id", "1"));
         Task first = middleware.InvokeAsync(a);
-        await Task.Delay(100);
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
 
         DefaultHttpContext same = live.Context(services, "order:{id}", route: ("id", "1"));
         await middleware.InvokeAsync(same);
@@ -99,7 +106,7 @@ public class MiddlewareTests
 
         DefaultHttpContext other = live.Context(services, "order:{id}", route: ("id", "2"));
         Task otherRun = middleware.InvokeAsync(other);
-        await Task.Delay(100);
+        await otherStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.False(otherRun.IsCompleted); // got its own lock and is running
 
         DefaultHttpContext missing = live.Context(services, "order:{id}");
@@ -110,7 +117,7 @@ public class MiddlewareTests
         await Task.WhenAll(first, otherRun);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task RequestAbortedTokenFiresWhenTheClientDisconnectsAndIsRestoredAfterwards()
     {
         if (await Live.ConnectAsync() is not { } live)
@@ -138,7 +145,7 @@ public class MiddlewareTests
         Assert.Equal(disconnect.Token, context.RequestAborted);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task LockLossCancelsTheRequestToken()
     {
         if (await Live.ConnectAsync() is not { } live)

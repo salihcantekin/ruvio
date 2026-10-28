@@ -185,7 +185,7 @@ public class SingletonTests
         Assert.Single(services, d => d.ServiceType == typeof(LeaderWorker));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task RunOncePerPeriodRunsOnlyForTheFirstCaller()
     {
         long reply = 1;
@@ -207,7 +207,7 @@ public class SingletonTests
             await provider.RunOncePerPeriodAsync("report", TimeSpan.FromSeconds(1), null!));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task LiveRunOncePerPeriodRunsOnce()
     {
         if (await LiveTests.TryConnectAsync() is not { } connected)
