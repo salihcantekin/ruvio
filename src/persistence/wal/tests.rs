@@ -2523,6 +2523,8 @@ fn a_resumed_reader_follows_rotation_and_rescans_when_its_segment_is_gone() {
     assert!(matches!(resumed, Ok(FrameRead::Gap)));
 }
 
+// Only Unix keeps the segment open between chunks.
+#[cfg(unix)]
 #[test]
 fn a_resumed_reader_keeps_the_live_segment_open_and_drops_a_replaced_one() {
     let directory = tempdir().unwrap();

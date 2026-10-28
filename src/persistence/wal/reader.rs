@@ -346,7 +346,10 @@ fn leave_cursor(
     open: Option<OpenSegment>,
 ) {
     cursor.position = position.map(|(index, offset)| (segments[index].clone(), offset));
-    cursor.open = open.filter(|_| cursor.position.is_some());
+    // Windows can delete a file that is still open and reuse its name, with no cheap way
+    // to tell the new file from the old one; and an open segment there can keep a deleted
+    // one listed but unopenable. Only Unix keeps the segment open.
+    cursor.open = open.filter(|_| cfg!(unix) && cursor.position.is_some());
     cursor.next_sequence = next_sequence;
 }
 
@@ -398,6 +401,8 @@ fn read_open_segment(
     let mut frames = Vec::new();
     let mut collected_bytes = 0usize;
     let mut expected_sequence = after_sequence.saturating_add(1);
+    // The cursor moves only on success, so an I/O error leaves it where this call began.
+    let mut next_offset = *offset;
 
     while expected_sequence <= through_sequence && collected_bytes < max_bytes {
         let mut length_bytes = [0; 4];
@@ -412,7 +417,7 @@ fn read_open_segment(
             break;
         }
 
-        let end = *offset + record_length as u64;
+        let end = next_offset + record_length as u64;
 
         if end > open.length {
             break;
@@ -434,13 +439,14 @@ fn read_open_segment(
         collected_bytes = collected_bytes.saturating_add(frame.len());
         frames.push(frame);
         expected_sequence += 1;
-        *offset = end;
+        next_offset = end;
     }
 
     if frames.is_empty() {
         return Ok(None);
     }
 
+    *offset = next_offset;
     cursor.next_sequence = expected_sequence;
     Ok(Some(FrameRead::Frames(frames)))
 }
