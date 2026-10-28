@@ -2773,3 +2773,51 @@ fn staged_records_survive_rotation_batch_overflow_and_a_refused_record() {
     // One large segment: the batch passes `WAL_GROUP_BYTES` several times.
     assert_eq!(check(4 * 1024 * 1024, 4000, 60), 1);
 }
+
+/// A record over the command limit, refused in the middle of a staged batch, leaves the batch
+/// as it was.
+#[test]
+fn a_record_over_the_command_limit_leaves_the_staged_batch_intact() {
+    let directory = tempdir().unwrap();
+    let config = bulk_config(directory.path());
+    let limits = ProtocolLimits {
+        max_command_bytes: 256,
+        ..ProtocolLimits::default()
+    };
+    let (mut sink, _, _) = WalSink::open(config.clone(), 0, limits).unwrap();
+
+    sink.begin_group();
+    sink.record(Mutation::SetBytes {
+        key: b"a",
+        value: b"1",
+    })
+    .unwrap();
+    let error = sink
+        .record(Mutation::SetBytes {
+            key: b"big",
+            value: &[7; 512],
+        })
+        .unwrap_err();
+
+    assert!(error.to_string().contains("command limit"), "{error}");
+    sink.record(Mutation::SetBytes {
+        key: b"b",
+        value: b"2",
+    })
+    .unwrap();
+    sink.end_group().unwrap();
+    sink.flush().unwrap();
+    drop(sink);
+
+    let (_sink, mutations, report) = WalSink::open(config, 0, limits).unwrap();
+    let keys: Vec<_> = mutations
+        .into_iter()
+        .map(|(_, mutation)| match mutation {
+            OwnedMutation::SetBytes { key, .. } => key,
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect();
+
+    assert_eq!(keys, [b"a".to_vec(), b"b".to_vec()]);
+    assert_eq!(report.last_sequence, 2);
+}
