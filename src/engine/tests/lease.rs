@@ -366,7 +366,7 @@ fn lease_setv_changes_and_delay_hold_their_own_contracts() {
     );
     execute_with_sink(
         &mut shard,
-        Command::ListPush(owned(b"list"), vec![owned(b"a")]),
+        Command::ListPush(owned(b"list"), vec![owned(b"a")].into()),
         &mut sink,
     )
     .unwrap();

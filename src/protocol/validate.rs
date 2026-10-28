@@ -497,9 +497,11 @@ pub(super) fn validate_command_payloads(
             validate_key(key, limits)?;
             validate_values(values, limits)?;
         }
-        Command::ListPush(key, values)
-        | Command::ListPushBack(key, values)
-        | Command::BloomAddMany(key, values)
+        Command::ListPush(key, values) | Command::ListPushBack(key, values) => {
+            validate_key(key, limits)?;
+            validate_values(values, limits)?;
+        }
+        Command::BloomAddMany(key, values)
         | Command::BloomContainsMany(key, values)
         | Command::SetAdd(key, values)
         | Command::SetRemove(key, values)

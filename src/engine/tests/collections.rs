@@ -408,7 +408,7 @@ fn sorted_set_family_pairs_scores_rank_and_increments() {
             &mut shard,
             Command::SortedSetAdd {
                 key: owned(b"z"),
-                pairs: vec![(2.0, owned(b"b")), (1.0, owned(b"a")), (3.0, owned(b"c"))],
+                pairs: vec![(2.0, owned(b"b")), (1.0, owned(b"a")), (3.0, owned(b"c"))].into(),
                 options: SortedSetAddOptions::default(),
             }
         ),
@@ -534,7 +534,7 @@ fn sorted_set_family_pairs_scores_rank_and_increments() {
         &mut shard,
         Command::SortedSetAdd {
             key: owned(b"string"),
-            pairs: vec![(1.0, owned(b"x"))],
+            pairs: vec![(1.0, owned(b"x"))].into(),
             options: SortedSetAddOptions::default(),
         },
         &mut sink,
@@ -552,7 +552,7 @@ fn sorted_set_lex_range_orders_members_and_limits() {
         &mut shard,
         Command::SortedSetAdd {
             key: owned(b"names"),
-            pairs: vec![(1.0, owned(b"c")), (5.0, owned(b"a")), (1.0, owned(b"b"))],
+            pairs: vec![(1.0, owned(b"c")), (5.0, owned(b"a")), (1.0, owned(b"b"))].into(),
             options: SortedSetAddOptions::default(),
         },
     );
@@ -624,7 +624,7 @@ fn list_family_commands_and_waiters_match_redis_order() {
     assert_eq!(
         execute(
             &mut shard,
-            Command::ListPushBack(owned(b"list"), vec![owned(b"a"), owned(b"b")])
+            Command::ListPushBack(owned(b"list"), vec![owned(b"a"), owned(b"b")].into())
         ),
         Response::Integer(2)
     );
@@ -691,7 +691,7 @@ fn list_family_commands_and_waiters_match_redis_order() {
     assert_eq!(
         execute_with_waiters(
             &mut shard,
-            Command::ListPushBack(owned(b"empty"), vec![owned(b"x"), owned(b"y")]),
+            Command::ListPushBack(owned(b"empty"), vec![owned(b"x"), owned(b"y")].into()),
             &mut NoopMutationSink,
             &mut waiters
         )

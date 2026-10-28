@@ -184,7 +184,7 @@ fn blocking_and_stream_replies_name_the_user_key() {
         &mut shard,
         &mut sink,
         4,
-        Command::ListPush(owned(b"queue"), vec![owned(b"job")]),
+        Command::ListPush(owned(b"queue"), vec![owned(b"job")].into()),
     );
     assert_eq!(
         in_db(
@@ -386,7 +386,7 @@ fn blocked_waiter_wakes_only_for_pushes_in_its_database() {
         .unwrap();
     let Ok(_) = execute_in_database(
         &mut shard,
-        Command::ListPush(owned(b"queue"), vec![owned(b"zero")]),
+        Command::ListPush(owned(b"queue"), vec![owned(b"zero")].into()),
         &mut NoopMutationSink,
         &mut waiters,
         0,
@@ -395,7 +395,7 @@ fn blocked_waiter_wakes_only_for_pushes_in_its_database() {
     assert!(receiver.try_recv().is_err());
     let Ok(_) = execute_in_database(
         &mut shard,
-        Command::ListPush(owned(b"queue"), vec![owned(b"three")]),
+        Command::ListPush(owned(b"queue"), vec![owned(b"three")].into()),
         &mut NoopMutationSink,
         &mut waiters,
         3,

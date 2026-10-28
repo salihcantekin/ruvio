@@ -606,6 +606,9 @@ impl IndexedSorted {
     }
 }
 
+/// Up to this many members are looked up in a flat set by scanning it.
+const FEW_MEMBERS: usize = 4;
+
 /// True when the members of the flat encoding `bytes` plus `members` fit one fresh arena.
 /// Rescoring members of a flat set never promotes it, so only new members count.
 fn flat_fits_fresh_arena<'m>(
@@ -618,11 +621,17 @@ fn flat_fits_fresh_arena<'m>(
         return crate::arena::Arena::new().fits(members.map(block));
     }
 
-    // Built once: a flat set is small, but the members to add may be many.
-    let stored: AHashSet<&[u8]> = SortedEntries::new(bytes)
-        .map(|(_, member)| member)
-        .collect();
-    let mut new_members = members.filter(|member| !stored.contains(member)).peekable();
+    // A few members scan the small flat set directly; many build its member set once.
+    let stored: Option<AHashSet<&[u8]>> = members.clone().nth(FEW_MEMBERS).map(|_| {
+        SortedEntries::new(bytes)
+            .map(|(_, member)| member)
+            .collect()
+    });
+    let is_stored = |member: &[u8]| match &stored {
+        Some(stored) => stored.contains(member),
+        None => SortedEntries::new(bytes).any(|(_, held)| held == member),
+    };
+    let mut new_members = members.filter(|member| !is_stored(member)).peekable();
 
     if new_members.peek().is_none() {
         return true;

@@ -65,7 +65,7 @@ fn take_and_getex_do_not_touch_the_plain_read_and_increment_paths() {
     );
     execute_with_sink(
         &mut shard,
-        Command::ListPush(owned(b"list"), vec![owned(b"a")]),
+        Command::ListPush(owned(b"list"), vec![owned(b"a")].into()),
         &mut sink,
     )
     .unwrap();
@@ -430,7 +430,7 @@ fn string_family_commands_match_redis_semantics() {
 
     execute(
         &mut shard,
-        Command::ListPush(owned(b"list"), vec![owned(b"item")]),
+        Command::ListPush(owned(b"list"), vec![owned(b"item")].into()),
     );
     assert_eq!(
         execute(&mut shard, Command::MGet(vec![owned(b"list")])),
@@ -603,7 +603,7 @@ fn keyspace_commands_cover_exists_type_scan_rename_and_dbsize() {
     execute(&mut shard, Command::set(owned(b"a"), owned(b"1")));
     execute(
         &mut shard,
-        Command::ListPush(owned(b"list"), vec![owned(b"item")]),
+        Command::ListPush(owned(b"list"), vec![owned(b"item")].into()),
     );
     assert_eq!(
         execute(
