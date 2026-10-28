@@ -165,7 +165,7 @@ with no listener attached an instrument costs one field read.
 - `Ruvio.Extensions.Caching`: `ruvio.cache.hit` and `ruvio.cache.miss` (tagged `operation`: `get` or
   `get_or_create`), `ruvio.cache.fail_safe` (a stale value returned because the factory threw), `ruvio.cache.outage`.
 - `Ruvio.AspNetCore.OutputCaching`: `ruvio.output_cache.hit`, `ruvio.output_cache.miss` (tagged `reason`: `absent`
-  or `tag_evicted`), `ruvio.output_cache.tag_evict`, `ruvio.output_cache.outage`, and the storage instruments
+  `tag_evicted` or `key_too_long`), `ruvio.output_cache.tag_evict`, `ruvio.output_cache.outage`, and the storage instruments
   `ruvio.output_cache.storage_calls`, `ruvio.output_cache.storage_commands` and `ruvio.output_cache.storage_duration`.
 - `Ruvio.AspNetCore.Idempotency`: `ruvio.idempotency.states` (tagged `state`, including `aborted` with `AbortOnException`), `ruvio.idempotency.outage`, and the storage instruments `ruvio.idempotency.storage_calls`,
   `ruvio.idempotency.storage_commands` and `ruvio.idempotency.storage_duration`.

@@ -24,7 +24,7 @@ public class LiveTests
     private static RuvioLockProvider Provider(IRuvioClient client) =>
         new(client, new RuvioLockOptions { KeyPrefix = "test:lock:" + Guid.NewGuid().ToString("N") + ":" });
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task OnlyOneOwnerHoldsAResourceAndReleaseHandsItOver()
     {
         if (await ConnectAsync() is not { } connected)
@@ -45,7 +45,7 @@ public class LiveTests
         Assert.NotNull(second);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task AWaitingCallerGetsTheLockWhenTheHolderReleases()
     {
         if (await ConnectAsync() is not { } connected)
@@ -66,7 +66,7 @@ public class LiveTests
         Assert.True(next.IsHeld);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task ALockThatExpiredIsNotReleasedForANewOwner()
     {
         if (await ConnectAsync() is not { } connected)
@@ -88,7 +88,7 @@ public class LiveTests
         Assert.True(fresh!.IsHeld);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task AutoRenewalKeepsAShortLeaseAlive()
     {
         if (await ConnectAsync() is not { } connected)
@@ -108,7 +108,7 @@ public class LiveTests
         Assert.Null(await provider.TryAcquireAsync("renewed", TimeSpan.FromSeconds(1)));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task LockLostFiresWhenAnotherOwnerTakesTheKey()
     {
         if (await ConnectAsync() is not { } connected)

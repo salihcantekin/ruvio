@@ -51,7 +51,7 @@ public class MetricsTests
         return listener;
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task GetCountsHitsAndMissesIncludingExpiredEntries()
     {
         var seen = new List<(string, string)>();
@@ -71,7 +71,7 @@ public class MetricsTests
         Assert.Equal([("ruvio.cache.hit", "get"), ("ruvio.cache.miss", "get"), ("ruvio.cache.miss", "get")], seen);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task GetOrCreateCountsAHitOrOneMissPerCall()
     {
         var seen = new List<(string, string)>();

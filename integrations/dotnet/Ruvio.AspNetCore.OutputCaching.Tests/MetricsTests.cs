@@ -20,7 +20,7 @@ public class MetricsTests
     private static RespValue Record(string count, string tags, string value = "payload") =>
         Resp.Bulk(Encoding.ASCII.GetBytes("ROC1" + count + tags + value));
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task LookupsCountHitsMissesWithReasonAndTagEvictions()
     {
         var seen = new List<string>();
