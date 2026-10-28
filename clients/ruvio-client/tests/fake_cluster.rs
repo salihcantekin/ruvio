@@ -1425,6 +1425,34 @@ fn the_eighth_tryagain_in_a_row_is_returned() {
 }
 
 #[test]
+fn a_pipeline_of_refused_commands_waits_for_one_tryagain_budget() {
+    let cluster = Cluster::start(2);
+    let mut client = cluster.client();
+    let key = cluster.key_on(1, "storm");
+    let commands: Vec<Vec<&str>> = (0..100).map(|_| vec!["GET", key.as_str()]).collect();
+    let borrowed: Vec<&[&str]> = commands.iter().map(Vec::as_slice).collect();
+
+    // The slot stays frozen: every send of any command is refused.
+    cluster.script("GET", b"-TRYAGAIN slot is being handed over\r\n", 1_000);
+
+    let started = Instant::now();
+    let replies = client.execute_many(&borrowed).unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(replies.len(), 100);
+    for reply in &replies {
+        let RespValue::Error(text) = reply else {
+            panic!("expected TRYAGAIN, got {reply:?}");
+        };
+
+        assert!(text.starts_with("TRYAGAIN"), "{text}");
+    }
+    // One budget (635 ms), not 100 of them; the bound leaves room for a slow machine.
+    assert!(elapsed >= Duration::from_millis(635), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+}
+
+#[test]
 fn ask_and_moved_share_one_budget_of_three_redirects() {
     let cluster = Cluster::start(2);
     let mut client = cluster.client();

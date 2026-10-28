@@ -63,6 +63,10 @@ A cluster client can send read-only commands to replicas. The server lists each 
 
 The live tests start a 2-shard primary and its 2-shard replica (`RUVIO_REPLICATED_ADDR`, `RUVIO_REPLICA_ADDR` from `scripts/run_with_servers.sh`) and check through the replica's `INFO get_commands` that a read went to the replica.
 
+## `TRYAGAIN` while a slot range moves
+
+A cluster client sends a command again after `-TRYAGAIN`, at most 7 times, after waits of 5, 10, 20, 40, 80, 160 and 320 ms (635 ms in all); the last `TRYAGAIN` is returned. The budget belongs to the call, not to each command: a pipeline of N refused commands waits for one budget, and a command not yet retried when the budget has run out still gets one more try, so a freeze that ended meanwhile does not fail the later ones. Rust cuts the budget to `command_timeout` when that is shorter; Go ends the wait with its context, C# with its cancellation token. Each client has a scripted test with 100 refused commands in one pipeline.
+
 ## Following a failover
 
 After a failover the primary is another node. A standalone client with several seeds, or with a coordinator name, finds it again instead of staying on a node that is now a replica. All six clients do the same; this section is the contract. It applies to standalone connections only: a cluster client (a multi-node slot map) keeps its `MOVED`/`ASK` rules and does not run any of this.

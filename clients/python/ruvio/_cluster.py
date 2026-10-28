@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import binascii
 import re
+import time
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -32,6 +33,38 @@ MAX_REDIRECTS = 3
 #: sleeps in seconds before each re-send of a command answered ``-TRYAGAIN``, doubling from 5 ms (635 ms in
 #: all): a slot range moving between nodes is frozen for a few hundred milliseconds
 TRYAGAIN_DELAYS = (0.005, 0.010, 0.020, 0.040, 0.080, 0.160, 0.320)
+
+
+class TryAgainClock:
+    """The one ``-TRYAGAIN`` wait of a call. The ``TRYAGAIN_DELAYS`` schedule runs from the first ``-TRYAGAIN``
+    the call sees and is shared by every command of a pipeline, so N refused commands wait for one budget, not N."""
+
+    __slots__ = ("start", "limit")
+
+    def __init__(self, limit: Optional[float] = None) -> None:
+        self.start: Optional[float] = None
+        self.limit = limit  # the command timeout, when it is shorter than the schedule
+
+    def pause(self, tries: int) -> Optional[float]:
+        """Seconds to sleep before re-send number ``tries`` (from 0), or None when the budget is spent. A command
+        that has not been re-sent yet always gets one more try, so a freeze that ended while earlier commands
+        waited does not fail the later ones."""
+        now = time.monotonic()
+        if self.start is None:
+            self.start = now
+        elapsed = now - self.start
+        budget = sum(TRYAGAIN_DELAYS)
+        if self.limit is not None:
+            budget = min(budget, self.limit)
+        at = 0.0
+        for step in TRYAGAIN_DELAYS:
+            at += step
+            if at > budget + 1e-9:
+                break
+            if at > elapsed:
+                return at - elapsed
+        return 0.0 if tries == 0 else None
+
 
 #: ``ASKING`` as a frame, sent in front of the command an ``-ASK`` redirect names
 ASKING = b"*1\r\n$6\r\nASKING\r\n"

@@ -336,6 +336,31 @@ async def test_tryagain_eight_times_gives_the_error_after_seven_retries(kind, ma
     await c.aclose()
 
 
+async def test_pipeline_of_refused_commands_waits_for_one_tryagain_budget(make, fc):
+    k = key_in(8192, 16383)
+    slot = cl.key_slot(k)
+
+    def get(cl_, node, args):
+        # The stale owner redirects every command; the new owner is mid-handover and refuses each one.
+        if node is cl_.nodes[1]:
+            return err(f"MOVED {slot} {cl_.nodes[0].addr}")
+        return err("TRYAGAIN slot is being handed over")
+
+    cluster = fc(extra={"GET": get})
+    c = make(cluster.nodes[0].addr)
+    p = pipe(c)
+    for _ in range(100):
+        p.get(k)
+    t0 = time.monotonic()
+    res = await maybe(p.execute(raise_on_error=False))
+    elapsed = time.monotonic() - t0
+    assert len(res) == 100
+    assert all(isinstance(r, ruvio.ResponseError) and str(r).startswith("TRYAGAIN") for r in res)
+    # One budget of 635 ms, not 100 of them; the bound leaves room for a slow machine.
+    assert 0.634 <= elapsed < 5.0, elapsed
+    await c.aclose()
+
+
 async def test_ask_and_moved_share_one_redirect_budget(kind, make, fc):
     k = key_in(8192, 16383)
     slot = cl.key_slot(k)

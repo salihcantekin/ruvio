@@ -1130,6 +1130,42 @@ func TestFakeTryAgainGivesUpAfterSevenRetries(t *testing.T) {
 	}
 }
 
+func TestFakePipelineTryAgainWaitsForOneBudget(t *testing.T) {
+	k := keyFor(true, 0)
+	a, _ := twoNodes(t, func(f *fakeNode, args []string) string {
+		if strings.ToUpper(args[0]) == "GET" {
+			return "-TRYAGAIN slot is being handed over\r\n"
+		}
+		return defaultFake(f, args)
+	}, nil)
+	c := newClusterClient(t, a.addr)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	start := time.Now()
+	vals, err := c.Pipelined(ctx, func(p *Pipeline) {
+		for i := 0; i < 100; i++ {
+			p.Get(k)
+		}
+	})
+	elapsed := time.Since(start)
+	var se *Error
+	if !errors.As(err, &se) || se.Prefix() != "TRYAGAIN" {
+		t.Fatalf("want the TRYAGAIN error, got %v", err)
+	}
+	if len(vals) != 100 {
+		t.Fatalf("got %d replies", len(vals))
+	}
+	for i, v := range vals {
+		if v.Kind != KindError || !strings.HasPrefix(string(v.Bytes), "TRYAGAIN") {
+			t.Fatalf("reply %d: %v", i, v)
+		}
+	}
+	// One budget of 635 ms, not 100 of them; the bound leaves room for a slow machine.
+	if elapsed < 635*time.Millisecond || elapsed > 5*time.Second {
+		t.Fatalf("pipeline took %v, want about one 635ms budget", elapsed)
+	}
+}
+
 func TestFakeTryAgainWaitEndsWithContext(t *testing.T) {
 	k := keyFor(true, 0)
 	a, _ := twoNodes(t, func(f *fakeNode, args []string) string {

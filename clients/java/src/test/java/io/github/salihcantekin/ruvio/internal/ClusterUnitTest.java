@@ -532,6 +532,31 @@ class ClusterUnitTest {
     }
 
     @Test
+    @Timeout(30)
+    void aPipelineOfRefusedCommandsWaitsForOneTryAgainBudget() throws Exception {
+        Pair p = new Pair();
+        RuvioClient<String, String> c = p.client();
+        String k = p.key(true, 0);
+        p.a.node.handler = a -> a.get(0).equalsIgnoreCase("GET")
+                ? FakeNode.error("TRYAGAIN slot is being moved") : p.a.handle(a);
+        Pipeline<String, String> pipe = c.async().pipeline();
+        List<CompletableFuture<String>> gets = new ArrayList<>();
+        for (int i = 0; i < 100; i++) {
+            gets.add(pipe.get(k));
+        }
+        long started = System.nanoTime();
+        pipe.sync();
+        for (CompletableFuture<String> f : gets) {
+            RuvioServerException e = assertThrows(java.util.concurrent.CompletionException.class, f::join).getCause() instanceof RuvioServerException x
+                    ? x : null;
+            assertEquals("TRYAGAIN", e.code());
+        }
+        long waitedMs = (System.nanoTime() - started) / 1_000_000;
+        // The retries wait at the same time: one budget (635 ms), not 100 of them.
+        assertTrue(waitedMs >= 630 && waitedMs < 5_000, "waited " + waitedMs + " ms");
+    }
+
+    @Test
     @Timeout(20)
     void askAndMovedShareOneRedirectBudget() throws Exception {
         Pair p = new Pair();
