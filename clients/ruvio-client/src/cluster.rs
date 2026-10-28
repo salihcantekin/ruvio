@@ -1436,7 +1436,7 @@ impl ClusterRouter {
                 let first = std::mem::replace(reply, RespValue::Null);
 
                 *reply = self.follow_moved_within(
-                    &mut clock,
+                    Some(&mut clock),
                     targets[index],
                     first,
                     |connection, asking| connection.send_with(commands[index], asking),
@@ -1577,10 +1577,12 @@ impl ClusterRouter {
 
             for ((destination, command), value) in destinations.into_iter().zip(&batch).zip(values)
             {
-                let value =
-                    self.follow_moved_within(&mut clock, target, value, |connection, asking| {
-                        connection.send_owned_with(command, asking)
-                    })?;
+                let value = self.follow_moved_within(
+                    Some(&mut clock),
+                    target,
+                    value,
+                    |connection, asking| connection.send_owned_with(command, asking),
+                )?;
 
                 match destination {
                     Destination::Whole(index) => replies[index] = value,
@@ -1873,14 +1875,14 @@ impl ClusterRouter {
         reply: RespValue,
         send: impl FnMut(&mut Connection, bool) -> Result<RespValue, Error>,
     ) -> Result<RespValue, Error> {
-        self.follow_moved_within(&mut TryAgainClock::default(), owner, reply, send)
+        self.follow_moved_within(None, owner, reply, send)
     }
 
-    /// `follow_moved` for one command of a pipeline: `clock` is shared by the pipeline's
-    /// commands, so all of them wait out one `TRYAGAIN` budget together.
+    /// `follow_moved` for one command of a pipeline: `clock`, when given, is shared by the
+    /// pipeline's commands, so all of them wait out one `TRYAGAIN` budget together.
     fn follow_moved_within(
         &mut self,
-        clock: &mut TryAgainClock,
+        mut clock: Option<&mut TryAgainClock>,
         mut owner: usize,
         mut reply: RespValue,
         mut send: impl FnMut(&mut Connection, bool) -> Result<RespValue, Error>,
@@ -1899,7 +1901,12 @@ impl ClusterRouter {
                     return Ok(reply);
                 }
 
-                let Some(pause) = clock.pause(retries, self.options.command_timeout) else {
+                // One command keeps the fixed schedule; a pipeline's commands share a clock.
+                let pause = match clock.as_deref_mut() {
+                    Some(clock) => clock.pause(retries, self.options.command_timeout),
+                    None => Some(TRYAGAIN_BACKOFF[retries]),
+                };
+                let Some(pause) = pause else {
                     return Ok(reply);
                 };
 

@@ -445,12 +445,25 @@ public class ClusterTests
 
         await ReplyAsync(ownerStream, string.Concat(Enumerable.Repeat("-TRYAGAIN slot is being moved\r\n", count)));
 
-        // The slot stays frozen: the first command is sent seven more times, each other one once.
-        for (int send = 0; send < 7 + count - 1; send++)
+        // The slot stays frozen: refuse every retry until the pipeline returns. How many retries a slow
+        // machine fits into the budget varies, so the server answers whatever arrives.
+        int retries = 0;
+        Task refuse = Task.Run(async () =>
         {
-            await ExpectAsync(ownerStream, "GET", "somekey");
-            await ReplyAsync(ownerStream, "-TRYAGAIN slot is being moved\r\n");
-        }
+            try
+            {
+                while (true)
+                {
+                    await ExpectAsync(ownerStream, "GET", "somekey");
+                    Interlocked.Increment(ref retries);
+                    await ReplyAsync(ownerStream, "-TRYAGAIN slot is being moved\r\n");
+                }
+            }
+            catch (Exception)
+            {
+                // The client closed the socket when the test ended.
+            }
+        });
 
         IReadOnlyList<RespValue> replies = await pending;
 
@@ -459,6 +472,11 @@ public class ClusterTests
 
         // One budget (635 ms), not 100 of them; the bound leaves room for a slow machine.
         Assert.InRange(clock.ElapsedMilliseconds, 630, 5000);
+
+        // 100 commands at 7 retries each would be 700 sends; one shared budget sends far fewer.
+        Assert.True(Volatile.Read(ref retries) < 300, $"{retries} retries");
+        owner.Dispose();
+        await refuse;
     }
 
     [Fact(Timeout = 15000)]

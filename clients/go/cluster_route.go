@@ -155,8 +155,7 @@ func (cl *cluster) run(ctx context.Context, t *topology, slot int, r *request, b
 // the table alone. -TRYAGAIN sends the command again, routed by the current table, up to
 // maxTryAgain times. It recycles r.
 func (cl *cluster) send(ctx context.Context, node *Client, r *request, blocking bool, redirects int) (Value, error) {
-	var clk tryAgainClock
-	return cl.drive(ctx, node, false, r, blocking, redirects, 0, &clk)
+	return cl.drive(ctx, node, false, r, blocking, redirects, 0, nil)
 }
 
 // drive is the loop behind send; asking says the first send goes out behind ASKING, and
@@ -245,7 +244,10 @@ func (cl *cluster) follow(ctx context.Context, msg []byte, r *request, redirects
 		if *retries >= maxTryAgain {
 			return nil, false, nil
 		}
-		wait, ok := clk.pause(*retries)
+		wait, ok := tryAgainWait<<*retries, true // one command keeps the fixed schedule
+		if clk != nil {                          // a pipeline's commands share one clock
+			wait, ok = clk.pause(*retries)
+		}
 		if !ok {
 			return nil, false, nil
 		}

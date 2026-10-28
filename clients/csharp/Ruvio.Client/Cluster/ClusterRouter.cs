@@ -1514,6 +1514,10 @@ internal sealed class ClusterRouter : IDisposable
     /// <paramref name="redirects"/> counts the <c>MOVED</c> replies already followed. <paramref name="route"/> picks the
     /// node for a retry from the current slot map; <paramref name="send"/> sends the command to a node, after <c>ASKING</c> when asked.
     /// </summary>
+    /// <summary>The wait before a <c>TRYAGAIN</c> retry: the fixed schedule for one command, the shared clock for a pipeline.</summary>
+    private static TimeSpan? NextTryAgainPause(TryAgainClock? clock, int retries) =>
+        clock is null ? TimeSpan.FromMilliseconds(FirstTryAgainDelayMs << retries) : clock.Pause(retries);
+
     private async Task<RespValue> ResolveAsync(
         RespValue reply,
         int redirects,
@@ -1553,7 +1557,7 @@ internal sealed class ClusterRouter : IDisposable
 
                 reply = await send(node, true, cancellationToken).ConfigureAwait(false);
             }
-            else if (IsTryAgain(reply) && retries < MaxTryAgains && (clock ??= new TryAgainClock()).Pause(retries) is { } pause)
+            else if (IsTryAgain(reply) && retries < MaxTryAgains && NextTryAgainPause(clock, retries) is { } pause)
             {
                 retries++;
 

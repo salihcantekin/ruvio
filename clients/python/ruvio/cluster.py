@@ -559,9 +559,8 @@ class ClusterRuvio(Ruvio):
                 node = self._route_node(data)
                 if node is None:
                     return reply
-                if clock is None:
-                    clock = self._tryagain_clock()
-                pause = clock.pause(tries)
+                # One command keeps the fixed schedule; a pipeline's commands share a clock.
+                pause = cl.TRYAGAIN_DELAYS[tries] if clock is None else clock.pause(tries)
                 if pause is None:
                     return reply
                 if pause > 0:
