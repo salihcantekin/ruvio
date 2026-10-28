@@ -911,7 +911,7 @@ fn gap_handshake_leaves_the_live_generation() {
     .unwrap();
     sink.flush().unwrap();
 
-    let published = sink.published();
+    let published = sink.durable();
 
     assert_eq!(published.load(Ordering::Acquire), 2);
     drop(sink);
@@ -1032,7 +1032,7 @@ fn two_replicas_receive_the_same_appended_frame() {
     };
 
     let (mut sink, _, _) = WalSink::open(config, 0, limits).unwrap();
-    let published = sink.published();
+    let published = sink.durable();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
 
@@ -1096,7 +1096,7 @@ fn closing_one_replica_leaves_the_other_streaming() {
     };
 
     let (mut sink, _, _) = WalSink::open(config, 0, limits).unwrap();
-    let published = sink.published();
+    let published = sink.durable();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
 
@@ -1167,7 +1167,7 @@ fn replica_limit_closes_the_extra_connection() {
         Shipment {
             listen: address,
             shard_id: 0,
-            published: sink.published(),
+            published: sink.durable(),
             data_dir: directory.path().to_path_buf(),
             requirepass: Vec::new(),
             limits,
@@ -1242,7 +1242,7 @@ fn a_replica_that_hangs_up_on_an_idle_primary_frees_its_slot() {
         Shipment {
             listen: address,
             shard_id: 0,
-            published: sink.published(),
+            published: sink.durable(),
             data_dir: directory.path().to_path_buf(),
             requirepass: Vec::new(),
             limits,
@@ -1324,7 +1324,7 @@ fn primary_refuses_a_replica_from_another_history_or_shard_layout() {
         Shipment {
             listen: address,
             shard_id: 0,
-            published: sink.published(),
+            published: sink.durable(),
             data_dir: directory.path().to_path_buf(),
             requirepass: Vec::new(),
             limits,
@@ -1528,7 +1528,7 @@ fn idle_shipment(data_dir: &Path, history: HistoryId) -> Shipment {
     Shipment {
         listen: "127.0.0.1:0".parse().unwrap(),
         shard_id: 0,
-        published: Arc::new(AtomicU64::new(0)),
+        published: Arc::new(crate::persistence::DurableSequence::new(0)),
         data_dir: data_dir.to_path_buf(),
         requirepass: Vec::new(),
         limits: ProtocolLimits::default(),

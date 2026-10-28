@@ -2524,6 +2524,58 @@ fn a_resumed_reader_follows_rotation_and_rescans_when_its_segment_is_gone() {
 }
 
 #[test]
+fn a_resumed_reader_keeps_the_live_segment_open_and_drops_a_replaced_one() {
+    let directory = tempdir().unwrap();
+    let limits = ProtocolLimits::default();
+    let config = config(directory.path(), DurabilityProfile::Always);
+    let (mut sink, _, _) = WalSink::open(config, 0, limits).unwrap();
+    let write = |sink: &mut WalSink, count: u8| {
+        for index in 0..count {
+            sink.record(Mutation::SetBytes {
+                key: b"key",
+                value: &[index; 16],
+            })
+            .unwrap();
+        }
+        sink.flush().unwrap();
+    };
+    write(&mut sink, 5);
+
+    let mut reader = FrameCursor::default();
+    let FrameRead::Frames(first) =
+        read_frames_resuming(&mut reader, directory.path(), 0, 0, 5, limits, usize::MAX).unwrap()
+    else {
+        panic!("missing WAL history");
+    };
+    assert_eq!(first.len(), 5);
+    assert!(reader.open.is_some());
+
+    // Records appended to the live segment after the first chunk come from the open file.
+    write(&mut sink, 3);
+    let FrameRead::Frames(next) =
+        read_frames_resuming(&mut reader, directory.path(), 0, 5, 8, limits, usize::MAX).unwrap()
+    else {
+        panic!("missing WAL history");
+    };
+    let FrameRead::Frames(scanned) = read_frames(directory.path(), 0, 5, 8, limits).unwrap() else {
+        panic!("missing WAL history");
+    };
+    assert_eq!(next, scanned);
+    assert!(reader.open.is_some());
+
+    // The same path now names another file: the reader rescans instead of reading on.
+    let (held, _) = reader.position.clone().unwrap();
+    let copy = held.with_extension("copy");
+    fs::copy(&held, &copy).unwrap();
+    fs::remove_file(&held).unwrap();
+    fs::rename(&copy, &held).unwrap();
+    write(&mut sink, 1);
+    let resumed = read_frames_resuming(&mut reader, directory.path(), 0, 8, 9, limits, usize::MAX);
+    let scanned = read_frames(directory.path(), 0, 8, 9, limits);
+    assert_eq!(format!("{resumed:?}"), format!("{scanned:?}"));
+}
+
+#[test]
 fn compact_of_the_full_log_leaves_recovery_from_the_covered_sequence() {
     let directory = tempdir().unwrap();
     let config = bulk_config(directory.path());

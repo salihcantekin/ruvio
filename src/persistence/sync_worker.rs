@@ -35,7 +35,7 @@ struct Shared {
     state: Mutex<State>,
     changed: Condvar,
     ready: Notify,
-    durable: Arc<AtomicU64>,
+    durable: Arc<super::DurableSequence>,
     syncs: AtomicU64,
     sync_nanos: AtomicU64,
     unavailable: AtomicBool,
@@ -56,7 +56,7 @@ pub(crate) struct SyncBarrier {
 }
 
 impl SyncWorker {
-    pub(crate) fn new(durable: Arc<AtomicU64>, shard: u32) -> io::Result<Self> {
+    pub(crate) fn new(durable: Arc<super::DurableSequence>, shard: u32) -> io::Result<Self> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
@@ -341,7 +341,7 @@ mod tests {
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"record").unwrap();
         let file = Arc::new(file);
-        let durable = Arc::new(AtomicU64::new(0));
+        let durable = Arc::new(super::super::DurableSequence::new(0));
         let worker = SyncWorker::new(Arc::clone(&durable), 0).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -364,7 +364,7 @@ mod tests {
     #[test]
     fn failure_is_permanent_and_does_not_advance_durable_cursor() {
         let file = Arc::new(tempfile::tempfile().unwrap());
-        let durable = Arc::new(AtomicU64::new(0));
+        let durable = Arc::new(super::super::DurableSequence::new(0));
         let worker = SyncWorker::new(Arc::clone(&durable), 0).unwrap();
         worker.shared.fail_sync.store(true, Ordering::Release);
         let barrier = worker.submit(Arc::clone(&file), 1).unwrap();
@@ -381,7 +381,7 @@ mod tests {
     #[test]
     fn paused_worker_coalesces_without_blocking_the_executor_or_losing_wakes() {
         let file = Arc::new(tempfile::tempfile().unwrap());
-        let durable = Arc::new(AtomicU64::new(0));
+        let durable = Arc::new(super::super::DurableSequence::new(0));
         let worker = SyncWorker::new(Arc::clone(&durable), 0).unwrap();
         worker.pause(true);
         let first = worker.submit(Arc::clone(&file), 1).unwrap();
@@ -411,7 +411,7 @@ mod tests {
     #[test]
     fn cancelled_waiter_does_not_cancel_sync_or_other_waiters() {
         let file = Arc::new(tempfile::tempfile().unwrap());
-        let durable = Arc::new(AtomicU64::new(0));
+        let durable = Arc::new(super::super::DurableSequence::new(0));
         let worker = SyncWorker::new(Arc::clone(&durable), 0).unwrap();
         worker.pause(true);
         let first = worker.submit(Arc::clone(&file), 1).unwrap();

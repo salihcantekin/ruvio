@@ -18,8 +18,9 @@ use wire::Wire;
 use crate::{
     KvShard, OwnedMutation,
     persistence::{
-        CheckpointManager, FrameCursor, FrameRead, PersistenceConfig, PersistenceError, WalSink,
-        apply_mutation, decode_record, read_frames, read_frames_resuming,
+        CheckpointManager, DurableSequence, FrameCursor, FrameRead, PersistenceConfig,
+        PersistenceError, WalSink, apply_mutation, decode_record, read_frames,
+        read_frames_resuming,
     },
     protocol::ProtocolLimits,
 };
@@ -1504,7 +1505,7 @@ fn put_u64(output: &mut Vec<u8>, value: u64) {
 pub struct Shipment {
     pub listen: SocketAddr,
     pub shard_id: u32,
-    pub published: Arc<AtomicU64>,
+    pub published: Arc<DurableSequence>,
     pub data_dir: PathBuf,
     pub requirepass: Vec<u8>,
     pub limits: ProtocolLimits,
@@ -2527,7 +2528,8 @@ fn stream_new_frames(
         let through = shipment.published.load(Ordering::Acquire);
 
         if through <= last_sent {
-            thread::sleep(SHIPPER_POLL);
+            // A synced record wakes this thread; the timeout still polls acks and control.
+            shipment.published.wait_past(last_sent, SHIPPER_POLL);
 
             continue;
         }
