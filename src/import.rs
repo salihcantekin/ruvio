@@ -26,6 +26,7 @@ pub struct ImportReport {
     pub scanned: u64,
     pub copied: u64,
     pub skipped_existing: u64,
+    pub skipped_staging: u64,
     pub vanished: u64,
     pub unsupported: u64,
     pub verified: u64,
@@ -476,19 +477,31 @@ fn next_stream_id(id: &[u8]) -> Result<Vec<u8>, String> {
     .into_bytes())
 }
 
-const STAGING_SUFFIX: &[u8] = b":import-tmp";
+/// Marker of a staging key. A per-run token follows it, so a real key named `<key>:import-tmp`
+/// cannot be the staging name of this run.
+const STAGING_MARKER: &str = ":import-tmp-";
+
+/// A token that differs between runs (process id and clock), so two imports into one target
+/// and a leftover of a crashed run do not share staging names.
+fn run_token() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+
+    format!("{:x}{:x}", std::process::id(), nanos)
+}
 
 /// A temporary name that hashes to the same slot as `key` (same hash tag, or `{key}` when it
-/// has no braces). None for a key with braces but no usable tag, where no same-slot name can
-/// be built by adding text; that key is replaced in place.
-fn staging_key(key: &[u8]) -> Option<Vec<u8>> {
+/// has no braces), ending in `suffix`. None for a key with braces but no usable tag, where no
+/// same-slot name can be built by adding text; that key is replaced in place.
+fn staging_key(key: &[u8], suffix: &[u8]) -> Option<Vec<u8>> {
     let tag_end = key.iter().position(|byte| *byte == b'{').and_then(|open| {
         key[open + 1..]
             .iter()
             .position(|byte| *byte == b'}')
             .map(|close| (open, close))
     });
-    let mut staging = Vec::with_capacity(key.len() + STAGING_SUFFIX.len() + 2);
+    let mut staging = Vec::with_capacity(key.len() + suffix.len() + 2);
 
     match tag_end {
         Some((_, close)) if close > 0 => staging.extend_from_slice(key),
@@ -500,8 +513,33 @@ fn staging_key(key: &[u8]) -> Option<Vec<u8>> {
         _ => return None,
     }
 
-    staging.extend_from_slice(STAGING_SUFFIX);
+    staging.extend_from_slice(suffix);
     Some(staging)
+}
+
+/// A staging name for `key` that the target does not hold. The token makes a clash unlikely;
+/// the `EXISTS` check and a counter make it impossible, so a real key is never deleted.
+fn free_staging_key(
+    target: &mut Connection,
+    key: &[u8],
+    token: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    for attempt in 0..16 {
+        let suffix = if attempt == 0 {
+            token.to_string()
+        } else {
+            format!("{token}-{attempt}")
+        };
+        let Some(staging) = staging_key(key, suffix.as_bytes()) else {
+            return Ok(None);
+        };
+
+        if target.call(&[b"EXISTS", &staging])?.int()? == 0 {
+            return Ok(Some(staging));
+        }
+    }
+
+    Err("no free staging key in the target".into())
 }
 
 fn write_value(target: &mut Connection, key: &[u8], value: &Value) -> Result<(), String> {
@@ -591,6 +629,7 @@ pub fn run(
         ..ImportReport::default()
     };
     let mut cursor = b"0".to_vec();
+    let token = format!("{STAGING_MARKER}{}", run_token());
 
     loop {
         let mut scan = command(&[b"SCAN", &cursor]);
@@ -646,6 +685,16 @@ pub fn run(
                 continue;
             };
 
+            // A source key that carries this run's staging marker would be taken for a copy in
+            // progress; no real key has it, since the token is made per run.
+            if key
+                .windows(token.len())
+                .any(|part| part == token.as_bytes())
+            {
+                report.skipped_staging += 1;
+                continue;
+            }
+
             if existing[index].int()? != 0 {
                 report.skipped_existing += 1;
                 continue;
@@ -679,7 +728,7 @@ pub fn run(
                 // renames it over the target's key, so a crash leaves the old value or the
                 // new one (with its TTL), never a half-written key.
                 let staging = if options.replace {
-                    staging_key(key)
+                    free_staging_key(&mut target, key, &token)?
                 } else {
                     None
                 };
@@ -773,17 +822,17 @@ mod tests {
     #[test]
     fn staging_key_keeps_the_slot_of_the_target() {
         assert_eq!(
-            staging_key(b"user:1").as_deref(),
-            Some(&b"{user:1}:import-tmp"[..])
+            staging_key(b"user:1", b":import-tmp-t").as_deref(),
+            Some(&b"{user:1}:import-tmp-t"[..])
         );
         assert_eq!(
-            staging_key(b"post:{9001}:body").as_deref(),
-            Some(&b"post:{9001}:body:import-tmp"[..])
+            staging_key(b"post:{9001}:body", b":import-tmp-t").as_deref(),
+            Some(&b"post:{9001}:body:import-tmp-t"[..])
         );
         // No usable tag but braces present: no same-slot name exists by adding text.
-        assert_eq!(staging_key(b"a{}b"), None);
-        assert_eq!(staging_key(b"a}b{c"), None);
-        assert_eq!(staging_key(b"{open"), None);
+        assert_eq!(staging_key(b"a{}b", b"-t"), None);
+        assert_eq!(staging_key(b"a}b{c", b"-t"), None);
+        assert_eq!(staging_key(b"{open", b"-t"), None);
     }
 
     #[test]

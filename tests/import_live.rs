@@ -155,6 +155,35 @@ fn replace_swaps_in_the_copy_with_its_ttl_and_leaves_no_staging_key() {
 }
 
 #[test]
+fn replace_never_touches_a_real_key_that_looks_like_the_staging_name() {
+    let (from, to) = (Server::start(), Server::start());
+    let mut source = Client::connect(&from.address);
+    let mut target = Client::connect(&to.address);
+
+    source.call(&["SET", "a", "new"]);
+    source.call(&["SET", "{t}b", "one"]);
+    source.call(&["SET", "{t}b:import-tmp", "two"]);
+    target.call(&["SET", "a", "old"]);
+    target.call(&["SET", "{a}:import-tmp", "real"]);
+
+    let report = run(
+        &ImportOptions {
+            replace: true,
+            ..options(&from, &to)
+        },
+        &mut |_| {},
+    )
+    .unwrap();
+
+    assert_eq!((report.copied, report.skipped_staging), (3, 0));
+    assert_eq!(target.call(&["GET", "a"]), "new");
+    assert_eq!(target.call(&["GET", "{a}:import-tmp"]), "real");
+    assert_eq!(target.call(&["GET", "{t}b"]), "one");
+    assert_eq!(target.call(&["GET", "{t}b:import-tmp"]), "two");
+    assert_eq!(target.call(&["DBSIZE"]), "4");
+}
+
+#[test]
 fn pattern_limits_the_keys_and_an_empty_source_is_fine() {
     let (from, to) = (Server::start(), Server::start());
     let mut source = Client::connect(&from.address);
