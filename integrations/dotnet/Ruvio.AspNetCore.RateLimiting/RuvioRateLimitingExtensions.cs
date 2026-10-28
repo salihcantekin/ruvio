@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 using Ruvio.Client;
 using Ruvio.Integrations;
 
@@ -33,7 +34,8 @@ public static class RuvioRateLimitingExtensions
                 "KeyPrefix must have 1-128 characters and no cluster hash tags.")
             .Validate(options => options.Outage.IsValid(), "Outage options are out of range.")
             .ValidateOnStart();
-        RuvioStartupChecks.RequireAtStart<IRuvioClient>(services, "Ruvio.AspNetCore.RateLimiting", static _ => null);
+        RuvioStartupChecks.RequireAtStart<IRuvioClient>(services, "Ruvio.AspNetCore.RateLimiting",
+            static provider => provider.GetRequiredService<IOptions<RuvioRateLimitingOptions>>().Value.ClientKey);
         RuvioEndpointCheck.Add(services, "Ruvio.AspNetCore.RateLimiting", RuvioRateLimitingMiddleware.EndpointError);
 
         return services;

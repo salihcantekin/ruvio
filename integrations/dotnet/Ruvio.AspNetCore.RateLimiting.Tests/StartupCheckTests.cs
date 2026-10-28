@@ -23,6 +23,16 @@ public sealed class StartupCheckTests
     }
 
     [Fact]
+    public async Task MissingKeyedClientFailsStartAndNamesTheKey()
+    {
+        await using WebApplication app = App(Client, clientKey: "limits");
+
+        var error = await Assert.ThrowsAsync<OptionsValidationException>(() => app.StartAsync());
+
+        Assert.Contains("AddKeyedRuvioClient(\"limits\"", error.Message);
+    }
+
+    [Fact]
     public async Task RegisteredClientIsNotResolvedAtStart()
     {
         await using WebApplication app = App(services =>
@@ -87,7 +97,8 @@ public sealed class StartupCheckTests
     private static void Client(IServiceCollection services)
         => services.AddSingleton<IRuvioClient>(_ => throw new InvalidOperationException("The client was resolved at start."));
 
-    private static WebApplication App(Action<IServiceCollection> services, Action<WebApplication>? map = null, bool partitionKey = true)
+    private static WebApplication App(
+        Action<IServiceCollection> services, Action<WebApplication>? map = null, bool partitionKey = true, string? clientKey = null)
     {
         var builder = WebApplication.CreateBuilder();
 
@@ -96,6 +107,8 @@ public sealed class StartupCheckTests
         services(builder.Services);
         builder.Services.AddRuvioRateLimiting(options =>
         {
+            options.ClientKey = clientKey;
+
             // Without the shared key the named policy brings its own, so only an inline limit lacks one.
             if (partitionKey)
                 options.PartitionKey = static context => "p";
