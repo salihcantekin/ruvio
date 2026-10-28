@@ -17,8 +17,8 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
@@ -82,13 +82,24 @@ public final class ClusterRouter implements AutoCloseable {
 
     private static final ThreadLocal<Frame> FRAMES = ThreadLocal.withInitial(() -> new Frame(true));
 
+    /** Threads that run follow-ups; a storm of MOVED or TRYAGAIN replies queues behind them instead of starting a thread each. */
+    private static final int BACKGROUND_THREADS = 8;
+    /** Follow-ups that may wait for a thread; more than this many in flight fail with the redirect error. */
+    private static final int BACKGROUND_QUEUE = 65_536;
+
     /** Runs MOVED follow-ups off the reader threads, which must never wait for a reply. */
-    private static final ExecutorService BACKGROUND = new ThreadPoolExecutor(0, Integer.MAX_VALUE, 30, TimeUnit.SECONDS,
-            new SynchronousQueue<>(), r -> {
-                Thread t = new Thread(r, "ruvio-cluster");
-                t.setDaemon(true);
-                return t;
-            });
+    private static final ExecutorService BACKGROUND = background();
+
+    private static ExecutorService background() {
+        ThreadPoolExecutor pool = new ThreadPoolExecutor(BACKGROUND_THREADS, BACKGROUND_THREADS, 30, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(BACKGROUND_QUEUE), r -> {
+                    Thread t = new Thread(r, "ruvio-cluster");
+                    t.setDaemon(true);
+                    return t;
+                });
+        pool.allowCoreThreadTimeOut(true);
+        return pool;
+    }
 
     private final RuvioOptions options;
     private volatile ClusterNode seed;

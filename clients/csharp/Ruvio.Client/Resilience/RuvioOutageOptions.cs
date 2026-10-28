@@ -129,6 +129,7 @@ public sealed class RuvioOutageOptions
     public static bool IsOutage(Exception error, CancellationToken cancellationToken) => error switch
     {
         SocketException or IOException or TimeoutException or RuvioCircuitOpenException => true,
+        RuvioException { IsClientError: true } => false,
         RuvioException { IsServerReply: false } => true,
         RuvioException { IsServerReply: true } reply => reply.Message.StartsWith("LOADING", StringComparison.Ordinal)
             || reply.Message.StartsWith("MASTERDOWN", StringComparison.Ordinal)

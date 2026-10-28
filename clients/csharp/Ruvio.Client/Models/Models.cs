@@ -170,7 +170,7 @@ public readonly record struct FillResult(FillState State, byte[]? Value, long? T
 
         if (reply.Items is not { Count: >= 2 } items || items[0].AsString() is not { } state)
         {
-            throw new RuvioException("FILLGET returned an unexpected reply");
+            throw RuvioException.Client("FILLGET returned an unexpected reply");
         }
 
         long? ParseToken(RespValue item) => item.Kind == RespKind.Null
@@ -183,7 +183,7 @@ public readonly record struct FillResult(FillState State, byte[]? Value, long? T
             ("FILL", 2) => new FillResult(FillState.Fill, null, ParseToken(items[1])),
             ("BUSY", 2) => new FillResult(FillState.Busy, null, null),
             ("STALE", 3) => new FillResult(FillState.Stale, items[1].Bytes ?? [], ParseToken(items[2])),
-            _ => throw new RuvioException("FILLGET returned an unexpected reply"),
+            _ => throw RuvioException.Client("FILLGET returned an unexpected reply"),
         };
     }
 }

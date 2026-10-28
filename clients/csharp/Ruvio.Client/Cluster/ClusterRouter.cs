@@ -371,7 +371,7 @@ internal sealed class ClusterRouter : IDisposable
 
         if (_options.ReadPolicy == ReadPolicy.Replica)
         {
-            throw new RuvioException($"no replica is known for slot {slot} (read policy Replica)");
+            throw RuvioException.Client($"no replica is known for slot {slot} (read policy Replica)");
         }
 
         return PrimaryReadAsync(slot, cancellationToken);

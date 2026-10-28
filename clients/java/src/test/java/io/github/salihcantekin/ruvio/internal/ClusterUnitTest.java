@@ -322,6 +322,32 @@ class ClusterUnitTest {
     }
 
     @Test
+    @Timeout(60)
+    void aStormOfMovedRepliesStaysOnABoundedPool() throws Exception {
+        Pair p = new Pair();
+        RuvioClient<String, String> c = p.client();
+        int n = 500;
+        List<String> keys = new ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            String k = p.key(true, i);
+            keys.add(k);
+            p.b.store.put(k, "v" + i);
+        }
+        // Every slot moved from A to B: each command gets its own MOVED.
+        p.a.end = -1;
+        p.b.start = 0;
+        List<CompletableFuture<String>> futures = new ArrayList<>();
+        for (String k : keys) {
+            futures.add(c.async().get(k));
+        }
+        for (int i = 0; i < n; i++) {
+            assertEquals("v" + i, futures.get(i).get(30, java.util.concurrent.TimeUnit.SECONDS));
+        }
+        long threads = Thread.getAllStackTraces().keySet().stream().filter(t -> "ruvio-cluster".equals(t.getName())).count();
+        assertTrue(threads <= 8, "follow-up threads: " + threads);
+    }
+
+    @Test
     void movedOnDifferentCommandsPatchesSlotsWithoutReloading() throws Exception {
         Pair p = new Pair();
         RuvioClient<String, String> c = p.client();
