@@ -159,6 +159,16 @@ Each change of a circuit is logged through `ILogger` under the package name: a W
 duration), Information for the trial call and when it closes. The client counts the changes in
 `ruvio_client_circuit_transitions`, and `RuvioCircuitBreaker.StateChanged` lets your own code react to them.
 
+```csharp
+options.Outage.CircuitBreaker = new RuvioCircuitBreakerOptions();
+// Subscribe after setting CircuitBreaker: setting it again replaces the breaker.
+options.Outage.Breaker!.StateChanged += (_, change) =>
+    RuvioHealth.Down = change.Current == RuvioCircuitState.Open;   // your own flag, read by a health check
+```
+
+To sort the errors that reach your own code (a retry policy, a job loop), use `RuvioErrors.IsTransient` and
+`RuvioErrors.MayHaveRun` from `Ruvio.Client`; see its README.
+
 Metrics: each package counts these requests in `ruvio.<feature>.outage` (`ruvio.rate_limit.outage`, `ruvio.idempotency.outage`,
 `ruvio.lock.outage`, `ruvio.output_cache.outage`, `ruvio.cache.outage`), tagged with `mode` and `reason` (`error` or
 `circuit_open`).

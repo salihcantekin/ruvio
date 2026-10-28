@@ -232,6 +232,14 @@ adds one to `ruvio.cache.fail_safe`.
 builder.Services.AddOpenTelemetry().WithMetrics(m => m.AddMeter("Ruvio.Extensions.Caching"));
 ```
 
+## Startup checks
+
+A configuration mistake stops the host while it starts, before the server takes a request, with the fix named in the error. This package checks:
+
+- the client is registered: `AddRuvioClient(...)`, or `AddKeyedRuvioClient(key, ...)` when `ClientKey` is set. Only the registration is checked, no connection is opened, so a Ruvio that is down at start still follows the `Outage` settings; skipped when another `IDistributedCache` was registered first, which then stays.
+
+See [Startup checks](../README.md#startup-checks) for how the checks run.
+
 ## When Ruvio is unreachable
 
 By default a storage error reaches the caller (`Outage.Mode = Throw`). With `FailOpen` the cache steps aside:
@@ -251,6 +259,27 @@ taken for an outage. `FailClosed` behaves as `Throw`: a cache has no response to
 cache is lost for the requests made during an outage in `FailOpen`.
 
 See [When Ruvio is unreachable](../README.md#when-ruvio-is-unreachable) for the modes and the circuit breaker.
+
+### Watching the circuit
+
+Each change of the circuit is logged through `ILogger` under the category `Ruvio.Extensions.Caching`: a Warning when it opens (with the break
+duration), Information for the trial call and when it closes. The client counts the changes in
+`ruvio_client_circuit_transitions`. To react in your own code, for a health check or an alert, subscribe to the breaker
+after setting it:
+
+```csharp
+builder.Services.AddRuvioDistributedCache(options =>
+{
+    options.Outage.Mode = RuvioOutageMode.FailOpen;
+    options.Outage.CircuitBreaker = new RuvioCircuitBreakerOptions();
+    // Subscribe after setting CircuitBreaker: setting it again replaces the breaker.
+    options.Outage.Breaker!.StateChanged += (_, change) =>
+        RuvioHealth.Down = change.Current == RuvioCircuitState.Open;   // your own flag, read by a health check
+});
+```
+
+The handler runs after the state changed, outside the breaker's lock; an exception it throws is caught and does not reach
+the call.
 
 ## Tests
 

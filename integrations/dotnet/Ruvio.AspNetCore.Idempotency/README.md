@@ -235,6 +235,16 @@ builder.Services.AddRuvioIdempotency(o =>
 The keyed client is looked up per request that the middleware handles, from the request's services. Host start fails
 when no client is registered under that key.
 
+## Startup checks
+
+A configuration mistake stops the host while it starts, before the server takes a request, with the fix named in the error. This package checks:
+
+- the client is registered: `AddRuvioClient(...)`, or `AddKeyedRuvioClient(key, ...)` when `ClientKey` is set. Only the registration is checked, no connection is opened, so a Ruvio that is down at start still follows the `Outage` settings;
+- `UseRuvioIdempotency()` throws at once when `AddRuvioIdempotency` was not called;
+- every endpoint with `[RuvioIdempotency]` or its builder form is checked once the pipeline is built: a value out of range stops start, and all bad endpoints are listed in one error.
+
+See [Startup checks](../README.md#startup-checks) for how the checks run.
+
 ## When Ruvio is unreachable
 
 By default a storage error reaches your exception handling (`Outage.Mode = Throw`). Choose what to do instead:
@@ -258,6 +268,27 @@ builder.Services.AddRuvioIdempotency(options =>
   pending, so a retry gets `409` until the retention ends.
 
 See [When Ruvio is unreachable](../README.md#when-ruvio-is-unreachable) for the modes and the circuit breaker.
+
+### Watching the circuit
+
+Each change of the circuit is logged through `ILogger` under the category `Ruvio.AspNetCore.Idempotency`: a Warning when it opens (with the break
+duration), Information for the trial call and when it closes. The client counts the changes in
+`ruvio_client_circuit_transitions`. To react in your own code, for a health check or an alert, subscribe to the breaker
+after setting it:
+
+```csharp
+builder.Services.AddRuvioIdempotency(options =>
+{
+    options.Outage.Mode = RuvioOutageMode.FailOpen;
+    options.Outage.CircuitBreaker = new RuvioCircuitBreakerOptions();
+    // Subscribe after setting CircuitBreaker: setting it again replaces the breaker.
+    options.Outage.Breaker!.StateChanged += (_, change) =>
+        RuvioHealth.Down = change.Current == RuvioCircuitState.Open;   // your own flag, read by a health check
+});
+```
+
+The handler runs after the state changed, outside the breaker's lock; an exception it throws is caught and does not reach
+the call.
 
 ## Bounds and pipeline caveats
 

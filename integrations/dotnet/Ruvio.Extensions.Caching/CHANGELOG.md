@@ -4,6 +4,7 @@ Notable changes to the NuGet package `Ruvio.Extensions.Caching`. New entries go 
 
 ## Unreleased
 
+- Docs: the README lists what this package checks while the host starts, and shows how to watch the circuit breaker (logs, `ruvio_client_circuit_transitions`, a `StateChanged` handler).
 - With `Outage.CircuitBreaker` set, the circuit's changes are logged through `ILogger` (category `Ruvio.Extensions.Caching`): Warning when it opens, with the break duration; Information for the trial call and when it closes. Nothing is logged without a breaker. The package now references `Microsoft.Extensions.Logging.Abstractions`.
 - Startup check: host start fails when the client (or the keyed client for `ClientKey`) is not registered, instead of on the first cache call. Skipped when another `IDistributedCache` was registered first. No connection is opened for the check.
 - `ClientKey` option: names a connection registered with `AddKeyedRuvioClient`, so the cache can use its own server or database. Null (the default) keeps the unkeyed `IRuvioClient`.
