@@ -2816,7 +2816,16 @@ fn read_primary(
             .min(crate::persistence::WAL_RECORD_MAX_BYTES),
     };
 
+    // Frames handed to the shard since its last wake: the shard is woken once every frame
+    // that arrived in the same read is queued, instead of once per frame.
+    let mut unwoken = false;
+
     loop {
+        if unwoken && !reader.frame_buffered() {
+            link.wake_shard.notify_one();
+            unwoken = false;
+        }
+
         if !wait_for_queue_room(link, outstanding, stop) {
             return (!stop.load(Ordering::Acquire), true);
         }
@@ -2825,6 +2834,9 @@ fn read_primary(
             Ok(Some(frame)) => frame,
             Ok(None) => return (false, true),
             Err(error) => {
+                if unwoken {
+                    link.wake_shard.notify_one();
+                }
                 if error.kind() == io::ErrorKind::InvalidData {
                     warn!(%error, "replication frame rejected");
                 }
@@ -2851,11 +2863,7 @@ fn read_primary(
         if !enqueue_frame(link, outstanding, frame, stop) {
             return (!stop.load(Ordering::Acquire), true);
         }
-        // One wake for every frame that arrived in the same read: the shard drains them
-        // together instead of waking once per frame.
-        if !reader.frame_buffered() {
-            link.wake_shard.notify_one();
-        }
+        unwoken = true;
         if let (Some(sequence), Some(through)) = (sequence, catchup.through)
             && sequence >= through
         {
@@ -2999,7 +3007,7 @@ fn wait_for_queue_room(
 /// Frames handed to the shard and not yet seen applied, with their total size kept as
 /// they come and go.
 #[derive(Default)]
-struct Outstanding {
+pub(crate) struct Outstanding {
     frames: VecDeque<(u64, usize)>,
     bytes: usize,
 }
