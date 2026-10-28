@@ -163,6 +163,30 @@ fn lfu_increment(rng: &mut u32, counter: u8) -> u8 {
     }
 }
 
+/// Writes one access into `cell`: LRU stores the stamp, LFU also bumps the decayed counter.
+fn stamp_cell(cell: &mut u32, stamp: u32, lfu: bool, rng: &mut u32) {
+    let counter = match AccessMeta::from_raw(*cell) {
+        None => {
+            if lfu {
+                LFU_INIT
+            } else {
+                1
+            }
+        }
+        Some(previous) if lfu => {
+            let aged = decayed(
+                previous.counter(),
+                idle(stamp, previous.stamp(), LFU_MINUTE_MASK),
+            );
+
+            lfu_increment(rng, aged)
+        }
+        Some(_) => 1,
+    };
+
+    *cell = AccessMeta::new(stamp, counter).0;
+}
+
 impl<C: Clock, I: StorageIndex> KvShard<C, I> {
     /// Stamps the access metadata of a key just created or overwritten, as Redis does on
     /// every write: a key that is only written then ages from its last write instead of
@@ -196,43 +220,44 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
     }
 
     pub(super) fn record_access(&mut self, key: &[u8]) {
-        let now_ms = self.now_unix_millis().get();
-        let lfu = matches!(self.eviction_policy, EvictionPolicy::AllKeysLfu);
-        let stamp = if lfu {
-            minutes(now_ms)
-        } else {
-            seconds(now_ms)
-        };
+        let (stamp, lfu) = self.access_stamp();
         let KvShard {
             entries,
             access_rng,
             ..
         } = self;
         // One lookup: the cell is read and written in place.
-        let Some(cell) = entries.access_mut(key) else {
-            return;
-        };
+        if let Some(cell) = entries.access_mut(key) {
+            stamp_cell(cell, stamp, lfu, access_rng);
+        }
+    }
 
-        let counter = match AccessMeta::from_raw(*cell) {
-            None => {
-                if lfu {
-                    LFU_INIT
-                } else {
-                    1
-                }
-            }
-            Some(previous) if lfu => {
-                let aged = decayed(
-                    previous.counter(),
-                    idle(stamp, previous.stamp(), LFU_MINUTE_MASK),
-                );
+    /// [`Self::record_access`] for the record a read just found at `address`.
+    pub(super) fn record_access_at(&mut self, address: u32) {
+        let (stamp, lfu) = self.access_stamp();
+        let KvShard {
+            entries,
+            access_rng,
+            ..
+        } = self;
 
-                lfu_increment(access_rng, aged)
-            }
-            Some(_) => 1,
-        };
+        if let Some(cell) = entries.access_at(address) {
+            stamp_cell(cell, stamp, lfu, access_rng);
+        }
+    }
 
-        *cell = AccessMeta::new(stamp, counter).0;
+    fn access_stamp(&self) -> (u32, bool) {
+        let now_ms = self.now_unix_millis().get();
+        let lfu = matches!(self.eviction_policy, EvictionPolicy::AllKeysLfu);
+
+        (
+            if lfu {
+                minutes(now_ms)
+            } else {
+                seconds(now_ms)
+            },
+            lfu,
+        )
     }
 
     /// Higher score evicts first. LRU: idle seconds. LFU: lower decayed counter first,
