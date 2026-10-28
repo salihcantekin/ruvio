@@ -667,12 +667,13 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
 
         let active = *active;
 
+        // The deadline write sets the key's TTL hint first, as it must, in the same lookup.
         let address = if db == active {
-            entries.key_address(key)
+            entries.mark_ttl_address(key)
         } else {
             databases
-                .get(db as usize)
-                .and_then(|slot| slot.as_ref()?.key_address(key))
+                .get_mut(db as usize)
+                .and_then(|slot| slot.as_mut()?.mark_ttl_address(key))
         };
 
         let previous = deadlines[db as usize].set(key, address, expires_at, |stored| {
@@ -684,7 +685,6 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         }
 
         self.note_deadline_bound(empty, expires_at);
-        self.mark_ttl_hint(db, key, true);
         self.update_deadline_index_bytes(db as usize, before);
         self.refresh_global_memory_usage();
     }

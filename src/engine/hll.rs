@@ -207,50 +207,70 @@ enum SparseSet {
     Promote,
 }
 
-/// Raises register `index` to `count` in a sparse value, Redis `hllSparseSet` without the
-/// promotion itself. `None` for corrupt runs.
-/// Whether raising register `index` to `count` would leave this sparse value as it is,
-/// decided without touching it. `None` for corrupt runs.
-fn sparse_unchanged(value: &[u8], index: usize, count: u8) -> Option<bool> {
-    if count > SPARSE_VAL_MAX_VALUE {
-        return Some(false);
-    }
+/// The opcode that holds one register of a sparse value.
+#[derive(Clone, Copy)]
+struct Located {
+    at: usize,
+    first: usize,
+    previous: Option<usize>,
+    register: u8,
+    span: usize,
+    size: usize,
+}
 
+/// Finds the opcode holding register `index`. `None` for corrupt runs.
+fn locate(value: &[u8], index: usize) -> Option<Located> {
     let mut at = HEADER;
     let mut first = 0;
+    let mut previous = None;
 
     loop {
         let (register, span, size) = opcode(value, at)?;
 
         if index < first + span {
-            return Some(register >= count);
-        }
-
-        at += size;
-        first += span;
-    }
-}
-
-fn sparse_set(value: &mut Vec<u8>, index: usize, count: u8) -> Option<SparseSet> {
-    if count > SPARSE_VAL_MAX_VALUE {
-        return Some(SparseSet::Promote);
-    }
-
-    let mut at = HEADER;
-    let mut first = 0;
-    let mut previous = None;
-
-    let (old, span, size) = loop {
-        let (register, span, size) = opcode(value, at)?;
-
-        if index < first + span {
-            break (register, span, size);
+            return Some(Located {
+                at,
+                first,
+                previous,
+                register,
+                span,
+                size,
+            });
         }
 
         previous = Some(at);
         at += size;
         first += span;
-    };
+    }
+}
+
+/// Raises register `index` to `count` in a sparse value, Redis `hllSparseSet` without the
+/// promotion itself. `None` for corrupt runs.
+fn sparse_set(value: &mut Vec<u8>, index: usize, count: u8) -> Option<SparseSet> {
+    if count > SPARSE_VAL_MAX_VALUE {
+        return Some(SparseSet::Promote);
+    }
+
+    let located = locate(value, index)?;
+
+    sparse_set_at(value, located, index, count)
+}
+
+/// `sparse_set` for a register already found with `locate` on this same value.
+fn sparse_set_at(
+    value: &mut Vec<u8>,
+    located: Located,
+    index: usize,
+    count: u8,
+) -> Option<SparseSet> {
+    let Located {
+        at,
+        first,
+        previous,
+        register: old,
+        span,
+        size,
+    } = located;
 
     if old >= count {
         return Some(SparseSet::Unchanged);
@@ -329,13 +349,33 @@ fn sparse_set(value: &mut Vec<u8>, index: usize, count: u8) -> Option<SparseSet>
 /// it has to. Whether the register changed; `None` for corrupt sparse runs.
 fn raise(value: &mut Vec<u8>, index: usize, count: u8) -> Option<bool> {
     if !is_dense(value) {
-        match sparse_set(value, index, count)? {
-            SparseSet::Unchanged => return Some(false),
-            SparseSet::Updated => return Some(true),
-            SparseSet::Promote => *value = sparse_to_dense(value)?,
-        }
+        let outcome = sparse_set(value, index, count)?;
+
+        return settle(value, index, count, outcome);
     }
 
+    raise_dense(value, index, count)
+}
+
+/// `raise` on a sparse value whose register was already found with `locate`.
+fn raise_located(value: &mut Vec<u8>, located: Located, index: usize, count: u8) -> Option<bool> {
+    let outcome = sparse_set_at(value, located, index, count)?;
+
+    settle(value, index, count, outcome)
+}
+
+fn settle(value: &mut Vec<u8>, index: usize, count: u8, outcome: SparseSet) -> Option<bool> {
+    match outcome {
+        SparseSet::Unchanged => Some(false),
+        SparseSet::Updated => Some(true),
+        SparseSet::Promote => {
+            *value = sparse_to_dense(value)?;
+            raise_dense(value, index, count)
+        }
+    }
+}
+
+fn raise_dense(value: &mut [u8], index: usize, count: u8) -> Option<bool> {
     let body = &mut value[HEADER..];
 
     if get_register(body, index) < count {
@@ -516,16 +556,44 @@ fn pf_add_sparse<'a, C: Clock, I: StorageIndex, S: MutationSink>(
     key: crate::protocol::Bytes<'a>,
     elements: &[crate::protocol::Bytes<'a>],
 ) -> Result<Response<'a>, S::Error> {
-    // Re-adding what the sketch already holds is the common case: no copy for it.
+    // Re-adding what the sketch already holds is the common case: no copy for it. The scan
+    // that finds the first element that changes also finds its opcode, so it is not searched
+    // for again when the value is updated.
+    let mut start = 0;
+    let mut located = None;
+
     if let Ok(Some(ByteView::Borrowed(bytes))) = shard.value_view(&key)
         && !is_dense(bytes)
-        && elements.iter().all(|element| {
+    {
+        let mut unchanged = true;
+
+        for (at, element) in elements.iter().enumerate() {
             let (index, length) = pattern(element);
 
-            sparse_unchanged(bytes, index, length) == Some(true)
-        })
-    {
-        return Ok(Response::Integer(0));
+            if length > SPARSE_VAL_MAX_VALUE {
+                start = at;
+                unchanged = false;
+                break;
+            }
+
+            match locate(bytes, index) {
+                Some(found) if found.register >= length => {}
+                Some(found) => {
+                    start = at;
+                    located = Some(found);
+                    unchanged = false;
+                    break;
+                }
+                None => {
+                    unchanged = false;
+                    break;
+                }
+            }
+        }
+
+        if unchanged {
+            return Ok(Response::Integer(0));
+        }
     }
 
     let (mut value, mut updated, before) = match shard.value_view(&key) {
@@ -533,10 +601,14 @@ fn pf_add_sparse<'a, C: Clock, I: StorageIndex, S: MutationSink>(
         _ => (new_value(), true, 0),
     };
 
-    for element in elements {
+    for (at, element) in elements.iter().enumerate().skip(start) {
         let (index, length) = pattern(element);
+        let changed = match located.take().filter(|_| at == start) {
+            Some(found) => raise_located(&mut value, found, index, length),
+            None => raise(&mut value, index, length),
+        };
 
-        match raise(&mut value, index, length) {
+        match changed {
             Some(changed) => updated |= changed,
             None => return Ok(Response::Error(CORRUPT)),
         }
@@ -798,5 +870,28 @@ mod tests {
         value.truncate(HEADER + 1);
         assert!(histogram(&value).is_none());
         assert!(raise(&mut value, 20_000 % REGISTERS, 3).is_none());
+    }
+
+    #[test]
+    fn raising_a_located_register_matches_raising_blind() {
+        let mut value = new_value();
+
+        for number in 0..2_000u32 {
+            let (index, length) = pattern(format!("l{number}").as_bytes());
+            let mut blind = value.clone();
+            let expected = raise(&mut blind, index, length);
+            let mut located = value.clone();
+            let actual = if is_dense(&located) || length > SPARSE_VAL_MAX_VALUE {
+                raise(&mut located, index, length)
+            } else {
+                let found = locate(&located, index).expect("valid runs");
+
+                raise_located(&mut located, found, index, length)
+            };
+
+            assert_eq!(actual, expected, "{number}");
+            assert_eq!(located, blind, "{number}");
+            value = blind;
+        }
     }
 }

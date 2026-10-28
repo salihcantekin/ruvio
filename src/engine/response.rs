@@ -518,19 +518,18 @@ pub fn hello_response(
     ])
 }
 
-/// Values up to this size are framed in a stack buffer and written with one call.
+/// Values up to this size are framed with a small stack header, no staging copy of the value.
 pub(super) const SMALL_BULK: usize = 128;
 
 pub(super) fn write_bulk(writer: &mut impl Write, value: &[u8]) -> io::Result<()> {
     if value.len() <= SMALL_BULK {
-        let mut frame = [0u8; SMALL_BULK + 8];
-        let mut digits = [0u8; 3];
-        let mut position = digits.len();
+        let mut header = [0u8; 6];
+        let mut position = 4;
         let mut len = value.len();
 
         loop {
             position -= 1;
-            digits[position] = b'0' + (len % 10) as u8;
+            header[position] = b'0' + (len % 10) as u8;
             len /= 10;
 
             if len == 0 {
@@ -538,20 +537,15 @@ pub(super) fn write_bulk(writer: &mut impl Write, value: &[u8]) -> io::Result<()
             }
         }
 
-        let digits = &digits[position..];
-        let mut at = 0;
-        frame[at] = b'$';
-        at += 1;
-        frame[at..at + digits.len()].copy_from_slice(digits);
-        at += digits.len();
-        frame[at..at + 2].copy_from_slice(b"\r\n");
-        at += 2;
-        frame[at..at + value.len()].copy_from_slice(value);
-        at += value.len();
-        frame[at..at + 2].copy_from_slice(b"\r\n");
-        at += 2;
+        // `$` goes right before the digits; the CRLF follows them.
+        position -= 1;
+        header[position] = b'$';
+        header[4] = b'\r';
+        header[5] = b'\n';
+        writer.write_all(&header[position..])?;
+        writer.write_all(value)?;
 
-        return writer.write_all(&frame[..at]);
+        return writer.write_all(b"\r\n");
     }
 
     writer.write_all(b"$")?;
@@ -581,19 +575,10 @@ pub(super) fn write_usize(writer: &mut impl Write, value: usize) -> io::Result<(
     write_u64(writer, value as u64)
 }
 
-pub(super) fn write_u64(writer: &mut impl Write, mut value: u64) -> io::Result<()> {
+pub(super) fn write_u64(writer: &mut impl Write, value: u64) -> io::Result<()> {
     let mut buffer = [0u8; 20];
-    let mut position = buffer.len();
 
-    loop {
-        position -= 1;
-        buffer[position] = b'0' + (value % 10) as u8;
-        value /= 10;
-
-        if value == 0 {
-            return writer.write_all(&buffer[position..]);
-        }
-    }
+    writer.write_all(crate::output::decimal(value, &mut buffer))
 }
 
 pub(super) fn write_i64(writer: &mut impl Write, value: i64) -> io::Result<()> {
@@ -795,6 +780,37 @@ pub(super) fn bloom_error(error: BloomError) -> Response<'static> {
         BloomError::WrongType => wrong_type(),
         BloomError::KeyExists => Response::Error(b"ERR item exists"),
         BloomError::InvalidConfiguration => Response::Error(b"ERR invalid Bloom configuration"),
+    }
+}
+
+#[cfg(test)]
+mod bulk_tests {
+    use super::*;
+
+    #[test]
+    fn write_bulk_frames_every_length_like_the_wire_format() {
+        for length in [0, 1, 9, 10, 99, 100, 127, 128, 129, 999, 1000, 100_000] {
+            let value = vec![b'x'; length];
+            let mut out = Vec::new();
+
+            write_bulk(&mut out, &value).unwrap();
+
+            let mut expected = format!("${length}\r\n").into_bytes();
+
+            expected.extend_from_slice(&value);
+            expected.extend_from_slice(b"\r\n");
+            assert_eq!(out, expected, "{length}");
+        }
+    }
+
+    #[test]
+    fn write_u64_matches_to_string() {
+        for value in [0, 7, 10, 99, 100, 12_345, u64::MAX] {
+            let mut out = Vec::new();
+
+            write_u64(&mut out, value).unwrap();
+            assert_eq!(out, value.to_string().as_bytes());
+        }
     }
 }
 

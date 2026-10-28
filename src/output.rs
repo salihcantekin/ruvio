@@ -54,6 +54,37 @@ impl BoundedOutput {
     }
 }
 
+const PAIRS: &[u8; 200] = b"0001020304050607080910111213141516171819\
+2021222324252627282930313233343536373839\
+4041424344454647484950515253545556575859\
+6061626364656667686970717273747576777879\
+8081828384858687888990919293949596979899";
+
+/// The decimal digits of `value`, written two at a time at the end of `buffer`.
+pub(crate) fn decimal(mut value: u64, buffer: &mut [u8; 20]) -> &[u8] {
+    let mut at = buffer.len();
+
+    while value >= 100 {
+        let pair = (value % 100) as usize * 2;
+
+        value /= 100;
+        at -= 2;
+        buffer[at..at + 2].copy_from_slice(&PAIRS[pair..pair + 2]);
+    }
+
+    if value >= 10 {
+        let pair = value as usize * 2;
+
+        at -= 2;
+        buffer[at..at + 2].copy_from_slice(&PAIRS[pair..pair + 2]);
+    } else {
+        at -= 1;
+        buffer[at] = b'0' + value as u8;
+    }
+
+    &buffer[at..]
+}
+
 impl Deref for BoundedOutput {
     type Target = [u8];
 
@@ -97,6 +128,35 @@ impl Write for BoundedOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decimal_matches_the_standard_formatting() {
+        let mut buffer = [0u8; 20];
+        let mut samples = vec![
+            0,
+            1,
+            9,
+            10,
+            99,
+            100,
+            101,
+            999,
+            1000,
+            12345,
+            u64::MAX,
+            u64::MAX - 1,
+        ];
+
+        for power in 0..20u32 {
+            let base = 10u64.pow(power);
+
+            samples.extend([base - 1, base, base + 1]);
+        }
+
+        for value in samples {
+            assert_eq!(decimal(value, &mut buffer), value.to_string().as_bytes());
+        }
+    }
 
     #[test]
     fn rejects_writes_before_exceeding_the_limit() {
