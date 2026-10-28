@@ -154,6 +154,28 @@ Keys, values and arguments are never recorded. A command span covers every comma
 the source or the meter a command pays one check and allocates nothing more; a measurement on a local server showed
 the same bytes per operation and throughput within noise. The cost with a listener attached was not measured.
 
+## .NET integrations
+
+Each integration package has a meter named after the package (for example `Ruvio.Extensions.Caching`); add the ones
+you use with `AddMeter(...)`. No instrument records keys, values, tags, tenant identifiers or idempotency keys, and
+with no listener attached an instrument costs one field read.
+
+- `Ruvio.Extensions.Caching`: `ruvio.cache.hit` and `ruvio.cache.miss` (tagged `operation`: `get` or
+  `get_or_create`), `ruvio.cache.fail_safe` (a stale value returned because the factory threw), `ruvio.cache.outage`.
+- `Ruvio.AspNetCore.OutputCaching`: `ruvio.output_cache.hit`, `ruvio.output_cache.miss` (tagged `reason`: `absent`
+  or `tag_evicted`), `ruvio.output_cache.tag_evict`, `ruvio.output_cache.outage`, and the storage instruments
+  `ruvio.output_cache.storage_calls`, `ruvio.output_cache.storage_commands` and `ruvio.output_cache.storage_duration`.
+- `Ruvio.AspNetCore.Idempotency`: `ruvio.idempotency.states` (tagged `state`, including `aborted` with `AbortOnException`), `ruvio.idempotency.outage`, and the storage instruments `ruvio.idempotency.storage_calls`,
+  `ruvio.idempotency.storage_commands` and `ruvio.idempotency.storage_duration`.
+- `Ruvio.Extensions.Idempotency`: `ruvio.idempotency.outcomes` (one per `ExecuteOnceAsync`, tagged `outcome`).
+- `Ruvio.AspNetCore.DistributedLock`: `ruvio.lock.acquired`, `ruvio.lock.rejected`, `ruvio.lock.lost`,
+  `ruvio.lock.errors`, `ruvio.lock.outage` and the histogram `ruvio.lock.wait_duration` (ms).
+- `Ruvio.AspNetCore.RateLimiting`: `ruvio.rate_limit.accepted`, `ruvio.rate_limit.rejected`,
+  `ruvio.rate_limit.errors`, `ruvio.rate_limit.outage`, and the storage instruments
+  `ruvio.rate_limit.storage_calls`, `ruvio.rate_limit.storage_commands` and `ruvio.rate_limit.storage_duration`.
+
+The tags of each instrument are listed in the package's README.
+
 ## Coordinators
 
 `ruvio coordinator` has no metrics endpoint; its `INFO` (after `AUTH secret`) is what to watch. On
