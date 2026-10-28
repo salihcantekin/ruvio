@@ -2809,6 +2809,7 @@ fn a_record_larger_than_a_shipper_write_is_written_on_its_own() {
     );
     assert_eq!(wire.writes, 3);
     assert!(batch.capacity() < SHIPPER_WRITE_BYTES);
+}
 
 #[test]
 fn a_publish_with_no_replica_builds_no_frame() {
