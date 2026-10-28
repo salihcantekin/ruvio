@@ -24,7 +24,7 @@ internal static class IdempotencyStore
         });
 
     internal static async Task<(string State, string? Result)> AcquireAsync(
-        IRuvioClient client, string key, string fingerprint, string owner, TimeSpan ttl, CancellationToken token)
+        IRuvioClient client, string key, string fingerprint, string owner, TimeSpan ttl, CancellationToken token, bool count = true)
     {
         long started = Stopwatch.GetTimestamp();
         var reply = await MeasureStorageAsync("begin", started,
@@ -40,14 +40,16 @@ internal static class IdempotencyStore
 
         if (state == "completed" && items.Count == 2 && items[1].Kind == RespKind.Bulk)
         {
-            RecordState(state);
+            if (count)
+                RecordState(state);
 
             return (state, items[1].AsString());
         }
 
         if (items.Count == 1 && state is "acquired" or "pending" or "conflict")
         {
-            RecordState(state);
+            if (count)
+                RecordState(state);
 
             return (state, null);
         }
@@ -93,6 +95,6 @@ internal static class IdempotencyStore
         }
     }
 
-    private static void RecordState(string state)
+    internal static void RecordState(string state)
         => States.Add(1, new TagList { { "state", state } });
 }
