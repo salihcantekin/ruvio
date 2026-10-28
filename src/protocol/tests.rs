@@ -2140,3 +2140,150 @@ fn stream_trim_limit_is_read_with_an_approximate_trim_and_ignored() {
         Ok(Command::StreamTrim { max_len: 10, .. })
     ));
 }
+
+/// Reads the length line `line` (digits and terminator) once with five bytes of padding
+/// after it, which the short reader takes, and once with nothing after it, which only
+/// the general reader takes. Both must agree.
+fn length_line_both_ways(line: &[u8]) -> Result<Option<(usize, usize)>, ProtocolError> {
+    let read = |bytes: &[u8]| {
+        let mut position = 0;
+        resp::read_length_line(bytes, &mut position).map(|value| value.map(|v| (v, position)))
+    };
+    let mut padded = line.to_vec();
+
+    padded.extend_from_slice(b"$$$$$");
+
+    let short = read(&padded);
+    let general = read(line);
+
+    match (&short, &general) {
+        (Ok(Some(_)), Ok(Some(_))) | (Err(_), Err(_)) => {
+            assert_eq!(format!("{short:?}"), format!("{general:?}"), "{line:?}")
+        }
+        // The unpadded line may end inside the terminator; the padded one never does.
+        (_, Ok(None)) => {}
+        _ => panic!("{line:?}: short {short:?}, general {general:?}"),
+    }
+
+    short
+}
+
+#[test]
+fn length_line_short_and_general_readers_agree() {
+    for value in [
+        0usize,
+        1,
+        9,
+        10,
+        99,
+        100,
+        999,
+        1000,
+        9999,
+        65_536,
+        usize::MAX,
+    ] {
+        let line = format!("{value}\r\n");
+
+        assert_eq!(
+            length_line_both_ways(line.as_bytes()).unwrap(),
+            Some((value, line.len())),
+            "{value}"
+        );
+    }
+
+    // Leading zeros keep their value on both paths.
+    assert_eq!(length_line_both_ways(b"007\r\n").unwrap(), Some((7, 5)));
+    assert_eq!(length_line_both_ways(b"0007\r\n").unwrap(), Some((7, 6)));
+
+    for bad in [
+        &b"\r\n"[..],
+        b"-1\r\n",
+        b"1\r\r",
+        b"12\rx",
+        b"123\n\r",
+        b"1x\r\n",
+        b"12 \r\n",
+        b"1\n",
+        b"99999999999999999999\r\n",
+        b"18446744073709551616\r\n",
+        b"123456789012345678901\r\n",
+    ] {
+        assert!(length_line_both_ways(bad).is_err(), "{bad:?}");
+    }
+
+    // Truncated lines wait for more bytes, at every cut.
+    let line = b"999\r\n";
+
+    for cut in 0..line.len() {
+        let mut position = 0;
+
+        assert_eq!(
+            resp::read_length_line(&line[..cut], &mut position).unwrap(),
+            None,
+            "cut {cut}"
+        );
+        assert_eq!(position, 0);
+    }
+}
+
+#[test]
+fn bulk_lengths_around_the_short_path_bound_parse_alike() {
+    for length in [0usize, 1, 9, 10, 99, 100, 998, 999, 1000, 1001, 4096] {
+        let value = vec![b'v'; length];
+        let mut frame = format!("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n${length}\r\n").into_bytes();
+
+        frame.extend_from_slice(&value);
+        frame.extend_from_slice(b"\r\n");
+
+        let general = parse_command(&frame).unwrap().expect("complete frame");
+
+        assert_eq!(general.1, frame.len());
+
+        match parse_hot_command(&frame).unwrap() {
+            HotParse::Complete(HotCommand::Set(key, payload, None), consumed) => {
+                assert_eq!(
+                    (key, payload, consumed),
+                    (&b"k"[..], &value[..], frame.len())
+                );
+            }
+            other => panic!("{length}: {other:?}"),
+        }
+
+        // Every cut of the frame is incomplete for both parsers.
+        for cut in 0..frame.len() {
+            assert_eq!(
+                parse_command(&frame[..cut]).unwrap(),
+                None,
+                "{length} cut {cut}"
+            );
+            assert!(
+                matches!(parse_hot_command(&frame[..cut]), Ok(HotParse::Incomplete)),
+                "{length} cut {cut}"
+            );
+        }
+
+        // A wrong terminator after the payload is refused by both.
+        let last = frame.len() - 1;
+
+        frame[last] = b'x';
+        assert!(parse_command(&frame).is_err(), "{length}");
+        assert!(parse_hot_command(&frame).is_err(), "{length}");
+    }
+}
+
+#[test]
+fn huge_bulk_lengths_are_refused_not_read() {
+    for header in [
+        &b"*2\r\n$3\r\nGET\r\n$18446744073709551615\r\n"[..],
+        b"*2\r\n$3\r\nGET\r\n$99999999999999999999\r\n",
+        b"*2\r\n$3\r\nGET\r\n$999999999999\r\n",
+    ] {
+        assert!(parse_command(header).is_err(), "{header:?}");
+        // The hot parser leaves the refusal to the general one.
+        assert!(
+            matches!(parse_hot_command(header), Ok(HotParse::Fallback)),
+            "{header:?}"
+        );
+    }
+}
