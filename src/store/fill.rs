@@ -3,15 +3,17 @@
 
 use super::*;
 
-/// Most markers kept per shard; expired ones are purged first.
+/// Most markers kept per shard; when full, lapsed fill tokens and the soft expiries of
+/// values that are gone are purged first.
 const MAX_MARKS: usize = 65_536;
 
 #[derive(Clone, Copy, Debug)]
 struct Mark {
     /// Token handed to the one client allowed to fill, and when it stops being valid.
     fill: Option<(u64, u64)>,
-    /// End of the fresh period for a value written with `SWR`.
-    soft_expires_at: Option<u64>,
+    /// For a value written with `SWR`: the end of its fresh period, and its deadline (the end
+    /// of the stale window), after which the mark says nothing.
+    soft: Option<(u64, u64)>,
 }
 
 #[derive(Default, Debug)]
@@ -44,10 +46,10 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
             .fills
             .as_ref()
             .and_then(|table| table.marks.get(&(self.active, key.into())))
-            .and_then(|mark| mark.soft_expires_at);
+            .and_then(|mark| mark.soft);
 
         match soft {
-            Some(soft) if now >= soft => FillState::Stale,
+            Some((soft, _)) if now >= soft => FillState::Stale,
             _ => FillState::Fresh,
         }
     }
@@ -66,9 +68,12 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         }
 
         if table.marks.len() >= MAX_MARKS && !table.marks.contains_key(&id) {
-            table
-                .marks
-                .retain(|_, mark| mark.fill.is_some_and(|(_, expires_at)| now < expires_at));
+            // A stale value's mark is what makes FILLGET answer STALE and hand out a refresh
+            // token; dropping it while the value lives would serve the value as fresh.
+            table.marks.retain(|_, mark| {
+                mark.fill.is_some_and(|(_, expires_at)| now < expires_at)
+                    || mark.soft.is_some_and(|(_, deadline)| now < deadline)
+            });
 
             if table.marks.len() >= MAX_MARKS {
                 return Err(());
@@ -79,7 +84,7 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         let token = table.next_token;
         let mark = table.marks.entry(id).or_insert(Mark {
             fill: None,
-            soft_expires_at: None,
+            soft: None,
         });
 
         mark.fill = Some((token, now.saturating_add(fill_ms)));
@@ -108,22 +113,17 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
             .map(|(_, expires_at)| expires_at.saturating_sub(now))
     }
 
-    /// Consume the marker after a successful `FILLSET`; remember the soft expiry if any.
-    pub(crate) fn fill_complete(&mut self, key: &[u8], soft_expires_at: Option<u64>) {
+    /// Consume the marker after a successful `FILLSET`; remember the soft expiry and the
+    /// value's deadline, if any.
+    pub(crate) fn fill_complete(&mut self, key: &[u8], soft: Option<(u64, u64)>) {
         let active = self.active;
         let table = self.fill_table();
         let id = (active, Box::<[u8]>::from(key));
 
-        if soft_expires_at.is_none() {
+        if soft.is_none() {
             table.marks.remove(&id);
         } else {
-            table.marks.insert(
-                id,
-                Mark {
-                    fill: None,
-                    soft_expires_at,
-                },
-            );
+            table.marks.insert(id, Mark { fill: None, soft });
         }
     }
 
@@ -169,7 +169,7 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         if let Some(table) = self.fills.as_mut()
             && let Some(mark) = table.marks.get_mut(&(active, key.into()))
         {
-            mark.soft_expires_at = None;
+            mark.soft = None;
         }
     }
 }
