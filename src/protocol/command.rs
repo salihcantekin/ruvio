@@ -236,6 +236,15 @@ impl<'a> Command<'a> {
                 owner: owned(owner),
                 result: owned(result),
             },
+            Self::IdempotencyAbort {
+                key,
+                fingerprint,
+                owner,
+            } => Command::IdempotencyAbort {
+                key: owned(key),
+                fingerprint: owned(fingerprint),
+                owner: owned(owner),
+            },
             Self::SetIfEq {
                 key,
                 value,

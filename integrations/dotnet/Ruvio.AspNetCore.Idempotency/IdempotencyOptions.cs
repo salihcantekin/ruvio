@@ -66,6 +66,14 @@ public sealed class IdempotencyOptions
     /// <summary>Retention measured from acquisition, not handler completion. No renewal or takeover.</summary>
     public TimeSpan Retention { get; set; } = TimeSpan.FromHours(24);
 
+    /// <summary>
+    /// When the handler throws, give up the pending record (<c>IDEM ABORT</c>) so a retry with the same key runs at once
+    /// instead of getting 409 until <see cref="Retention"/> ends. Off by default: turn it on only for handlers that
+    /// throw before their work takes effect, or whose work is safe to repeat, because the retry runs it again. A
+    /// response the handler returns, 5xx included, is stored and replayed as before.
+    /// </summary>
+    public bool AbortOnException { get; set; }
+
     /// <summary>Maximum request body size, in bytes. Must be between 1 and <see cref="MaximumPayloadBytes"/>.</summary>
     public int MaxRequestBodyBytes { get; set; } = 64 * 1024;
 

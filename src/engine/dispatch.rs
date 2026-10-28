@@ -252,6 +252,11 @@ pub fn execute_in_database<'a, C: Clock, I: StorageIndex, S: MutationSink, W: Li
             owner,
             result,
         } => idempotency::complete(shard, sink, &key, &fingerprint, &owner, &result),
+        Command::IdempotencyAbort {
+            key,
+            fingerprint,
+            owner,
+        } => idempotency::abort(shard, sink, &key, &fingerprint, &owner),
         Command::Lease { key, ttl_ms } => {
             let planned = match shard.lease_plan(&key, ttl_ms) {
                 Ok(planned) => planned,

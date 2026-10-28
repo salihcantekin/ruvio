@@ -101,6 +101,7 @@ fn eligible_outside_multi(command: WalGroupCommand<'_, '_>) -> bool {
             Command::Limit { .. }
                 | Command::IdempotencyBegin { .. }
                 | Command::IdempotencyComplete { .. }
+                | Command::IdempotencyAbort { .. }
                 | Command::Get { .. }
                 | Command::Set { .. }
                 | Command::GetEx { .. }

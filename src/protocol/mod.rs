@@ -654,6 +654,12 @@ pub enum Command<'a> {
         owner: Bytes<'a>,
         result: Bytes<'a>,
     },
+    /// `IDEM key ABORT fingerprint owner`: removes a pending record of this owner.
+    IdempotencyAbort {
+        key: Bytes<'a>,
+        fingerprint: Bytes<'a>,
+        owner: Bytes<'a>,
+    },
     Take {
         key: Bytes<'a>,
         count: i64,

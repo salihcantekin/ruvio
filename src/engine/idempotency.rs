@@ -1,5 +1,5 @@
 use super::*;
-use crate::protocol::{LimitMode, MAX_IDEMPOTENCY_RESULT_BYTES, MAX_IDEMPOTENCY_TTL_MS};
+use crate::protocol::{Bytes, LimitMode, MAX_IDEMPOTENCY_RESULT_BYTES, MAX_IDEMPOTENCY_TTL_MS};
 use crate::store::LimitError;
 
 // Native state machine rather than a Lua script: the record is replicated and recovered like
@@ -136,6 +136,43 @@ pub(super) fn complete<'a, C: Clock, I: StorageIndex, S: MutationSink>(
         deadline.get(),
         Response::Integer(1),
     )
+}
+
+/// Removes a pending record when `fingerprint` and `owner` match, so a later `BEGIN` acquires
+/// it. A completed record, another owner's record or a missing key is left alone (0). Recorded
+/// as an ordinary delete.
+pub(super) fn abort<'a, C: Clock, I: StorageIndex, S: MutationSink>(
+    shard: &'a mut KvShard<C, I>,
+    sink: &mut S,
+    key: &Bytes<'_>,
+    fingerprint: &[u8],
+    owner: &[u8],
+) -> Result<Response<'a>, S::Error> {
+    if !tokens_valid(fingerprint, owner) {
+        return Ok(Response::Error(INPUT));
+    }
+    if !shard.contains_key(key) {
+        return Ok(Response::Integer(0));
+    }
+    if shard.expires_at(key).is_none() {
+        return Ok(Response::Error(INVALID));
+    }
+    let bytes = match shard.value_view(key) {
+        Ok(Some(ByteView::Borrowed(bytes))) => bytes,
+        _ => return Ok(wrong_type()),
+    };
+    let Some(record) = Record::decode(bytes) else {
+        return Ok(Response::Error(INVALID));
+    };
+    if record.result.is_some() || record.fingerprint != fingerprint || record.owner != owner {
+        return Ok(Response::Integer(0));
+    }
+    before_mutation_allow_oom(shard, sink, [key.as_ref()], 0)?;
+    sink.record(Mutation::Delete {
+        keys: std::slice::from_ref(key),
+    })?;
+    shard.delete(key);
+    Ok(Response::Integer(1))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -383,6 +420,100 @@ mod tests {
         );
     }
 
+    fn give_up<'a>(fingerprint: &'a [u8], owner: &'a [u8]) -> Command<'a> {
+        Command::IdempotencyAbort {
+            key: Cow::Borrowed(b"request"),
+            fingerprint: Cow::Borrowed(fingerprint),
+            owner: Cow::Borrowed(owner),
+        }
+    }
+
+    #[test]
+    fn abort_removes_only_a_pending_record_of_the_same_owner_and_fingerprint() {
+        let clock = TestClock::new(1_000);
+        let mut shard = KvShard::with_clock(clock.clone());
+        let mut log = Log::default();
+
+        assert_eq!(
+            execute_with_sink(&mut shard, give_up(b"fp", b"owner"), &mut log).unwrap(),
+            Response::Integer(0)
+        );
+        execute_with_sink(&mut shard, reserve(b"owner"), &mut log).unwrap();
+        for (fingerprint, owner) in [(&b"fp"[..], &b"other"[..]), (b"other", b"owner")] {
+            assert_eq!(
+                execute_with_sink(&mut shard, give_up(fingerprint, owner), &mut log).unwrap(),
+                Response::Integer(0)
+            );
+        }
+        assert_eq!(log.records.len(), 1);
+        assert_eq!(
+            execute_with_sink(&mut shard, give_up(b"fp", b"owner"), &mut log).unwrap(),
+            Response::Integer(1)
+        );
+        assert!(!shard.contains_key(b"request"));
+        assert_eq!(
+            log.records.last(),
+            Some(&OwnedMutation::Delete {
+                keys: vec![b"request".to_vec()]
+            })
+        );
+        assert_eq!(
+            execute_with_sink(&mut shard, give_up(b"fp", b"owner"), &mut log).unwrap(),
+            Response::Integer(0)
+        );
+
+        // A retry acquires at once instead of waiting for the retention to end.
+        assert_eq!(
+            execute_with_sink(&mut shard, reserve(b"retry"), &mut log).unwrap(),
+            state(b"acquired")
+        );
+        execute_with_sink(&mut shard, finish(b"retry", b"done"), &mut log).unwrap();
+        let records = log.records.len();
+        assert_eq!(
+            execute_with_sink(&mut shard, give_up(b"fp", b"retry"), &mut log).unwrap(),
+            Response::Integer(0)
+        );
+        assert_eq!(log.records.len(), records);
+        assert_eq!(shard.pttl(b"request"), 1_000);
+
+        shard.set_bytes(b"plain", b"value");
+        assert_eq!(
+            abort(
+                &mut shard,
+                &mut log,
+                &Cow::Borrowed(&b"plain"[..]),
+                b"fp",
+                b"owner"
+            )
+            .unwrap(),
+            Response::Error(INVALID)
+        );
+        assert_eq!(
+            abort(
+                &mut shard,
+                &mut log,
+                &Cow::Borrowed(&b"request"[..]),
+                b"",
+                b"owner"
+            )
+            .unwrap(),
+            Response::Error(INPUT)
+        );
+    }
+
+    #[test]
+    fn abort_failing_to_reach_the_log_keeps_the_pending_record() {
+        let clock = TestClock::new(1_000);
+        let mut shard = KvShard::with_clock(clock);
+        let mut log = Log::default();
+
+        execute_with_sink(&mut shard, reserve(b"owner"), &mut log).unwrap();
+        log.fail = true;
+        assert!(execute_with_sink(&mut shard, give_up(b"fp", b"owner"), &mut log).is_err());
+        assert!(shard.contains_key(b"request"));
+        assert_eq!(shard.pttl(b"request"), 1_000);
+    }
+
     #[test]
     fn idempotency_wal_failure_and_oom_preserve_pending_value_and_deadline() {
         let clock = TestClock::new(1_000);
@@ -529,11 +660,21 @@ mod tests {
             ],
             vec![b"IDEM".as_slice(), b"k", b"BEGIN", b"", b"owner", b"1000"],
             vec![b"IDEM".as_slice(), b"k", b"STEAL", b"fp", b"owner", b"1000"],
+            vec![b"IDEM".as_slice(), b"k", b"ABORT", b"fp", b"owner", b"1000"],
+            vec![b"IDEM".as_slice(), b"k", b"ABORT", b"fp", b""],
+            vec![b"IDEM".as_slice(), b"k", b"BEGIN", b"fp", b"owner"],
         ] {
             assert!(crate::protocol::parse_command(&wire(&args)).is_err());
         }
         let args = wire(&[b"IDEM", b"{tag}k", b"COMPLETE", b"fp", b"owner", b"\0\xff"]);
         let (command, _) = crate::protocol::parse_command(&args).unwrap().unwrap();
+        assert_eq!(
+            crate::routing::command_keys(&command),
+            vec![b"{tag}k".as_slice()]
+        );
+        let abort = wire(&[b"IDEM", b"{tag}k", b"abort", b"fp", b"owner"]);
+        let (command, _) = crate::protocol::parse_command(&abort).unwrap().unwrap();
+        assert!(matches!(command, Command::IdempotencyAbort { .. }));
         assert_eq!(
             crate::routing::command_keys(&command),
             vec![b"{tag}k".as_slice()]
