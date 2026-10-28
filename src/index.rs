@@ -233,6 +233,12 @@ pub trait StorageIndex: Debug + Send + 'static {
         None
     }
 
+    /// `mark_ttl` and `key_address` in one lookup.
+    fn mark_ttl_address(&mut self, key: &[u8]) -> Option<u32> {
+        self.mark_ttl(key);
+        self.key_address(key)
+    }
+
     fn key_bytes_at(&self, _address: u32) -> Option<&[u8]> {
         None
     }
@@ -1801,6 +1807,17 @@ impl StorageIndex for AHashIndex {
         self.table
             .find(hash, |addr| Self::same_key(&self.keys, addr, key))
             .map(|addr| addr.0)
+    }
+
+    fn mark_ttl_address(&mut self, key: &[u8]) -> Option<u32> {
+        let hash = self.hash_key(key);
+        let addr = self
+            .table
+            .find(hash, |record| Self::same_key(&self.keys, record, key))
+            .copied()?;
+
+        Self::set_ttl_hint(&mut self.keys, addr, true);
+        Some(addr.0)
     }
 
     fn key_bytes_at(&self, address: u32) -> Option<&[u8]> {
