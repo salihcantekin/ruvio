@@ -189,5 +189,7 @@ duration), `RuvioCircuitHalfOpen` (Information, the trial call) and `RuvioCircui
 the leader (`is_leader:1`), alert on a group whose `state` is not `ok` for longer than a few
 `down_after_ms` (`state_ms`), on `members_answering` below the member count, and on a rising
 `failovers_total`. With the primary lease, `lease_grant_ms` above `primary_lease_ms` means this
-coordinator is not renewing the primary. A group that waits is also logged as a warning, at most every
+coordinator is not renewing the primary, and a rising `lease_grants_refused` means the node answers
+the grants with an error (a wrong `primary_lease_coordinators`, or the coordinator set changed; the
+coordinator logs a warning with the likely cause, at most once a minute per node). A group that waits is also logged as a warning, at most every
 10 seconds. Fields are listed in [COORDINATOR.md](COORDINATOR.md).

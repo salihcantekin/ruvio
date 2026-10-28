@@ -1940,6 +1940,46 @@ fn a_stalled_member_does_not_hold_up_the_primary_lease() {
     assert!(writes > 20, "only {writes} writes in four seconds");
 }
 
+/// A node whose `primary_lease_coordinators` lists other coordinators refuses every grant; the
+/// coordinators count the refusals in `INFO` and log a warning that names the cause.
+#[test]
+fn a_node_that_refuses_lease_grants_is_counted_and_warned_about() {
+    let dir = tempfile::tempdir().unwrap();
+    let group = Group::new();
+    let env = [
+        ("RUVIO_PRIMARY_LEASE", "yes"),
+        ("RUVIO_PRIMARY_LEASE_COORDINATORS", "7,8,9"),
+    ];
+    let _nodes = [
+        group.node_with(dir.path(), 0, None, &env),
+        group.node_with(dir.path(), 1, Some(0), &env),
+    ];
+    let log = dir.path().join("coordinator0.log");
+    let _coordinators: Vec<Process> = (0..3)
+        .map(|index| {
+            group.coordinator_with(
+                dir.path(),
+                index,
+                "primary_lease_ms = 700\nprimary_lease_drift_percent = 5",
+                &group.resp,
+                (index == 0).then_some(log.as_path()),
+            )
+        })
+        .collect();
+    let coordinator = group.coordinators[0].to_string();
+
+    wait_until("a counted refusal", || {
+        call_with_secret(&coordinator, &["INFO"]).is_some_and(|info| {
+            info.contains("lease_grants_refused=") && !info.contains("lease_grants_refused=0")
+        })
+    });
+    wait_until("the warning in the coordinator's log", || {
+        std::fs::read_to_string(&log).is_ok_and(|text| {
+            text.contains("refuses lease grants") && text.contains("primary_lease_coordinators")
+        })
+    });
+}
+
 /// A data node that answers what the coordinators ask when they look at it (`ROLE` as a
 /// replica of nobody in the group, one shard, map version 3) and never answers anything else,
 /// such as `REPLICAOF`: a member stuck after it was seen.
