@@ -5,9 +5,11 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import io.github.salihcantekin.ruvio.RuvioClient;
 import io.github.salihcantekin.ruvio.RuvioConnectionException;
+import io.github.salihcantekin.ruvio.RuvioErrors;
 import io.github.salihcantekin.ruvio.RuvioException;
 import io.github.salihcantekin.ruvio.RuvioOptions;
 import io.github.salihcantekin.ruvio.RuvioServerException;
+import io.github.salihcantekin.ruvio.RuvioTimeoutException;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.util.List;
@@ -130,6 +132,8 @@ class LinkFakeTest {
                 long start = System.nanoTime();
                 RuvioException e = assertThrows(RuvioException.class, () -> c.get("k"));
                 assertTrue(e.getMessage().contains("no reply within 150 ms"), e.getMessage());
+                assertInstanceOf(RuvioTimeoutException.class, e);
+                assertTrue(RuvioErrors.isTransient(e) && RuvioErrors.mayHaveRun(e), "a timeout is transient and may have run");
                 assertTrue((System.nanoTime() - start) / 1_000_000 < 2000, "the timeout must not hang");
             }
         }

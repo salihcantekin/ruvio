@@ -39,6 +39,69 @@ pub enum Error {
     Server(String),
 }
 
+/// Server replies that a later attempt can get past: the server is loading or has no primary, a slot or key
+/// is moving, a failover is in progress, or too few replicas confirmed a durable write in time.
+const TRANSIENT_REPLIES: [&str; 6] = [
+    "LOADING",
+    "MASTERDOWN",
+    "CLUSTERDOWN",
+    "TRYAGAIN",
+    "READONLY",
+    "NOREPLICAS",
+];
+
+impl Error {
+    /// True when the same call can succeed later without any change on the caller's side: the socket failed
+    /// or timed out ([`Error::Io`]), or the server answered `LOADING`, `MASTERDOWN`, `CLUSTERDOWN`,
+    /// `TRYAGAIN`, `READONLY` or `NOREPLICAS`. False for every other server reply (`WRONGTYPE`, `OOM`, a
+    /// syntax error) and for [`Error::Protocol`].
+    ///
+    /// The client already follows `MOVED`/`ASK` and waits out `TRYAGAIN` during a slot move; this judges
+    /// what still reaches the caller, for a retry loop of your own. Retry only when this is true and the
+    /// command is safe to repeat (a read, a `SET` of the same value, a command with an idempotency key) or
+    /// [`may_have_run`](Error::may_have_run) is false.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use ruvio_client::*;
+    /// # fn run(client: &mut Client) -> Result<i64, Error> {
+    /// let mut attempt = 0;
+    /// loop {
+    ///     match client.incr("visits") {
+    ///         // INCR is not safe to repeat: retry it only when it surely did not run.
+    ///         Err(error) if attempt < 3 && error.is_transient() && !error.may_have_run() => attempt += 1,
+    ///         result => return result,
+    ///     }
+    /// }
+    /// # }
+    /// ```
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Error::Io(_) => true,
+            Error::Server(message) => TRANSIENT_REPLIES
+                .iter()
+                .any(|code| reply_code(message) == *code),
+            Error::Protocol(_) => false,
+        }
+    }
+
+    /// True when the failed call may have changed data, so repeating a write that is not safe to repeat
+    /// could apply it twice. False only for a server error reply, which the server sends instead of running
+    /// the command; `NOREPLICAS` is the exception, because the write was applied on the primary and only
+    /// the replica confirmation timed out. A failed or timed-out socket and a protocol error may have run.
+    pub fn may_have_run(&self) -> bool {
+        match self {
+            Error::Server(message) => reply_code(message) == "NOREPLICAS",
+            Error::Io(_) | Error::Protocol(_) => true,
+        }
+    }
+}
+
+fn reply_code(message: &str) -> &str {
+    message.split(' ').next().unwrap_or(message)
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -68,6 +131,45 @@ mod tests {
     use super::Error;
     use std::error::Error as _;
     use std::io::{self, ErrorKind};
+
+    #[test]
+    fn transient_covers_io_and_the_retryable_replies_only() {
+        for reply in [
+            "LOADING Ruvio is loading the dataset in memory",
+            "MASTERDOWN Link with MASTER is down",
+            "CLUSTERDOWN The cluster is down",
+            "TRYAGAIN slot is moving",
+            "READONLY You can't write against a read only replica.",
+            "NOREPLICAS Not enough good replicas to write.",
+        ] {
+            assert!(Error::Server(reply.into()).is_transient(), "{reply}");
+        }
+        for reply in [
+            "WRONGTYPE Operation against a key",
+            "OOM command not allowed",
+            "ERR syntax error",
+            "READONLYX x",
+            "LOAD",
+        ] {
+            assert!(!Error::Server(reply.into()).is_transient(), "{reply}");
+        }
+        assert!(Error::Io(io::Error::new(ErrorKind::TimedOut, "slow")).is_transient());
+        assert!(Error::Io(io::Error::new(ErrorKind::ConnectionReset, "reset")).is_transient());
+        assert!(!Error::Protocol("bad frame".into()).is_transient());
+    }
+
+    #[test]
+    fn only_a_refusing_server_reply_surely_did_not_run() {
+        assert!(!Error::Server("WRONGTYPE Operation against a key".into()).may_have_run());
+        assert!(!Error::Server("TRYAGAIN slot is moving".into()).may_have_run());
+        assert!(!Error::Server("READONLY replica".into()).may_have_run());
+        assert!(
+            Error::Server("NOREPLICAS Not enough good replicas to write.".into()).may_have_run()
+        );
+        assert!(Error::Server("NOREPLICAS".into()).may_have_run());
+        assert!(Error::Io(io::Error::new(ErrorKind::TimedOut, "slow")).may_have_run());
+        assert!(Error::Protocol("bad frame".into()).may_have_run());
+    }
 
     #[test]
     fn display_shows_the_message_of_every_variant() {

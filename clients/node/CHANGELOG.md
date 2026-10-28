@@ -4,6 +4,7 @@ Notable changes to the Node.js client `ruvio-client` on npm. New entries go unde
 
 ## Unreleased
 
+- `isTransient(err)` and `mayHaveRun(err)` sort an error for a retry policy of your own (cockatiel, a loop): transient means trying again later can succeed (`ConnectionError`, including a command timeout, or the replies `LOADING`, `MASTERDOWN`, `CLUSTERDOWN`, `TRYAGAIN`, `READONLY`, `NOREPLICAS`); may have run is false only for a server error reply other than `NOREPLICAS`. The same rules as the other clients. Nothing changes on the command path.
 - `idemAbort(key, fingerprint, owner)` sends `IDEM key ABORT fingerprint owner`: it removes a pending record of that owner and fingerprint so the next `idemBegin` acquires the key at once, and resolves `true`/`false` (`false` for a missing key, a completed record or another owner). `idempotent` takes `opts.abortOnError` (default `false`); when set, a throwing `fn` sends `ABORT` and the original error is rethrown (a failed abort is ignored). The default behavior is unchanged. Needs a server that has `IDEM ... ABORT`.
 - The reply parser refuses a bulk string over 64 MiB and an array, set, push or map over 1,048,576 elements as a protocol error before it allocates, the same limits as the Rust and C# clients. Before, Node.js had no limit.
 - `evalCached(script, keys, args)` runs a script by its SHA1 and sends the whole script only when the shard answers `NOSCRIPT` (`EVALSHA`, then `EVAL` once). The SHA1 is computed in the client; nothing changes for `eval` and `evalsha`.

@@ -4,6 +4,7 @@ package io.github.salihcantekin.ruvio.internal;
 import io.github.salihcantekin.ruvio.RuvioConnectionException;
 import io.github.salihcantekin.ruvio.RuvioException;
 import io.github.salihcantekin.ruvio.RuvioServerException;
+import io.github.salihcantekin.ruvio.RuvioTimeoutException;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -212,7 +213,7 @@ public class Connection implements AutoCloseable {
                 Request<?> q = ring[(int) (i & mask)];
                 if (q != null && q.deadline != 0 && now - q.deadline >= 0) {
                     q.deadline = 0;
-                    q.fail(new RuvioException("no reply within " + millis + " ms (command timeout)"));
+                    q.fail(new RuvioTimeoutException("no reply within " + millis + " ms (command timeout)"));
                 }
             }
         }

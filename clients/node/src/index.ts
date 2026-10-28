@@ -44,7 +44,7 @@ export type { ClusterOptions, ReadPolicy } from './cluster.js';
 export { Subscriber } from './subscriber.js';
 export type { PubSubMessage, SubscriberOptions } from './subscriber.js';
 export type { ConnectionOptions } from './connection.js';
-export { RuvioError, ConnectionError, ReplyError } from './errors.js';
+export { RuvioError, ConnectionError, ReplyError, isTransient, mayHaveRun } from './errors.js';
 export { Encoder, cmd } from './encoder.js';
 export type { Arg, Cmd } from './encoder.js';
 export { Parser, NEED_MORE, PushMessage } from './parser.js';

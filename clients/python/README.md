@@ -388,6 +388,33 @@ client = Ruvio(seeds=["10.0.0.1:6379", ("10.0.0.2", 6379), "[::1]:6379"])
   table). Pipelines, fan-out commands and transactions do not trigger the reload on their own; they fail as
   before and the next single-key or keyless command reloads. Seeds are never asked while the known nodes answer.
 
+## Retry policies of your own
+
+`ruvio.is_transient` and `ruvio.may_have_run` sort what a call raises, for a retry policy of your own
+(tenacity, a loop). The client already follows `MOVED`/`ASK`, waits out `TRYAGAIN` during a slot move and
+finds a new primary after a failover; these judge what still reaches you.
+
+- `is_transient(e)`: trying again later can succeed. True for `ConnectionError` and `TimeoutError` and for
+  `LOADING`, `MASTERDOWN`, `CLUSTERDOWN`, `TRYAGAIN`, `READONLY` and `NOREPLICAS`; false for `WRONGTYPE`, `OOM`,
+  syntax errors, `ProtocolError` and a cancelled task.
+- `may_have_run(e)`: the failed call may have changed data. False only for a server error reply (the server
+  refused the command), except `NOREPLICAS`: the write was applied and only the replica confirmation timed out.
+  A failed connection or a timeout may have run.
+
+Repeat a write only when it is safe to repeat or did not run:
+
+```python
+from tenacity import retry, retry_if_exception, stop_after_attempt
+from ruvio import is_transient, may_have_run
+
+# incr is not safe to repeat: retry it only when it surely did not run.
+@retry(retry=retry_if_exception(lambda e: is_transient(e) and not may_have_run(e)), stop=stop_after_attempt(3))
+def visit(r):
+    return r.incr("visits")
+```
+
+For a read, `is_transient` alone is enough.
+
 ## Following a failover
 
 A standalone client with two or more `seeds`, or with `sentinel_master`, finds the primary again after a

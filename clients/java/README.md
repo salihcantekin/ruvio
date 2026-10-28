@@ -281,6 +281,34 @@ RuvioClient<String, String> client = RuvioClient.connect(options);
   Seeds are not asked while the known nodes answer, so routing is unchanged. Pipelines are not re-routed: a
   group whose node cannot be opened fails, as before.
 
+## Retry policies of your own
+
+`RuvioErrors` sorts what a call throws, for a retry policy of your own (resilience4j, Failsafe, a loop).
+The client already follows `MOVED`/`ASK`, waits out `TRYAGAIN` during a slot move and finds a new primary after
+a failover; these judge what still reaches you. A `CompletionException` or `ExecutionException` from the async
+API is judged by its cause.
+
+- `RuvioErrors.isTransient(e)`: trying again later can succeed. True for `RuvioConnectionException`,
+  `RuvioTimeoutException` (no reply within the command timeout) and `LOADING`, `MASTERDOWN`, `CLUSTERDOWN`,
+  `TRYAGAIN`, `READONLY` and `NOREPLICAS`; false for `WRONGTYPE`, `OOM`, syntax errors and an interrupted or
+  cancelled wait.
+- `RuvioErrors.mayHaveRun(e)`: the failed call may have changed data. False only for a server error reply (the
+  server refused the command), except `NOREPLICAS`: the write was applied and only the replica confirmation
+  timed out. A failed connection or a timeout may have run.
+
+Repeat a write only when it is safe to repeat or did not run:
+
+```java
+RetryConfig config = RetryConfig.custom()
+    .maxAttempts(3)
+    // INCR is not safe to repeat: retry it only when it surely did not run.
+    .retryOnException(e -> RuvioErrors.isTransient(e) && !RuvioErrors.mayHaveRun(e))
+    .build();
+long visits = Retry.of("visits", config).executeSupplier(() -> client.incr("visits"));
+```
+
+For a read, `isTransient` alone is enough.
+
 ## Following a failover
 
 A standalone client with at least two seeds, or with a coordinator name, finds the primary again after a failover
