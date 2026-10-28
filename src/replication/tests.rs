@@ -1568,8 +1568,22 @@ fn copied_publish_round_trips_and_rejects_a_wal_frame() {
         decode_copied_publish(&frame),
         Some((false, b"news".to_vec(), b"hello".to_vec()))
     );
+    assert!(is_copied_publish(&frame));
     frame[4] = b'X';
     assert_eq!(decode_copied_publish(&frame), None);
+    assert!(!is_copied_publish(&frame));
+
+    let mut damaged = encode_copied_publish(true, b"news", b"hello");
+    let last = damaged.len() - 1;
+
+    damaged[last] ^= 1;
+    assert!(
+        is_copied_publish(&damaged),
+        "only the shard checks the checksum"
+    );
+    assert_eq!(decode_copied_publish(&damaged), None);
+    assert!(!is_copied_publish(&damaged[..31]));
+    assert!(!is_copied_publish(&encode_control(1, false)));
 }
 
 #[test]

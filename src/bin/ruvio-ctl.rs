@@ -153,10 +153,11 @@ fn run(cli: Cli) -> Result<(), PersistenceError> {
             .map_err(PersistenceError::Failed)?;
 
             println!(
-                "scanned={} copied={} skipped_existing={} vanished={} unsupported={}",
+                "scanned={} copied={} skipped_existing={} skipped_staging={} vanished={} unsupported={}",
                 report.scanned,
                 report.copied,
                 report.skipped_existing,
+                report.skipped_staging,
                 report.vanished,
                 report.unsupported
             );

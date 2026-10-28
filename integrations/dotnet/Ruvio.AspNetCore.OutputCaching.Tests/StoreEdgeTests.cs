@@ -93,7 +93,7 @@ public class StoreEdgeTests
         Assert.Equal(a.EntryKey(new string('x', 3000)).Length, a.EntryKey("short").Length);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task GetReturnsNullForMissingStaleOrMismatchedEntriesAndRejectsCorruption()
     {
         (RuvioOutputCacheStore store, StoreClient client) = Make(o => o.MaxTagsPerEntry = 2);
@@ -157,7 +157,7 @@ public class StoreEdgeTests
         await Assert.ThrowsAsync<RuvioException>(async () => await store.GetAsync("k", default));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task EvictAcceptsZeroOrOneAndRejectsAnythingElse()
     {
         (RuvioOutputCacheStore store, StoreClient client) = Make();
@@ -180,7 +180,7 @@ public class StoreEdgeTests
         }
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task SetWithoutTagsWritesOneEntryAndChecksTheReply()
     {
         (RuvioOutputCacheStore store, StoreClient client) = Make();
@@ -213,7 +213,7 @@ public class StoreEdgeTests
         await store.SetAsync("k", [], [], TimeSpan.FromMilliseconds(1), default);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task SetWithTagsCreatesExtendsOrKeepsTagGenerations()
     {
         (RuvioOutputCacheStore store, StoreClient client) = Make();
@@ -247,7 +247,7 @@ public class StoreEdgeTests
         Assert.Equal("2000", writes[1][2]);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task SetWithTagsThatAreAllCurrentWritesOnlyTheEntry()
     {
         (RuvioOutputCacheStore store, StoreClient client) = Make();
@@ -260,7 +260,7 @@ public class StoreEdgeTests
         Assert.DoesNotContain(client.ManyCommands, c => c[0] is "SET" or "PEXPIRE");
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task TagStateThatCannotBeTrustedIsAnError()
     {
         (RuvioOutputCacheStore store, StoreClient client) = Make();

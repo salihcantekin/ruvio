@@ -8,7 +8,7 @@ namespace Ruvio.AspNetCore.OutputCaching.Tests;
 
 public class KeyedClientTests
 {
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task ClientKeySelectsTheKeyedClient()
     {
         var keyed = DispatchProxy.Create<IRuvioClient, StoreTests.RejectingClient>();
