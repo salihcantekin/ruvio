@@ -415,6 +415,52 @@ public class ClusterTests
         Assert.True(clock.ElapsedMilliseconds >= 4, $"retried after {clock.ElapsedMilliseconds} ms");
     }
 
+    [Fact(Timeout = 30000)]
+    public async Task PipelineOfRefusedCommandsWaitsForOneTryAgainBudget()
+    {
+        using var first = Listen();
+        using var second = Listen();
+        (RuvioConnection opened, NetworkStream seedStream, TcpClient seed) = await ConnectTwoShards(first, second);
+
+        await using RuvioConnection connection = opened;
+        using TcpClient seedClient = seed;
+        RuvioClient client = await connection.GetDefaultDatabaseAsync();
+        const int count = 100;
+        var commands = new IReadOnlyList<string>[count];
+
+        for (int index = 0; index < count; index++)
+        {
+            commands[index] = ["GET", "somekey"];
+        }
+
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        ValueTask<IReadOnlyList<RespValue>> pending = client.ExecuteManyAsync(commands);
+        using TcpClient owner = await second.AcceptTcpClientAsync();
+        NetworkStream ownerStream = owner.GetStream();
+
+        for (int index = 0; index < count; index++)
+        {
+            await ExpectAsync(ownerStream, "GET", "somekey");
+        }
+
+        await ReplyAsync(ownerStream, string.Concat(Enumerable.Repeat("-TRYAGAIN slot is being moved\r\n", count)));
+
+        // The slot stays frozen: the first command is sent seven more times, each other one once.
+        for (int send = 0; send < 7 + count - 1; send++)
+        {
+            await ExpectAsync(ownerStream, "GET", "somekey");
+            await ReplyAsync(ownerStream, "-TRYAGAIN slot is being moved\r\n");
+        }
+
+        IReadOnlyList<RespValue> replies = await pending;
+
+        Assert.Equal(count, replies.Count);
+        Assert.All(replies, reply => Assert.StartsWith("TRYAGAIN", reply.Text));
+
+        // One budget (635 ms), not 100 of them; the bound leaves room for a slow machine.
+        Assert.InRange(clock.ElapsedMilliseconds, 630, 5000);
+    }
+
     [Fact(Timeout = 15000)]
     public async Task TryAgainIsReturnedAfterSevenRetries()
     {
