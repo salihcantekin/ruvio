@@ -211,7 +211,7 @@ public sealed class RuvioConnection : IRuvioConnection
 
             if (IsCluster && index != 0)
             {
-                throw new RuvioException("SELECT is not supported in cluster mode");
+                throw RuvioException.Client("SELECT is not supported in cluster mode");
             }
 
             RuvioClientOptions databaseOptions = CopyOptions(_options, index);
