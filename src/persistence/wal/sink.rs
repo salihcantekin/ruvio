@@ -23,7 +23,7 @@ impl WalSink {
 
         if !config.profile.uses_wal() {
             let published = Arc::new(AtomicU64::new(0));
-            let durable = Arc::new(AtomicU64::new(0));
+            let durable = Arc::new(DurableSequence::new(0));
             let backlog_floor = Arc::new(AtomicU64::new(u64::MAX));
             let replica_count = Arc::new(AtomicU64::new(0));
 
@@ -118,7 +118,7 @@ impl WalSink {
         };
 
         let published = Arc::new(AtomicU64::new(report.last_sequence));
-        let durable = Arc::new(AtomicU64::new(report.last_sequence));
+        let durable = Arc::new(DurableSequence::new(report.last_sequence));
         let backlog_floor = Arc::new(AtomicU64::new(u64::MAX));
         let replica_count = Arc::new(AtomicU64::new(0));
         let sync_error = Arc::new(SyncError::default());
@@ -190,7 +190,7 @@ impl WalSink {
     }
 
     /// Last sequence synced to disk. Replication ships through this cursor.
-    pub fn durable(&self) -> Arc<AtomicU64> {
+    pub fn durable(&self) -> Arc<DurableSequence> {
         Arc::clone(&self.durable)
     }
 

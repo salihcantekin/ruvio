@@ -550,11 +550,15 @@ pub(crate) fn record_header_plausible(
         && le_u32(frame, field::PAYLOAD_LENGTH) as usize == frame.len() - RECORD_MIN_LEN
 }
 
-pub(crate) fn decode_record(
+/// Every check `decode_record` makes on `frame` except decoding its payload: the length,
+/// command limit, checksum, version, flags, shard and payload length. Returns the record's
+/// sequence. A reader that only forwards the frame (replication, CDC) needs no more, and
+/// whoever applies it decodes the payload then.
+pub(crate) fn verify_record_frame(
     frame: &[u8],
     expected_shard: u32,
     limits: ProtocolLimits,
-) -> Result<DecodedRecord, PersistenceError> {
+) -> Result<u64, PersistenceError> {
     let limits = record_read_limits(limits);
 
     if frame.len() < RECORD_MIN_LEN {
@@ -590,7 +594,6 @@ pub(crate) fn decode_record(
         return Err(PersistenceError::Unsupported("WAL record version".into()));
     }
 
-    let record_type = le_u16(frame, field::TYPE);
     let flags = le_u32(frame, field::FLAGS);
 
     if flags & !RECORD_DATABASE_MASK != 0 {
@@ -599,17 +602,12 @@ pub(crate) fn decode_record(
         ));
     }
 
-    let database = (flags & RECORD_DATABASE_MASK) as u8;
-
-    let shard_id = le_u32(frame, field::SHARD);
-
-    if shard_id != expected_shard {
+    if le_u32(frame, field::SHARD) != expected_shard {
         return Err(PersistenceError::Corruption(
             "WAL record shard mismatch".into(),
         ));
     }
 
-    let sequence = le_u64(frame, field::SEQUENCE);
     let payload_length = le_u32(frame, field::PAYLOAD_LENGTH) as usize;
 
     if payload_length != checksum_offset - RECORD_HEADER_LEN {
@@ -618,10 +616,20 @@ pub(crate) fn decode_record(
         ));
     }
 
+    Ok(le_u64(frame, field::SEQUENCE))
+}
+
+pub(crate) fn decode_record(
+    frame: &[u8],
+    expected_shard: u32,
+    limits: ProtocolLimits,
+) -> Result<DecodedRecord, PersistenceError> {
+    let sequence = verify_record_frame(frame, expected_shard, limits)?;
+    let database = (le_u32(frame, field::FLAGS) & RECORD_DATABASE_MASK) as u8;
     let mutation = decode_payload(
-        record_type,
-        &frame[RECORD_HEADER_LEN..checksum_offset],
-        limits,
+        le_u16(frame, field::TYPE),
+        &frame[RECORD_HEADER_LEN..frame.len() - 4],
+        record_read_limits(limits),
     )?;
 
     Ok(DecodedRecord {

@@ -18,8 +18,9 @@ use wire::Wire;
 use crate::{
     KvShard, OwnedMutation,
     persistence::{
-        CheckpointManager, FrameCursor, FrameRead, PersistenceConfig, PersistenceError, WalSink,
-        apply_mutation, decode_record, read_frames, read_frames_resuming,
+        CheckpointManager, DurableSequence, FrameCursor, FrameRead, PersistenceConfig,
+        PersistenceError, WalSink, apply_mutation, decode_record, read_frames,
+        read_frames_resuming,
     },
     protocol::ProtocolLimits,
 };
@@ -1506,7 +1507,7 @@ fn put_u64(output: &mut Vec<u8>, value: u64) {
 pub struct Shipment {
     pub listen: SocketAddr,
     pub shard_id: u32,
-    pub published: Arc<AtomicU64>,
+    pub published: Arc<DurableSequence>,
     pub data_dir: PathBuf,
     pub requirepass: Vec<u8>,
     pub limits: ProtocolLimits,
@@ -2282,22 +2283,29 @@ fn caught_up_cursor_is_retained(shipment: &Shipment, after_sequence: u64, throug
 /// connection failed: an idle primary writes nothing that would find out, so without this
 /// the connection would hold one of the replica slots for good.
 fn poll_acks(stream: &mut dyn Wire, hold: &CursorHold, pending: &mut Vec<u8>) -> bool {
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(1)));
+    // Only what has arrived. A read timeout, however short, rounds up to the kernel's timer
+    // tick (often 4 ms) and holds the sender here, where a synced record cannot wake it.
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
     let mut scratch = [0u8; 64];
-
-    loop {
+    let open = loop {
         match stream.read(&mut scratch) {
-            Ok(0) => return false,
+            Ok(0) => break false,
             Ok(read) => pending.extend_from_slice(&scratch[..read]),
             Err(error)
                 if error.kind() == io::ErrorKind::WouldBlock
                     || error.kind() == io::ErrorKind::TimedOut =>
             {
-                break;
+                break true;
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return false,
+            Err(_) => break false,
         }
+    };
+
+    if !open || stream.set_nonblocking(false).is_err() {
+        return false;
     }
 
     while pending.len() >= ACK_LEN {
@@ -2318,7 +2326,7 @@ struct AckSend {
     /// While it reports a copy in progress, nothing is sent.
     status: Arc<LinkStatus>,
     /// The log's durable cursor, read without taking the log's lock.
-    durable: Arc<AtomicU64>,
+    durable: Arc<DurableSequence>,
     last: u64,
     /// When `last` was sent: it is sent again after [`ACK_HEARTBEAT`].
     sent_at: std::time::Instant,
@@ -2527,7 +2535,8 @@ fn stream_new_frames(
         let through = shipment.published.load(Ordering::Acquire);
 
         if through <= last_sent {
-            thread::sleep(SHIPPER_POLL);
+            // A synced record wakes this thread; the timeout still polls acks and control.
+            shipment.published.wait_past(last_sent, SHIPPER_POLL);
 
             continue;
         }
