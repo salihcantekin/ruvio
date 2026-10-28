@@ -4,8 +4,9 @@
 //! new primary or owner is larger than any token an earlier one handed out, even one that was
 //! lost with it. Within a generation, `low` is the larger of one past the last token this shard
 //! granted or applied and the clock in milliseconds shifted left by 6. The clock floor keeps
-//! tokens moving forward across a restart that lost the counter (memory mode, or a lease that
-//! expired before the last snapshot).
+//! tokens moving forward across a restart that lost the counter (memory mode, or a lease released
+//! or expired before the last checkpoint, which leaves no key): a restart from a checkpoint reads
+//! the clock no earlier than one past the checkpoint's time.
 
 use super::*;
 
@@ -35,12 +36,20 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
 
     /// The token the next grant gets, larger than `after` (the key's own last token).
     pub(crate) fn next_fence_token(&self, after: u64) -> u64 {
-        let now = self.now_unix_millis().get();
+        let now = self.now_unix_millis().get().max(self.fence_clock_floor);
         let clock = (self.fence_generation << GENERATION_SHIFT) | ((now << CLOCK_SHIFT) & LOW_MASK);
 
         clock
             .max(self.fence_last.saturating_add(1))
             .max(after.saturating_add(1))
+    }
+
+    /// Takes new tokens from a clock no earlier than one past `at`, in every generation. A restart
+    /// from a checkpoint taken at `at` calls it: a lease released or expired before the checkpoint
+    /// left no key behind to carry its token, and tokens granted by then are at most 64 per
+    /// millisecond past the clock unless the counter ran ahead of it.
+    pub(crate) fn raise_fence_floor(&mut self, at: UnixMillis) {
+        self.fence_clock_floor = self.fence_clock_floor.max(at.get().saturating_add(1));
     }
 
     /// Remembers a token this shard granted or applied (live, from its log, or from its

@@ -651,6 +651,8 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
             // A snapshot from before leases had their own deadline: a lease that has run out is
             // dropped, and a live one gets its deadline below.
             SnapshotValue::Lease { token, expires_at } => {
+                self.note_fence_token(token);
+
                 if expires_at <= self.now_unix_millis().get() {
                     return Ok(());
                 }
@@ -665,6 +667,7 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
             } => {
                 let now = self.now_unix_millis().get();
 
+                self.note_fence_token(next_token.saturating_sub(1));
                 holders.retain(|(_, expires_at)| *expires_at > now);
 
                 if holders.is_empty() {
