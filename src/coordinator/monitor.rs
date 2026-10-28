@@ -311,8 +311,11 @@ pub struct Stats {
     /// Per group: its state, since when, and when a warning about it was last logged.
     groups: Mutex<HashMap<String, (GroupState, Instant, Instant)>>,
     /// Per group: lease grants a node refused, and per member when it was last warned about.
-    refused: Mutex<HashMap<String, (u64, HashMap<String, Instant>)>>,
+    refused: Mutex<HashMap<String, Refusals>>,
 }
+
+/// A group's refused lease grants: how many, and when each member was last warned about.
+type Refusals = (u64, HashMap<String, Instant>);
 
 /// How often at most a group that stays without a writer is warned about.
 const WARN_EVERY: Duration = Duration::from_secs(10);
