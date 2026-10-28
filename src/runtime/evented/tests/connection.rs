@@ -279,20 +279,22 @@ fn evented_pipeline_set_get_and_info_on_the_owning_thread() {
     let (address, stop, server) = serve_on_ephemeral();
     let text = String::from_utf8(request(
             address,
-            b"*1\r\n$4\r\nPING\r\n*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n*1\r\n$4\r\nINFO\r\n",
+            b"*1\r\n$4\r\nPING\r\n*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n*2\r\n$4\r\nINCR\r\n$3\r\nkey\r\n*1\r\n$4\r\nINFO\r\n",
         ))
         .unwrap();
 
     assert!(
-        text.starts_with("+PONG\r\n+OK\r\n$5\r\nvalue\r\n$"),
+        text.starts_with("+PONG\r\n+OK\r\n$5\r\nvalue\r\n-ERR"),
         "{text:?}"
     );
     assert!(text.contains("ruvio_backend:evented"), "{text}");
+    // Every command ahead of INFO in the same batch is counted, the refused INCR too.
     for field in [
-        "total_commands_processed:",
-        "get_commands:1",
-        "set_commands:1",
-        "other_commands:",
+        "total_commands_processed:4\r\n",
+        "get_commands:1\r\n",
+        "set_commands:1\r\n",
+        "increment_commands:1\r\n",
+        "other_commands:1\r\n",
         "index_memory_bytes:",
         "pooled_value_bytes:",
     ] {
@@ -497,6 +499,77 @@ fn evented_limits_inactive_partial_frame_reads() {
 
     client.read_to_end(&mut response).unwrap();
     assert_eq!(response, b"-ERR protocol error\r\n");
+    stop.request();
+    join_within(server, PATIENCE).unwrap();
+}
+
+/// The idle timeout counts from the last request, not from the connect: a client that
+/// keeps talking for longer than the timeout stays, and is closed once it goes quiet.
+#[test]
+fn evented_idle_timeout_restarts_with_each_request() {
+    const IDLE: Duration = Duration::from_secs(2);
+    let (address, stop, server) = serve_with(|config| {
+        config.timeouts = ConnectionTimeouts {
+            idle: IDLE,
+            read: Duration::from_secs(1),
+            write: Duration::from_secs(1),
+        };
+    });
+    let mut client = StdTcpStream::connect(address).unwrap();
+
+    client.set_read_timeout(Some(PATIENCE)).unwrap();
+    // Twelve requests 250 ms apart span 3 s, past the 2 s idle timeout.
+    for _ in 0..12 {
+        thread::sleep(Duration::from_millis(250));
+        client.write_all(b"*1\r\n$4\r\nPING\r\n").unwrap();
+        let mut reply = [0; 7];
+
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"+PONG\r\n");
+    }
+
+    let quiet = std::time::Instant::now();
+    let mut response = Vec::new();
+
+    client.read_to_end(&mut response).unwrap();
+    assert!(response.is_empty());
+    let waited = quiet.elapsed();
+
+    assert!(
+        waited >= IDLE - Duration::from_millis(100),
+        "closed after {waited:?}"
+    );
+    stop.request();
+    join_within(server, PATIENCE).unwrap();
+}
+
+/// A partial frame after an idle stretch gets the short read timeout, not what is left of
+/// the long idle one.
+#[test]
+fn evented_read_timeout_after_requests_is_not_the_idle_timeout() {
+    let (address, stop, server) = serve_with(|config| {
+        config.timeouts = ConnectionTimeouts {
+            idle: Duration::from_secs(60),
+            read: Duration::from_millis(100),
+            write: Duration::from_secs(1),
+        };
+    });
+    let mut client = StdTcpStream::connect(address).unwrap();
+
+    client.set_read_timeout(Some(PATIENCE)).unwrap();
+    client.write_all(b"*1\r\n$4\r\nPING\r\n").unwrap();
+    let mut reply = [0; 7];
+
+    client.read_exact(&mut reply).unwrap();
+    assert_eq!(&reply, b"+PONG\r\n");
+    let started = std::time::Instant::now();
+
+    client.write_all(b"*2\r\n").unwrap();
+    let mut response = Vec::new();
+
+    client.read_to_end(&mut response).unwrap();
+    assert_eq!(response, b"-ERR protocol error\r\n");
+    assert!(started.elapsed() < Duration::from_secs(20));
     stop.request();
     join_within(server, PATIENCE).unwrap();
 }

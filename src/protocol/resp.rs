@@ -317,6 +317,51 @@ pub(super) fn read_length_line(
     bytes: &[u8],
     position: &mut usize,
 ) -> Result<Option<usize>, ProtocolError> {
+    if let Some((value, next)) = short_length_line(bytes, *position) {
+        *position = next;
+        return Ok(Some(value));
+    }
+
+    read_length_line_general(bytes, position)
+}
+
+/// The common case of `read_length_line`: one to three digits and CRLF, read from a fixed
+/// five-byte window with no overflow checks (999 fits any `usize`). `None` sends every
+/// other line, including a complete one too close to the end of `bytes`, to the general
+/// reader, which also reports the errors.
+#[inline(always)]
+fn short_length_line(bytes: &[u8], at: usize) -> Option<(usize, usize)> {
+    const CRLF: u16 = u16::from_ne_bytes(*b"\r\n");
+
+    let window: &[u8; 5] = bytes.get(at..at.wrapping_add(5))?.try_into().ok()?;
+    let crlf_at = |index: usize| u16::from_ne_bytes([window[index], window[index + 1]]) == CRLF;
+    let digit = |index: usize| {
+        let value = window[index].wrapping_sub(b'0');
+        (value <= 9).then_some(usize::from(value))
+    };
+
+    let mut value = digit(0)?;
+
+    if crlf_at(1) {
+        return Some((value, at + 3));
+    }
+
+    value = value * 10 + digit(1)?;
+
+    if crlf_at(2) {
+        return Some((value, at + 4));
+    }
+
+    value = value * 10 + digit(2)?;
+
+    crlf_at(3).then_some((value, at + 5))
+}
+
+#[inline(never)]
+fn read_length_line_general(
+    bytes: &[u8],
+    position: &mut usize,
+) -> Result<Option<usize>, ProtocolError> {
     const MAX_DIGITS: usize = 20;
 
     let start = *position;

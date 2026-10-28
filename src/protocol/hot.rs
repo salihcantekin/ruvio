@@ -47,17 +47,49 @@ fn parse_hot_frame(bytes: &[u8], limits: ProtocolLimits) -> Result<HotParse<'_>,
         return Ok(HotParse::Fallback);
     }
 
-    // Hot names are 3 to 6 bytes long: any other `$<len>\r\n` goes to the general
-    // parser before the name is read.
-    if let [b'$', length, b'\r', ..] = bytes[position.min(bytes.len())..]
-        && !matches!(length, b'3' | b'4' | b'5' | b'6')
-    {
-        return Ok(HotParse::Fallback);
-    }
-
+    // Hot names are 3 to 6 bytes long and start with one of a few letter pairs: any
+    // other `$<len>\r\n` or name head goes to the general parser before the name is read.
+    let rest = &bytes[position.min(bytes.len())..];
     let mut arguments = [&[][..]; 5];
-    let Some(name) = read_hot_bulk(bytes, &mut position, limits)? else {
-        return Ok(HotParse::Incomplete);
+    let name = match *rest {
+        [b'$', length @ b'3'..=b'6', b'\r', b'\n', first, second, ..] => {
+            if !hot_name_head(first, second) {
+                return Ok(HotParse::Fallback);
+            }
+
+            // The header is already checked: take the name when it, its CRLF and the
+            // limits are plainly fine, and let `read_hot_bulk` word anything else.
+            let length = (length - b'0') as usize;
+            let end = position + 4 + length;
+
+            if rest.get(4 + length..6 + length) == Some(b"\r\n")
+                && end + 2 <= limits.max_command_bytes
+                && length <= limits.max_bulk_bytes()
+            {
+                let name = &rest[4..4 + length];
+
+                position = end + 2;
+                name
+            } else {
+                let Some(name) = read_hot_bulk(bytes, &mut position, limits)? else {
+                    return Ok(HotParse::Incomplete);
+                };
+
+                name
+            }
+        }
+
+        [b'$', length, b'\r', ..] if !matches!(length, b'3'..=b'6') => {
+            return Ok(HotParse::Fallback);
+        }
+
+        _ => {
+            let Some(name) = read_hot_bulk(bytes, &mut position, limits)? else {
+                return Ok(HotParse::Incomplete);
+            };
+
+            name
+        }
     };
 
     arguments[0] = name;
@@ -211,6 +243,28 @@ fn parse_hot_frame(bytes: &[u8], limits: ProtocolLimits) -> Result<HotParse<'_>,
     }
 
     Ok(HotParse::Fallback)
+}
+
+/// The second letter of every hot name, by its first letter's low five bits (both
+/// lowercase): DEL/DECR*, GET, INCR*, PING, SET*, UNLINK.
+const HOT_SECOND: [u8; 32] = {
+    let mut table = [0; 32];
+
+    table[(b'd' & 31) as usize] = b'e';
+    table[(b'g' & 31) as usize] = b'e';
+    table[(b'i' & 31) as usize] = b'n';
+    table[(b'p' & 31) as usize] = b'i';
+    table[(b's' & 31) as usize] = b'e';
+    table[(b'u' & 31) as usize] = b'n';
+    table
+};
+
+/// Whether a name starting with these two bytes can be hot. One table read; a non-letter
+/// that aliases a pair only costs the full check, and an empty entry (zero) never matches
+/// since `second | 0x20` is never zero.
+#[inline(always)]
+fn hot_name_head(first: u8, second: u8) -> bool {
+    HOT_SECOND[(first & 31) as usize] == second | 0x20
 }
 
 pub(super) fn hot_command_name(name: &[u8], count: usize) -> bool {

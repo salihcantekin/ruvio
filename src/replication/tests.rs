@@ -864,6 +864,8 @@ fn frame_reader_accepts_a_length_above_the_default_within_configured_max() {
     let length = crate::protocol::DEFAULT_MAX_COMMAND_BYTES + 1;
     let mut reader = FrameReader {
         pending: (length as u32).to_le_bytes().to_vec(),
+        start: 0,
+        scratch: Vec::new(),
         max_frame_bytes: configured,
     };
 
@@ -874,6 +876,68 @@ fn frame_reader_accepts_a_length_above_the_default_within_configured_max() {
     assert!(taken.is_none());
     reader.pending = 31u32.to_le_bytes().to_vec();
     assert!(reader.take_frame().is_err());
+}
+
+#[test]
+fn frame_reader_takes_frames_in_order_and_keeps_a_partial_one() {
+    let frame = |fill: u8, length: usize| {
+        let mut bytes = vec![fill; length];
+        bytes[..4].copy_from_slice(&(length as u32).to_le_bytes());
+        bytes
+    };
+    let (first, second, third) = (frame(1, 32), frame(2, 40), frame(3, 48));
+    let mut pending = [first.clone(), second.clone()].concat();
+    pending.extend_from_slice(&third[..20]);
+    let mut reader = FrameReader {
+        pending,
+        start: 0,
+        scratch: Vec::new(),
+        max_frame_bytes: 1024,
+    };
+
+    assert!(reader.frame_buffered());
+    assert_eq!(reader.take_frame().unwrap(), Some(first));
+    assert!(reader.frame_buffered());
+    assert_eq!(reader.take_frame().unwrap(), Some(second));
+    assert!(!reader.frame_buffered());
+    assert_eq!(reader.take_frame().unwrap(), None);
+
+    // What the next socket read does: the partial frame moves to the front.
+    reader.pending.drain(..reader.start);
+    reader.start = 0;
+    reader.pending.extend_from_slice(&third[20..]);
+    assert!(reader.frame_buffered());
+    assert_eq!(reader.take_frame().unwrap(), Some(third));
+    assert!(!reader.frame_buffered());
+}
+
+#[test]
+fn outstanding_frames_keep_their_byte_total() {
+    let mut outstanding = Outstanding::default();
+
+    assert!(outstanding.has_room());
+    outstanding.push(1, 10);
+    outstanding.push(2, 20);
+    outstanding.push(3, QUEUE_BYTES);
+    assert_eq!(outstanding.bytes, QUEUE_BYTES + 30);
+    assert!(!outstanding.has_room());
+
+    outstanding.reclaim_through(2);
+    assert_eq!(outstanding.bytes, QUEUE_BYTES);
+    assert_eq!(outstanding.frames.len(), 1);
+    assert!(!outstanding.has_room());
+
+    outstanding.reclaim_through(3);
+    assert_eq!(outstanding.bytes, 0);
+    assert!(outstanding.has_room());
+
+    for sequence in 0..QUEUE_FRAMES as u64 {
+        outstanding.push(sequence + 10, 1);
+    }
+    assert!(!outstanding.has_room());
+    outstanding.clear();
+    assert_eq!(outstanding.bytes, 0);
+    assert!(outstanding.has_room());
 }
 
 #[test]
@@ -911,7 +975,7 @@ fn gap_handshake_leaves_the_live_generation() {
     .unwrap();
     sink.flush().unwrap();
 
-    let published = sink.published();
+    let published = sink.durable();
 
     assert_eq!(published.load(Ordering::Acquire), 2);
     drop(sink);
@@ -1032,7 +1096,7 @@ fn two_replicas_receive_the_same_appended_frame() {
     };
 
     let (mut sink, _, _) = WalSink::open(config, 0, limits).unwrap();
-    let published = sink.published();
+    let published = sink.durable();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
 
@@ -1096,7 +1160,7 @@ fn closing_one_replica_leaves_the_other_streaming() {
     };
 
     let (mut sink, _, _) = WalSink::open(config, 0, limits).unwrap();
-    let published = sink.published();
+    let published = sink.durable();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
 
@@ -1167,7 +1231,7 @@ fn replica_limit_closes_the_extra_connection() {
         Shipment {
             listen: address,
             shard_id: 0,
-            published: sink.published(),
+            published: sink.durable(),
             data_dir: directory.path().to_path_buf(),
             requirepass: Vec::new(),
             limits,
@@ -1242,7 +1306,7 @@ fn a_replica_that_hangs_up_on_an_idle_primary_frees_its_slot() {
         Shipment {
             listen: address,
             shard_id: 0,
-            published: sink.published(),
+            published: sink.durable(),
             data_dir: directory.path().to_path_buf(),
             requirepass: Vec::new(),
             limits,
@@ -1324,7 +1388,7 @@ fn primary_refuses_a_replica_from_another_history_or_shard_layout() {
         Shipment {
             listen: address,
             shard_id: 0,
-            published: sink.published(),
+            published: sink.durable(),
             data_dir: directory.path().to_path_buf(),
             requirepass: Vec::new(),
             limits,
@@ -1528,7 +1592,7 @@ fn idle_shipment(data_dir: &Path, history: HistoryId) -> Shipment {
     Shipment {
         listen: "127.0.0.1:0".parse().unwrap(),
         shard_id: 0,
-        published: Arc::new(AtomicU64::new(0)),
+        published: Arc::new(crate::persistence::DurableSequence::new(0)),
         data_dir: data_dir.to_path_buf(),
         requirepass: Vec::new(),
         limits: ProtocolLimits::default(),
@@ -1704,7 +1768,7 @@ fn snapshot_reply_leaves_the_upstream_record_until_the_snapshot_is_installed() {
     let (retry, _) = read_primary(
         &mut stream,
         &link,
-        &mut VecDeque::new(),
+        &mut Outstanding::default(),
         &AtomicBool::new(false),
     );
 
@@ -1728,7 +1792,7 @@ fn snapshot_reply_leaves_the_upstream_record_until_the_snapshot_is_installed() {
     read_primary(
         &mut stream,
         &link,
-        &mut VecDeque::new(),
+        &mut Outstanding::default(),
         &AtomicBool::new(false),
     );
     join_within(server).unwrap();
@@ -2354,7 +2418,7 @@ fn a_replica_does_not_follow_a_primary_below_the_epoch_it_followed() {
     let (retry, _) = read_primary(
         &mut stream,
         &link,
-        &mut VecDeque::new(),
+        &mut Outstanding::default(),
         &AtomicBool::new(false),
     );
     let sent = join_within(server).unwrap();
@@ -2521,6 +2585,7 @@ fn a_replica_still_copying_sends_no_acknowledgement() {
     let (link, _deliveries) = link_to(primary.local_addr().unwrap(), directory.path());
     let mut acks = AckSend {
         status: Arc::clone(&link.status),
+        durable: link.wal.lock().unwrap().durable(),
         last: 0,
         sent_at: std::time::Instant::now() - ACK_HEARTBEAT,
         offset: 0,
@@ -2529,7 +2594,7 @@ fn a_replica_still_copying_sends_no_acknowledgement() {
     };
 
     link.status.set_copying(true);
-    acks.poll(&mut replica_side, &link.wal);
+    acks.poll(&mut replica_side);
     primary_side
         .set_read_timeout(Some(Duration::from_millis(50)))
         .unwrap();
@@ -2538,7 +2603,7 @@ fn a_replica_still_copying_sends_no_acknowledgement() {
     assert!(primary_side.read(&mut byte).is_err(), "an ack was sent");
 
     link.status.set_copying(false);
-    acks.poll(&mut replica_side, &link.wal);
+    acks.poll(&mut replica_side);
     assert_eq!(read_socket(&mut primary_side, ACK_LEN).len(), ACK_LEN);
 }
 
@@ -2566,6 +2631,184 @@ fn only_host_names_and_addresses_are_announced() {
         assert_eq!(read_endpoint(7000, host.as_bytes()), Ok(None));
     }
 }
+
+/// Accepts at most `limit` bytes per write and counts the writes.
+struct CountingWire {
+    written: Vec<u8>,
+    writes: usize,
+    limit: usize,
+}
+
+impl Read for CountingWire {
+    fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+        Ok(0)
+    }
+}
+
+impl Write for CountingWire {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let accepted = bytes.len().min(self.limit);
+
+        self.written.extend_from_slice(&bytes[..accepted]);
+        self.writes += 1;
+        Ok(accepted)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Wire for CountingWire {
+    fn set_read_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn set_write_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn set_nodelay(&self, _: bool) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn set_nonblocking(&self, _: bool) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
+        Err(io::ErrorKind::NotConnected.into())
+    }
+}
+
+#[test]
+fn shipped_records_are_gathered_into_few_writes_in_order() {
+    use crate::{
+        mutation::{Mutation, MutationSink},
+        persistence::DurabilityProfile,
+    };
+
+    let limits = ProtocolLimits::default();
+    let dir = tempfile::tempdir().unwrap();
+    let config = PersistenceConfig {
+        profile: DurabilityProfile::Everysec,
+        data_dir: dir.path().to_path_buf(),
+        ..PersistenceConfig::default()
+    };
+    let (mut wal, _, _) = WalSink::open(config, 0, limits).unwrap();
+    let value = vec![b'v'; 1000];
+
+    for index in 0..600u32 {
+        wal.record(Mutation::SetBytes {
+            key: &index.to_le_bytes(),
+            value: &value,
+        })
+        .unwrap();
+    }
+
+    let FrameRead::Frames(frames) = read_frames(dir.path(), 0, 0, 600, limits).unwrap() else {
+        panic!("WAL frames unavailable");
+    };
+    let expected = frames.concat();
+    let floor = Arc::new(AtomicU64::new(u64::MAX));
+    let progress = Arc::new(ReplicaProgress::new(
+        Arc::clone(&floor),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(DurableAcks::new()),
+    ));
+    let hold = progress.hold(0);
+    let stop = AtomicBool::new(false);
+    let mut batch = Vec::new();
+
+    for limit in [usize::MAX, 4096] {
+        let mut wire = CountingWire {
+            written: Vec::new(),
+            writes: 0,
+            limit,
+        };
+        let last = write_frames(&mut wire, &frames, &mut batch, &hold, &stop).unwrap();
+
+        assert_eq!(frames.len(), 600);
+        assert_eq!(last, Some(Some(600)));
+        assert_eq!(floor.load(Ordering::Acquire), 600);
+        assert!(wire.written == expected, "records out of order or lost");
+
+        let batches = expected.len().div_ceil(SHIPPER_WRITE_BYTES);
+
+        if limit == usize::MAX {
+            assert!(wire.writes <= batches + 1, "{} writes", wire.writes);
+        } else {
+            assert!(wire.writes <= expected.len().div_ceil(limit) + batches + 1);
+        }
+    }
+
+    stop.store(true, Ordering::Release);
+
+    let mut wire = CountingWire {
+        written: Vec::new(),
+        writes: 0,
+        limit: usize::MAX,
+    };
+
+    assert_eq!(
+        write_frames(&mut wire, &frames, &mut batch, &hold, &stop).unwrap(),
+        None
+    );
+    assert!(wire.written.is_empty());
+}
+
+#[test]
+fn a_record_larger_than_a_shipper_write_is_written_on_its_own() {
+    use crate::{
+        mutation::{Mutation, MutationSink},
+        persistence::DurabilityProfile,
+    };
+
+    let limits = ProtocolLimits::default();
+    let dir = tempfile::tempdir().unwrap();
+    let config = PersistenceConfig {
+        profile: DurabilityProfile::Everysec,
+        data_dir: dir.path().to_path_buf(),
+        ..PersistenceConfig::default()
+    };
+    let (mut wal, _, _) = WalSink::open(config, 0, limits).unwrap();
+    let small = vec![b's'; 100];
+    let large = vec![b'l'; SHIPPER_WRITE_BYTES];
+
+    for (key, value) in [(b"a", &small), (b"b", &large), (b"c", &small)] {
+        wal.record(Mutation::SetBytes { key, value }).unwrap();
+    }
+
+    let FrameRead::Frames(frames) = read_frames(dir.path(), 0, 0, 3, limits).unwrap() else {
+        panic!("WAL frames unavailable");
+    };
+    let progress = Arc::new(ReplicaProgress::new(
+        Arc::new(AtomicU64::new(u64::MAX)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(DurableAcks::new()),
+    ));
+    let hold = progress.hold(0);
+    let mut wire = CountingWire {
+        written: Vec::new(),
+        writes: 0,
+        limit: usize::MAX,
+    };
+    let mut batch = Vec::new();
+    let last = write_frames(
+        &mut wire,
+        &frames,
+        &mut batch,
+        &hold,
+        &AtomicBool::new(false),
+    );
+
+    assert_eq!(last.unwrap(), Some(Some(3)));
+    assert!(
+        wire.written == frames.concat(),
+        "records out of order or lost"
+    );
+    assert_eq!(wire.writes, 3);
+    assert!(batch.capacity() < SHIPPER_WRITE_BYTES);
 
 #[test]
 fn a_publish_with_no_replica_builds_no_frame() {

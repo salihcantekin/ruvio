@@ -676,9 +676,21 @@ impl Forwarding {
     }
 }
 
+/// Most bytes a forwarding buffer reserves up front from a size hint, so one large value does
+/// not make every later batch allocate as much.
+const PRESIZE_LIMIT: usize = 16 * 1024;
+
 struct Lane {
     frames: Vec<u8>,
     count: u32,
+    /// Bytes the lane sent last time: the next batch reserves that much (up to
+    /// `PRESIZE_LIMIT`) at once instead of growing from empty; an idle lane holds no buffer.
+    last_bytes: usize,
+    /// Index of this lane's reply in `Forwarder::replies` once it was sent.
+    reply: usize,
+    /// Read cursor into the reply while it is spliced: commands and data bytes.
+    command: usize,
+    data_at: usize,
 }
 
 struct Mark {
@@ -694,6 +706,12 @@ pub(super) struct Forwarder {
     /// Bit `dst` is set once a command that may write went to shard `dst` (see
     /// `TxSession::forwarded_shards`). Reads do not count: a WAIT waits for writes.
     wrote: u64,
+    /// Kept between batches so a settle allocates nothing of its own.
+    tokens: Vec<u64>,
+    replies: Vec<Option<Reply>>,
+    arrived: Vec<Reply>,
+    /// The output after the first mark while answers are spliced in.
+    tail: Vec<u8>,
 }
 
 impl Forwarder {
@@ -703,11 +721,19 @@ impl Forwarder {
                 .map(|_| Lane {
                     frames: Vec::new(),
                     count: 0,
+                    last_bytes: 0,
+                    reply: 0,
+                    command: 0,
+                    data_at: 0,
                 })
                 .collect(),
             marks: Vec::new(),
             next_token: 1,
             wrote: 0,
+            tokens: Vec::new(),
+            replies: Vec::new(),
+            arrived: Vec::new(),
+            tail: Vec::new(),
         }
     }
 
@@ -733,12 +759,17 @@ impl Forwarder {
             self.wrote |= 1 << dst;
         }
 
+        if lane.frames.capacity() == 0 {
+            lane.frames
+                .reserve(lane.last_bytes.min(PRESIZE_LIMIT).max(frame.len()));
+        }
         lane.frames.extend_from_slice(frame);
         lane.count += 1;
         self.marks.push(Mark { dst, offset });
     }
 
-    /// Sends the queued frames and waits for every reply. Returns the lane order and replies.
+    /// Sends the queued frames and waits for every reply. The replies land in `replies` in
+    /// shard order; each lane sent records its index there.
     async fn exchange(
         &mut self,
         forwarding: &Forwarding,
@@ -746,10 +777,13 @@ impl Forwarder {
         conn: u64,
         session: &TxSession,
         auth: &crate::acl::ConnectionAuth,
-    ) -> io::Result<(Vec<(usize, u64)>, Vec<Reply>)> {
-        let mut tokens: Vec<(usize, u64)> = Vec::new();
+    ) -> io::Result<()> {
+        self.tokens.clear();
+        self.replies.clear();
 
         for (dst, lane) in self.lanes.iter_mut().enumerate() {
+            // A lane not sent this time has no reply: a mark left for it fails loudly.
+            lane.reply = usize::MAX;
             if lane.count == 0 {
                 continue;
             }
@@ -757,7 +791,9 @@ impl Forwarder {
             let token = self.next_token;
 
             self.next_token += 1;
-            tokens.push((dst, token));
+            lane.reply = self.tokens.len();
+            lane.last_bytes = lane.frames.len();
+            self.tokens.push(token);
             forwarding.fabric.send(
                 forwarding.me,
                 dst,
@@ -778,15 +814,16 @@ impl Forwarder {
             lane.count = 0;
         }
 
-        let mut replies: Vec<Option<Reply>> = tokens.iter().map(|_| None).collect();
-        let mut missing = tokens.len();
+        self.replies.resize_with(self.tokens.len(), || None);
+        let mut missing = self.tokens.len();
 
         while missing > 0 {
-            let arrived: Vec<Reply> = entry.ready.borrow_mut().drain(..).collect();
+            // Swapped, not drained into a new Vec: both buffers keep their capacity.
+            std::mem::swap(&mut *entry.ready.borrow_mut(), &mut self.arrived);
 
-            for reply in arrived {
-                if let Some(index) = tokens.iter().position(|(_, token)| *token == reply.token) {
-                    replies[index] = Some(reply);
+            for reply in self.arrived.drain(..) {
+                if let Some(index) = self.tokens.iter().position(|token| *token == reply.token) {
+                    self.replies[index] = Some(reply);
                     missing -= 1;
                 }
             }
@@ -796,12 +833,7 @@ impl Forwarder {
             }
         }
 
-        let replies = replies
-            .into_iter()
-            .map(|reply| reply.expect("reply arrived"))
-            .collect();
-
-        Ok((tokens, replies))
+        Ok(())
     }
 
     /// Sends the queued frames, waits for every reply and splices them into `output`.
@@ -818,35 +850,64 @@ impl Forwarder {
             return Ok(());
         }
 
-        let (tokens, replies) = self
-            .exchange(forwarding, entry, conn, session, auth)
+        self.exchange(forwarding, entry, conn, session, auth)
             .await?;
-        let old = output.to_vec();
-        let mut cursors = vec![(0usize, 0usize); tokens.len()];
-        let mut written = 0usize;
 
-        output.clear();
+        let spliced = self.splice(output);
 
-        for mark in self.marks.drain(..) {
-            let lane = tokens
-                .iter()
-                .position(|(dst, _)| *dst == mark.dst)
-                .expect("lane was sent");
-            let reply = &replies[lane];
-            let (command, data_at) = &mut cursors[lane];
-            let length =
-                *reply.lens.get(*command).ok_or_else(|| {
-                    io::Error::other("forwarded reply is shorter than its request")
-                })? as usize;
+        self.marks.clear();
+        self.replies.clear();
+        spliced
+    }
 
-            output.write_all(&old[written..mark.offset])?;
-            written = mark.offset;
-            output.write_all(&reply.data[*data_at..*data_at + length])?;
-            *data_at += length;
-            *command += 1;
+    /// Puts each lane's answers at their marks in `output`. Only the bytes after the first mark
+    /// are set aside and written back around the answers; the part before it stays in place.
+    fn splice(&mut self, output: &mut BoundedOutput) -> io::Result<()> {
+        // An output already past its limit is rebuilt from the start, so the limit cuts it
+        // again where the answers now fall.
+        let first = if output.exceeded() {
+            0
+        } else {
+            self.marks.first().map_or(0, |mark| mark.offset)
+        };
+
+        self.tail.clear();
+        self.tail.extend_from_slice(&output[first..]);
+        if first == 0 {
+            output.clear();
+        } else {
+            output.truncate_to(first);
+        }
+        for lane in &mut self.lanes {
+            lane.command = 0;
+            lane.data_at = 0;
         }
 
-        output.write_all(&old[written..])?;
+        let mut written = first;
+
+        for mark in &self.marks {
+            let lane = &mut self.lanes[mark.dst];
+            let reply = self.replies[lane.reply].as_ref().expect("reply arrived");
+            let length =
+                *reply.lens.get(lane.command).ok_or_else(|| {
+                    io::Error::other("forwarded reply is shorter than its request")
+                })? as usize;
+            let answer = reply
+                .data
+                .get(lane.data_at..lane.data_at + length)
+                .ok_or_else(|| io::Error::other("forwarded reply is shorter than its lengths"))?;
+
+            output.write_all(&self.tail[written - first..mark.offset - first])?;
+            written = mark.offset;
+            output.write_all(answer)?;
+            lane.data_at += length;
+            lane.command += 1;
+        }
+
+        output.write_all(&self.tail[written - first..])?;
+        if self.tail.capacity() > PRESIZE_LIMIT {
+            self.tail = Vec::new();
+        }
         Ok(())
     }
 
@@ -867,11 +928,14 @@ impl Forwarder {
         }
 
         self.marks.clear();
-        let (_, replies) = self
-            .exchange(forwarding, entry, conn, session, auth)
+        self.exchange(forwarding, entry, conn, session, auth)
             .await?;
 
-        Ok(replies.into_iter().map(|reply| reply.data).collect())
+        Ok(self
+            .replies
+            .drain(..)
+            .map(|reply| reply.expect("reply arrived").data)
+            .collect())
     }
 }
 
@@ -1279,7 +1343,12 @@ async fn execute_request_in(
         rules: Arc::clone(&request.rules),
     };
     let mut rate = CommandRateLimiter::new(0);
-    let mut output = BoundedOutput::with_capacity(0, state.live.max_output_buffer_bytes.get());
+    // Short answers (the common forwarded GET or SET) fit in the size of their requests, so
+    // the reply buffer is usually allocated once instead of growing from empty.
+    let mut output = BoundedOutput::with_capacity(
+        request.frames.len().min(PRESIZE_LIMIT),
+        state.live.max_output_buffer_bytes.get(),
+    );
     let mut lens = Vec::with_capacity(request.count as usize);
     let mut unlogged = Vec::new();
     let suspended = std::cell::Cell::new(false);
@@ -2446,5 +2515,158 @@ mod tests {
         let error = b"-MISCONF persistence error\r\n";
         assert_eq!(reply.lens, [error.len() as u32, 4, error.len() as u32]);
         assert_eq!(reply.data, [&error[..], b":0\r\n", error].concat());
+    }
+
+    /// Queues one mark per `(dst, offset)` and hands each lane its reply, as `exchange` does.
+    fn forwarder_with(marks: &[(usize, usize)], replies: &[(usize, &[&[u8]])]) -> Forwarder {
+        let mut forwarder = Forwarder::new(4);
+
+        load(&mut forwarder, marks, replies);
+        forwarder
+    }
+
+    fn load(forwarder: &mut Forwarder, marks: &[(usize, usize)], replies: &[(usize, &[&[u8]])]) {
+        forwarder.marks.clear();
+        forwarder.replies.clear();
+        for &(dst, offset) in marks {
+            forwarder.push(dst, b"", offset, false);
+        }
+        for (index, (dst, answers)) in replies.iter().enumerate() {
+            forwarder.lanes[*dst].reply = index;
+            forwarder.lanes[*dst].count = 0;
+            forwarder.replies.push(Some(Reply {
+                conn: 1,
+                token: index as u64,
+                lens: answers.iter().map(|answer| answer.len() as u32).collect(),
+                data: answers.concat(),
+                unlogged: Vec::new(),
+            }));
+        }
+    }
+
+    fn output_of(bytes: &[u8], maximum: usize) -> BoundedOutput {
+        let mut output = BoundedOutput::with_capacity(0, maximum);
+
+        output.write_all(bytes).unwrap();
+        output
+    }
+
+    #[test]
+    fn spliced_replies_land_at_their_marks_between_local_answers() {
+        // local "+A" | lane 1 | local "+B" | lane 2 | lane 1 | local "+C"
+        let mut forwarder = forwarder_with(
+            &[(1, 4), (2, 8), (1, 8)],
+            &[(1, &[b":1\r\n", b":2\r\n"]), (2, &[b"$1\r\nx\r\n"])],
+        );
+        let mut output = output_of(b"+A\r\n+B\r\n+C\r\n", 1 << 20);
+
+        forwarder.splice(&mut output).unwrap();
+        assert_eq!(&*output, b"+A\r\n:1\r\n+B\r\n$1\r\nx\r\n:2\r\n+C\r\n");
+    }
+
+    /// The splice as it was first written: the whole output copied aside and written back.
+    fn copying_splice(
+        output: &mut BoundedOutput,
+        marks: &[(usize, usize)],
+        lanes: &[(usize, &[&[u8]])],
+    ) {
+        let old = output.to_vec();
+        let mut taken = [0usize; 4];
+        let mut written = 0;
+
+        output.clear();
+        for &(dst, offset) in marks {
+            let answers = lanes.iter().find(|(lane, _)| *lane == dst).unwrap().1;
+
+            output.write_all(&old[written..offset]).unwrap();
+            written = offset;
+            output.write_all(answers[taken[dst]]).unwrap();
+            taken[dst] += 1;
+        }
+        output.write_all(&old[written..]).unwrap();
+    }
+
+    #[test]
+    fn splice_matches_copying_the_whole_output_for_every_layout_and_limit() {
+        let answers: [&[u8]; 3] = [b"+OK\r\n", b"$3\r\nabc\r\n", b":-1\r\n"];
+
+        for layout in 0u32..512 {
+            let mut marks = Vec::new();
+            let mut local = Vec::new();
+            let mut counts = [0usize; 4];
+
+            for step in 0..9 {
+                if layout >> step & 1 == 1 {
+                    local.extend_from_slice(b"+L\r\n");
+                }
+                let dst = 1 + (layout as usize + step) % 3;
+
+                marks.push((dst, local.len()));
+                counts[dst] += 1;
+            }
+            local.extend_from_slice(b"+E\r\n");
+
+            let lanes: Vec<(usize, Vec<&[u8]>)> = (1..4)
+                .filter(|dst| counts[*dst] > 0)
+                .map(|dst| {
+                    (
+                        dst,
+                        (0..counts[dst]).map(|i| answers[(i + dst) % 3]).collect(),
+                    )
+                })
+                .collect();
+            let lanes: Vec<(usize, &[&[u8]])> =
+                lanes.iter().map(|(dst, list)| (*dst, &list[..])).collect();
+
+            // Roomy, cut inside the answers, exactly full, and already past the limit.
+            for (maximum, overflow) in [
+                (1 << 20, false),
+                (local.len() + 20, false),
+                (local.len(), false),
+                (local.len() + 20, true),
+            ] {
+                let mut forwarder = forwarder_with(&marks, &lanes);
+                let mut output = output_of(&local, maximum);
+                let mut expected = output_of(&local, maximum);
+
+                if overflow {
+                    output.write_all(&[b'x'; 64]).unwrap();
+                    expected.write_all(&[b'x'; 64]).unwrap();
+                }
+                forwarder.splice(&mut output).unwrap();
+                copying_splice(&mut expected, &marks, &lanes);
+                assert_eq!(&*output, &*expected, "layout {layout:b}, limit {maximum}");
+                assert_eq!(output.exceeded(), expected.exceeded());
+            }
+        }
+    }
+
+    #[test]
+    fn a_splice_past_the_output_limit_is_cut_at_the_first_piece_that_does_not_fit() {
+        let mut forwarder = forwarder_with(&[(1, 4), (1, 8)], &[(1, &[b":1\r\n", b":2\r\n"])]);
+        let mut output = output_of(b"+A\r\n+B\r\n+C\r\n", 18);
+
+        forwarder.splice(&mut output).unwrap();
+        assert!(output.exceeded());
+        assert_eq!(&*output, b"+A\r\n:1\r\n+B\r\n:2\r\n");
+    }
+
+    #[test]
+    fn a_reply_shorter_than_its_request_is_an_error_and_the_next_splice_still_works() {
+        let mut forwarder = forwarder_with(&[(1, 0), (1, 0)], &[(1, &[b":1\r\n"])]);
+        let mut output = output_of(b"", 1 << 20);
+
+        assert!(forwarder.splice(&mut output).is_err());
+
+        // The connection is closed on that error; a later batch starts from its own output.
+        let mut output = output_of(b"", 1 << 20);
+
+        load(
+            &mut forwarder,
+            &[(2, 0), (1, 0)],
+            &[(2, &[b":7\r\n"]), (1, &[b":8\r\n"])],
+        );
+        forwarder.splice(&mut output).unwrap();
+        assert_eq!(&*output, b":7\r\n:8\r\n");
     }
 }

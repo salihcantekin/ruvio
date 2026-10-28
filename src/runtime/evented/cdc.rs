@@ -80,7 +80,7 @@ pub(super) fn start(
 /// What a stream may read up to: the durable log, and for `COMMITTED` the shard's committed
 /// sequence as well.
 struct Feed {
-    durable: Arc<AtomicU64>,
+    durable: Arc<crate::persistence::DurableSequence>,
     committed: Option<Arc<crate::replication::DurableReplies>>,
     /// The shard's epoch when the stream was asked for.
     epoch: u64,

@@ -95,6 +95,18 @@ pub(crate) fn read_frames_resuming(
         return Ok(FrameRead::Frames(Vec::new()));
     }
 
+    if let Some(read) = read_open_segment(
+        cursor,
+        shard_id,
+        after_sequence,
+        through_sequence,
+        limits,
+        max_bytes,
+    )? {
+        return Ok(read);
+    }
+    cursor.open = None;
+
     let directory = shard_wal_directory(data_dir, shard_id);
 
     if !directory.is_dir() {
@@ -126,11 +138,21 @@ pub(crate) fn read_frames_resuming(
     // Just past the last record consumed, so the cursor can be left there on return.
     let mut position: Option<(usize, u64)> = None;
 
+    // The segment being read, left open in the cursor on return.
+    let mut current: Option<OpenSegment> = None;
+
     'segments: for (index, path) in segments.iter().enumerate().skip(start) {
         let is_last = index + 1 == segments.len();
         let file = File::open(path)?;
-        let segment_length = file.metadata()?.len();
-        let mut file = io::BufReader::with_capacity(FRAME_READ_BUFFER, file);
+        let metadata = file.metadata()?;
+        let segment_length = metadata.len();
+        let file = &mut current
+            .insert(OpenSegment {
+                file: io::BufReader::with_capacity(FRAME_READ_BUFFER, file),
+                length: segment_length,
+                identity: file_identity(&metadata),
+            })
+            .file;
 
         if segment_length < WAL_HEADER_LEN as u64 {
             if !is_last {
@@ -222,7 +244,7 @@ pub(crate) fn read_frames_resuming(
 
             let mut length_bytes = [0; 4];
 
-            match read_partial(&mut file, &mut length_bytes)? {
+            match read_partial(file, &mut length_bytes)? {
                 0 => break,
                 4 => {}
                 _ if is_last => return Ok(FrameRead::Local),
@@ -252,9 +274,7 @@ pub(crate) fn read_frames_resuming(
             let mut frame = Vec::new();
             // Longer than its segment: torn or corrupt, and never worth the allocation.
             let body_read = if record_length as u64 <= segment_length {
-                frame.resize(record_length, 0);
-                frame[..4].copy_from_slice(&length_bytes);
-                read_partial(&mut file, &mut frame[4..])?
+                read_record_body(file, &length_bytes, record_length, &mut frame)?
             } else {
                 0
             };
@@ -269,13 +289,15 @@ pub(crate) fn read_frames_resuming(
                 return Ok(FrameRead::Local);
             }
 
-            match decode_record(&frame, shard_id, limits) {
-                Ok(record) => {
-                    if record.sequence != expected_sequence {
+            // The checksum is still checked: a damaged record answers `Local` here rather
+            // than reaching a replica that would refuse it on every retry.
+            match verify_record_frame(&frame, shard_id, limits) {
+                Ok(sequence) => {
+                    if sequence != expected_sequence {
                         return Ok(FrameRead::Local);
                     }
 
-                    if record.sequence > after_sequence {
+                    if sequence > after_sequence {
                         collected_bytes = collected_bytes.saturating_add(frame.len());
                         frames.push(frame);
                     }
@@ -286,7 +308,7 @@ pub(crate) fn read_frames_resuming(
                     offset += record_length as u64;
                     position = Some((index, offset));
                     if collected_bytes >= max_bytes && !frames.is_empty() {
-                        leave_cursor(cursor, &segments, position, expected_sequence);
+                        leave_cursor(cursor, &segments, position, expected_sequence, current);
                         return Ok(FrameRead::Frames(frames));
                     }
                 }
@@ -310,7 +332,7 @@ pub(crate) fn read_frames_resuming(
         return Ok(FrameRead::Local);
     }
 
-    leave_cursor(cursor, &segments, position, expected_sequence);
+    leave_cursor(cursor, &segments, position, expected_sequence, current);
     Ok(FrameRead::Frames(frames))
 }
 
@@ -321,7 +343,110 @@ fn leave_cursor(
     segments: &[PathBuf],
     position: Option<(usize, u64)>,
     next_sequence: u64,
+    open: Option<OpenSegment>,
 ) {
     cursor.position = position.map(|(index, offset)| (segments[index].clone(), offset));
+    // Windows can delete a file that is still open and reuse its name, with no cheap way
+    // to tell the new file from the old one; and an open segment there can keep a deleted
+    // one listed but unopenable. Only Unix keeps the segment open.
+    cursor.open = open.filter(|_| cfg!(unix) && cursor.position.is_some());
     cursor.next_sequence = next_sequence;
+}
+
+/// Read the `record_length - 4` bytes after a record's length straight into `frame`,
+/// which then holds the whole record. Returns how many body bytes the file had.
+fn read_record_body(
+    file: &mut io::BufReader<File>,
+    length_bytes: &[u8; 4],
+    record_length: usize,
+    frame: &mut Vec<u8>,
+) -> Result<usize, PersistenceError> {
+    frame.reserve_exact(record_length);
+    frame.extend_from_slice(length_bytes);
+    let body = (record_length - 4) as u64;
+
+    Ok(file.take(body).read_to_end(frame)?)
+}
+
+/// Continue in the segment the cursor left open, without listing the directory or opening
+/// the file again: one `stat` of its path confirms it is still the same file. `None` hands
+/// the request to the full scan, which starts where the cursor stopped: the request does
+/// not continue the cursor, the segment is gone or replaced, it ended (the log rolled
+/// over), or a record looks wrong, which the scan then judges.
+fn read_open_segment(
+    cursor: &mut FrameCursor,
+    shard_id: u32,
+    after_sequence: u64,
+    through_sequence: u64,
+    limits: ProtocolLimits,
+    max_bytes: usize,
+) -> Result<Option<FrameRead>, PersistenceError> {
+    if cursor.next_sequence != after_sequence.saturating_add(1) {
+        return Ok(None);
+    }
+    let (Some((path, offset)), Some(open)) = (cursor.position.as_mut(), cursor.open.as_mut())
+    else {
+        return Ok(None);
+    };
+    match fs::metadata(path) {
+        Ok(metadata) if file_identity(&metadata) == open.identity => {
+            open.length = metadata.len();
+        }
+        _ => return Ok(None),
+    }
+
+    // Seeking drops what the buffer read ahead: the live segment may have changed there.
+    open.file.seek(SeekFrom::Start(*offset))?;
+
+    let mut frames = Vec::new();
+    let mut collected_bytes = 0usize;
+    let mut expected_sequence = after_sequence.saturating_add(1);
+    // The cursor moves only on success, so an I/O error leaves it where this call began.
+    let mut next_offset = *offset;
+
+    while expected_sequence <= through_sequence && collected_bytes < max_bytes {
+        let mut length_bytes = [0; 4];
+
+        if read_partial(&mut open.file, &mut length_bytes)? != 4 {
+            break;
+        }
+
+        let record_length = u32::from_le_bytes(length_bytes) as usize;
+
+        if record_length < RECORD_MIN_LEN {
+            break;
+        }
+
+        let end = next_offset + record_length as u64;
+
+        if end > open.length {
+            break;
+        }
+
+        let mut frame = Vec::new();
+
+        if read_record_body(&mut open.file, &length_bytes, record_length, &mut frame)?
+            != record_length - 4
+        {
+            break;
+        }
+
+        match verify_record_frame(&frame, shard_id, limits) {
+            Ok(sequence) if sequence == expected_sequence => {}
+            _ => break,
+        }
+
+        collected_bytes = collected_bytes.saturating_add(frame.len());
+        frames.push(frame);
+        expected_sequence += 1;
+        next_offset = end;
+    }
+
+    if frames.is_empty() {
+        return Ok(None);
+    }
+
+    *offset = next_offset;
+    cursor.next_sequence = expected_sequence;
+    Ok(Some(FrameRead::Frames(frames)))
 }

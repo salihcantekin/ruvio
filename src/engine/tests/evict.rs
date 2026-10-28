@@ -170,6 +170,59 @@ fn hot_get_keeps_the_recent_key_under_lru_eviction() {
     assert_eq!(shard.get(b"new"), Some(&b"3"[..]));
 }
 
+/// The hot GET stamps a read through the record its lookup found; it must leave the
+/// same metadata as a separate `touch` of the key, for every kind of hit and miss.
+#[test]
+fn hot_get_stamps_reads_like_touch() {
+    for policy in [
+        crate::EvictionPolicy::AllKeysLru,
+        crate::EvictionPolicy::AllKeysLfu,
+    ] {
+        let clock = crate::time::TestClock::new(1_000);
+        let mut hot = KvShard::with_clock(clock.clone());
+        let mut touched = KvShard::with_clock(clock.clone());
+
+        for shard in [&mut hot, &mut touched] {
+            shard.set_eviction_policy(policy);
+            shard.set_bytes(b"string", b"value");
+            shard.set_bytes(b"counter", b"42");
+            shard.set_bytes(b"due", b"gone");
+            shard.expire_at(b"due", crate::time::UnixMillis::new(6_000));
+            execute(&mut *shard, command_of(&[b"HSET", b"hash", b"f", b"v"]));
+        }
+
+        // Reads over a few minutes: the LFU counter climbs and ages, the LRU stamp moves.
+        for round in 0..200u64 {
+            clock.set(1_000 + round * 1_000);
+
+            for key in [&b"string"[..], b"counter", b"hash", b"due", b"missing"] {
+                let mut output = Vec::new();
+                execute_hot_into(&mut hot, HotCommand::Get(key), &mut output).unwrap();
+                touched.touch(key);
+            }
+        }
+
+        clock.set(1_000 + 200 * 1_000 + 7_000);
+        for key in [&b"string"[..], b"counter", b"hash"] {
+            assert_eq!(
+                hot.idle_seconds(key),
+                touched.idle_seconds(key),
+                "{policy:?}"
+            );
+            assert_eq!(
+                hot.access_frequency(key),
+                touched.access_frequency(key),
+                "{policy:?}"
+            );
+        }
+        if policy == crate::EvictionPolicy::AllKeysLfu {
+            assert!(hot.access_frequency(b"string").unwrap() > 5);
+        } else {
+            assert_eq!(hot.idle_seconds(b"string"), Some(8));
+        }
+    }
+}
+
 #[test]
 fn eviction_policies_preserve_write_keys_and_record_victims_before_mutating() {
     for policy in [

@@ -16,10 +16,11 @@ use crate::{
 };
 
 use super::{
-    DurabilityProfile, PersistenceConfig, PersistenceError,
+    DurabilityProfile, DurableSequence, PersistenceConfig, PersistenceError,
     codec::{
         FORMAT_MINOR, RECORD_MIN_LEN, WAL_HEADER_LEN, decode_record, decode_segment_header,
-        encode_borrowed_record_into, encode_segment_header, record_header_plausible,
+        encode_borrowed_record_appended, encode_borrowed_record_into, encode_segment_header,
+        record_header_plausible, verify_record_frame,
     },
     crash, snapshot, sync_worker,
 };
@@ -54,6 +55,52 @@ pub type RecoveredMutations = Vec<(u8, OwnedMutation)>;
 
 /// Bytes staged for one client batch before a single `write`.
 const WAL_GROUP_BYTES: usize = 64 * 1024;
+
+/// The first error a background sync or fill reported, for the shard thread to pick up. The
+/// flag lets every append check it with one load instead of locking the mutex.
+#[derive(Default)]
+struct SyncError {
+    set: AtomicBool,
+    message: Mutex<Option<String>>,
+}
+
+impl SyncError {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        self.message
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Records `message`, replacing an earlier one.
+    fn report(&self, message: String) {
+        let mut slot = self.lock();
+
+        *slot = Some(message);
+        self.set.store(true, Ordering::Release);
+    }
+
+    /// Records `message` unless an error is already waiting.
+    fn report_first(&self, message: String) {
+        let mut slot = self.lock();
+
+        slot.get_or_insert(message);
+        self.set.store(true, Ordering::Release);
+    }
+
+    fn is_set(&self) -> bool {
+        self.set.load(Ordering::Acquire)
+    }
+
+    fn take(&self) -> Option<String> {
+        if !self.is_set() {
+            return None;
+        }
+        let mut slot = self.lock();
+
+        self.set.store(false, Ordering::Release);
+        slot.take()
+    }
+}
 /// How far ahead of the write cursor a segment is extended with `fallocate`.
 const WAL_PREALLOC_CHUNK: u64 = 4 * 1024 * 1024;
 /// A new chunk is requested when less than this much written-zero space is left ahead of the cursor.
@@ -177,7 +224,7 @@ pub struct WalSink {
     hot_through: u64,
     last_recovery: Option<Instant>,
     published: Arc<AtomicU64>,
-    durable: Arc<AtomicU64>,
+    durable: Arc<DurableSequence>,
     backlog_floor: Arc<AtomicU64>,
     replica_count: Arc<AtomicU64>,
     database: u8,
@@ -190,7 +237,7 @@ pub struct WalSink {
     /// One level of `group` is held for the shard's current scheduler turn (`hold_for_tick`).
     tick_hold: bool,
     sync_running: Arc<AtomicBool>,
-    sync_error: Arc<Mutex<Option<String>>>,
+    sync_error: Arc<SyncError>,
     /// Bytes covered by the running background `everysec` sync; still counted in `dirty_bytes`.
     sync_in_flight: u64,
     sync_worker: Option<super::sync_worker::SyncWorker>,
@@ -251,11 +298,40 @@ pub enum FrameRead {
 /// the last record it returned, and the sequence that record's successor carries. A
 /// chunk that starts there seeks straight to it instead of decoding the segment again
 /// from its header, so following a long segment costs its length once, not per chunk.
+///
+/// The segment stays open between chunks, so a reader that keeps up with the live segment
+/// lists the directory and opens a file only when the log rolls over to a new segment.
 #[derive(Debug, Default)]
 pub(crate) struct FrameCursor {
     position: Option<(PathBuf, u64)>,
     next_sequence: u64,
+    /// The segment `position` names, still open.
+    open: Option<OpenSegment>,
 }
+
+#[derive(Debug)]
+struct OpenSegment {
+    file: io::BufReader<File>,
+    /// The file's length when last looked at; the live segment can grow past it.
+    length: u64,
+    /// Which file this is, so a compacted or replaced segment is not read on.
+    identity: FileIdentity,
+}
+
+#[cfg(unix)]
+type FileIdentity = (u64, u64);
+#[cfg(not(unix))]
+type FileIdentity = ();
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn file_identity(_: &fs::Metadata) -> FileIdentity {}
 
 struct Segment {
     path: PathBuf,

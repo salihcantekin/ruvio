@@ -487,8 +487,10 @@ impl<'a> Command<'a> {
             },
             Self::DbSize => Command::DbSize,
             Self::Del(keys) => Command::Del(owned_vec(keys.into_vec()).into()),
-            Self::ListPush(key, values) => Command::ListPush(owned(key), owned_vec(values)),
-            Self::ListPushBack(key, values) => Command::ListPushBack(owned(key), owned_vec(values)),
+            Self::ListPush(key, values) => Command::ListPush(owned(key), values.map(&owned)),
+            Self::ListPushBack(key, values) => {
+                Command::ListPushBack(owned(key), values.map(&owned))
+            }
             Self::ListPop { key, count } => Command::ListPop {
                 key: owned(key),
                 count,
@@ -682,10 +684,7 @@ impl<'a> Command<'a> {
                 options,
             } => Command::SortedSetAdd {
                 key: owned(key),
-                pairs: pairs
-                    .into_iter()
-                    .map(|(score, member)| (score, owned(member)))
-                    .collect(),
+                pairs: pairs.map(|(score, member)| (score, owned(member))),
                 options,
             },
             Self::SortedSetRange {

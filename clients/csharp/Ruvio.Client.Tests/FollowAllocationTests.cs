@@ -7,22 +7,22 @@ namespace Ruvio.Client.Tests;
 /// A client that follows a failover (two seeds, <c>FollowPrimary</c> on) allocates what a single-seed client allocates
 /// per command while the connection is healthy, and keeps no state that grows with the number of commands. Runs against
 /// the failover pair that <c>scripts/run_with_servers.sh</c> starts (<c>RUVIO_FAILOVER_ADDRS</c>); returns early without
-/// it. The commands complete on socket threads, so the whole process is counted, not the test thread; the tests of this
-/// collection run alone, and each measurement keeps the best of three trials as <see cref="AllocationTests"/> does.
+/// it. The commands complete on socket threads, so the whole process is counted, not the test thread. The two clients
+/// take turns round by round and each is judged by its median round, so an allocation by an unrelated thread (pool,
+/// timer, runner) lands on a few rounds of either client and moves neither median.
 /// </summary>
 [Collection("Allocation")]
 public class FollowAllocationTests
 {
-    private const int Trials = 5;
+    private const int Trials = 3;
     private const int Warmup = 30;
     private const int Rounds = 500;
 
     // Bytes per round (a SET and a GET, or 16 pipelined commands) a following client may allocate beyond a single-seed
-    // one. The process-wide count picks up a few KB of unrelated allocation (pool, timer and runner threads) now and
-    // then on a busy CI runner: spread over 500 rounds that has reached 17 bytes per round, where 100 rounds let 24-35
-    // bytes per round through. Locally the two differ by at most ten bytes per round in either direction. The smallest
-    // object, one per command, is 24 bytes, so a per-command allocation by following mode shows up as at least 48 bytes
-    // per round (384 for the pipeline of 16) and still fails above this slack.
+    // one, median against median. Summing whole runs let a few KB of unrelated process-wide allocation through as 24-209
+    // bytes per round on busy CI runners; the medians of the two clients agree to a few bytes. The smallest object, one
+    // per command, is 24 bytes, so a per-command allocation by following mode shows up in every round as at least 48
+    // bytes (384 for the pipeline of 16) and still fails above this slack.
     private const double Slack = 32;
 
     [Fact(Timeout = 120000)]
@@ -52,24 +52,26 @@ public class FollowAllocationTests
             async Task Pipelined(RuvioClient client) =>
                 Assert.Equal(16, (await client.ExecuteManyAsync(batch)).Count);
 
-            long singleLoop = long.MaxValue, followingLoop = long.MaxValue;
-            long singleBatch = long.MaxValue, followingBatch = long.MaxValue;
+            double loopGap = double.MaxValue, batchGap = double.MaxValue;
+            string report = "";
 
-            for (int trial = 0; trial < Trials; trial++)
+            for (int trial = 0; trial < Trials && (loopGap > Slack || batchGap > Slack); trial++)
             {
-                singleLoop = Math.Min(singleLoop, await MeasureAsync(() => SetGet(pair.Single)));
-                followingLoop = Math.Min(followingLoop, await MeasureAsync(() => SetGet(pair.Following)));
-                singleBatch = Math.Min(singleBatch, await MeasureAsync(() => Pipelined(pair.Single)));
-                followingBatch = Math.Min(followingBatch, await MeasureAsync(() => Pipelined(pair.Following)));
+                (long singleLoop, long followingLoop) =
+                    await MedianRoundsAsync(() => SetGet(pair.Single), () => SetGet(pair.Following));
+                (long singleBatch, long followingBatch) =
+                    await MedianRoundsAsync(() => Pipelined(pair.Single), () => Pipelined(pair.Following));
+
+                Assert.True(singleLoop > 0, "the measurement counts nothing");
+                loopGap = Math.Min(loopGap, followingLoop - singleLoop);
+                batchGap = Math.Min(batchGap, followingBatch - singleBatch);
+                report +=
+                    $"SET+GET single {singleLoop} B, following {followingLoop} B; " +
+                    $"pipeline of 16 single {singleBatch} B, following {followingBatch} B. ";
             }
 
-            Console.WriteLine(
-                $"follow alloc: SET+GET single {singleLoop / (double)Rounds:F1} B, following {followingLoop / (double)Rounds:F1} B; " +
-                $"pipeline of 16 single {singleBatch / (double)Rounds:F1} B, following {followingBatch / (double)Rounds:F1} B");
-
-            Assert.True(singleLoop > 0, "the measurement counts nothing");
-            Assert.InRange((followingLoop - singleLoop) / (double)Rounds, double.NegativeInfinity, Slack);
-            Assert.InRange((followingBatch - singleBatch) / (double)Rounds, double.NegativeInfinity, Slack);
+            Assert.True(loopGap <= Slack, $"SET+GET gap {loopGap} B per round; {report}");
+            Assert.True(batchGap <= Slack, $"pipeline gap {batchGap} B per round; {report}");
         }
     }
 
@@ -114,22 +116,41 @@ public class FollowAllocationTests
 
     private static long Retained() => GC.GetTotalMemory(forceFullCollection: true);
 
-    /// <summary>Bytes allocated per <see cref="Rounds"/> rounds of <paramref name="round"/>, after a warm-up.</summary>
-    private static async Task<long> MeasureAsync(Func<Task> round)
+    /// <summary>
+    /// Median bytes allocated by one round of <paramref name="single"/> and of <paramref name="following"/>, after a
+    /// warm-up. The rounds alternate, so noise from other threads falls on both clients alike.
+    /// </summary>
+    private static async Task<(long Single, long Following)> MedianRoundsAsync(Func<Task> single, Func<Task> following)
     {
+        long[] singleRounds = new long[Rounds];
+        long[] followingRounds = new long[Rounds];
+
         for (int index = 0; index < Warmup; index++)
         {
-            await round();
+            await single();
+            await following();
         }
-
-        long before = GC.GetTotalAllocatedBytes(precise: true);
 
         for (int index = 0; index < Rounds; index++)
         {
-            await round();
+            long before = GC.GetTotalAllocatedBytes(precise: true);
+
+            await single();
+
+            long middle = GC.GetTotalAllocatedBytes(precise: true);
+
+            await following();
+
+            long after = GC.GetTotalAllocatedBytes(precise: true);
+
+            singleRounds[index] = middle - before;
+            followingRounds[index] = after - middle;
         }
 
-        return GC.GetTotalAllocatedBytes(precise: true) - before;
+        Array.Sort(singleRounds);
+        Array.Sort(followingRounds);
+
+        return (singleRounds[Rounds / 2], followingRounds[Rounds / 2]);
     }
 
     private static async Task<Pair?> ConnectPairAsync()

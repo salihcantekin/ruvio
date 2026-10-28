@@ -30,6 +30,13 @@ pub trait StorageIndex: Debug + Send + 'static {
         self.lookup(key)
     }
     fn insert(&mut self, key: &[u8], entry: Entry) -> Option<Entry>;
+    /// [`Self::insert`] of a key the caller just looked up and found missing, with
+    /// `hint` from [`Self::lookup_hint`]: skips the lookup `insert` starts with.
+    fn insert_absent_hinted(&mut self, key: &[u8], _hint: u64, entry: Entry) {
+        let previous = self.insert(key, entry);
+
+        debug_assert!(previous.is_none(), "insert_absent_hinted on a present key");
+    }
     fn remove(&mut self, key: &[u8]) -> Option<Entry>;
 
     /// Insert `create()` when the key is missing. `None` means the key exists
@@ -204,6 +211,11 @@ pub trait StorageIndex: Debug + Send + 'static {
         false
     }
 
+    /// [`Self::write_integer`] given `hint` from [`Self::lookup_hint`].
+    fn write_integer_hinted(&mut self, key: &[u8], value: i64, _hint: u64) -> bool {
+        self.write_integer(key, value)
+    }
+
     /// Length of the index's key log, when it has one. Addresses from `key_address`
     /// and `scan_slots` are below it for keys that exist now.
     fn key_log_len(&self) -> Option<u32> {
@@ -220,6 +232,12 @@ pub trait StorageIndex: Debug + Send + 'static {
     /// deadline, true means it might. Indexes without a hint always say true.
     fn lookup_ttl(&self, key: &[u8]) -> Option<(IndexRef<'_>, bool)> {
         self.lookup(key).map(|hit| (hit, true))
+    }
+
+    /// [`Self::lookup_ttl`] plus the record's address for [`Self::access_at`], when the
+    /// index keeps a stable key log; `None` address otherwise.
+    fn lookup_ttl_at(&self, key: &[u8]) -> Option<(IndexRef<'_>, bool, Option<u32>)> {
+        self.lookup_ttl(key).map(|(hit, hint)| (hit, hint, None))
     }
 
     /// Records that `key` has a deadline.
@@ -253,6 +271,12 @@ pub trait StorageIndex: Debug + Send + 'static {
     /// index keeps none. Storage is allocated by the first call, so a shard that never
     /// tracks recency pays nothing.
     fn access_mut(&mut self, _key: &[u8]) -> Option<&mut u32> {
+        None
+    }
+
+    /// [`Self::access_mut`] for the record at `address` from [`Self::lookup_ttl_at`], with
+    /// no second lookup. The address holds until the index is next written.
+    fn access_at(&mut self, _address: u32) -> Option<&mut u32> {
         None
     }
 
@@ -763,18 +787,26 @@ impl Default for AHashIndex {
 }
 
 impl AHashIndex {
-    fn decode(keys: &ValueLog, addr: Addr) -> (u16, u16, u16) {
+    /// Key length and meta word (kind, TTL hint, payload length) of the record at `addr`.
+    #[inline(always)]
+    fn header(keys: &ValueLog, addr: Addr) -> (u16, u16) {
         let raw = keys.slice(addr.0, HEADER_LEN as u16);
-        let key_len = u16::from_le_bytes([raw[0], raw[1]]);
-        let meta = u16::from_le_bytes([raw[2], raw[3]]);
+
+        (
+            u16::from_le_bytes([raw[0], raw[1]]),
+            u16::from_le_bytes([raw[2], raw[3]]),
+        )
+    }
+
+    #[inline(always)]
+    fn decode(keys: &ValueLog, addr: Addr) -> (u16, u16, u16) {
+        let (key_len, meta) = Self::header(keys, addr);
 
         (key_len, meta >> KIND_SHIFT, meta & LEN_MASK)
     }
 
     fn ttl_hint(keys: &ValueLog, addr: Addr) -> bool {
-        let raw = keys.slice(addr.0, HEADER_LEN as u16);
-
-        u16::from_le_bytes([raw[2], raw[3]]) & TTL_HINT != 0
+        Self::header(keys, addr).1 & TTL_HINT != 0
     }
 
     fn set_ttl_hint(keys: &mut ValueLog, addr: Addr, on: bool) {
@@ -790,6 +822,7 @@ impl AHashIndex {
         keys.write_at(addr.0 + 2, &meta.to_le_bytes());
     }
 
+    #[inline]
     fn payload_at(addr: Addr, key_len: u16) -> u32 {
         addr.0 + HEADER_LEN + u32::from(key_len)
     }
@@ -856,8 +889,9 @@ impl AHashIndex {
         hasher.hash_one(keys.slice(addr.0 + HEADER_LEN, key_len))
     }
 
+    #[inline(always)]
     fn same_key(keys: &ValueLog, addr: &Addr, key: &[u8]) -> bool {
-        let (key_len, _, _) = Self::decode(keys, *addr);
+        let (key_len, _) = Self::header(keys, *addr);
 
         keys.slice(addr.0 + HEADER_LEN, key_len) == key
     }
@@ -868,6 +902,7 @@ impl AHashIndex {
         u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])
     }
 
+    #[inline(always)]
     fn view<'a>(
         addr: Addr,
         keys: &'a ValueLog,
@@ -875,7 +910,31 @@ impl AHashIndex {
         objects: &'a Chunked<Option<Entry>>,
         slabs: &'a SlabPages,
     ) -> IndexRef<'a> {
-        let (key_len, kind, _) = Self::decode(keys, addr);
+        let (key_len, meta) = Self::header(keys, addr);
+
+        Self::view_at(
+            addr,
+            key_len,
+            meta >> KIND_SHIFT,
+            keys,
+            heaps,
+            objects,
+            slabs,
+        )
+    }
+
+    /// [`Self::view`] of a record whose header the caller already read. Strings are
+    /// read in line; every other kind goes through one call.
+    #[inline(always)]
+    fn view_at<'a>(
+        addr: Addr,
+        key_len: u16,
+        kind: u16,
+        keys: &'a ValueLog,
+        heaps: &'a Chunked<Option<Vec<u8>>>,
+        objects: &'a Chunked<Option<Entry>>,
+        slabs: &'a SlabPages,
+    ) -> IndexRef<'a> {
         let payload = Self::payload_at(addr, key_len);
 
         match kind {
@@ -895,6 +954,20 @@ impl AHashIndex {
                 IndexRef::Integer(i64::from_le_bytes(bytes))
             }
 
+            _ => Self::view_stored(kind, payload, keys, heaps, objects, slabs),
+        }
+    }
+
+    #[inline(never)]
+    fn view_stored<'a>(
+        kind: u16,
+        payload: u32,
+        keys: &'a ValueLog,
+        heaps: &'a Chunked<Option<Vec<u8>>>,
+        objects: &'a Chunked<Option<Entry>>,
+        slabs: &'a SlabPages,
+    ) -> IndexRef<'a> {
+        match kind {
             TAG_HEAP => IndexRef::Heap(
                 heaps[Self::read_u32(keys, payload) as usize]
                     .as_ref()
@@ -1128,6 +1201,8 @@ impl StorageIndex for AHashIndex {
 
     #[inline]
     fn lookup_hinted(&self, key: &[u8], hash: u64) -> Option<IndexRef<'_>> {
+        debug_assert_eq!(hash, self.hash_key(key));
+
         let AHashIndex {
             keys,
             table,
@@ -1153,12 +1228,38 @@ impl StorageIndex for AHashIndex {
             ..
         } = self;
 
+        // One header read serves the view and the TTL hint.
+        table
+            .find(hash, |record| Self::same_key(keys, record, key))
+            .map(|addr| {
+                let (key_len, meta) = Self::header(keys, *addr);
+                let kind = meta >> KIND_SHIFT;
+
+                (
+                    Self::view_at(*addr, key_len, kind, keys, heaps, objects, slabs),
+                    meta & TTL_HINT != 0,
+                )
+            })
+    }
+
+    fn lookup_ttl_at(&self, key: &[u8]) -> Option<(IndexRef<'_>, bool, Option<u32>)> {
+        let hash = self.hash_key(key);
+        let AHashIndex {
+            keys,
+            table,
+            heaps,
+            objects,
+            slabs,
+            ..
+        } = self;
+
         table
             .find(hash, |record| Self::same_key(keys, record, key))
             .map(|addr| {
                 (
                     Self::view(*addr, keys, heaps, objects, slabs),
                     Self::ttl_hint(keys, *addr),
+                    Some(addr.0),
                 )
             })
     }
@@ -1182,6 +1283,10 @@ impl StorageIndex for AHashIndex {
             .find(hash, |record| Self::same_key(&self.keys, record, key))
             .copied()?;
         Some(self.access.cell_mut((addr.0 >> 3) as usize))
+    }
+
+    fn access_at(&mut self, address: u32) -> Option<&mut u32> {
+        Some(self.access.cell_mut((address >> 3) as usize))
     }
 
     fn reset_access(&mut self) {
@@ -1362,6 +1467,20 @@ impl StorageIndex for AHashIndex {
             return Some(previous);
         }
 
+        self.insert_absent_hinted(key, hash, entry);
+
+        None
+    }
+
+    fn insert_absent_hinted(&mut self, key: &[u8], hash: u64, entry: Entry) {
+        debug_assert_eq!(hash, self.hash_key(key));
+        debug_assert!(
+            self.table
+                .find(hash, |record| Self::same_key(&self.keys, record, key))
+                .is_none(),
+            "insert_absent_hinted on a present key"
+        );
+
         let stored = self.store_entry(key, entry);
         let AHashIndex {
             keys,
@@ -1371,8 +1490,6 @@ impl StorageIndex for AHashIndex {
         } = self;
 
         table.insert_unique(hash, stored, |addr| Self::hash_record(keys, hasher, addr));
-
-        None
     }
 
     fn remove(&mut self, key: &[u8]) -> Option<Entry> {
@@ -1778,18 +1895,21 @@ impl StorageIndex for AHashIndex {
     }
 
     fn write_integer(&mut self, key: &[u8], value: i64) -> bool {
-        let hash = self.hash_key(key);
+        self.write_integer_hinted(key, value, self.hash_key(key))
+    }
+
+    fn write_integer_hinted(&mut self, key: &[u8], value: i64, hash: u64) -> bool {
+        debug_assert_eq!(hash, self.hash_key(key));
+
         let payload = {
             let AHashIndex { keys, table, .. } = self;
 
             table
                 .find(hash, |addr| Self::same_key(keys, addr, key))
-                .copied()
-                .filter(|addr| Self::decode(keys, *addr).1 == TAG_INTEGER)
-                .map(|addr| {
-                    let (key_len, _, _) = Self::decode(keys, addr);
+                .and_then(|addr| {
+                    let (key_len, kind, _) = Self::decode(keys, *addr);
 
-                    Self::payload_at(addr, key_len)
+                    (kind == TAG_INTEGER).then(|| Self::payload_at(*addr, key_len))
                 })
         };
 

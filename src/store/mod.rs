@@ -43,7 +43,7 @@ mod tests;
 mod value;
 pub(crate) use fill::FillState;
 pub(crate) use limit::{LIMIT_SLIDING_MAX, LIMIT_TOKENS_MAX_CAPACITY, LIMIT_TOKENS_MAX_REFILL_MS};
-pub(crate) use string::SMALL_JSON_EDIT;
+pub(crate) use string::{ReadMark, SMALL_JSON_EDIT};
 mod zset;
 
 use access::*;
@@ -675,6 +675,14 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         Some(charge.key_bytes + charge.value_bytes + charge.collection_bytes)
     }
 
+    /// What every lookup of `key` computes first (its hash under the index's fixed
+    /// hasher). It stays valid while the index changes, so a command that looks the key
+    /// up more than once (read, then write) hashes it once.
+    #[inline]
+    pub(crate) fn key_hint(&self, key: &[u8]) -> u64 {
+        self.entries.lookup_hint(key)
+    }
+
     fn entry_charge(&self, key: &[u8]) -> EntryCharge {
         let Some((stored_key, hit)) = self.entries.get_key_value(key) else {
             return EntryCharge::default();
@@ -1009,11 +1017,15 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
 
     /// Makes `database` the map every key method uses. A map is created on first use.
     /// Parked maps do not change, so their totals are cached until they are entered again.
+    #[inline]
     pub(crate) fn enter(&mut self, database: u8) {
-        if database == self.active {
-            return;
+        if database != self.active {
+            self.switch_database(database);
         }
+    }
 
+    #[inline(never)]
+    fn switch_database(&mut self, database: u8) {
         let next = self
             .slot(database)
             .take()
@@ -1868,6 +1880,12 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         self.notify.take()
     }
 
+    /// Nothing for `drain_notices` to hand out.
+    #[inline]
+    pub(crate) fn notices_idle(&self) -> bool {
+        self.notify.is_idle()
+    }
+
     /// One borrow for the connection loop: the notices to publish and the keys expiry or
     /// eviction removed for tracking. An idle notify state allocates nothing.
     #[allow(clippy::type_complexity)]
@@ -1921,6 +1939,15 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         }
 
         self.record_access(key);
+    }
+
+    /// Stamps the read that [`Self::value_view_read`] described, once its view is dropped.
+    pub(crate) fn mark_read(&mut self, key: &[u8], mark: ReadMark) {
+        match mark {
+            ReadMark::Missing => {}
+            ReadMark::At(address) => self.record_access_at(address),
+            ReadMark::Key => self.touch(key),
+        }
     }
 }
 

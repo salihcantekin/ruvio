@@ -122,7 +122,15 @@ pub(super) fn refresh_notify_listeners(state: &ShardState) {
     state.store.borrow_mut().set_notify_listeners(listeners);
 }
 
+#[inline]
 pub(super) fn flush_key_notices(state: &ShardState) {
+    if !state.store.borrow().notices_idle() {
+        publish_key_notices(state);
+    }
+}
+
+#[inline(never)]
+fn publish_key_notices(state: &ShardState) {
     let (mask, pending, dropped) = state.store.borrow_mut().drain_notices();
 
     if !dropped.is_empty() {
