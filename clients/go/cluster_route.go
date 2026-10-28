@@ -155,12 +155,13 @@ func (cl *cluster) run(ctx context.Context, t *topology, slot int, r *request, b
 // the table alone. -TRYAGAIN sends the command again, routed by the current table, up to
 // maxTryAgain times. It recycles r.
 func (cl *cluster) send(ctx context.Context, node *Client, r *request, blocking bool, redirects int) (Value, error) {
-	return cl.drive(ctx, node, false, r, blocking, redirects, 0)
+	var clk tryAgainClock
+	return cl.drive(ctx, node, false, r, blocking, redirects, 0, &clk)
 }
 
 // drive is the loop behind send; asking says the first send goes out behind ASKING, and
 // retries is how many -TRYAGAIN retries the command has used.
-func (cl *cluster) drive(ctx context.Context, node *Client, asking bool, r *request, blocking bool, redirects, retries int) (Value, error) {
+func (cl *cluster) drive(ctx context.Context, node *Client, asking bool, r *request, blocking bool, redirects, retries int, clk *tryAgainClock) (Value, error) {
 	reloaded := false
 	for {
 		var ok bool
@@ -199,7 +200,7 @@ func (cl *cluster) drive(ctx context.Context, node *Client, asking bool, r *requ
 		}
 		v := r.val
 		if v.Kind == KindError {
-			nn, ask, err := cl.follow(ctx, v.Bytes, r, &redirects, &retries)
+			nn, ask, err := cl.follow(ctx, v.Bytes, r, &redirects, &retries, clk)
 			if err != nil {
 				putReq(r)
 				return Value{}, err
@@ -221,7 +222,7 @@ func (cl *cluster) drive(ctx context.Context, node *Client, asking bool, r *requ
 // follow decides what to do with the error reply msg to r: it returns the node to send r
 // to again (behind ASKING when ask is set), or a nil node when the reply goes back to the
 // caller (not a redirect, or its budget is spent). -TRYAGAIN waits before it returns.
-func (cl *cluster) follow(ctx context.Context, msg []byte, r *request, redirects, retries *int) (node *Client, ask bool, err error) {
+func (cl *cluster) follow(ctx context.Context, msg []byte, r *request, redirects, retries *int, clk *tryAgainClock) (node *Client, ask bool, err error) {
 	if ms, addr, ok := parseMoved(msg); ok {
 		if *redirects >= maxRedirects {
 			return nil, false, nil
@@ -244,14 +245,21 @@ func (cl *cluster) follow(ctx context.Context, msg []byte, r *request, redirects
 		if *retries >= maxTryAgain {
 			return nil, false, nil
 		}
-		wait := tryAgainWait << *retries
+		wait, ok := clk.pause(*retries)
+		if !ok {
+			return nil, false, nil
+		}
 		*retries++
-		tm := time.NewTimer(wait)
-		select {
-		case <-ctx.Done():
-			tm.Stop()
-			return nil, false, ctx.Err()
-		case <-tm.C:
+		if wait > 0 {
+			tm := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				tm.Stop()
+				return nil, false, ctx.Err()
+			case <-tm.C:
+			}
+		} else if err := ctx.Err(); err != nil {
+			return nil, false, err
 		}
 		node = cl.seed
 		if _, slot, _, rerr := routeFrame(r.buf); rerr == nil && slot >= 0 {
@@ -324,10 +332,11 @@ func (cl *cluster) reloadNode(ctx context.Context, r *request) *Client {
 }
 
 // redirect resends the command in r after its first -MOVED, -ASK or -TRYAGAIN reply msg
-// (from a pipelined write), with the same limits and table updates as send. It recycles r.
-func (cl *cluster) redirect(ctx context.Context, msg []byte, r *request) (Value, error) {
+// (from a pipelined write), with the same limits and table updates as send; clk is the
+// -TRYAGAIN clock the call's commands share. It recycles r.
+func (cl *cluster) redirect(ctx context.Context, msg []byte, r *request, clk *tryAgainClock) (Value, error) {
 	redirects, retries := 0, 0
-	nn, ask, err := cl.follow(ctx, msg, r, &redirects, &retries)
+	nn, ask, err := cl.follow(ctx, msg, r, &redirects, &retries, clk)
 	if err != nil {
 		putReq(r)
 		return Value{}, err
@@ -336,7 +345,7 @@ func (cl *cluster) redirect(ctx context.Context, msg []byte, r *request) (Value,
 		putReq(r)
 		return Value{Kind: KindError, Bytes: msg}, &Error{Msg: b2s(msg)}
 	}
-	return cl.drive(ctx, nn, ask, r, false, redirects, retries)
+	return cl.drive(ctx, nn, ask, r, false, redirects, retries, clk)
 }
 
 // routeFrame reads the command at the start of b and reports how to route it. slot is the
@@ -526,6 +535,7 @@ func (cl *cluster) split(ctx context.Context, t *topology, spec cmdSpec, r *requ
 		}
 		g.parts = append(g.parts, pi)
 	}
+	clk := new(tryAgainClock) // one -TRYAGAIN budget for all the parts
 	var wg sync.WaitGroup
 	do := func(ni int) {
 		g := groups[ni]
@@ -568,7 +578,7 @@ func (cl *cluster) split(ctx context.Context, t *topology, spec cmdSpec, r *requ
 				if _, _, isMoved := parseMoved(v.Bytes); isMoved { // repair this part alone
 					again := getReq()
 					p.appendPart(again, pi)
-					replies[pi], errs[pi] = cl.redirect(ctx, v.Bytes, again)
+					replies[pi], errs[pi] = cl.redirect(ctx, v.Bytes, again, clk)
 					continue
 				}
 				errs[pi] = &Error{Msg: b2s(v.Bytes)}

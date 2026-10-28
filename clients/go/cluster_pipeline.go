@@ -322,10 +322,11 @@ func (cl *cluster) pipeSpread(ctx context.Context, t *topology, r *request, n in
 		putReq(r)
 		return nil, first
 	}
+	var clk tryAgainClock
 	for i := range out {
 		if out[i].Kind == KindError {
 			if isRedirectErr(out[i].Bytes) {
-				cl.redo(ctx, r.buf[s.offs[i]:s.offs[i+1]], &out[i])
+				cl.redo(ctx, r.buf[s.offs[i]:s.offs[i+1]], &out[i], &clk)
 			}
 		}
 	}
@@ -365,10 +366,11 @@ func (cl *cluster) pipeOne(ctx context.Context, node *Client, r *request, n int)
 		return nil, err
 	}
 	vals := r.vals
+	var clk tryAgainClock
 	for i := range vals {
 		if vals[i].Kind == KindError {
 			if isRedirectErr(vals[i].Bytes) {
-				cl.redo(ctx, frameAt(r.buf, i), &vals[i])
+				cl.redo(ctx, frameAt(r.buf, i), &vals[i], &clk)
 			}
 		}
 	}
@@ -378,10 +380,10 @@ func (cl *cluster) pipeOne(ctx context.Context, node *Client, r *request, n int)
 
 // redo sends one command again after -MOVED, -ASK or -TRYAGAIN (the table is updated first) and stores the
 // outcome in dst.
-func (cl *cluster) redo(ctx context.Context, frame []byte, dst *Value) {
+func (cl *cluster) redo(ctx context.Context, frame []byte, dst *Value, clk *tryAgainClock) {
 	req := getReq()
 	req.buf = append(req.buf, frame...)
-	v, err := cl.redirect(ctx, dst.Bytes, req)
+	v, err := cl.redirect(ctx, dst.Bytes, req, clk)
 	if err != nil && v.Kind != KindError {
 		v = Value{Kind: KindError, Bytes: []byte(err.Error())}
 	}
@@ -462,6 +464,7 @@ func (cl *cluster) pipeMany(ctx context.Context, t *topology, r *request, n int,
 	}
 	out := make([]Value, n)
 	errs := make([]error, len(groups))
+	clk := new(tryAgainClock) // one -TRYAGAIN budget for the groups, which repair their replies at the same time
 	var wg sync.WaitGroup
 	do := func(gi int) {
 		g := groups[gi]
@@ -498,7 +501,7 @@ func (cl *cluster) pipeMany(ctx context.Context, t *topology, r *request, n int,
 					again := getReq()
 					plans[it.i].appendPart(again, it.part)
 					var err error
-					if v, err = cl.redirect(ctx, v.Bytes, again); err != nil && v.Kind != KindError {
+					if v, err = cl.redirect(ctx, v.Bytes, again, clk); err != nil && v.Kind != KindError {
 						v = Value{Kind: KindError, Bytes: []byte(err.Error())}
 					}
 				}
@@ -530,7 +533,7 @@ func (cl *cluster) pipeMany(ctx context.Context, t *topology, r *request, n int,
 		}
 		if out[i].Kind == KindError {
 			if isRedirectErr(out[i].Bytes) {
-				cl.redo(ctx, r.buf[offs[i]:offs[i+1]], &out[i])
+				cl.redo(ctx, r.buf[offs[i]:offs[i+1]], &out[i], clk)
 			}
 		}
 	}

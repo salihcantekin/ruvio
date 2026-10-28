@@ -381,6 +381,34 @@ const (
 	tryAgainWait = 5 * time.Millisecond
 )
 
+// tryAgainClock is the one -TRYAGAIN wait of a call. The retry schedule runs from the first
+// -TRYAGAIN the call sees and is shared by every command of a pipeline (and by the nodes it
+// spans), so N refused commands wait for one budget, not N.
+type tryAgainClock struct {
+	start atomic.Int64 // unix nanoseconds of the first -TRYAGAIN, 0 before it
+}
+
+// pause is how long to wait before retry number retries (from 0), or false when the budget
+// is spent. A command that has not been retried yet always gets one more try, so a freeze that
+// ended while earlier commands waited does not fail the later ones.
+func (c *tryAgainClock) pause(retries int) (time.Duration, bool) {
+	now := time.Now().UnixNano()
+	start := c.start.Load()
+	if start == 0 {
+		c.start.CompareAndSwap(0, now)
+		start = c.start.Load()
+	}
+	elapsed := time.Duration(now - start)
+	var at time.Duration
+	for i := 0; i < maxTryAgain; i++ {
+		at += tryAgainWait << i
+		if at > elapsed {
+			return at - elapsed, true
+		}
+	}
+	return 0, retries == 0
+}
+
 // applyMoved updates the table after -MOVED and returns the node to retry on: the one the
 // MOVED named. The slot is patched at once; the whole table is reloaded only when the target
 // is unknown or when reload is set (the second or later MOVED of one command).
