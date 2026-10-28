@@ -21,7 +21,7 @@ public class FencingTests
 
     private static RuvioLockOptions Fenced(string prefix = "p:") => new() { KeyPrefix = prefix, Fenced = true, AutoRenew = false };
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task FencedLockUsesLeaseRenewAndReleaseWithItsToken()
     {
         long renewReply = 1;
@@ -51,7 +51,7 @@ public class FencingTests
         await second.DisposeAsync();
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task FencedAcquireTreatsAPlainLockAsTakenAndOtherErrorsAsErrors()
     {
         var (client, _) = Fake((_, _) => Resp.Error("WRONGTYPE Operation against a key holding the wrong kind of value"));
@@ -70,7 +70,7 @@ public class FencingTests
             await new RuvioLockProvider(client, new RuvioLockOptions { AutoRenew = false }).TryAcquireAsync("job", TimeSpan.FromSeconds(5)));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task PlainLocksAndOtherImplementationsHaveNoFencingToken()
     {
         var (client, _) = Fake((command, _) => command[0] == "DELEX" ? Resp.Int(1) : Resp.Ok);
@@ -81,7 +81,7 @@ public class FencingTests
         Assert.Null(((IRuvioLock)new OtherLock()).FencingToken);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task TheAttributeMiddlewareHandsTheLockToTheHandler()
     {
         var (client, _) = Fake((command, _) => command[0] == "LEASE" ? Resp.Int(7) : Resp.Int(1));
@@ -105,7 +105,7 @@ public class FencingTests
         Assert.Equal(7, seen);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task LiveTokensGrowAndPlainAndFencedLocksExcludeEachOther()
     {
         if (await LiveTests.TryConnectAsync() is not { } connected)

@@ -1360,6 +1360,15 @@ pub fn decode_control(frame: &[u8]) -> Option<(u64, bool)> {
     ))
 }
 
+/// Whether `frame` is shaped like a copied `PUBLISH` (length field and magic). Nothing is copied
+/// and the checksum is not read, so the receive thread can tell a publish from a record cheaply;
+/// the shard still runs the full `decode_copied_publish` and treats a damaged frame as a record.
+pub fn is_copied_publish(frame: &[u8]) -> bool {
+    frame.len() >= 32
+        && frame[..4] == (frame.len() as u32).to_le_bytes()
+        && &frame[4..12] == PUBLISH_MAGIC
+}
+
 pub fn decode_copied_publish(frame: &[u8]) -> Option<(bool, Vec<u8>, Vec<u8>)> {
     if frame.len() < 32 || u32::from_le_bytes(frame[..4].try_into().ok()?) as usize != frame.len() {
         return None;
@@ -2968,7 +2977,7 @@ fn read_primary(
             continue;
         }
 
-        let sequence = if decode_copied_publish(&frame).is_some() {
+        let sequence = if is_copied_publish(&frame) {
             None
         } else {
             Some(frame_sequence(&frame))

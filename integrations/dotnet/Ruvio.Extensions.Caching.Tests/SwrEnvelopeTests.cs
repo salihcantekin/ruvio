@@ -32,7 +32,7 @@ public class SwrEnvelopeTests
         StaleFor = TimeSpan.FromSeconds(50),
     };
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task EntriesWithoutExtrasKeepTheOldFormat()
     {
         var (cache, script) = Make();
@@ -45,7 +45,7 @@ public class SwrEnvelopeTests
         Assert.Equal("RDC1\n0\n0\nv", script.Commands[1][2]);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task AStalePeriodIsStoredAfterTheFreshDeadline()
     {
         var (cache, script) = Make();
@@ -66,7 +66,7 @@ public class SwrEnvelopeTests
         Assert.Equal(header[1], script.Commands[0][4]);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task StalePeriodOptionsAreValidatedBeforeAnythingIsSent()
     {
         var (cache, script) = Make();
@@ -89,7 +89,7 @@ public class SwrEnvelopeTests
         await Assert.ThrowsAsync<ArgumentException>(() => cache.RemoveByTagAsync(""));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task APlainGetMissesAStaleEntryWithoutDeletingIt()
     {
         var (cache, script) = Make();
@@ -99,7 +99,7 @@ public class SwrEnvelopeTests
         Assert.Equal(["GET"], script.Commands.Select(c => c[0]));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task AStaleRefresherStoresWithItsTokenAndTheSwrWindow()
     {
         var (cache, script) = Make();
@@ -116,7 +116,7 @@ public class SwrEnvelopeTests
         Assert.StartsWith("RDC2\n", fillSet[2]);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task AFailingRefreshGetsTheStaleValue()
     {
         var (cache, script) = Make();
@@ -138,7 +138,7 @@ public class SwrEnvelopeTests
         }, Swr, cancelled.Token));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task WhenTheServerForgotTheSoftExpiryTheEnvelopeDecides()
     {
         var (cache, script) = Make();
