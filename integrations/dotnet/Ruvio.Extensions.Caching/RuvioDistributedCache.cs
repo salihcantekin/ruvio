@@ -49,6 +49,8 @@ public sealed class RuvioDistributedCache : IDistributedCache
     private readonly RuvioOutageOptions _outage;
     private static readonly System.Diagnostics.Metrics.Meter Meter = new("Ruvio.Extensions.Caching");
     private static readonly System.Diagnostics.Metrics.Counter<long> Outages = Meter.CreateCounter<long>("ruvio.cache.outage");
+    private static readonly System.Diagnostics.Metrics.Counter<long> Hits = Meter.CreateCounter<long>("ruvio.cache.hit");
+    private static readonly System.Diagnostics.Metrics.Counter<long> Misses = Meter.CreateCounter<long>("ruvio.cache.miss");
 
     /// <summary>Constructs a provider with validated, snapshotted options and a borrowed client.</summary>
     public RuvioDistributedCache(IRuvioClient client, IOptions<RuvioCacheOptions> options)
@@ -69,6 +71,15 @@ public sealed class RuvioDistributedCache : IDistributedCache
 
     // Without an outage mode or a circuit breaker the operations run unwrapped.
     private bool Guarded => _outage.Mode == RuvioOutageMode.FailOpen || _outage.CircuitBreaker is not null;
+
+    // Enabled is one field read, so a cache nobody measures pays no more than that per lookup.
+    private static void CountLookup(bool hit, string operation)
+    {
+        var counter = hit ? Hits : Misses;
+
+        if (counter.Enabled)
+            counter.Add(1, new KeyValuePair<string, object?>("operation", operation));
+    }
 
     private void CountOutage(string operation, Exception? cause) =>
         Outages.Add(1, new System.Diagnostics.TagList
@@ -155,13 +166,19 @@ public sealed class RuvioDistributedCache : IDistributedCache
         CheckReply(reply);
 
         if (reply.Kind == RespKind.Null)
+        {
+            CountLookup(false, "get");
+
             return default;
+        }
 
         if (reply.Kind != RespKind.Bulk)
             throw UnexpectedReply();
 
         byte[] stored = reply.Bytes!;
         int offset = await Decode(encoded, stored, token).ConfigureAwait(false);
+
+        CountLookup(offset >= 0, "get");
 
         return offset < 0 ? default : convert(stored, offset, state);
     }
@@ -454,9 +471,14 @@ public sealed class RuvioDistributedCache : IDistributedCache
             int offset = await Decode(encoded, fill.Value!, token).ConfigureAwait(false);
 
             if (offset >= 0)
+            {
+                CountLookup(true, "get_or_create");
+
                 return read(fill.Value!, offset);
+            }
         }
 
+        CountLookup(false, "get_or_create");
         T value = await factory(token).ConfigureAwait(false);
 
         if (fill.State == FillState.Fill)
