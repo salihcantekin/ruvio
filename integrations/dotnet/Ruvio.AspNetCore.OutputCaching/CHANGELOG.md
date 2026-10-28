@@ -4,6 +4,7 @@ Notable changes to the NuGet package `Ruvio.AspNetCore.OutputCaching`. New entri
 
 ## Unreleased
 
+- `ClientKey` option: names a connection registered with `AddKeyedRuvioClient`, so the store can use its own server or database. Null (the default) keeps the unkeyed `IRuvioClient`.
 - Metrics: `ruvio.output_cache.hit`, `ruvio.output_cache.miss` (tagged `reason`: `absent` or `tag_evicted`) and `ruvio.output_cache.tag_evict`. No keys or values are recorded; with no listener a lookup pays one field read.
 - `options.Outage`: `FailOpen` drops `EvictByTagAsync` calls instead of throwing when Ruvio is unreachable, and an optional circuit breaker stops requests from waiting on a Ruvio that is down. Default (`Throw`) unchanged. See the README.
 

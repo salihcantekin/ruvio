@@ -26,7 +26,9 @@ public static class RuvioOutputCacheExtensions
         services.RemoveAll<IOutputCacheStore>();
 
         services.AddSingleton<IOutputCacheStore>(provider => new RuvioOutputCacheStore(
-            () => provider.GetRequiredService<Client.IRuvioClient>(),
+            () => options.ClientKey is { } key
+                ? provider.GetRequiredKeyedService<Client.IRuvioClient>(key)
+                : provider.GetRequiredService<Client.IRuvioClient>(),
             provider.GetRequiredService<IOptions<RuvioOutputCacheOptions>>()));
 
         return services;

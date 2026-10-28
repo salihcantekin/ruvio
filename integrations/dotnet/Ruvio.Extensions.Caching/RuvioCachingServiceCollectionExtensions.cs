@@ -22,7 +22,16 @@ public static class RuvioCachingServiceCollectionExtensions
         configure?.Invoke(options);
         options.Validate();
         services.TryAddSingleton(Options.Create(options));
-        services.TryAddSingleton<IDistributedCache, RuvioDistributedCache>();
+
+        if (options.ClientKey is { } key)
+        {
+            services.TryAddSingleton<IDistributedCache>(provider => new RuvioDistributedCache(
+                provider.GetRequiredKeyedService<Ruvio.Client.IRuvioClient>(key), provider.GetRequiredService<IOptions<RuvioCacheOptions>>()));
+        }
+        else
+        {
+            services.TryAddSingleton<IDistributedCache, RuvioDistributedCache>();
+        }
 
         return services;
     }

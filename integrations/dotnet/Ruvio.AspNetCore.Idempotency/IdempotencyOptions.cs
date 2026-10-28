@@ -41,6 +41,12 @@ public sealed class IdempotencyOptions
     /// <summary>Required stable application namespace, shared by all replicas.</summary>
     public string Namespace { get; set; } = "";
 
+    /// <summary>
+    /// The key of a connection registered with <c>AddKeyedRuvioClient</c>. Null (the default) uses the unkeyed
+    /// <c>IRuvioClient</c>.
+    /// </summary>
+    public string? ClientKey { get; set; }
+
     /// <summary>Required trusted tenant/user scope. Never derive this solely from caller-supplied headers.</summary>
     public Func<HttpContext, string?>? ScopeSelector { get; set; }
 

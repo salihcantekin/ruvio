@@ -9,6 +9,12 @@ public sealed class RuvioCacheOptions
     /// <summary>Application namespace, prepended to the reserved <c>:ruvio:cache:v1:</c> marker.</summary>
     public string InstanceName { get; set; } = "default";
 
+    /// <summary>
+    /// The key of a connection registered with <c>AddKeyedRuvioClient</c>. Null (the default) uses the unkeyed
+    /// <c>IRuvioClient</c>.
+    /// </summary>
+    public string? ClientKey { get; set; }
+
     /// <summary>Maximum payload size, excluding the storage header. Defaults to one MiB.</summary>
     public int MaxValueBytes { get; set; } = 1024 * 1024;
 

@@ -8,6 +8,12 @@ public sealed class RuvioDataProtectionOptions
     /// <summary>The Ruvio key that holds the key ring.</summary>
     public string Key { get; set; } = "ruvio:data-protection:v1:keys";
 
+    /// <summary>
+    /// The key of a connection registered with <c>AddKeyedRuvioClient</c>. Null (the default) uses the unkeyed
+    /// <c>IRuvioClient</c> (its connection's default database); ignored by the connection-factory overload of <c>PersistKeysToRuvio</c>.
+    /// </summary>
+    public string? ClientKey { get; set; }
+
     /// <summary>The longest a key-ring read or write may take, from 1 ms to 5 minutes.</summary>
     public TimeSpan OperationTimeout { get; set; } = TimeSpan.FromSeconds(10);
 

@@ -216,6 +216,24 @@ removed record counts as state `aborted` on `ruvio.idempotency.states`, and each
 attempt as operation `abort` on `ruvio.idempotency.storage_calls`. Needs a
 server with `IDEM ... ABORT`.
 
+## A separate connection
+
+By default the middleware uses the unkeyed `IRuvioClient`. To give it a connection of its
+own (another server, database or set of options), register one with
+`AddKeyedRuvioClient` from `Ruvio.Client.AspNetCore` and name it in `ClientKey`:
+
+```csharp
+builder.Services.AddKeyedRuvioClient("idempotency", builder.Configuration.GetSection("RuvioDurable"));
+builder.Services.AddRuvioIdempotency(o =>
+{
+    o.ClientKey = "idempotency";
+    o.Namespace = "orders";
+    o.ScopeSelector = context => context.User.FindFirst("tenant")?.Value;
+});
+```
+
+The keyed client is looked up per request that the middleware handles, from the request's services.
+
 ## When Ruvio is unreachable
 
 By default a storage error reaches your exception handling (`Outage.Mode = Throw`). Choose what to do instead:

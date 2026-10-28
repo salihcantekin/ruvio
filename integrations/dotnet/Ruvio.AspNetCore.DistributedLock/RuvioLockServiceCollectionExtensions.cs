@@ -18,7 +18,9 @@ public static class RuvioLockServiceCollectionExtensions
         configure?.Invoke(options);
         options.Validate();
         services.TryAddSingleton(provider =>
-            new RuvioLockProvider(provider.GetRequiredService<IRuvioClient>(), options));
+            new RuvioLockProvider(options.ClientKey is { } key
+                ? provider.GetRequiredKeyedService<IRuvioClient>(key)
+                : provider.GetRequiredService<IRuvioClient>(), options));
 
         return services;
     }

@@ -4,6 +4,7 @@ Notable changes to the NuGet package `Ruvio.AspNetCore.Idempotency`. New entries
 
 ## Unreleased
 
+- `ClientKey` option: names a connection registered with `AddKeyedRuvioClient`, so the middleware can use its own server or database. Null (the default) keeps the unkeyed `IRuvioClient`.
 - `options.AbortOnException` (off by default): when the handler throws, the pending record is given up with `IDEM ... ABORT`, so a retry with the same key runs at once instead of getting 409 until the retention ends. Only a pending record of this request is removed. Turn it on only for handlers whose work did not take effect when they throw, or is safe to repeat. Needs a server with `IDEM ABORT`. See the README.
 - New options, with today's behavior as the default. `MismatchStatusCode` (409; set 422 for the IETF `Idempotency-Key` draft) for a key reused with a different request; `PendingWait` (zero) lets a request whose key is still running wait and replay the first result instead of answering 409; `KeyHeader`; `ReplayHeaders` (add `Location` for 201 responses; cookie, authentication, CORS and transport headers are refused). A 409 for a running request now carries `Retry-After: 1` and a replay carries `Idempotent-Replayed: true`. `[RuvioIdempotency]` and the new `WithRuvioIdempotency(e => ...)` take per-endpoint `RetentionSeconds`, `KeyHeader`, `KeyRequired` and `PendingWaitMilliseconds`. Unmarked endpoints are unchanged.
 - README: lists the existing `ruvio.idempotency.states` counter and its tags.

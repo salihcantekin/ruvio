@@ -158,6 +158,17 @@ Fixed names are tagged `resource`; templated names are not, to keep cardinality 
 builder.Services.AddOpenTelemetry().WithMetrics(m => m.AddMeter(RuvioLockTelemetry.Name));
 ```
 
+## A separate connection
+
+By default the lock provider uses the unkeyed `IRuvioClient`. To give it a connection of its
+own (another server, database or set of options), register one with
+`AddKeyedRuvioClient` from `Ruvio.Client.AspNetCore` and name it in `ClientKey`:
+
+```csharp
+services.AddKeyedRuvioClient("locks", "lock-host", 6379);
+services.AddRuvioDistributedLock(o => o.ClientKey = "locks");
+```
+
 ## When Ruvio is unreachable
 
 If the lock cannot be asked for, `Outage.Mode` decides. The default (`Throw`) keeps today's behavior: the `[RuvioLock]`
