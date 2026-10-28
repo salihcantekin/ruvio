@@ -40,10 +40,10 @@ mimalloc = { version = "0.1", default-features = false, optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value", "preserve_order"] }
 blake3 = "1"
-toml = "0.9"
+toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-sha1 = "0.10.6"
+sha1 = "0.11.0"
 mlua = { version = "0.12.1", default-features = false, features = ["lua51", "vendored"] }
 rustls = "0.23"
 tokio = { version = "1", default-features = false, features = ["net", "rt", "time", "io-util", "macros", "sync"] }
