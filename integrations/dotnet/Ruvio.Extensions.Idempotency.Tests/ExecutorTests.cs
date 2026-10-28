@@ -21,6 +21,8 @@ public class ExecutorTests
         public List<string> Keys { get; } = [];
         public List<TimeSpan> Retentions { get; } = [];
         public long? CompleteReply { get; set; }
+        public int Aborts { get; set; }
+        public bool AbortFails { get; set; }
 
         protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
         {
@@ -74,6 +76,29 @@ public class ExecutorTests
                     return new ValueTask<RespValue>(Resp.Int(1));
                 }
 
+                case nameof(IRuvioClient.AbortIdempotencyAsync):
+                {
+                    var key = (string)args![0]!;
+
+                    Aborts++;
+                    Assert.Equal(CancellationToken.None, (CancellationToken)args[3]!);
+
+                    if (AbortFails)
+                    {
+                        return ValueTask.FromException<bool>(new RuvioException("unreachable"));
+                    }
+
+                    bool removed = Records.TryGetValue(key, out var record) && record.Result is null
+                        && record.Fingerprint == (string)args[1]! && record.Owner == (string)args[2]!;
+
+                    if (removed)
+                    {
+                        Records.Remove(key);
+                    }
+
+                    return new ValueTask<bool>(removed);
+                }
+
                 default:
                     throw new NotSupportedException(targetMethod.Name);
             }
@@ -124,6 +149,40 @@ public class ExecutorTests
         Assert.False(conflict.HasValue);
         Assert.Null(conflict.Value);
         Assert.Equal(0, runs);
+    }
+
+    [Fact]
+    public async Task AbortOnExceptionFreesTheKeyForEveryOverloadAndKeepsTheException()
+    {
+        var (executor, fake) = New(new RuvioIdempotentExecutorOptions { AbortOnException = true });
+        int runs = 0;
+
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await executor.ExecuteOnceAsync("a-1", null, (Func<CancellationToken, Task>)(_ => throw new InvalidOperationException("boom"))));
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await executor.ExecuteOnceAsync("a-2", null, (Func<CancellationToken, Task<byte[]>>)(_ => throw new InvalidOperationException("boom"))));
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await executor.ExecuteOnceAsync<Receipt>("a-3", null, _ => throw new InvalidOperationException("boom"), TestJson.Default.Receipt));
+
+        Assert.Equal(3, fake.Aborts);
+        Assert.Equal(IdempotentOutcome.Executed, await executor.ExecuteOnceAsync("a-1", null, _ => { runs++; return Task.CompletedTask; }));
+        Assert.Equal(IdempotentOutcome.Executed, (await executor.ExecuteOnceAsync("a-2", null, _ => { runs++; return Task.FromResult(new byte[1]); })).Outcome);
+        Assert.Equal(2, runs);
+        Assert.Equal(3, fake.Aborts);
+    }
+
+    [Fact]
+    public async Task AFailedAbortKeepsTheWorksExceptionAndThePendingRecord()
+    {
+        var (executor, fake) = New(new RuvioIdempotentExecutorOptions { AbortOnException = true });
+
+        fake.AbortFails = true;
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await executor.ExecuteOnceAsync("f-1", null, (Func<CancellationToken, Task>)(_ => throw new InvalidOperationException("boom"))));
+
+        Assert.Equal("boom", thrown.Message);
+        Assert.Equal(1, fake.Aborts);
+        Assert.Equal(IdempotentOutcome.Pending, await executor.ExecuteOnceAsync("f-1", null, _ => Task.CompletedTask));
     }
 
     [Fact]

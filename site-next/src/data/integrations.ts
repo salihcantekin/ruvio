@@ -184,7 +184,7 @@ app.MapPost("/orders", HandleOrder)
   },
   "Ruvio.Extensions.Idempotency": {
     summary:
-      "Run work once per key outside HTTP: message consumers, background jobs, gRPC handlers. A redelivered message gets the stored result instead of running the work again; a running or failed attempt and other content under the same key are reported.",
+      "Run work once per key outside HTTP: message consumers, background jobs, gRPC handlers. A redelivered message gets the stored result instead of running the work again; a running or failed attempt and other content under the same key are reported, and a failed attempt can optionally free its key at once.",
     useCases: ["idempotency"],
     example: cs(`builder.Services.AddRuvioIdempotentExecutor(o => o.KeyPrefix = "payments:");
 

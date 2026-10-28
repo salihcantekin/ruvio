@@ -15,9 +15,9 @@ namespace Ruvio.Extensions.Idempotency;
 /// work. The executor neither owns nor disposes the client.
 /// </summary>
 /// <remarks>
-/// There is no way to abandon a record: when the work throws, the key stays pending until its retention ends, and
-/// calls in that time get <see cref="IdempotentOutcome.Pending"/>. This is at-most-once for the work, not
-/// exactly-once for its side effects outside Ruvio.
+/// By default, when the work throws, the key stays pending until its retention ends, and calls in that time get
+/// <see cref="IdempotentOutcome.Pending"/>; <see cref="RuvioIdempotentExecutorOptions.AbortOnException"/> frees it
+/// instead. This is at-most-once for the work, not exactly-once for its side effects outside Ruvio.
 /// </remarks>
 public sealed class RuvioIdempotentExecutor
 {
@@ -31,6 +31,7 @@ public sealed class RuvioIdempotentExecutor
     private readonly IRuvioClient client;
     private readonly string keyPrefix;
     private readonly long defaultRetention;
+    private readonly bool abortOnException;
 
     /// <summary>Creates an executor on <paramref name="client"/>.</summary>
     /// <param name="client">The client the records live on.</param>
@@ -43,6 +44,7 @@ public sealed class RuvioIdempotentExecutor
         this.client = client;
         keyPrefix = options.KeyPrefix;
         defaultRetention = RetentionMilliseconds(options.DefaultRetention, nameof(options.DefaultRetention));
+        abortOnException = options.AbortOnException;
     }
 
     /// <summary>Runs <paramref name="work"/> once for <paramref name="key"/> and stores its bytes for repeats.</summary>
@@ -70,7 +72,17 @@ public sealed class RuvioIdempotentExecutor
             return new IdempotentResult<byte[]>(call.Outcome, call.Stored);
         }
 
-        byte[] result = await work(cancellationToken).ConfigureAwait(false);
+        byte[] result;
+
+        try
+        {
+            result = await work(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception) when (abortOnException)
+        {
+            await AbortAsync(call).ConfigureAwait(false);
+            throw;
+        }
 
         ArgumentNullException.ThrowIfNull(result, "work result");
         bool stored = await CompleteAsync(call, result, cancellationToken).ConfigureAwait(false);
@@ -106,7 +118,18 @@ public sealed class RuvioIdempotentExecutor
             return new IdempotentResult<T>(call.Outcome, replayed);
         }
 
-        T result = await work(cancellationToken).ConfigureAwait(false);
+        T result;
+
+        try
+        {
+            result = await work(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception) when (abortOnException)
+        {
+            await AbortAsync(call).ConfigureAwait(false);
+            throw;
+        }
+
         bool stored = await CompleteAsync(call, JsonSerializer.SerializeToUtf8Bytes(result, typeInfo), cancellationToken).ConfigureAwait(false);
 
         return new IdempotentResult<T>(IdempotentOutcome.Executed, result, stored);
@@ -137,7 +160,16 @@ public sealed class RuvioIdempotentExecutor
             return call.Outcome;
         }
 
-        await work(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await work(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception) when (abortOnException)
+        {
+            await AbortAsync(call).ConfigureAwait(false);
+            throw;
+        }
+
         await CompleteAsync(call, [], cancellationToken).ConfigureAwait(false);
 
         return IdempotentOutcome.Executed;
@@ -208,6 +240,24 @@ public sealed class RuvioIdempotentExecutor
         }
 
         return reply.Integer == 1;
+    }
+
+    // Sent even when the caller's token caused the failure. A failed abort is swallowed: the work's exception is what
+    // the caller needs, and the record then stays pending until its retention ends, as without the option.
+    private async ValueTask AbortAsync(Call call)
+    {
+        try
+        {
+            if (await client.AbortIdempotencyAsync(call.Key, call.Fingerprint, call.Owner!, CancellationToken.None)
+                    .ConfigureAwait(false)
+                && Outcomes.Enabled)
+            {
+                Outcomes.Add(1, new TagList { { "outcome", "aborted" } });
+            }
+        }
+        catch (Exception)
+        {
+        }
     }
 
     private static void Count(IdempotentOutcome outcome)

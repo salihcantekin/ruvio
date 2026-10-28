@@ -16,6 +16,15 @@ public sealed class RuvioIdempotentExecutorOptions
     public TimeSpan DefaultRetention { get; set; } = TimeSpan.FromDays(1);
 
     /// <summary>
+    /// When the work throws (or is cancelled), give up the pending record with <c>IDEM ... ABORT</c> so the next call
+    /// with the same key runs at once instead of getting <see cref="IdempotentOutcome.Pending"/> until the retention
+    /// ends. The exception still reaches the caller. Off by default: turn it on only for work that throws before it
+    /// takes effect, or that is safe to repeat, because the next call runs it again. Needs a server with
+    /// <c>IDEM ... ABORT</c>; a failed abort leaves the record pending.
+    /// </summary>
+    public bool AbortOnException { get; set; }
+
+    /// <summary>
     /// The key of a connection registered with <c>AddKeyedRuvioClient</c>, used by <c>AddRuvioIdempotentExecutor</c>.
     /// Null (the default) uses the unkeyed <c>IRuvioClient</c>.
     /// </summary>

@@ -72,14 +72,32 @@ package, because ordinary writes (`SET`, `DEL`, expiry changes) to those keys br
 
 ## Failures: at most once, not exactly once
 
-- **The work throws.** The exception reaches you and the record stays pending until its retention ends;
-  `IDEM` has no way to abandon a record. Calls in that time get `Pending` and do not run the work. Choose the
-  retention with this in mind: a short one lets a failed message be processed again sooner, a long one catches
-  repeats for longer.
+- **The work throws.** The exception reaches you and, by default, the record stays pending until its retention
+  ends. Calls in that time get `Pending` and do not run the work. Choose the retention with this in mind: a short
+  one lets a failed message be processed again sooner, a long one catches repeats for longer. To free the key at
+  once instead, see below.
 - **The work outlives the retention.** The record expired while it ran, so the result is not stored:
   `Executed` comes back with `Stored = false`, and another call may already have run the work too.
 - **The process dies mid-work, or Ruvio is unreachable.** Like a throw: pending until the retention ends. A
   storage error after the work ran is raised and never retried, because the result may have been stored.
+
+### Freeing the key when the work throws
+
+```csharp
+builder.Services.AddRuvioIdempotentExecutor(o =>
+{
+    o.KeyPrefix = "payments:";
+    o.AbortOnException = true;
+});
+```
+
+With `AbortOnException` (off by default), a work function that throws or is cancelled makes the executor send
+`IDEM key ABORT fingerprint owner` before the exception reaches you, so the next call with that key runs the
+work at once. The server removes the record only while it is still pending with this call's owner, so a result
+stored by another call is never removed. Turn it on only for work that throws before it takes effect, or that is
+safe to run again: the next call runs it again. If the abort itself fails (Ruvio unreachable) the work's exception
+still reaches you and the record stays pending until its retention ends. Needs a server with `IDEM ... ABORT`.
+Nothing is sent when the work succeeds or when the option is off.
 
 Side effects outside Ruvio (a payment, an email) still happen once per run of the work. Pass the key to the
 external system as its own idempotency key where it has one.
@@ -87,7 +105,7 @@ external system as its own idempotency key where it has one.
 ## Telemetry
 
 Meter `Ruvio.Extensions.Idempotency`, counter `ruvio.idempotency.outcomes` tagged `outcome`
-(`executed`, `replayed`, `pending`, `conflict`). No keys or results are recorded; with no listener a call pays
+(`executed`, `replayed`, `pending`, `conflict`, and `aborted` for a record freed by `AbortOnException`). No keys or results are recorded; with no listener a call pays
 one field read.
 
 ## Tests

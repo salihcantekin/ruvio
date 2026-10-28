@@ -167,7 +167,8 @@ with no listener attached an instrument costs one field read.
   `ruvio.output_cache.storage_calls`, `ruvio.output_cache.storage_commands` and `ruvio.output_cache.storage_duration`.
 - `Ruvio.AspNetCore.Idempotency`: `ruvio.idempotency.states` (tagged `state`, including `aborted` with `AbortOnException`), `ruvio.idempotency.outage`, and the storage instruments `ruvio.idempotency.storage_calls`,
   `ruvio.idempotency.storage_commands` and `ruvio.idempotency.storage_duration`.
-- `Ruvio.Extensions.Idempotency`: `ruvio.idempotency.outcomes` (one per `ExecuteOnceAsync`, tagged `outcome`).
+- `Ruvio.Extensions.Idempotency`: `ruvio.idempotency.outcomes` (one per `ExecuteOnceAsync`, tagged `outcome`; plus one `aborted` for each record
+  freed by `AbortOnException`).
 - `Ruvio.AspNetCore.DistributedLock`: `ruvio.lock.acquired`, `ruvio.lock.rejected`, `ruvio.lock.lost`,
   `ruvio.lock.errors`, `ruvio.lock.outage` and the histogram `ruvio.lock.wait_duration` (ms).
 - `Ruvio.AspNetCore.RateLimiting`: `ruvio.rate_limit.accepted`, `ruvio.rate_limit.rejected`,

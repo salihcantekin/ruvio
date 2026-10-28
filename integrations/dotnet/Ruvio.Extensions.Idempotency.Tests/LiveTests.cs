@@ -59,4 +59,37 @@ public class LiveTests
         Assert.Equal(IdempotentOutcome.Replayed, stored.Outcome);
         Assert.Equal(new Receipt("r-1", 5), stored.Value);
     }
+
+    [Fact]
+    public async Task AbortOnExceptionFreesTheKeyOnARealServer()
+    {
+        string? address = Environment.GetEnvironmentVariable("RUVIO_TEST_ADDR");
+
+        if (string.IsNullOrWhiteSpace(address))
+        {
+            return;
+        }
+
+        var uri = new Uri("tcp://" + address);
+        await using RuvioConnection connection = await RuvioConnection.ConnectAsync(uri.Host, uri.Port);
+        IRuvioClient client = await connection.GetDefaultDatabaseAsync();
+        string prefix = "test:idem:" + Guid.NewGuid().ToString("N") + ":";
+
+        foreach (bool abort in new[] { false, true })
+        {
+            var executor = new RuvioIdempotentExecutor(client, new RuvioIdempotentExecutorOptions
+            {
+                KeyPrefix = prefix + abort + ":",
+                DefaultRetention = TimeSpan.FromSeconds(30),
+                AbortOnException = abort,
+            });
+
+            await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+                await executor.ExecuteOnceAsync("job", "sha:a", (Func<CancellationToken, Task>)(_ => throw new InvalidOperationException("transient"))));
+
+            IdempotentOutcome retry = await executor.ExecuteOnceAsync("job", "sha:a", _ => Task.CompletedTask);
+
+            Assert.Equal(abort ? IdempotentOutcome.Executed : IdempotentOutcome.Pending, retry);
+        }
+    }
 }
