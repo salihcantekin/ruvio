@@ -51,6 +51,71 @@ await RunReportAsync(held.LockLost);    // stops if the lock is lost mid-run
 - `RuvioLockOptions.TimeProvider` drives the renewal timer and the acquisition wait. Tests can pass a
   `FakeTimeProvider` to run a lease through its life without waiting; the lease itself still expires on the server's clock.
 
+## Fencing tokens
+
+A lock alone cannot stop an owner that paused (a long GC, a frozen VM) past its lease from writing after the
+next owner took over. With `Fenced` on, each lock carries a number that only grows for that resource, and the
+resource you write can refuse a write that carries a smaller number than one it already saw.
+
+```csharp
+services.AddRuvioDistributedLock(options => options.Fenced = true);
+
+await using IRuvioLock held = await locks.AcquireAsync("ledger", TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(5));
+
+// UPDATE ledger SET ..., fence = @token WHERE id = @id AND fence < @token
+await SaveAsync(held.FencingToken!.Value, held.LockLost);
+```
+
+- The lock then uses the server's `LEASE` (renewed with `RENEW`, freed with `RELEASE`) instead of `SET NX`.
+  The token survives expiry, release, a restart and a failover: a later owner always gets a larger one.
+- `[RuvioLock]` endpoints read it with `HttpContext.GetRuvioLock()?.FencingToken`.
+- Without `Fenced`, `FencingToken` is null. Other `IRuvioLock` implementations get null from the interface's default.
+- **The server keeps a lease's key after it is released or expires** (that is how the token keeps growing), so
+  each resource name used with fencing stays as one small key. Use it for a bounded set of names (jobs, ledgers,
+  tenants), not for a template such as `order:{id}` over every order, unless the keys are deleted later.
+- **Turn it on for every instance at once.** A resource a plain lock holds is taken for a fenced one, and the
+  other way round, so the two never run together. But a plain lock can never take a resource a fenced lock has
+  used, because the kept key is there: turning fencing off again means deleting those keys while nothing runs.
+
+## One instance at a time: `AddRuvioSingleton`
+
+Background work that must run on exactly one instance (a queue poller, a scheduler, a cache warmer):
+
+```csharp
+services.AddRuvioDistributedLock();
+services.AddRuvioSingleton<OutboxPublisher>("outbox-publisher");
+
+public sealed class OutboxPublisher(AppDb db) : IRuvioSingletonWorker
+{
+    public async Task ExecuteAsync(IRuvioLock leadership, CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            await PublishPendingAsync(db, stoppingToken);
+            await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
+        }
+    }
+}
+```
+
+Every instance asks for the lock every `RetryInterval` (5 s by default, one command per instance). The one
+that gets it resolves the worker in a new scope and runs it; the lease (`Lease`, 30 s by default) is renewed
+while it runs. `stoppingToken` is cancelled when the host stops or the lock is lost. When the work returns,
+throws (the error is logged) or the instance stops, the lock is released and another instance takes over.
+A crashed instance holds the work up for at most one lease. Needs `AutoRenew` (the default); the host refuses
+to start without it. With `Fenced` on, `leadership.FencingToken` is set.
+
+## Once per period: `RunOncePerPeriodAsync`
+
+```csharp
+// Every instance runs this at startup or on its own timer; only the first in each hour sends the report.
+bool ran = await locks.RunOncePerPeriodAsync("hourly-report", TimeSpan.FromHours(1), SendReportAsync, ct);
+```
+
+One `ONCE` command: the first caller sets a marker that lasts `period` and runs the work; the rest get false.
+The period starts at that first call, not on the hour. The marker is set before the work runs, so a failed run
+is not repeated in the same period; use `AddRuvioSingleton` or a lock when a failure must be retried.
+
 ## ASP.NET Core: `[RuvioLock]` for endpoints
 
 **Why.** Some endpoints must never run twice at once for the same thing: charging an order,
@@ -117,8 +182,7 @@ See [When Ruvio is unreachable](../README.md#when-ruvio-is-unreachable) for the 
 ## Limits
 
 - One lock lives on one server. If a failover loses the key, two owners can overlap for up to a
-  lease. Work that must never overlap should also check a version or fencing value on the resource
-  it writes. This package does not issue fencing tokens: handing out an increasing number and
-  taking the lock are two commands, so they cannot be made atomic here.
+  lease. Work that must never overlap should also check a fencing token (see "Fencing tokens") or a
+  version on the resource it writes.
 - Locks are not reentrant. Acquiring a held resource again from the same process waits like any caller.
 - Lease times are wall-clock server TTLs; keep the lease well above the longest pause your process can have.

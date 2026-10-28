@@ -157,6 +157,82 @@ public class HttpPipelineTests
         }
     }
 
+    [LiveFact]
+    public async Task Real_http_waits_for_a_running_request_and_replays_its_201_with_location()
+    {
+        var endpoint = Environment.GetEnvironmentVariable("RUVIO_TEST_ADDR")!.Split(':');
+
+        await using var connection = await RuvioConnection.ConnectAsync(endpoint[0], int.Parse(endpoint[1]));
+        IRuvioClient client = await connection.GetDefaultDatabaseAsync();
+
+        var builder = WebApplication.CreateBuilder();
+
+        builder.WebHost.UseUrls("http://127.0.0.1:0");
+        builder.Logging.ClearProviders();
+        builder.Services.AddSingleton<IRuvioClient>(client);
+        builder.Services.AddRuvioIdempotency(o =>
+        {
+            o.Namespace = "native-wait-" + Guid.NewGuid().ToString("N");
+            o.ScopeSelector = _ => "tenant";
+            o.Retention = TimeSpan.FromSeconds(10);
+            o.MismatchStatusCode = StatusCodes.Status422UnprocessableEntity;
+            o.ReplayHeaders.Add("Location");
+        });
+
+        await using var app = builder.Build();
+        app.Use(async (context, next) =>
+        {
+            context.User = new ClaimsPrincipal(new ClaimsIdentity([new Claim("sub", "user")], "test"));
+            await next();
+        });
+
+        app.UseRouting();
+        app.UseRuvioIdempotency();
+        int calls = 0;
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        app.MapPost("/orders", async () =>
+        {
+            Interlocked.Increment(ref calls);
+            entered.TrySetResult();
+            await release.Task;
+
+            return Results.Created("/orders/7", new { id = 7 });
+        }).WithRuvioIdempotency(a => a.PendingWaitMilliseconds = 5000);
+
+        await app.StartAsync();
+        try
+        {
+            string address = app.Services.GetRequiredService<IServer>().Features
+                .Get<IServerAddressesFeature>()!.Addresses.Single();
+            using var http = new HttpClient { BaseAddress = new Uri(address), Timeout = TimeSpan.FromSeconds(10) };
+
+            http.DefaultRequestHeaders.Add("Idempotency-Key", "double-click");
+            Task<HttpResponseMessage> firstCall = http.PostAsync("/orders", new StringContent("{}"));
+
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Task<HttpResponseMessage> secondCall = http.PostAsync("/orders", new StringContent("{}"));
+
+            await Task.Delay(100);
+            release.SetResult();
+            using var first = await firstCall;
+            using var second = await secondCall;
+
+            Assert.Equal(HttpStatusCode.Created, first.StatusCode);
+            Assert.Equal(HttpStatusCode.Created, second.StatusCode);
+            Assert.Equal("/orders/7", second.Headers.Location?.ToString());
+            Assert.Equal("true", second.Headers.GetValues("Idempotent-Replayed").Single());
+            Assert.Equal(await first.Content.ReadAsStringAsync(), await second.Content.ReadAsStringAsync());
+            using var changed = await http.PostAsync("/orders", new StringContent("{\"changed\":true}"));
+
+            Assert.Equal(HttpStatusCode.UnprocessableEntity, changed.StatusCode);
+            Assert.Equal(1, calls);
+        }
+
+        finally { await app.StopAsync(); }
+    }
+
     [Fact]
     public async Task RealHttpReplaysJsonAndNeverSendsPartialHandlerFailure()
     {

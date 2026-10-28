@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Globalization;
 using System.Threading.Channels;
@@ -549,6 +550,41 @@ public sealed partial class RuvioClient : IRuvioClient
         RespCommand command,
         CancellationToken cancellationToken)
     {
+        // With no tracing or metrics listener this is one check; the command span lives in its own method.
+        return RuvioSocket.CommandTelemetryEnabled
+            ? ExecuteObservedAsync(command, cancellationToken)
+            : ExecuteCommandCoreAsync(command, cancellationToken);
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    private async ValueTask<RespValue> ExecuteObservedAsync(
+        RespCommand command,
+        CancellationToken cancellationToken)
+    {
+        long started = Stopwatch.GetTimestamp();
+        using Activity? activity = RuvioSocket.StartCommand(command.Name, _database);
+        Exception? failure = null;
+
+        try
+        {
+            return await ExecuteCommandCoreAsync(command, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+
+            throw;
+        }
+        finally
+        {
+            RuvioSocket.EndCommand(activity, command.Name, started, failure);
+        }
+    }
+
+    private ValueTask<RespValue> ExecuteCommandCoreAsync(
+        RespCommand command,
+        CancellationToken cancellationToken)
+    {
         // Hot path: one pooled request, one pooled await. Everything unusual takes the full path.
         RuvioSocket socket = _seed;
 
@@ -594,10 +630,45 @@ public sealed partial class RuvioClient : IRuvioClient
     }
 
     /// <inheritdoc />
-    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-    public async ValueTask<RespValue> ExecuteBinaryAsync(
+    public ValueTask<RespValue> ExecuteBinaryAsync(
         IReadOnlyList<ReadOnlyMemory<byte>> arguments,
         CancellationToken cancellationToken = default)
+    {
+        return RuvioSocket.CommandTelemetryEnabled
+            ? ExecuteBinaryObservedAsync(arguments, cancellationToken)
+            : ExecuteBinaryCoreAsync(arguments, cancellationToken);
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    private async ValueTask<RespValue> ExecuteBinaryObservedAsync(
+        IReadOnlyList<ReadOnlyMemory<byte>> arguments,
+        CancellationToken cancellationToken)
+    {
+        string? name = arguments is { Count: > 0 } ? System.Text.Encoding.ASCII.GetString(arguments[0].Span) : null;
+        long started = Stopwatch.GetTimestamp();
+        using Activity? activity = RuvioSocket.StartCommand(name, _database);
+        Exception? failure = null;
+
+        try
+        {
+            return await ExecuteBinaryCoreAsync(arguments, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+
+            throw;
+        }
+        finally
+        {
+            RuvioSocket.EndCommand(activity, name, started, failure);
+        }
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    private async ValueTask<RespValue> ExecuteBinaryCoreAsync(
+        IReadOnlyList<ReadOnlyMemory<byte>> arguments,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(arguments);
 

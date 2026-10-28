@@ -94,30 +94,72 @@ and unguessable; use this only when that shared boundary is appropriate.
   handler or after idempotency. Outer middleware may still add fresh security
   headers/cookies, but these are never loaded from the stored result.
 - Only POST, PUT, PATCH, DELETE are supported (other marked methods: 405).
-  Each marked request requires one `Idempotency-Key`, 1–128 printable non-space
-  ASCII characters (invalid/missing: 400). Keep keys random and unguessable.
+  Each marked request requires one `Idempotency-Key` (or the header named by
+  `KeyHeader`), 1–128 printable non-space ASCII characters (invalid/missing: 400).
+  Keep keys random and unguessable.
 - SHA-256 length-delimited hashes cover namespace, authenticated subject, scope,
   and key for storage addressing, and method, path base, path, raw query,
   content type, raw body, namespace/subject/scope for the request fingerprint.
   Storage keys contain only a versioned prefix and one hex hash tag; no raw
   credentials, tenant, key, URL, or payload. Hashing is not encryption.
-  A key reused in the same scope for different request content returns 409.
+  A key reused in the same scope for different request content returns 409, or
+  `MismatchStatusCode` (set 422 to follow the IETF `Idempotency-Key` header draft).
 - Responses must depend only on this fingerprinted input. Headers such as Accept
   and API-version headers are **not** fingerprinted: normalize them upstream or
   place a validated variant in the scope. Streaming, upgrades, trailers, changing
   response body features and indefinite handlers are unsupported.
-- Matching completed requests replay status, body, and only `Content-Type`,
-  `Content-Language`, `ETag`, `Last-Modified`. `Content-Length` is recomputed.
-  Cookies, authorization, cache/security headers and redirects' `Location` are
-  **not** stored. Avoid endpoints whose result requires those headers.
+- Matching completed requests replay status, body, and only the headers in
+  `ReplayHeaders`: by default `Content-Type`, `Content-Language`, `ETag`,
+  `Last-Modified`. `Content-Length` is recomputed, and a replay carries
+  `Idempotent-Replayed: true`. Add `Location` for endpoints that answer
+  `201 Created`. Cookies, authentication, CORS and transport-security headers
+  are refused at startup and never stored. A stored header outside the list is
+  treated as a corrupt record (an error, never replayed), so removing a header
+  from the list fails the records stored with it until they expire.
   Normal returned error responses (including 4xx/5xx) are stored too.
   Thrown handler/storage errors and cancellation propagate, never become a
   success response, and are never automatically retried.
 
+## Waiting for a running request and per-endpoint settings
+
+A request whose key is still running answers `409` with `Retry-After: 1`. With
+`PendingWait` (default zero, at most 30 s) it waits instead: it asks Ruvio again
+with a growing delay of at most 25 ms and, when the first request completes,
+replays its result, so a double click or a client retry gets the real answer. If
+the first request does not finish in time the answer is the same `409`. The
+wait ends when the caller disconnects. A waiting request keeps its buffered body
+and costs one `IDEM BEGIN` per poll, which only reads.
+
+```csharp
+builder.Services.AddRuvioIdempotency(options =>
+{
+    options.Namespace = "orders-production-v1";
+    options.ScopeSelector = context => context.User.FindFirst("tenant_id")?.Value;
+    options.MismatchStatusCode = StatusCodes.Status422UnprocessableEntity;
+    options.PendingWait = TimeSpan.FromSeconds(2);
+    options.ReplayHeaders.Add("Location");
+});
+
+// Settings of its own for one endpoint; the rest come from the options above.
+app.MapPost("/payments", Pay).WithRuvioIdempotency(e =>
+{
+    e.RetentionSeconds = 7 * 24 * 3600;
+    e.KeyHeader = "X-Request-Id";
+});
+app.MapPost("/emails", Send).WithRuvioIdempotency(e => e.KeyRequired = false);
+// Controllers: [RuvioIdempotency(RetentionSeconds = 300, PendingWaitMilliseconds = 2000)]
+```
+
+`KeyRequired = false` lets a request without the key header run unchecked, before
+any body is read; a request that sends the key is checked as usual. Endpoint
+values are validated on each request (a wrong one throws), since endpoint
+metadata is not seen at startup.
+
 ## State and failure model (not downstream exactly-once)
 
 Native `IDEM key BEGIN ...` creates a **pending** record with a random ownership
-token and one retention TTL. An existing pending request returns 409, including
+token and one retention TTL. An existing pending request returns 409 (after
+`PendingWait`, when set), including
 after crashes, cancellation, response overflow or uncertain downstream outcomes.
 It is not renewed, stolen or retried by this package, and it is deleted only by
 the opt-in `AbortOnException` below. Completion checks
@@ -237,6 +279,12 @@ See [When Ruvio is unreachable](../README.md#when-ruvio-is-unreachable) for the 
 - Instrumentation is off by default. `EnableInstrumentation` enables the
   `Ruvio.AspNetCore.Idempotency` ActivitySource with an `idempotency` activity and
   only the bounded `idempotency.state` tag. No request/identity/key/body data.
+- Metrics are always published on the `Ruvio.AspNetCore.Idempotency` Meter (an exporter
+  only sees them when the host adds that Meter): `ruvio.idempotency.states`, tagged
+  `state` = `acquired` (the handler runs), `completed` (a stored result is replayed),
+  `pending` (the first request still runs: 409) or `conflict` (the key was used for a
+  different request: 409); `ruvio.idempotency.storage_calls`, `storage_commands`,
+  `storage_duration` (tagged `operation` and `outcome`); and `ruvio.idempotency.outage`.
 
 ## Tests
 

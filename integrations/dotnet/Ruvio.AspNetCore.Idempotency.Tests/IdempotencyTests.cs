@@ -961,6 +961,7 @@ public class StubClient : DispatchProxy
     internal bool LoseOwnership;
     internal Func<Task>? BeforeCompletion;
     internal int Acquisitions;
+    internal long LastTtl;
 
     internal static (IRuvioClient Client, StubClient Stub) Create()
     {
@@ -988,6 +989,7 @@ public class StubClient : DispatchProxy
             if (operation == nameof(IRuvioClient.BeginIdempotencyAsync))
             {
                 Acquisitions++;
+                LastTtl = (long)args[3]!;
 
                 if (!Records.TryGetValue(key, out var entry))
                 {

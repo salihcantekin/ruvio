@@ -111,7 +111,10 @@ pub(super) fn fill_set<'a, C: Clock, I: StorageIndex, S: MutationSink>(
 
     shard.set_bytes(&key, &value);
     shard.expire_at(&key, expires_at);
-    shard.fill_complete(&key, swr_ms.map(|_| now.get().saturating_add(ttl_ms)));
+    shard.fill_complete(
+        &key,
+        swr_ms.map(|_| (now.get().saturating_add(ttl_ms), expires_at.get())),
+    );
 
     Ok(Response::Integer(1))
 }

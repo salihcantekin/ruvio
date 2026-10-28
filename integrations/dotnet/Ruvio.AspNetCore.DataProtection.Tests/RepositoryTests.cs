@@ -89,6 +89,23 @@ public class RepositoryTests
     }
 
     [LiveFact]
+    public async Task Require_durable_storage_follows_the_live_servers_profile()
+    {
+        await using var scope = await Scope.Open();
+        string info = await scope.Client.GetInfoAsync("server");
+        string? profile = RuvioXmlRepository.DurabilityProfile(info);
+        var strict = new RuvioXmlRepository(scope.Client,
+            Options.Create(new RuvioDataProtectionOptions { Key = scope.Key, RequireDurableStorage = true }));
+
+        Assert.NotNull(profile);
+
+        if (profile == "memory")
+            Assert.Throws<RuvioException>(() => strict.GetAllElements());
+        else
+            Assert.Empty(strict.GetAllElements());
+    }
+
+    [LiveFact]
     public async Task Append_is_immutable_deduplicates_content_and_preserves_revocations_without_ttl()
     {
         await using var scope = await Scope.Open();

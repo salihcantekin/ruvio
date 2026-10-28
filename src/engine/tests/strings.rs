@@ -760,6 +760,71 @@ fn fillget_hands_one_client_the_token_and_fillset_is_fenced_by_it() {
     assert_eq!(fill_get(&mut shard), Some(b"HIT".to_vec()));
 }
 
+#[test]
+fn a_full_fill_table_keeps_the_soft_expiry_of_a_value_that_is_still_stored() {
+    let clock = crate::time::TestClock::new(1_000);
+    let mut shard = KvShard::with_clock(clock.clone());
+    let get = |shard: &mut KvShard<crate::time::TestClock>, key: &[u8], fill_ms: u64| {
+        let response = execute(
+            shard,
+            Command::FillGet {
+                key: owned(key),
+                fill_ms,
+                wait_ms: None,
+            },
+        );
+
+        String::from_utf8(fill_status(&response).unwrap()).unwrap()
+    };
+
+    assert_eq!(get(&mut shard, b"k", 5_000), "FILL");
+    assert_eq!(
+        execute(
+            &mut shard,
+            Command::FillSet {
+                key: owned(b"k"),
+                value: owned(b"v"),
+                ttl_ms: 100,
+                token: 1,
+                swr_ms: Some(10_000),
+            },
+        ),
+        Response::Integer(1)
+    );
+
+    // Fill the table with short fill tokens, then let them lapse and the value turn stale.
+    for index in 1..65_536u32 {
+        assert_eq!(get(&mut shard, &index.to_be_bytes(), 10), "FILL");
+    }
+
+    clock.set(2_000);
+    // A new key needs room: the purge drops the lapsed tokens but keeps the stale value's mark.
+    assert_eq!(get(&mut shard, b"new", 1_000_000), "FILL");
+    assert_eq!(get(&mut shard, b"k", 5_000), "STALE");
+
+    // Once the value's own deadline has passed, its mark is the only one the purge can drop.
+    clock.set(12_000);
+    for index in 1..65_535u32 {
+        assert_eq!(
+            get(&mut shard, &(index + 100_000).to_be_bytes(), 1_000_000),
+            "FILL"
+        );
+    }
+
+    assert_eq!(get(&mut shard, b"newer", 5_000), "FILL");
+    assert!(matches!(
+        execute(
+            &mut shard,
+            Command::FillGet {
+                key: owned(b"newest"),
+                fill_ms: 5_000,
+                wait_ms: None,
+            },
+        ),
+        Response::Error(_)
+    ));
+}
+
 fn fill_get_waiting(shard: &mut KvShard) -> String {
     let response = execute(
         shard,
