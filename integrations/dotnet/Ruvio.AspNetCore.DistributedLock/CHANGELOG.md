@@ -4,6 +4,7 @@ Notable changes to the NuGet package `Ruvio.AspNetCore.DistributedLock`. New ent
 
 ## Unreleased
 
+- Docs: the README lists what this package checks while the host starts, and shows how to watch the circuit breaker (logs, `ruvio_client_circuit_transitions`, a `StateChanged` handler).
 - With `Outage.CircuitBreaker` set, the circuit's changes are logged through `ILogger` (category `Ruvio.AspNetCore.DistributedLock`): Warning when it opens, with the break duration; Information for the trial call and when it closes. Nothing is logged without a breaker.
 - Startup checks: host start fails when the client (or the keyed client for `ClientKey`) is not registered, when an endpoint's `[RuvioLock]` has a reject status outside 4xx/5xx or a negative wait, and `UseRuvioLock` throws without `AddRuvioDistributedLock`. `WithDistributedLock` checks its lease, wait and status when the endpoint is mapped. No connection is opened for the checks; requests are unchanged.
 - `ClientKey` option: names a connection registered with `AddKeyedRuvioClient`, so the lock provider can use its own server or database. Null (the default) keeps the unkeyed `IRuvioClient`.

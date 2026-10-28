@@ -108,6 +108,14 @@ Meter `Ruvio.Extensions.Idempotency`, counter `ruvio.idempotency.outcomes` tagge
 (`executed`, `replayed`, `pending`, `conflict`, and `aborted` for a record freed by `AbortOnException`). No keys or results are recorded; with no listener a call pays
 one field read.
 
+## Startup checks
+
+A configuration mistake stops the host while it starts, before the server takes a request, with the fix named in the error. This package checks:
+
+- the client is registered: `AddRuvioClient(...)`, or `AddKeyedRuvioClient(key, ...)` when `ClientKey` is set. Only the registration is checked and no connection is opened, so a Ruvio that is down at start does not stop it. Skipped when an executor was registered first, which then stays.
+
+See [Startup checks](../README.md#startup-checks) for how the checks run.
+
 ## Tests
 
 ```bash

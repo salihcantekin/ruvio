@@ -167,6 +167,16 @@ services.AddKeyedRuvioClient("locks", "lock-host", 6379);
 services.AddRuvioDistributedLock(o => o.ClientKey = "locks");
 ```
 
+## Startup checks
+
+A configuration mistake stops the host while it starts, before the server takes a request, with the fix named in the error. This package checks:
+
+- the client is registered: `AddRuvioClient(...)`, or `AddKeyedRuvioClient(key, ...)` when `ClientKey` is set. Only the registration is checked, no connection is opened, so a Ruvio that is down at start still follows the `Outage` settings; skipped when a `RuvioLockProvider` was registered first, which then stays;
+- `UseRuvioLock()` throws at once when `AddRuvioDistributedLock` was not called;
+- every `[RuvioLock]` endpoint is checked once the pipeline is built: a reject status outside 4xx/5xx or a negative wait stops start, all bad endpoints in one error. `WithDistributedLock` checks its lease, wait and status when the endpoint is mapped.
+
+See [Startup checks](../README.md#startup-checks) for how the checks run.
+
 ## When Ruvio is unreachable
 
 If the lock cannot be asked for, `Outage.Mode` decides. The default (`Throw`) keeps today's behavior: the `[RuvioLock]`
@@ -187,6 +197,27 @@ outage) answers `503`, as before; `FailOpen` bypasses on real outages only. `IRu
 A lock lost while the request runs is still reported through `LockLost`.
 
 See [When Ruvio is unreachable](../README.md#when-ruvio-is-unreachable) for the modes and the circuit breaker.
+
+### Watching the circuit
+
+Each change of the circuit is logged through `ILogger` under the category `Ruvio.AspNetCore.DistributedLock`: a Warning when it opens (with the break
+duration), Information for the trial call and when it closes. The client counts the changes in
+`ruvio_client_circuit_transitions`. To react in your own code, for a health check or an alert, subscribe to the breaker
+after setting it:
+
+```csharp
+builder.Services.AddRuvioDistributedLock(options =>
+{
+    options.Outage.Mode = RuvioOutageMode.FailOpen;
+    options.Outage.CircuitBreaker = new RuvioCircuitBreakerOptions();
+    // Subscribe after setting CircuitBreaker: setting it again replaces the breaker.
+    options.Outage.Breaker!.StateChanged += (_, change) =>
+        RuvioHealth.Down = change.Current == RuvioCircuitState.Open;   // your own flag, read by a health check
+});
+```
+
+The handler runs after the state changed, outside the breaker's lock; an exception it throws is caught and does not reach
+the call.
 
 ## Limits
 

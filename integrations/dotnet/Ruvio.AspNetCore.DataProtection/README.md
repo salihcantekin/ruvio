@@ -176,6 +176,14 @@ application. Session remains ASP.NET Core's non-locking, last-writer-wins model;
 the counter above is illustrative, not a concurrent atomic counter. Use native
 Ruvio coordination commands for that requirement.
 
+## Startup checks
+
+A configuration mistake stops the host while it starts, before the server takes a request, with the fix named in the error. This package checks:
+
+- the connection is registered: `AddRuvioClient(...)`, or `AddKeyedRuvioClient(key, ...)` when `ClientKey` is set (Data Protection uses `IRuvioConnection`). Data Protection loads its key ring while the host starts, so a missing connection fails there with the same message naming the call to add.
+
+See [Startup checks](../README.md#startup-checks) for how the checks run.
+
 ## Development
 
 ```bash
