@@ -82,7 +82,7 @@ function load(id: Platform["id"], file: string, name: string, short: string, par
 }
 
 export const platforms: Platform[] = [
-  load("mac", "benchmark/records/mac-2026-10-14.json", "Mac (ARM)", "Mac"),
+  load("mac", "benchmark/records/mac-2026-10-28.json", "Mac (ARM)", "Mac"),
   load("azure", "benchmark/records/x86-azure-2026-10-11.json", "Azure VM (x86)", "Azure", "features"),
 ];
 export const primary = platforms[0];
