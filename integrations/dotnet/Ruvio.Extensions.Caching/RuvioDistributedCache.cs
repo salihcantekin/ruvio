@@ -729,6 +729,8 @@ public sealed class RuvioDistributedCache : IDistributedCache
     }
 
     private const int TagBytes = 96;
+    private const int DigestBytes = 64;
+    private static ReadOnlySpan<byte> LowerHex => "0123456789abcdef"u8;
 
     private static Header Parse(byte[] stored)
     {
@@ -902,7 +904,7 @@ public sealed class RuvioDistributedCache : IDistributedCache
     {
         ArgumentException.ThrowIfNullOrEmpty(tag);
         token.ThrowIfCancellationRequested();
-        RespValue reply = await Execute([Delete, RuvioCacheOptions.Utf8.GetBytes(TagKey(Digest(tag)))], token).ConfigureAwait(false);
+        RespValue reply = await Execute([Delete, TagKeyBytes(tag)], token).ConfigureAwait(false);
 
         if (reply.Kind != RespKind.Integer || reply.Integer is < 0 or > 1)
             throw UnexpectedReply();
@@ -916,13 +918,12 @@ public sealed class RuvioDistributedCache : IDistributedCache
     private async ValueTask<byte[]> TagBlock(IReadOnlyList<string> tags, long lifetime, CancellationToken token)
     {
         var keys = new string[tags.Count];
-        var digests = new string[tags.Count];
         var lookup = new IReadOnlyList<string>[tags.Count * 2];
+        byte[] block = new byte[tags.Count * TagBytes];
 
         for (int i = 0; i < tags.Count; i++)
         {
-            digests[i] = Digest(tags[i]);
-            keys[i] = TagKey(digests[i]);
+            keys[i] = TagKey(tags[i], block, i * TagBytes);
             lookup[i * 2] = ["GET", keys[i]];
             lookup[i * 2 + 1] = ["PTTL", keys[i]];
         }
@@ -935,7 +936,6 @@ public sealed class RuvioDistributedCache : IDistributedCache
         string created = Guid.NewGuid().ToString("N");
         string? life = lifetime > 0 ? lifetime.ToString(CultureInfo.InvariantCulture) : null;
         var writes = new List<IReadOnlyList<string>>();
-        byte[] block = new byte[tags.Count * TagBytes];
 
         for (int i = 0; i < tags.Count; i++)
         {
@@ -965,8 +965,7 @@ public sealed class RuvioDistributedCache : IDistributedCache
                     writes.Add(["PEXPIRE", keys[i], life]);
             }
 
-            Encoding.ASCII.GetBytes(digests[i], block.AsSpan(i * TagBytes, 64));
-            Encoding.ASCII.GetBytes(generation, block.AsSpan(i * TagBytes + 64, 32));
+            Encoding.ASCII.GetBytes(generation, block.AsSpan(i * TagBytes + DigestBytes, 32));
         }
 
         if (writes.Count > 0)
@@ -985,7 +984,7 @@ public sealed class RuvioDistributedCache : IDistributedCache
         var keys = new string[header.TagCount];
 
         for (int i = 0; i < keys.Length; i++)
-            keys[i] = TagKey(Encoding.ASCII.GetString(stored, start + i * TagBytes, 64));
+            keys[i] = TagKey(stored, start + i * TagBytes);
 
         string[] command = new string[keys.Length + 1];
 
@@ -1015,16 +1014,61 @@ public sealed class RuvioDistributedCache : IDistributedCache
         return true;
     }
 
-    private string TagKey(string digest) => _tagPrefix + digest;
-
-    // Hashing keeps tag keys a fixed length whatever the tag.
-    private static string Digest(string tag)
+    /// <summary>Writes the tag's digest into <paramref name="block"/> at <paramref name="offset"/> and returns its key.</summary>
+    private string TagKey(string tag, byte[] block, int offset)
     {
-        Span<byte> digest = stackalloc byte[SHA256.HashSizeInBytes];
+        Digest(tag, block.AsSpan(offset, DigestBytes));
 
-        SHA256.HashData(RuvioCacheOptions.Utf8.GetBytes(tag), digest);
+        return TagKey(block, offset);
+    }
 
-        return Convert.ToHexString(digest).ToLowerInvariant();
+    /// <summary><c>{instance}{tag prefix}{digest}</c> in one allocation, the digest read from <paramref name="source"/>.</summary>
+    private string TagKey(byte[] source, int offset) =>
+        string.Create(_tagPrefix.Length + DigestBytes, (Prefix: _tagPrefix, Source: source, Offset: offset), static (text, state) =>
+        {
+            state.Prefix.CopyTo(text);
+            // The digest is lowercase hex, so each byte is one char.
+            Encoding.ASCII.GetChars(state.Source.AsSpan(state.Offset, DigestBytes), text[state.Prefix.Length..]);
+        });
+
+    private byte[] TagKeyBytes(string tag)
+    {
+        int prefix = RuvioCacheOptions.Utf8.GetByteCount(_tagPrefix);
+        var key = new byte[prefix + DigestBytes];
+
+        RuvioCacheOptions.Utf8.GetBytes(_tagPrefix, key);
+        Digest(tag, key.AsSpan(prefix));
+
+        return key;
+    }
+
+    /// <summary>
+    /// Writes the lowercase hex SHA-256 of the tag's UTF-8 bytes as 64 ASCII bytes. Hashing keeps tag keys a fixed
+    /// length whatever the tag. The bytes are stored in entries and name the tag keys, so they must never change.
+    /// </summary>
+    internal static void Digest(string tag, Span<byte> hex)
+    {
+        int length = RuvioCacheOptions.Utf8.GetByteCount(tag);
+        byte[]? rented = null;
+        Span<byte> buffer = length <= 256 ? stackalloc byte[256] : (rented = ArrayPool<byte>.Shared.Rent(length));
+        Span<byte> hash = stackalloc byte[SHA256.HashSizeInBytes];
+
+        try
+        {
+            int written = RuvioCacheOptions.Utf8.GetBytes(tag, buffer);
+            SHA256.HashData(buffer[..written], hash);
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
+        }
+
+        for (int i = 0; i < hash.Length; i++)
+        {
+            hex[i * 2] = LowerHex[hash[i] >> 4];
+            hex[i * 2 + 1] = LowerHex[hash[i] & 0xF];
+        }
     }
 
     private static void CheckReply(RespValue reply)
