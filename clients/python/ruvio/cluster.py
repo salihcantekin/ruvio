@@ -546,7 +546,7 @@ class ClusterRuvio(Ruvio):
             return node.conn
         raise error
 
-    def _redirect(self, err: MovedError, data: bytes, dec: bool) -> Any:
+    def _redirect(self, err: MovedError, data: bytes, dec: bool, clock: Optional[cl.TryAgainClock] = None) -> Any:
         """Follows ``-MOVED`` and ``-ASK`` (one budget of ``MAX_REDIRECTS`` per command) and re-sends after
         ``-TRYAGAIN`` (``TRYAGAIN_DELAYS``, one sleep before each re-send); the last error is returned when
         a budget runs out. ``ASK`` sends ``ASKING`` and the command to the named node and leaves the table alone."""
@@ -559,7 +559,13 @@ class ClusterRuvio(Ruvio):
                 node = self._route_node(data)
                 if node is None:
                     return reply
-                time.sleep(cl.TRYAGAIN_DELAYS[tries])
+                if clock is None:
+                    clock = self._tryagain_clock()
+                pause = clock.pause(tries)
+                if pause is None:
+                    return reply
+                if pause > 0:
+                    time.sleep(pause)
                 tries += 1
                 reply = self._rt(node.conn, data, dec)
             else:
@@ -577,6 +583,10 @@ class ClusterRuvio(Ruvio):
                 hops += 1
             if reply.__class__ is not MovedError and not cl.is_tryagain(reply):
                 return reply
+
+    def _tryagain_clock(self) -> cl.TryAgainClock:
+        """A fresh ``-TRYAGAIN`` budget, cut to the socket timeout when that is shorter than the schedule."""
+        return cl.TryAgainClock(self._conn.opts.socket_timeout)
 
     def _route_node(self, data: bytes) -> Optional[_Node]:
         """The node the current table names for a command's frame (the seed for a keyless one); None for a
@@ -771,9 +781,10 @@ class ClusterRuvio(Ruvio):
                 nxt[i] = iter(r).__next__
             replies = [nxt[i]() for i in idx]
         if MovedError in set(map(type, replies)):
+            clock = self._tryagain_clock()
             for i, v in enumerate(replies):
                 if v.__class__ is MovedError:
-                    replies[i] = self._redirect(v, payload[i], dec)
+                    replies[i] = self._redirect(v, payload[i], dec, clock)
         return replies
 
     def _batch_split(self, payload: List[bytes], dec: bool) -> List[Any]:
@@ -793,9 +804,10 @@ class ClusterRuvio(Ruvio):
                 replies[i] = v
         if failure is not None:
             raise failure
+        clock = self._tryagain_clock()
         for i, v in enumerate(replies):
             if v.__class__ is MovedError:
-                replies[i] = self._redirect(v, payload[i] if i < n else subs[i - n][4], dec)  # type: ignore[index]
+                replies[i] = self._redirect(v, payload[i] if i < n else subs[i - n][4], dec, clock)  # type: ignore[index]
         return replies if subs is None else cl.merge_pipeline(replies, n, subs)
 
     def _batch_tx(self, payload: List[bytes], dec: bool) -> List[Any]:
