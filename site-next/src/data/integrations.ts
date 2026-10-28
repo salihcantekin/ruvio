@@ -162,7 +162,7 @@ app.MapGet("/health", () => "ok").DisableRuvioRateLimit();     // never limited`
   },
   "Ruvio.AspNetCore.Idempotency": {
     summary:
-      "HTTP request deduplication and response replay on the native IDEM command. A retried request with the same Idempotency-Key gets the stored response instead of running twice. Choose what happens when Ruvio is unreachable: throw, answer 503, or run unchecked, with an optional circuit breaker. Optionally free the key when the handler throws, so a retry runs at once.",
+      "HTTP request deduplication and response replay on the native IDEM command. A retried request with the same Idempotency-Key gets the stored response instead of running twice; a retry that arrives while the first is still running can wait for it and replay its result. Answer 409 or 422 for a key reused with a different request, and pick the replayed headers. Choose what happens when Ruvio is unreachable: throw, answer 503, or run unchecked, with an optional circuit breaker. Optionally free the key when the handler throws, so a retry runs at once.",
     useCases: ["idempotency"],
     example: cs(`builder.Services.AddRuvioClient(builder.Configuration.GetSection("Ruvio"));
 builder.Services.AddRuvioIdempotency(options =>
@@ -221,7 +221,7 @@ app.MapPost("/orders/{id}/pay", PayAsync).WithMetadata(new RuvioLockAttribute("o
   },
   "Ruvio.AspNetCore.DataProtection": {
     summary:
-      "Durable Data Protection key ring, so every instance can read the others' cookies and protected payloads. Encryption of the ring is required by default.",
+      "Durable Data Protection key ring, so every instance can read the others' cookies and protected payloads. Encryption of the ring is required by default, and it warns (or, if you ask, refuses) when the server keeps data in memory only.",
     useCases: ["sessions"],
     example: cs(`builder.Services.AddDataProtection()
     .SetApplicationName("orders-production")

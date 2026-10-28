@@ -91,6 +91,7 @@ Ruvio-specific commands and options added in this pass:
 | `JSON.INDEX CREATE/DROP/LIST`, `JSON.FIND` | `JsonCreateIndexAsync(name, prefix, path, JsonIndexType)`, `JsonDropIndexAsync`, `JsonListIndexesAsync`, `JsonFindAsync(index, value, count?, after?)` |
 | `JSON.OBJLEN`, `JSON.STRAPPEND`, `JSON.NUMMULTBY`, `JSON.ARRINSERT`, `JSON.ARRPOP`, `JSON.ARRTRIM`, `JSON.ARRINDEX`, `JSON.FORGET`, `JMERGE` | `JsonObjectLengthAsync`, `JsonStringAppendAsync`, `JsonMultiplyAsync`, `JsonArrayInsertAsync`, `JsonArrayPopAsync`, `JsonArrayTrimAsync`, `JsonArrayIndexAsync`, `JsonForgetAsync`, `JMergeAsync` |
 | `IDEM key BEGIN` (typed) | `TryBeginIdempotencyAsync` returns `IdempotencyBegin(State, Result)` |
+| `IDEM key ABORT` (typed) | `AbortIdempotencyAsync` returns `true` when it removed a pending record |
 | `RUVIO`, `RUVIO OWNER` | `RuvioAsync`, `GetRuvioOwnerAsync` |
 
 Redis-compatible commands added: `SETEX`/`PSETEX` (`SetExpireAsync`, `SetExpireMillisecondsAsync`), `SETNX`
@@ -474,10 +475,29 @@ Address? a = await client.JsonGetValueAsync<Address>("user:1", "$.addr");
 
 `JsonMergeValueAsync` and `JsonArrayAppendValueAsync` work the same way. The overloads that take `JsonSerializerOptions` use reflection (marked for trimming); pass a `JsonTypeInfo<T>` for trimmed or AOT apps.
 
+## Tracing and metrics
+
+Every command sent through the typed methods, `ExecuteAsync` or `ExecuteBinaryAsync` gets an OpenTelemetry client
+span named after it and a duration on the `ruvio_client_command_duration_milliseconds` histogram. The client reports
+through `System.Diagnostics`, so no OpenTelemetry package is needed, and nothing is recorded until you listen:
+
+```csharp
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracing => tracing.AddSource("Ruvio.Client"))
+    .WithMetrics(metrics => metrics.AddMeter("Ruvio.Client"));
+```
+
+Keys and values are never recorded. Without a listener a command costs one check and no allocation. The full list
+of spans, tags and instruments is in [Observability](../../../docs/OBSERVABILITY.md#net-client).
+
 ## Connecting
 
 Native idempotency is exposed as `BeginIdempotencyAsync(key, fingerprint, owner,
 ttlMs)` and `CompleteIdempotencyAsync(key, fingerprint, owner, result)`.
+`AbortIdempotencyAsync(key, fingerprint, owner)` gives up a pending record of this
+owner (`IDEM key ABORT ...`), so the next begin acquires it at once instead of
+waiting for retention to end; it returns `false` for a completed record or another
+owner's. Abort only when the work did not take effect or is safe to run again.
 Begin returns a RESP array (`acquired`, `pending`, `conflict`, or `completed` plus
 result bytes); complete returns a boolean acknowledgment. The completion helper
 takes text; `ExecuteBinaryAsync` supports arbitrary binary tokens/results with

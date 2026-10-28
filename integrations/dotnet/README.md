@@ -167,6 +167,8 @@ dotnet test integrations/dotnet/Ruvio.AspNetCore.RateLimiting.Tests
 dotnet test integrations/dotnet/Ruvio.AspNetCore.Idempotency.Tests
 dotnet test integrations/dotnet/Ruvio.AspNetCore.OutputCaching.Tests
 dotnet test integrations/dotnet/Ruvio.AspNetCore.DataProtection.Tests
+dotnet test integrations/dotnet/Ruvio.AspNetCore.DistributedLock.Tests
+dotnet test integrations/dotnet/Ruvio.Extensions.Idempotency.Tests
 dotnet pack integrations/dotnet/Ruvio.Extensions.Caching -c Release -o dist
 ```
 
