@@ -21,6 +21,8 @@ public class RepositoryEdgeTests
         public bool Exists { get; set; }
         public long Length { get; set; }
         public long Added { get; set; } = 1;
+        public string Info { get; set; } = "# Server\r\nruvio_durability:everysec\r\n";
+        public bool RefuseInfo { get; set; }
         public List<string> Calls { get; } = [];
 
         protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
@@ -28,6 +30,10 @@ public class RepositoryEdgeTests
             string name = targetMethod!.Name;
 
             Calls.Add(name);
+
+            if (name == "GetInfoAsync" && RefuseInfo)
+                return new ValueTask<string>(Task.FromException<string>(new RuvioException("NOPERM", isServerReply: true)));
+
             object? value = name switch
             {
                 "GetTimeToLiveMillisecondsAsync" => Ttl,
@@ -35,6 +41,7 @@ public class RepositoryEdgeTests
                 "HashFieldExistsAsync" => Exists,
                 "GetHashLengthAsync" => Length,
                 "SetHashFieldsAsync" => Added,
+                "GetInfoAsync" => Info,
                 _ => throw new NotSupportedException(name),
             };
 
