@@ -6,7 +6,7 @@ struct PrefillJob {
     file: File,
     start: u64,
     length: u64,
-    sync_error: Option<Arc<Mutex<Option<String>>>>,
+    sync_error: Option<Arc<SyncError>>,
     #[cfg(test)]
     fail_sync: bool,
 }
@@ -34,7 +34,7 @@ pub(super) struct Prefill {
     pending: Option<u64>,
     /// Where a failed sync of a fill is reported: it is a sync of the live segment, so it
     /// also covers record pages (see `WalSink::sync_failed`).
-    sync_error: Option<Arc<Mutex<Option<String>>>>,
+    sync_error: Option<Arc<SyncError>>,
 }
 
 impl Drop for Prefill {
@@ -47,7 +47,7 @@ impl Drop for Prefill {
 }
 
 impl Prefill {
-    pub(super) fn reporting_to(sync_error: Arc<Mutex<Option<String>>>) -> Self {
+    pub(super) fn reporting_to(sync_error: Arc<SyncError>) -> Self {
         Self {
             shared: None,
             pending: None,
@@ -206,10 +206,7 @@ fn prefill_thread(shared: &PrefillShared) {
             Ok(filled) => filled,
             Err(error) => {
                 if let Some(sync_error) = &job.sync_error {
-                    sync_error
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .get_or_insert(error);
+                    sync_error.report_first(error);
                 }
                 false
             }
