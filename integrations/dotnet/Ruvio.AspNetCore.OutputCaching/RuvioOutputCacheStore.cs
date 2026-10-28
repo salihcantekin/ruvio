@@ -123,6 +123,12 @@ public sealed class RuvioOutputCacheStore : IOutputCacheStore
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        ArgumentNullException.ThrowIfNull(key);
+
+        // A request whose cache key is too long cannot be cached; the response is simply not stored.
+        if (TooLong(key))
+            return;
+
         byte[] entryKey = KeyBytes("entry:", key);
 
         ArgumentNullException.ThrowIfNull(value);
@@ -276,6 +282,16 @@ public sealed class RuvioOutputCacheStore : IOutputCacheStore
     private async ValueTask<byte[]?> GetCoreAsync(string key, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        ArgumentNullException.ThrowIfNull(key);
+
+        // A request whose cache key is too long is a miss, not an error: the endpoint runs and answers.
+        if (TooLong(key))
+        {
+            CountMiss("key_too_long");
+
+            return null;
+        }
+
         var reply = await Execute("get_entry", [Get, KeyBytes("entry:", key)], cancellationToken).ConfigureAwait(false);
 
         if (reply.Kind == RespKind.Null)
@@ -416,6 +432,8 @@ public sealed class RuvioOutputCacheStore : IOutputCacheStore
 
         return key;
     }
+
+    private bool TooLong(string key) => RuvioOutputCacheOptions.Utf8.GetByteCount(key) > maxKeyBytes;
 
     private void ValidatedDigest(string value, Span<byte> digest)
     {

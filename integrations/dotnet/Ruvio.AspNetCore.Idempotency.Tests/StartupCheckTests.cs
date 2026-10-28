@@ -11,7 +11,7 @@ namespace Ruvio.AspNetCore.Idempotency.Tests;
 /// <summary>What the package checks before the server takes a request.</summary>
 public sealed class StartupCheckTests
 {
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task MissingClientFailsStartAndNamesTheFix()
     {
         await using WebApplication app = App(static services => { });
@@ -21,7 +21,7 @@ public sealed class StartupCheckTests
         Assert.Contains("services.AddRuvioClient", error.Message);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task MissingKeyedClientFailsStartAndNamesTheKey()
     {
         await using WebApplication app = App(Client, clientKey: "orders");
@@ -31,7 +31,7 @@ public sealed class StartupCheckTests
         Assert.Contains("AddKeyedRuvioClient(\"orders\"", error.Message);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task RegisteredKeyedClientIsNotResolvedAtStart()
     {
         await using WebApplication app = App(static services => services.AddKeyedSingleton<IRuvioClient>("orders",
@@ -41,7 +41,7 @@ public sealed class StartupCheckTests
         await app.StopAsync();
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task OutOfRangeEndpointSettingFailsStart()
     {
         await using WebApplication app = App(Client, map: static app =>
@@ -57,7 +57,7 @@ public sealed class StartupCheckTests
         Assert.DoesNotContain("/ok", error.Message);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task UseWithoutAddFails()
     {
         var builder = WebApplication.CreateBuilder();

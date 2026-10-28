@@ -47,7 +47,7 @@ public class HelperTests
         }
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task ModelRoundTripsWithSerializerOptions()
     {
         var cache = new MapCache();
@@ -60,7 +60,7 @@ public class HelperTests
         Assert.Null(await cache.GetJsonAsync<Order>("missing", camel));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task ModelRoundTripsWithSourceGeneratedTypeInfo()
     {
         var cache = new MapCache();
@@ -71,7 +71,7 @@ public class HelperTests
         Assert.Equal(new Order(1, "Bo"), await cache.GetJsonAsync("o", info));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task GetOrCreateRunsTheFactoryOnceForStringsAndModels()
     {
         var cache = new MapCache();
@@ -99,7 +99,7 @@ public class DirectStringJsonTests
 
     private static string Sent(CacheEdgeTests.Script script, int index) => script.Commands[0][index];
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task SetStringWritesTheUtf8RecordInOneCommand()
     {
         var (cache, script) = Make();
@@ -111,7 +111,7 @@ public class DirectStringJsonTests
         Assert.Single(script.Commands);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task SetJsonWritesCamelCaseWhenAskedAndHonoursTheSizeLimit()
     {
         var (cache, script) = Make();
@@ -123,7 +123,7 @@ public class DirectStringJsonTests
         Assert.Equal("RDC1\n0\n0\n{\"id\":1,\"customerName\":\"Ada\"}", script.Commands[0][2]);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task GetStringAndGetJsonReadThePayloadDirectly()
     {
         var (cache, script) = Make();
