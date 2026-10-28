@@ -100,8 +100,55 @@ receive the stored value. With 20 concurrent callers the factory runs once.
 * The stored entry is the same envelope as `SetAsync`, so `Get`, sliding renewal and
   expiry behave identically. An entry without any expiry is stored with a placeholder TTL and
   then persisted (one extra command, only on a miss).
-* Stale-while-revalidate (`SWR`) is available on the client as `FillSetAsync(..., stale)` but this
-  provider does not use it.
+* A stale period (below) adds stale-while-revalidate and fail-safe on top of this.
+
+## Stale values, fail-safe and tags
+
+Pass `RuvioCacheEntryOptions` (a `DistributedCacheEntryOptions`) wherever entry options are taken:
+
+```csharp
+var entry = new RuvioCacheEntryOptions
+{
+    AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5),  // fresh for 5 minutes
+    StaleFor = TimeSpan.FromHours(1),                            // then kept as a fallback for an hour
+    Tags = ["customer:7", "invoices"],
+};
+
+Invoice invoice = await cache.GetOrCreateJsonAsync("invoice:42", LoadInvoiceAsync, AppJson.Default.Invoice, entry);
+
+// Later, when customer 7 changes: every entry tagged with it is gone for every reader.
+await cache.RemoveByTagAsync("customer:7");
+```
+
+**`StaleFor`** keeps the entry after its fresh period ends. In that window `GetOrCreate*`:
+
+* returns the stale value at once to every caller but one, and that one caller runs the factory and stores the
+  new value (`FILLSET ... SWR`), so a busy key never makes callers wait for a rebuild;
+* returns the stale value when the factory throws (fail-safe), unless the caller's token was cancelled. Each such
+  fallback adds one to the `ruvio.cache.fail_safe` counter on the `Ruvio.Extensions.Caching` meter.
+
+A plain `Get` treats a stale entry as a miss and leaves it stored. `StaleFor` needs an absolute or relative
+expiration (the end of the fresh period) and cannot be combined with `SlidingExpiration`; both are checked before
+anything is sent.
+
+**`Tags`** (up to `MaxTagsPerEntry`, default 8, at most 64) let `RemoveByTagAsync(tag)` remove every entry written
+with that tag. Removal is one `DEL` of the tag's generation key, with no scan: the entries stay stored until they
+expire, but no read returns them again. The extension `RemoveByTagAsync` on `IDistributedCache` throws
+`NotSupportedException` for other caches.
+
+Costs, paid only by entries that use these options:
+
+* A tagged write first reads each tag's generation (`GET` and `PTTL` in one pipeline) and creates or extends the
+  missing ones (a second pipeline, only when needed). A tagged read adds one `MGET` of the entry's tags. In a
+  cluster the tag keys live on their own slots, so these pipelines can reach several shards.
+* Each tag adds 96 bytes to the stored entry and one small key (`<InstanceName>:ruvio:cache-tag:v1:<sha256>`)
+  shared by all its entries. A tag key lives as long as the longest entry written with it.
+* A stale period adds one header field and keeps the entry stored for `StaleFor` longer.
+
+> [!WARNING]
+> Entries written with a stale period or tags use a newer stored format (`RDC2`) that earlier package versions
+> cannot read: they throw on it. Upgrade every instance that shares an `InstanceName` before using these options.
+> Entries written without them keep the old format, so upgrading alone changes nothing.
 
 ## Contract and expiration
 
@@ -145,9 +192,11 @@ tags in keys/namespaces retain their normal meaning. Scripts declare exactly one
 and work with the client's cluster routing.
 
 One native string entry contains `RDC1\n<absolute-ms-or-0>\n<sliding-ms-or-0>\n<payload>`.
-The envelope costs **9–37 bytes** (ASCII decimal fields), not base64 expansion. Native
+The envelope costs **9–37 bytes** (ASCII decimal fields), not base64 expansion. An entry
+with a stale period or tags is stored as
+`RDC2\n<absolute>\n<sliding>\n<fresh-until>\n<tag-count>\n<96 bytes per tag><payload>`. Native
 key/object/index overhead is additional and implementation-dependent. Persistent
-entries have no TTL; no extra metadata keys, hash fields, polling tasks, timers, or
+entries have no TTL; apart from tag keys (only with `Tags`) no extra metadata keys, hash fields, polling tasks, timers, or
 server changes are introduced. Sliding-only entries use only native expiry plus the
 in-value sliding duration. The provider logs no keys or values; its
 metrics are counters without key tags (see Metrics).
@@ -164,7 +213,9 @@ text cached on the shard.
 
 Meter `Ruvio.Extensions.Caching` counts lookups: `ruvio.cache.hit` and `ruvio.cache.miss`, tagged `operation`
 (`get` for `Get*`/`Refresh*`, `get_or_create` for `GetOrCreate*`). An expired entry counts as a miss. The tags carry no keys
-or values. With no listener attached each lookup pays one field read.
+or values. With no listener attached each lookup pays one field read. With `StaleFor`, a stale value served while
+another caller refreshes counts as a hit, a refresh as a miss, and a stale value returned because the factory threw
+adds one to `ruvio.cache.fail_safe`.
 
 ```csharp
 builder.Services.AddOpenTelemetry().WithMetrics(m => m.AddMeter("Ruvio.Extensions.Caching"));

@@ -39,6 +39,19 @@ public static class RuvioDistributedCacheExtensions
         return value;
     }
 
+    /// <summary>
+    /// Removes every entry written with <paramref name="tag"/> in <see cref="RuvioCacheEntryOptions.Tags"/>. Only
+    /// <see cref="RuvioDistributedCache"/> keeps tags; any other cache throws <see cref="NotSupportedException"/>.
+    /// </summary>
+    public static Task RemoveByTagAsync(this IDistributedCache cache, string tag, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(cache);
+
+        return cache is RuvioDistributedCache ruvio
+            ? ruvio.RemoveByTagAsync(tag, token)
+            : throw new NotSupportedException("Only RuvioDistributedCache removes entries by tag.");
+    }
+
     private static readonly UTF8Encoding Utf8 = new(false);
 
     private static DistributedCacheEntryOptions Default(DistributedCacheEntryOptions? options) => options ?? new();
