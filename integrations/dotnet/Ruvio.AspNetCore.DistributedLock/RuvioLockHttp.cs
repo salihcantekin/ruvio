@@ -71,11 +71,13 @@ internal static class RuvioLockHttp
 
         if (held is not null)
         {
-            context.Items[ItemKey] = held;
+            Set(context, held);
         }
 
         return new Take(held, Bypass: false, null);
     }
+
+    internal static void Set(HttpContext context, IRuvioLock held) => context.Items[ItemKey] = held;
 
     internal static IRuvioLock? Get(HttpContext context) =>
         context.Items.TryGetValue(ItemKey, out object? held) ? held as IRuvioLock : null;

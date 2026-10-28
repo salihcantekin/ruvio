@@ -2,7 +2,7 @@
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <Version>0.2.0</Version>
-    <Description>Distributed mutual-exclusion locks for Ruvio, plus an ASP.NET Core [RuvioLock] endpoint attribute that serialises requests per resource, cancels them when the lock is lost and reports metrics.</Description>
+    <Description>Distributed mutual-exclusion locks for Ruvio with optional fencing tokens, a one-instance hosted service, plus an ASP.NET Core [RuvioLock] endpoint attribute that serialises requests per resource, cancels them when the lock is lost and reports metrics.</Description>
     <PackageId>Ruvio.AspNetCore.DistributedLock</PackageId>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageTags>ruvio;aspnetcore;lock;distributed-lock;leader-election</PackageTags>

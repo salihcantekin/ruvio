@@ -16,6 +16,13 @@ public interface IRuvioLock : IAsyncDisposable
     CancellationToken LockLost { get; }
 
     /// <summary>
+    /// The fencing token of this lock when <see cref="RuvioLockOptions.Fenced"/> is on: a number that only grows for one
+    /// resource, also across expiry and release. Pass it to the resource you write and refuse writes carrying a smaller one,
+    /// so an owner whose lease ran out cannot overwrite the next owner's work. Null when fencing is off.
+    /// </summary>
+    long? FencingToken => null;
+
+    /// <summary>
     /// Sets the lease to <paramref name="lease"/> from now (or the original lease when null).
     /// False when the lock is no longer ours.
     /// </summary>
