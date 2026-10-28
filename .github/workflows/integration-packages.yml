@@ -59,6 +59,7 @@ jobs:
         if: github.ref_name == 'dev'
         env:
           PACKAGE: ${{ inputs.package }}
+          PUBLISH: ${{ inputs.publish }}
           RUN_NUMBER: ${{ github.run_number }}
         run: |
           set -euo pipefail
@@ -72,6 +73,24 @@ jobs:
             python3 scripts/release_version.py "$name" --stamp "$version"
             echo "$name $version"
           done
+          # The packages depend on the Ruvio.Client version in this checkout, which is the next release and not
+          # on NuGet yet, so NuGet would resolve the oldest client preview instead (one without this checkout's
+          # client API). Point them at the newest client preview of that release; publish it first with
+          # release.yml (target nuget) from dev.
+          prefix=$(python3 scripts/release_version.py csharp --preview 1)
+          prefix=${prefix%1}
+          published=$(curl -fsS https://api.nuget.org/v3-flatcontainer/ruvio.client/index.json || echo '{"versions":[]}')
+          client=$(python3 -c 'import json,sys
+          p=sys.argv[1]
+          v=[x for x in json.loads(sys.argv[2])["versions"] if x.startswith(p) and x[len(p):].isdigit()]
+          print(max(v, key=lambda x: int(x[len(p):])) if v else "")' "$prefix" "$published")
+          if [ -n "$client" ]; then
+            python3 scripts/release_version.py csharp --stamp "$client"
+            echo "Ruvio.Client dependency $client"
+          elif [ "$PUBLISH" = "true" ]; then
+            echo "::error::No Ruvio.Client ${prefix}N preview is on NuGet. Run release.yml with target nuget from dev first."
+            exit 1
+          fi
       - name: Refuse a version NuGet already has
         if: inputs.publish
         env:

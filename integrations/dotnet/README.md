@@ -215,3 +215,8 @@ separate input and skips a version already on NuGet. Each package depends on
 the `Ruvio.Client` version in this checkout, so publish that client first.
 Update the selected integration's `Version` for a release; a server release
 does not bump it.
+
+Started from `dev`, the workflow publishes previews (`X.Y.Z-preview.N`) that
+depend on the newest `Ruvio.Client` preview on NuGet for the client version in
+this checkout. Publish that first: run `release.yml` with target `nuget` from
+`dev`, then this workflow with `publish` on.
