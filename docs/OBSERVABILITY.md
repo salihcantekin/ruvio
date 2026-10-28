@@ -165,7 +165,7 @@ with no listener attached an instrument costs one field read.
 - `Ruvio.Extensions.Caching`: `ruvio.cache.hit` and `ruvio.cache.miss` (tagged `operation`: `get` or
   `get_or_create`), `ruvio.cache.fail_safe` (a stale value returned because the factory threw), `ruvio.cache.outage`.
 - `Ruvio.AspNetCore.OutputCaching`: `ruvio.output_cache.hit`, `ruvio.output_cache.miss` (tagged `reason`: `absent`
-  or `tag_evicted`), `ruvio.output_cache.tag_evict`, `ruvio.output_cache.outage`, and the storage instruments
+  `tag_evicted` or `key_too_long`), `ruvio.output_cache.tag_evict`, `ruvio.output_cache.outage`, and the storage instruments
   `ruvio.output_cache.storage_calls`, `ruvio.output_cache.storage_commands` and `ruvio.output_cache.storage_duration`.
 - `Ruvio.AspNetCore.Idempotency`: `ruvio.idempotency.states` (tagged `state`, including `aborted` with `AbortOnException`), `ruvio.idempotency.outage`, and the storage instruments `ruvio.idempotency.storage_calls`,
   `ruvio.idempotency.storage_commands` and `ruvio.idempotency.storage_duration`.
@@ -189,5 +189,7 @@ duration), `RuvioCircuitHalfOpen` (Information, the trial call) and `RuvioCircui
 the leader (`is_leader:1`), alert on a group whose `state` is not `ok` for longer than a few
 `down_after_ms` (`state_ms`), on `members_answering` below the member count, and on a rising
 `failovers_total`. With the primary lease, `lease_grant_ms` above `primary_lease_ms` means this
-coordinator is not renewing the primary. A group that waits is also logged as a warning, at most every
+coordinator is not renewing the primary, and a rising `lease_grants_refused` means the node answers
+the grants with an error (a wrong `primary_lease_coordinators`, or the coordinator set changed; the
+coordinator logs a warning with the likely cause, at most once a minute per node). A group that waits is also logged as a warning, at most every
 10 seconds. Fields are listed in [COORDINATOR.md](COORDINATOR.md).

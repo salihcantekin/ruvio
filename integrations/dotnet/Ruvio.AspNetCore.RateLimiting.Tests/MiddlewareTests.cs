@@ -36,7 +36,7 @@ public class MiddlewareTests
         Assert.True(allocated <= 22 + (key.Length * 2) + 8, $"allocated {allocated} bytes");
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task BypassHasNoServicesCommandsOrAllocations()
     {
         var context = new DefaultHttpContext();
@@ -80,7 +80,7 @@ public class MiddlewareTests
         }
     }
 
-    [Theory]
+    [Theory(Timeout = 30000)]
     [InlineData(0L, 200, 1)]
     [InlineData(4L, 200, 1)]
     [InlineData(null, 429, 0)]
@@ -107,7 +107,7 @@ public class MiddlewareTests
             Assert.Equal("60", context.Response.Headers.RetryAfter.ToString());
     }
 
-    [Theory]
+    [Theory(Timeout = 30000)]
     [InlineData(RuvioRateLimitAlgorithm.SlidingWindow, nameof(IRuvioClient.LimitSlidingWithRetryAsync))]
     [InlineData(RuvioRateLimitAlgorithm.TokenBucket, nameof(IRuvioClient.LimitTokensWithRetryAsync))]
     public async Task OtherAlgorithmsUseTheirModeAndExactRetryAfter(RuvioRateLimitAlgorithm algorithm, string method)
@@ -136,7 +136,7 @@ public class MiddlewareTests
         Assert.Equal(60_000, stub.Window);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task FailuresPropagateWithoutRetryOrExecution()
     {
         var client = DispatchProxy.Create<IRuvioClient, Stub>();
@@ -150,7 +150,7 @@ public class MiddlewareTests
         Assert.Equal(1, stub.Calls);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task PartitionsAreIsolatedAndCancellationIsForwarded()
     {
         var client = DispatchProxy.Create<IRuvioClient, Stub>();
@@ -169,7 +169,7 @@ public class MiddlewareTests
         Assert.NotEqual(key, stub.Key);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task MissingPartitionDoesNotConsumeABudget()
     {
         var client = DispatchProxy.Create<IRuvioClient, Stub>();
@@ -180,7 +180,7 @@ public class MiddlewareTests
         Assert.Equal(0, ((Stub)client).Calls);
     }
 
-    [Theory]
+    [Theory(Timeout = 30000)]
     [InlineData(-1)]
     [InlineData(5)]
     public async Task InvalidServerAllowanceNeverAdmitsARequest(long remaining)

@@ -851,6 +851,189 @@ fn writes_v1_wal_fixtures_when_requested() {
     for (name, shard, sequence, mutation) in v1_wal_records() {
         write_hex_fixture(name, &encode_record(shard, sequence, 0, &mutation).unwrap());
     }
+
+    for minor in 1..=FORMAT_MINOR {
+        write_hex_fixture(
+            &format!("wal-header-minor{minor}.hex"),
+            &encode_segment_header_at(1, minor, 0, 0, 1, 1_700_000_000_000, 0),
+        );
+    }
+
+    for (name, _minor, shard, sequence, mutation) in later_minor_wal_records() {
+        write_hex_fixture(name, &encode_record(shard, sequence, 0, &mutation).unwrap());
+    }
+}
+
+/// Records added after minor 0, with the minor that introduced them. Their bytes are as
+/// frozen as the minor-0 ones: a log written by an older release must stay readable.
+fn later_minor_wal_records() -> Vec<(&'static str, u16, u32, u64, OwnedMutation)> {
+    vec![
+        (
+            "wal-minor1-set-range.hex",
+            1,
+            0,
+            1,
+            OwnedMutation::SetRange {
+                key: b"k".to_vec(),
+                offset: 5,
+                bytes: b"tail".to_vec(),
+            },
+        ),
+        (
+            "wal-minor1-list-set.hex",
+            1,
+            0,
+            2,
+            OwnedMutation::ListSet {
+                key: b"l".to_vec(),
+                index: -1,
+                value: b"v".to_vec(),
+            },
+        ),
+        (
+            "wal-minor1-list-insert.hex",
+            1,
+            0,
+            3,
+            OwnedMutation::ListInsert {
+                key: b"l".to_vec(),
+                before: true,
+                pivot: b"p".to_vec(),
+                value: b"v".to_vec(),
+            },
+        ),
+        (
+            "wal-minor1-list-remove.hex",
+            1,
+            0,
+            4,
+            OwnedMutation::ListRemove {
+                key: b"l".to_vec(),
+                count: -2,
+                value: b"v".to_vec(),
+            },
+        ),
+        (
+            "wal-minor2-bloom-reserve-expansion.hex",
+            2,
+            0,
+            5,
+            OwnedMutation::BloomReserve {
+                key: b"b".to_vec(),
+                error_rate: 0.01,
+                capacity: 1000,
+                expansion: 4,
+            },
+        ),
+        (
+            "wal-minor2-bloom-add-many.hex",
+            2,
+            0,
+            6,
+            OwnedMutation::BloomAddMany {
+                key: b"b".to_vec(),
+                values: vec![b"x".to_vec(), b"y".to_vec()],
+            },
+        ),
+        (
+            "wal-minor3-set-bytes-expiring.hex",
+            3,
+            0,
+            7,
+            OwnedMutation::SetBytesExpiring {
+                key: b"lock".to_vec(),
+                value: b"token".to_vec(),
+                expires_at: 1_700_000_030_000,
+            },
+        ),
+        (
+            "wal-minor4-slot-copy.hex",
+            4,
+            0,
+            8,
+            OwnedMutation::SlotCopy {
+                key: b"k".to_vec(),
+                entry: Some(b"entry".to_vec()),
+            },
+        ),
+        (
+            "wal-minor4-slots-moved.hex",
+            4,
+            0,
+            9,
+            OwnedMutation::SlotsMoved {
+                first: 0,
+                last: 4095,
+                to: 1,
+                position: 42,
+            },
+        ),
+        (
+            "wal-minor5-slots-incoming.hex",
+            5,
+            0,
+            10,
+            OwnedMutation::SlotsIncoming {
+                first: 100,
+                last: 199,
+                step: crate::slot_moves::IncomingStep::Prepared as u8,
+            },
+        ),
+        (
+            "wal-minor5-slots-given.hex",
+            5,
+            0,
+            11,
+            OwnedMutation::SlotsGiven {
+                first: 100,
+                last: 199,
+                address: b"10.0.0.7:6379".to_vec(),
+                position: 77,
+            },
+        ),
+        (
+            "wal-minor6-slots-arrived.hex",
+            6,
+            0,
+            12,
+            OwnedMutation::SlotsIncoming {
+                first: 100,
+                last: 199,
+                step: crate::slot_moves::IncomingStep::Completed as u8,
+            },
+        ),
+    ]
+}
+
+#[test]
+fn later_minor_wal_record_fixtures_stay_stable() {
+    let records = later_minor_wal_records();
+
+    for (name, _minor, shard, sequence, mutation) in &records {
+        assert_v1_record_fixture(name, *shard, *sequence, mutation);
+    }
+
+    // One fixture per record type added since minor 0 (types 58 to 69, minors 1 to 6).
+    assert_eq!(records.len(), 12);
+    assert_eq!(
+        records.iter().map(|record| record.1).max(),
+        Some(FORMAT_MINOR),
+        "a new minor needs a fixture"
+    );
+}
+
+#[test]
+fn later_minor_segment_headers_decode_with_their_minor() {
+    for minor in 1..=FORMAT_MINOR {
+        let header = load_hex_fixture(&format!("wal-header-minor{minor}.hex"));
+
+        assert_eq!(
+            header,
+            encode_segment_header_at(1, minor, 0, 0, 1, 1_700_000_000_000, 0),
+            "minor {minor} header drifted"
+        );
+        assert_eq!(decode_segment_header(&header).unwrap().minor, minor);
+    }
 }
 
 fn v1_wal_records() -> Vec<(&'static str, u32, u64, OwnedMutation)> {

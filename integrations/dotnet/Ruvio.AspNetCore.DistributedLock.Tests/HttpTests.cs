@@ -68,11 +68,11 @@ public class HttpTests
         };
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task ASecondRequestForTheSameResourceGets409WhileOtherResourcesAndLaterRequestsProceed()
     {
-        var gate = new TaskCompletionSource();
-        var started = new TaskCompletionSource();
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         int runs = 0;
 
         await using Host? host = await StartAsync(app => app.MapPost("/orders/{orderId}/pay", async (int orderId) =>
@@ -82,7 +82,7 @@ public class HttpTests
             if (orderId == 1)
             {
                 started.TrySetResult();
-                await gate.Task;
+                await gate.Task.WaitAsync(TimeSpan.FromSeconds(20));
             }
 
             return Results.Ok(orderId);
@@ -111,7 +111,7 @@ public class HttpTests
         Assert.Equal(HttpStatusCode.OK, again.StatusCode); // released when the first finished
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task TheLockIsReleasedWhenTheHandlerThrows()
     {
         int calls = 0;
@@ -134,20 +134,30 @@ public class HttpTests
         Assert.Equal(HttpStatusCode.OK, next.StatusCode);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task WaitLetsTheSecondRequestRunAfterTheFirstAndTheStatusCodeIsConfigurable()
     {
-        var gate = new TaskCompletionSource();
-        var started = new TaskCompletionSource();
-        var slowStarted = new TaskCompletionSource();
-        var slowGate = new TaskCompletionSource();
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var slowStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var slowGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondArrived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int arrivals = 0;
 
         await using Host? host = await StartAsync(app =>
         {
+            // Signals when the second /queued request is inside the server, so no sleep is needed to let it arrive.
+            app.Use(async (context, next) =>
+            {
+                if (context.Request.Path == "/queued" && Interlocked.Increment(ref arrivals) == 2)
+                    secondArrived.TrySetResult();
+
+                await next(context);
+            });
             app.MapGet("/queued", async () =>
             {
                 started.TrySetResult();
-                await gate.Task;
+                await gate.Task.WaitAsync(TimeSpan.FromSeconds(20));
 
                 return Results.Ok();
             }).WithDistributedLock("queued", wait: TimeSpan.FromSeconds(5));
@@ -155,7 +165,7 @@ public class HttpTests
             app.MapGet("/impatient", async () =>
             {
                 slowStarted.TrySetResult();
-                await slowGate.Task;
+                await slowGate.Task.WaitAsync(TimeSpan.FromSeconds(20));
 
                 return Results.Ok();
             }).WithDistributedLock("impatient", conflictStatusCode: 423);
@@ -169,8 +179,8 @@ public class HttpTests
         await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Task<HttpResponseMessage> second = host.Http.GetAsync("/queued");
 
-        await Task.Delay(200);
-        Assert.False(second.IsCompleted); // waiting, not rejected
+        await secondArrived.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.False(second.IsCompleted); // waiting, not rejected: the first still holds the lock
         gate.SetResult();
 
         Assert.Equal(HttpStatusCode.OK, (await first).StatusCode);
@@ -186,7 +196,7 @@ public class HttpTests
         (await slow).Dispose();
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task TheHandlerCanReadItsLockAndAMissingRouteValueFailsLoudly()
     {
         await using Host? host = await StartAsync(app =>
@@ -206,9 +216,10 @@ public class HttpTests
         Assert.Equal(HttpStatusCode.InternalServerError, typo.StatusCode);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task TheMvcAttributeLocksPerRouteValue()
     {
+        MvcLockController.Reset();
         await using Host? host = await StartAsync(app => app.UseRuvioLock(), mvc: true);
 
         if (host is null)
@@ -241,8 +252,17 @@ public class HttpTests
 [Route("mvc-lock")]
 public class MvcLockController : ControllerBase
 {
-    public static readonly TaskCompletionSource Started = new();
-    public static readonly TaskCompletionSource Gate = new();
+    // One test uses these; it calls Reset() first so no state is shared with another run.
+    public static TaskCompletionSource Started { get; private set; } = Create();
+    public static TaskCompletionSource Gate { get; private set; } = Create();
+
+    public static void Reset()
+    {
+        Started = Create();
+        Gate = Create();
+    }
+
+    private static TaskCompletionSource Create() => new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
     [HttpPost("{orderId}")]
     [RuvioLock("mvc:{orderId}")]
@@ -251,7 +271,7 @@ public class MvcLockController : ControllerBase
         if (orderId == 1)
         {
             Started.TrySetResult();
-            await Gate.Task;
+            await Gate.Task.WaitAsync(TimeSpan.FromSeconds(20));
         }
 
         return Ok();

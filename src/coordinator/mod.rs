@@ -474,7 +474,10 @@ impl Api {
                             .last(&group.name, &primary.member)
                             .map_or(-1, |at| at.elapsed().as_millis() as i64);
 
-                        text += &format!(",lease_grant_ms={age}");
+                        text += &format!(
+                            ",lease_grant_ms={age},lease_grants_refused={}",
+                            self.sightings.stats().refused_grants(&group.name)
+                        );
                     }
                     // Only for groups whose clients use `CLIENT DURABILITY`: per shard, the
                     // values in the Raft record, then the highest record a failover must keep

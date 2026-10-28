@@ -136,7 +136,7 @@ The keyed client is resolved on first use, like the unkeyed one.
 ## Metrics
 
 Meter `Ruvio.AspNetCore.OutputCaching`: `ruvio.output_cache.hit`, `ruvio.output_cache.miss` (tagged `reason`: `absent`
-when no entry is stored, `tag_evicted` when a tag of the entry was evicted since) and `ruvio.output_cache.tag_evict`
+when no entry is stored, `tag_evicted` when a tag of the entry was evicted since, `key_too_long` when the request's key is over `MaxKeyBytes`, which is never stored) and `ruvio.output_cache.tag_evict`
 (one per `EvictByTagAsync`), next to the existing `ruvio.output_cache.storage_calls`, `storage_commands` and
 `storage_duration` (tagged `operation` and `outcome`). No keys or tags are recorded. With no listener attached a lookup
 pays one field read.

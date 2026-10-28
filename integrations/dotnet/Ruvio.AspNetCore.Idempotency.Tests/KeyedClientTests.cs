@@ -10,7 +10,7 @@ namespace Ruvio.AspNetCore.Idempotency.Tests;
 
 public class KeyedClientTests
 {
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task ClientKeySelectsTheKeyedClientPerRequest()
     {
         var keyed = DispatchProxy.Create<IRuvioClient, IdempotencyEdgeTests.EdgeClient>();
