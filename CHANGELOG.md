@@ -4,6 +4,7 @@ Notable changes to the Ruvio server (`ruvio`, `ruvio-ctl`, the Docker image and 
 
 ## Unreleased
 
+- Docs: `docs/CLIENT_BEHAVIOR.md` has a TLS section: what the six clients verify by default, which sockets use TLS (including follow-primary probes), how to disable verification, and the option names per client (issue #323).
 - Fixed: `ruvio import --replace` staged a copy under `<key>:import-tmp`, so a real key of that name in the target was deleted without a trace. The staging name now ends in a token made per run, the importer checks that the name is free in the target before writing, and source keys that carry the run's marker are skipped and shown as `skipped_staging`. A crash can still leave one staging key behind; `docs/IMPORT.md` says how to find it. Server unchanged.
 - Docs: `CLAUDE.md` and the `.claude/` skills and settings describe how to work on the repository with Claude Code; `scripts/check_hygiene.sh` scans a change for text that must not reach the public repository.
 - Fixed: a replica's receive queue counted copied `PUBLISH` messages against nothing after the stall fix below, so a burst of large messages could hold up to 1,024 frames of any size; they now count against the queue's 16 MB budget like records. A replica no longer syncs its log on every drain while `CLIENT DURABILITY` is in use when nothing arrived. Nothing changes on the primary or on disk.
