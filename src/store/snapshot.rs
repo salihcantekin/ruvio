@@ -648,7 +648,13 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
                     .map_err(|_| "invalid Bloom filter in snapshot")?,
             )),
 
+            // A snapshot from before leases had their own deadline: a lease that has run out is
+            // dropped, and a live one gets its deadline below.
             SnapshotValue::Lease { token, expires_at } => {
+                if expires_at <= self.now_unix_millis().get() {
+                    return Ok(());
+                }
+
                 Value::Lease(Box::new(LeaseValue { token, expires_at }))
             }
 
@@ -700,7 +706,12 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         let key = snapshot.key;
         let before = self.entry_charge(&key);
 
-        let expires_at = snapshot.expires_at;
+        let expires_at = match &value {
+            Value::Lease(lease) if snapshot.expires_at.is_none() => {
+                Some(UnixMillis::new(lease.expires_at))
+            }
+            _ => snapshot.expires_at,
+        };
 
         let timed = value.soonest_field_deadline().is_some();
 

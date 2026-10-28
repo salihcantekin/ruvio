@@ -132,8 +132,11 @@ public class FencingTests
         Assert.False(await first.ExtendAsync());
         Assert.True(await second.ReleaseAsync());
 
-        // The server keeps a released lease's key, so a plain lock never takes that resource again.
-        Assert.Null(await plain.TryAcquireAsync("job", TimeSpan.FromSeconds(5)));
+        // A released lease takes its key with it, so a plain lock can take the resource again.
+        await using (IRuvioLock? plainAfter = await plain.TryAcquireAsync("job", TimeSpan.FromSeconds(5)))
+        {
+            Assert.NotNull(plainAfter);
+        }
 
         // A resource a plain lock holds is taken for a fenced one (LEASE answers WRONGTYPE).
         await using IRuvioLock? plainHolder = await plain.TryAcquireAsync("other", TimeSpan.FromSeconds(5));

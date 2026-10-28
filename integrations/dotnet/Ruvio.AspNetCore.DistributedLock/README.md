@@ -70,12 +70,10 @@ await SaveAsync(held.FencingToken!.Value, held.LockLost);
   The token survives expiry, release, a restart and a failover: a later owner always gets a larger one.
 - `[RuvioLock]` endpoints read it with `HttpContext.GetRuvioLock()?.FencingToken`.
 - Without `Fenced`, `FencingToken` is null. Other `IRuvioLock` implementations get null from the interface's default.
-- **The server keeps a lease's key after it is released or expires** (that is how the token keeps growing), so
-  each resource name used with fencing stays as one small key. Use it for a bounded set of names (jobs, ledgers,
-  tenants), not for a template such as `order:{id}` over every order, unless the keys are deleted later.
 - **Turn it on for every instance at once.** A resource a plain lock holds is taken for a fenced one, and the
-  other way round, so the two never run together. But a plain lock can never take a resource a fenced lock has
-  used, because the kept key is there: turning fencing off again means deleting those keys while nothing runs.
+  other way round, so the two never run together. A lease's key goes away when it is released or expires, so
+  names such as `order:{id}` leave nothing behind and a plain lock can take the name again afterwards.
+  Servers before this change kept the key: there, use fencing for a bounded set of names.
 
 ## One instance at a time: `AddRuvioSingleton`
 

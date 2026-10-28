@@ -1052,10 +1052,6 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
     }
 
     pub fn pttl(&self, key: &[u8]) -> i64 {
-        if let Some(ttl) = self.lease_ttl_ms(key) {
-            return ttl;
-        }
-
         if self.entries.lookup(key).is_none() || self.key_is_expired(key) {
             return -2;
         }
