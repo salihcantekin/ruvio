@@ -9,7 +9,7 @@ namespace Ruvio.AspNetCore.RateLimiting.Tests;
 
 public class PolicyExtensionTests
 {
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task EachPolicyUsesItsOwnPartitionAndFallsBackToTheDefault()
     {
         var (stub, client) = NewClient();
@@ -40,7 +40,7 @@ public class PolicyExtensionTests
         }));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task InlineEndpointWithoutAnyPartitionKeyFailsBeforeCallingRuvio()
     {
         var (stub, client) = NewClient();
@@ -52,7 +52,7 @@ public class PolicyExtensionTests
         Assert.Empty(stub.Keys);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task DefaultPolicyAppliesToEndpointsWithoutMetadataAndCanBeDisabled()
     {
         var (stub, client) = NewClient();
@@ -81,7 +81,7 @@ public class PolicyExtensionTests
         Assert.Equal(2, stub.Keys.Count);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task WithoutADefaultPolicyEndpointsWithoutMetadataAreNotLimited()
     {
         var (stub, client) = NewClient();
@@ -92,7 +92,7 @@ public class PolicyExtensionTests
         Assert.Empty(stub.Keys);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task BlankPartitionThrowsByDefaultAndSharesOneBucketOnRequest()
     {
         var (stub, client) = NewClient();
@@ -123,7 +123,7 @@ public class PolicyExtensionTests
             () => middleware.InvokeAsync(Context(shared, new RuvioRateLimitAttribute("p", 5, 60))));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task ChainedLimitsEachUseTheirOwnKeyAndStopAtTheFirstRejection()
     {
         var (stub, client) = NewClient();
@@ -177,7 +177,7 @@ public class PolicyExtensionTests
         Assert.Throws<ArgumentNullException>(() => options.AddPolicy("a", 1, TimeSpan.FromSeconds(1), (Func<HttpContext, string>)null!));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task ConcurrencySlotIsHeldWhileTheEndpointRunsAndReleased()
     {
         var (stub, client) = NewClient();
@@ -197,7 +197,7 @@ public class PolicyExtensionTests
         Assert.Equal((stub.Keys[0], 77L), Assert.Single(stub.Released));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task ConcurrencySlotIsReleasedWhenTheEndpointThrows()
     {
         var (stub, client) = NewClient();
@@ -209,7 +209,7 @@ public class PolicyExtensionTests
         Assert.Single(stub.Released);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task FullConcurrencyAnswers429WithoutRunningTheEndpoint()
     {
         var (stub, client) = NewClient();
@@ -225,7 +225,7 @@ public class PolicyExtensionTests
         Assert.Empty(stub.Released);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task SlotIsReleasedWhenALaterLimitRejects()
     {
         var (stub, client) = NewClient();
@@ -240,7 +240,7 @@ public class PolicyExtensionTests
         Assert.Single(stub.Released);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task FailedReleaseDoesNotFailTheRequest()
     {
         var (stub, client) = NewClient();
@@ -252,7 +252,7 @@ public class PolicyExtensionTests
         await middleware.InvokeAsync(Context(services, new RuvioRateLimitAttribute("uploads")));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task OnRejectedRunsAfterTheDefaultAnswerAndMayReplaceIt()
     {
         var (stub, client) = NewClient();

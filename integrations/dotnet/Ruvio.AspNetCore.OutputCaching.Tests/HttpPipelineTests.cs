@@ -13,7 +13,7 @@ namespace Ruvio.AspNetCore.OutputCaching.Tests;
 
 public class HttpPipelineTests
 {
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task UnselectedEndpointDoesNotCreateAClient()
     {
         var builder = Builder();

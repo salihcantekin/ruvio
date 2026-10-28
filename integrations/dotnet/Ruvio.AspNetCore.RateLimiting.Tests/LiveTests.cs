@@ -9,7 +9,7 @@ namespace Ruvio.AspNetCore.RateLimiting.Tests;
 
 public class LiveTests
 {
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task InstancesShareABudgetAndExpiredWindowsReset()
     {
         string? address = Environment.GetEnvironmentVariable("RUVIO_TEST_ADDR");
@@ -62,7 +62,7 @@ public class LiveTests
         }
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task NamedPolicyLimitsAgainstARealServer()
     {
         string? address = Environment.GetEnvironmentVariable("RUVIO_TEST_ADDR");
@@ -112,7 +112,7 @@ public class LiveTests
         }
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task ChainedLimitsConcurrencyAndOnRejectedWorkAgainstARealServer()
     {
         string? address = Environment.GetEnvironmentVariable("RUVIO_TEST_ADDR");
@@ -146,9 +146,9 @@ public class LiveTests
         });
 
         using var services = collection.BuildServiceProvider();
-        var release = new TaskCompletionSource();
-        var entered = new TaskCompletionSource();
-        var holder = MiddlewareTests.Create(async _ => { entered.SetResult(); await release.Task; }, services);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var holder = MiddlewareTests.Create(async _ => { entered.SetResult(); await release.Task.WaitAsync(TimeSpan.FromSeconds(20)); }, services);
         var quick = MiddlewareTests.Create(_ => Task.CompletedTask, services);
 
         // The second limit (2 per window) refuses the third call; the first limit has counted it.
