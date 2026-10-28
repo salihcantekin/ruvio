@@ -85,18 +85,64 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
     }
 
     /// `write_bytes`; with `HINTED`, `hint` is the index's `lookup_hint` of `key` and
-    /// saves hashing it again. Without, `hint` is unused and the code is the plain write.
+    /// saves hashing it again. Without, `hint` is unused and the key is hashed once here.
     fn write_bytes_hinted<const HINTED: bool>(&mut self, key: &[u8], value: &[u8], hint: u64) {
-        if self.overwrite_log::<HINTED>(key, value, hint) || self.overwrite_heap(key, value) {
+        // A log-sized value hashes the key once for every lookup below. A long value
+        // starts with the heap lookup, which hashes on its own, and hashes here only
+        // for a new key.
+        let small = value.len() <= LOG_VALUE_MAX;
+        let hint = if HINTED {
+            hint
+        } else if small {
+            self.entries.lookup_hint(key)
+        } else {
+            0
+        };
+
+        if small {
+            // The deadline is gone or kept on purpose, so a raw miss is a new key.
+            let found = match self.entries.lookup_hinted(key, hint) {
+                None => None,
+                Some(IndexRef::Log { offset, len }) => Some(Some((offset, len))),
+                Some(_) => Some(None),
+            };
+
+            match found {
+                None => {
+                    let created = self.alloc_bytes(value);
+
+                    self.insert_new_bytes(key, created, hint);
+
+                    return;
+                }
+                Some(Some((offset, len))) if self.overwrite_log(key, value, offset, len) => {
+                    self.finish_set(key);
+
+                    return;
+                }
+                Some(_) => {}
+            }
+        } else if self.overwrite_heap(key, value) {
             self.finish_set(key);
 
             return;
         }
 
         // The deadline is gone or kept on purpose, so one raw lookup is the live view.
-        let (before, body, exists) = match self.entries.get_key_value(key) {
-            Some((stored_key, hit)) => (charge_of(stored_key, hit), bytes_body_of(hit), true),
-            None => (EntryCharge::default(), None, false),
+        let (before, body) = match self.entries.get_key_value(key) {
+            Some((stored_key, hit)) => (charge_of(stored_key, hit), bytes_body_of(hit)),
+            None => {
+                let hint = if HINTED || small {
+                    hint
+                } else {
+                    self.entries.lookup_hint(key)
+                };
+                let created = self.alloc_bytes(value);
+
+                self.insert_new_bytes(key, created, hint);
+
+                return;
+            }
         };
 
         let previous = if let Some(body) = body {
@@ -109,15 +155,10 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
 
             let _ = self.entries.insert(key, entry);
             None
-        } else if exists {
-            let created = self.alloc_bytes(value);
-
-            self.replace_with_bytes(key, created)
         } else {
             let created = self.alloc_bytes(value);
 
-            self.insert_entry(key, Entry::fresh(Value::Bytes(created)));
-            None
+            self.replace_with_bytes(key, created)
         };
 
         if let Some(previous) = previous {
@@ -458,25 +499,9 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
 
     /// Same-size and smaller log strings stay in the existing span. A larger
     /// short string takes a new span and the key record keeps its place.
-    pub(super) fn overwrite_log<const HINTED: bool>(
-        &mut self,
-        key: &[u8],
-        value: &[u8],
-        hint: u64,
-    ) -> bool {
-        if value.len() > LOG_VALUE_MAX {
-            return false;
-        }
-
-        let found = if HINTED {
-            self.entries.lookup_hinted(key, hint)
-        } else {
-            self.entries.lookup(key)
-        };
-        let Some(IndexRef::Log { offset, len }) = found else {
-            return false;
-        };
-
+    /// `offset` and `len` are the key's log record, just looked up; `value` fits the log.
+    #[inline(always)]
+    fn overwrite_log(&mut self, key: &[u8], value: &[u8], offset: u32, len: u16) -> bool {
         if is_integer(len) {
             return false;
         }
@@ -1209,6 +1234,28 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         previous
     }
 
+    /// Stores a string under `key`, which the caller just found missing; `hint` is the
+    /// index's `lookup_hint` of `key`. The charge comes from the value in hand, so the
+    /// write costs one hash and no lookup after the miss.
+    fn insert_new_bytes(&mut self, key: &[u8], created: BytesValue, hint: u64) {
+        let entry = Entry::fresh(Value::Bytes(created));
+        let after = EntryCharge::for_entry(key, &entry);
+
+        self.entries.insert_absent_hinted(key, hint, entry);
+
+        if self.json_indexes.is_some() {
+            self.json_index_refresh(key);
+        }
+
+        debug_assert_eq!(after, self.entry_charge(key), "new string charge");
+        self.apply_entry_charge(EntryCharge::default(), after, key);
+        self.note_key(key, crate::notify::KeyEvent::Set);
+
+        if self.change_log.is_some() {
+            self.note_change(format!("SET {}", String::from_utf8_lossy(key)));
+        }
+    }
+
     pub(super) fn alloc_bytes(&mut self, value: &[u8]) -> BytesValue {
         if value.len() <= LOG_VALUE_MAX {
             let (offset, len) = self.value_log.alloc(value);
@@ -1306,7 +1353,17 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
 
 impl<C: Clock, I: StorageIndex> KvShard<C, I> {
     pub(crate) fn preview_increment(&self, key: &[u8], delta: i64) -> Result<i64, IncrementError> {
-        let Some(current) = self.current_integer(key)? else {
+        self.preview_increment_hinted(key, delta, self.entries.lookup_hint(key))
+    }
+
+    /// `preview_increment` given `hint` from [`Self::key_hint`].
+    pub(crate) fn preview_increment_hinted(
+        &self,
+        key: &[u8],
+        delta: i64,
+        hint: u64,
+    ) -> Result<i64, IncrementError> {
+        let Some(current) = self.current_integer_hinted(key, hint)? else {
             return Ok(delta);
         };
 
@@ -1430,9 +1487,13 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
     }
 
     pub(super) fn current_integer(&self, key: &[u8]) -> Result<Option<i64>, IncrementError> {
+        self.current_integer_hinted(key, self.entries.lookup_hint(key))
+    }
+
+    fn current_integer_hinted(&self, key: &[u8], hint: u64) -> Result<Option<i64>, IncrementError> {
         let Some(hit) = self
             .entries
-            .lookup(key)
+            .lookup_hinted(key, hint)
             .filter(|_| !self.key_is_expired(key))
         else {
             return Ok(None);
@@ -1487,8 +1548,18 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
     }
 
     pub(crate) fn set_integer(&mut self, key: &[u8], value: i64) -> Result<(), WrongType> {
+        self.set_integer_hinted(key, value, self.entries.lookup_hint(key))
+    }
+
+    /// `set_integer` given `hint` from [`Self::key_hint`].
+    pub(crate) fn set_integer_hinted(
+        &mut self,
+        key: &[u8],
+        value: i64,
+        hint: u64,
+    ) -> Result<(), WrongType> {
         if (self.expiration.keys_with_ttl == 0 || !self.key_is_expired(key))
-            && self.entries.write_integer(key, value)
+            && self.entries.write_integer_hinted(key, value, hint)
         {
             self.note_mutation(key);
             self.note_write(key);
@@ -1545,9 +1616,10 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
     }
 
     pub fn increment(&mut self, key: &[u8], delta: i64) -> Result<i64, IncrementError> {
-        let updated = self.preview_increment(key, delta)?;
+        let hint = self.key_hint(key);
+        let updated = self.preview_increment_hinted(key, delta, hint)?;
 
-        self.set_integer(key, updated)
+        self.set_integer_hinted(key, updated, hint)
             .map_err(|_| IncrementError::WrongType)?;
         Ok(updated)
     }

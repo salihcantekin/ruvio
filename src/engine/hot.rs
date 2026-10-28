@@ -136,29 +136,33 @@ pub fn execute_hot_into_with_sink<C: Clock, I: StorageIndex, S: MutationSink>(
             output.write_all(if removed { b":1\r\n" } else { b":0\r\n" })?;
         }
 
-        HotCommand::Increment(key, delta) => match shard.preview_increment(key, delta) {
-            Ok(value) => {
-                if let Some(rejected) =
-                    before_mutation(shard, sink, [key], key.len() + ADMISSION_OVERHEAD_BYTES)
-                        .map_err(ExecuteError::Mutation)?
-                {
-                    write_response(output, rejected)?;
+        HotCommand::Increment(key, delta) => {
+            let hint = shard.key_hint(key);
 
-                    return Ok(());
+            match shard.preview_increment_hinted(key, delta, hint) {
+                Ok(value) => {
+                    if let Some(rejected) =
+                        before_mutation(shard, sink, [key], key.len() + ADMISSION_OVERHEAD_BYTES)
+                            .map_err(ExecuteError::Mutation)?
+                    {
+                        write_response(output, rejected)?;
+
+                        return Ok(());
+                    }
+
+                    sink.record(Mutation::SetInteger { key, value })
+                        .map_err(ExecuteError::Mutation)?;
+                    shard
+                        .set_integer_hinted(key, value, hint)
+                        .expect("increment type was validated before recording");
+                    output.write_all(b":")?;
+                    write_i64(output, value)?;
+                    output.write_all(b"\r\n")?;
                 }
 
-                sink.record(Mutation::SetInteger { key, value })
-                    .map_err(ExecuteError::Mutation)?;
-                shard
-                    .set_integer(key, value)
-                    .expect("increment type was validated before recording");
-                output.write_all(b":")?;
-                write_i64(output, value)?;
-                output.write_all(b"\r\n")?;
+                Err(error) => write_response(output, increment_error(error))?,
             }
-
-            Err(error) => write_response(output, increment_error(error))?,
-        },
+        }
     }
 
     Ok(())

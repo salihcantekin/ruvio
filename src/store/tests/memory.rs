@@ -407,6 +407,92 @@ fn string_charges_count_records_and_allocator_blocks() {
     assert_eq!(shard.key_memory_usage(key), Some(16 + 12));
 }
 
+/// Every write that skips a lookup (a new string charged from the value in hand, a
+/// counter written with the read's hash) must leave the shard's totals equal to a
+/// recount of what the index holds, on both index kinds.
+fn new_key_writes_charge_like_a_recount<I: StorageIndex>(index: I) {
+    let clock = TestClock::new(1_000);
+    let mut shard = KvShard::with_index_and_clock(index, clock.clone());
+    let check = |shard: &KvShard<TestClock, I>| {
+        let (mut keys, mut values, mut collections) = (0, 0, 0);
+        let mut entries = 0;
+
+        for (_, map) in shard.database_maps() {
+            entries += map.len();
+
+            for (key, hit) in map.entries() {
+                let charge = charge_of(key, hit);
+
+                keys += charge.key_bytes;
+                values += charge.value_bytes;
+                collections += charge.collection_bytes;
+            }
+        }
+
+        let usage = shard.memory_usage();
+
+        assert_eq!(usage.entries, entries);
+        assert_eq!(usage.key_bytes, keys);
+        assert_eq!(usage.value_bytes, values);
+        assert_eq!(usage.collection_bytes, collections);
+    };
+
+    // New short, empty and long strings.
+    shard.set_bytes(b"short", b"value");
+    shard.set_bytes(b"empty", b"");
+    shard.set_bytes(b"long", &[4; 5_000]);
+    check(&shard);
+    assert_eq!(shard.get(b"short"), Some(&b"value"[..]));
+    assert_eq!(shard.get(b"long").map(<[u8]>::len), Some(5_000));
+
+    // Overwrites in place, larger, and across the short/long boundary.
+    shard.set_bytes(b"short", b"v");
+    shard.set_bytes(b"short", &[5; 40]);
+    shard.set_bytes(b"short", &[6; 5_000]);
+    shard.set_bytes(b"long", b"tiny");
+    check(&shard);
+
+    // Many new keys in a pipeline, including enough to grow the table.
+    let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..600)
+        .map(|n| (format!("m:{n}").into_bytes(), vec![b'x'; n % 50]))
+        .collect();
+
+    shard.set_many_bytes(&pairs);
+    check(&shard);
+    assert_eq!(shard.get(b"m:49"), Some(&[b'x'; 49][..]));
+
+    // A string over another type, and over a key whose deadline has passed.
+    shard.list_push_back(b"list", &[b"item"]).unwrap();
+    shard.set_bytes(b"list", b"now a string");
+    assert!(shard.expire_at(b"short", UnixMillis::new(1_500)));
+    clock.set(2_000);
+    shard.set_bytes(b"short", b"after expiry");
+    check(&shard);
+    assert_eq!(shard.get(b"short"), Some(&b"after expiry"[..]));
+    assert_eq!(shard.get(b"list"), Some(&b"now a string"[..]));
+
+    // Counters: new, in place, from a string, and a wrong type left untouched.
+    assert_eq!(shard.increment(b"counter", 5), Ok(5));
+    assert_eq!(shard.increment(b"counter", -7), Ok(-2));
+    shard.set_bytes(b"text", b"41");
+    assert_eq!(shard.increment(b"text", 1), Ok(42));
+    shard.list_push_back(b"jobs", &[b"item"]).unwrap();
+    assert!(shard.increment(b"jobs", 1).is_err());
+    check(&shard);
+    assert_eq!(shard.copied_value(b"counter"), Some(b"-2".to_vec()));
+    assert_eq!(shard.copied_value(b"text"), Some(b"42".to_vec()));
+}
+
+#[test]
+fn new_key_writes_charge_like_a_recount_on_the_hash_index() {
+    new_key_writes_charge_like_a_recount(crate::index::AHashIndex::default());
+}
+
+#[test]
+fn new_key_writes_charge_like_a_recount_on_the_tree_index() {
+    new_key_writes_charge_like_a_recount(crate::index::BTreeIndex::default());
+}
+
 #[test]
 fn repeated_list_pushes_charge_payload_without_rescanning() {
     let value = vec![b'x'; 64];
