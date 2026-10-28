@@ -864,6 +864,8 @@ fn frame_reader_accepts_a_length_above_the_default_within_configured_max() {
     let length = crate::protocol::DEFAULT_MAX_COMMAND_BYTES + 1;
     let mut reader = FrameReader {
         pending: (length as u32).to_le_bytes().to_vec(),
+        start: 0,
+        scratch: Vec::new(),
         max_frame_bytes: configured,
     };
 
@@ -874,6 +876,68 @@ fn frame_reader_accepts_a_length_above_the_default_within_configured_max() {
     assert!(taken.is_none());
     reader.pending = 31u32.to_le_bytes().to_vec();
     assert!(reader.take_frame().is_err());
+}
+
+#[test]
+fn frame_reader_takes_frames_in_order_and_keeps_a_partial_one() {
+    let frame = |fill: u8, length: usize| {
+        let mut bytes = vec![fill; length];
+        bytes[..4].copy_from_slice(&(length as u32).to_le_bytes());
+        bytes
+    };
+    let (first, second, third) = (frame(1, 32), frame(2, 40), frame(3, 48));
+    let mut pending = [first.clone(), second.clone()].concat();
+    pending.extend_from_slice(&third[..20]);
+    let mut reader = FrameReader {
+        pending,
+        start: 0,
+        scratch: Vec::new(),
+        max_frame_bytes: 1024,
+    };
+
+    assert!(reader.frame_buffered());
+    assert_eq!(reader.take_frame().unwrap(), Some(first));
+    assert!(reader.frame_buffered());
+    assert_eq!(reader.take_frame().unwrap(), Some(second));
+    assert!(!reader.frame_buffered());
+    assert_eq!(reader.take_frame().unwrap(), None);
+
+    // What the next socket read does: the partial frame moves to the front.
+    reader.pending.drain(..reader.start);
+    reader.start = 0;
+    reader.pending.extend_from_slice(&third[20..]);
+    assert!(reader.frame_buffered());
+    assert_eq!(reader.take_frame().unwrap(), Some(third));
+    assert!(!reader.frame_buffered());
+}
+
+#[test]
+fn outstanding_frames_keep_their_byte_total() {
+    let mut outstanding = Outstanding::default();
+
+    assert!(outstanding.has_room());
+    outstanding.push(1, 10);
+    outstanding.push(2, 20);
+    outstanding.push(3, QUEUE_BYTES);
+    assert_eq!(outstanding.bytes, QUEUE_BYTES + 30);
+    assert!(!outstanding.has_room());
+
+    outstanding.reclaim_through(2);
+    assert_eq!(outstanding.bytes, QUEUE_BYTES);
+    assert_eq!(outstanding.frames.len(), 1);
+    assert!(!outstanding.has_room());
+
+    outstanding.reclaim_through(3);
+    assert_eq!(outstanding.bytes, 0);
+    assert!(outstanding.has_room());
+
+    for sequence in 0..QUEUE_FRAMES as u64 {
+        outstanding.push(sequence + 10, 1);
+    }
+    assert!(!outstanding.has_room());
+    outstanding.clear();
+    assert_eq!(outstanding.bytes, 0);
+    assert!(outstanding.has_room());
 }
 
 #[test]
@@ -1704,7 +1768,7 @@ fn snapshot_reply_leaves_the_upstream_record_until_the_snapshot_is_installed() {
     let (retry, _) = read_primary(
         &mut stream,
         &link,
-        &mut VecDeque::new(),
+        &mut Outstanding::default(),
         &AtomicBool::new(false),
     );
 
@@ -1728,7 +1792,7 @@ fn snapshot_reply_leaves_the_upstream_record_until_the_snapshot_is_installed() {
     read_primary(
         &mut stream,
         &link,
-        &mut VecDeque::new(),
+        &mut Outstanding::default(),
         &AtomicBool::new(false),
     );
     join_within(server).unwrap();
@@ -2354,7 +2418,7 @@ fn a_replica_does_not_follow_a_primary_below_the_epoch_it_followed() {
     let (retry, _) = read_primary(
         &mut stream,
         &link,
-        &mut VecDeque::new(),
+        &mut Outstanding::default(),
         &AtomicBool::new(false),
     );
     let sent = join_within(server).unwrap();
@@ -2521,6 +2585,7 @@ fn a_replica_still_copying_sends_no_acknowledgement() {
     let (link, _deliveries) = link_to(primary.local_addr().unwrap(), directory.path());
     let mut acks = AckSend {
         status: Arc::clone(&link.status),
+        durable: link.wal.lock().unwrap().durable(),
         last: 0,
         sent_at: std::time::Instant::now() - ACK_HEARTBEAT,
         offset: 0,
@@ -2529,7 +2594,7 @@ fn a_replica_still_copying_sends_no_acknowledgement() {
     };
 
     link.status.set_copying(true);
-    acks.poll(&mut replica_side, &link.wal);
+    acks.poll(&mut replica_side);
     primary_side
         .set_read_timeout(Some(Duration::from_millis(50)))
         .unwrap();
@@ -2538,7 +2603,7 @@ fn a_replica_still_copying_sends_no_acknowledgement() {
     assert!(primary_side.read(&mut byte).is_err(), "an ack was sent");
 
     link.status.set_copying(false);
-    acks.poll(&mut replica_side, &link.wal);
+    acks.poll(&mut replica_side);
     assert_eq!(read_socket(&mut primary_side, ACK_LEN).len(), ACK_LEN);
 }
 
