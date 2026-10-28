@@ -7,6 +7,8 @@ use crate::{OwnedMutation, mutation::Mutation, protocol::ProtocolLimits};
 
 use super::PersistenceError;
 
+mod crc;
+
 pub(crate) const WAL_MAGIC: &[u8; 8] = b"RUVWAL01";
 pub(crate) const WAL_HEADER_LEN: usize = 52;
 pub(crate) const RECORD_HEADER_LEN: usize = 28;
@@ -313,7 +315,7 @@ pub(crate) fn encode_record_into(
     bytes.clear();
     bytes.resize(RECORD_HEADER_LEN, 0);
     let record_type = encode_payload(mutation, bytes)?;
-    finish_record(bytes, shard_id, sequence, database, record_type)
+    finish_record_at(bytes, 0, shard_id, sequence, database, record_type)
 }
 
 /// Encodes a borrowed mutation without first copying it into an `OwnedMutation`.
@@ -327,14 +329,29 @@ pub(crate) fn encode_borrowed_record_into(
     mutation: &Mutation<'_>,
 ) -> Result<(), PersistenceError> {
     bytes.clear();
-    bytes.resize(RECORD_HEADER_LEN, 0);
+    encode_borrowed_record_appended(bytes, shard_id, sequence, database, mutation)
+}
+
+/// [`encode_borrowed_record_into`] that appends the record after what `bytes` already holds,
+/// so a WAL batch buffer takes it without a second copy. On error `bytes` may hold a partial
+/// record past its old length; the caller truncates it.
+pub(crate) fn encode_borrowed_record_appended(
+    bytes: &mut Vec<u8>,
+    shard_id: u32,
+    sequence: u64,
+    database: u8,
+    mutation: &Mutation<'_>,
+) -> Result<(), PersistenceError> {
+    let start = bytes.len();
+
+    bytes.resize(start + RECORD_HEADER_LEN, 0);
 
     let record_type = match encode_borrowed_payload(mutation, bytes)? {
         Some(record_type) => record_type,
         None => encode_payload(&Mutation::to_owned(*mutation), bytes)?,
     };
 
-    finish_record(bytes, shard_id, sequence, database, record_type)
+    finish_record_at(bytes, start, shard_id, sequence, database, record_type)
 }
 
 fn encode_borrowed_payload(
@@ -449,13 +466,16 @@ fn encode_borrowed_payload(
     Ok(Some(record_type))
 }
 
-fn finish_record(
-    bytes: &mut Vec<u8>,
+/// Fills the header of the record that starts at `start` and appends its checksum.
+fn finish_record_at(
+    buffer: &mut Vec<u8>,
+    start: usize,
     shard_id: u32,
     sequence: u64,
     database: u8,
     record_type: u16,
 ) -> Result<(), PersistenceError> {
+    let bytes = &mut buffer[start..];
     let payload_len = bytes.len() - RECORD_HEADER_LEN;
     let total_length = u32::try_from(bytes.len() + 4)
         .map_err(|_| PersistenceError::Failed("WAL record exceeds 4 GiB".into()))?;
@@ -471,9 +491,9 @@ fn finish_record(
             .map_err(|_| PersistenceError::Failed("WAL payload exceeds 4 GiB".into()))?
             .to_le_bytes(),
     );
-    let checksum = crc32c::crc32c(&bytes[field::LENGTH.end..]);
+    let checksum = crc::checksum(&bytes[field::LENGTH.end..]);
 
-    put_u32(bytes, checksum);
+    put_u32(buffer, checksum);
     Ok(())
 }
 
@@ -560,7 +580,7 @@ pub(crate) fn decode_record(
     let checksum_offset = frame.len() - 4;
     let expected_checksum = u32::from_le_bytes(frame[checksum_offset..].try_into().unwrap());
 
-    if crc32c::crc32c(&frame[field::LENGTH.end..checksum_offset]) != expected_checksum {
+    if crc::checksum(&frame[field::LENGTH.end..checksum_offset]) != expected_checksum {
         return Err(PersistenceError::Corruption(
             "WAL record checksum mismatch".into(),
         ));

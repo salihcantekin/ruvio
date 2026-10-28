@@ -96,6 +96,10 @@ pub const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(30);
 pub const QUEUE_FRAMES: usize = 1024;
 pub const QUEUE_BYTES: usize = 16 * 1024 * 1024;
 const SHIPPER_READ_BYTES: usize = 16 * 1024 * 1024;
+/// One socket read on the replica: large enough to take many small frames at once.
+const RECEIVE_READ_BYTES: usize = 64 * 1024;
+/// Log records gathered into one write to a replica: one syscall per batch, not per record.
+const SHIPPER_WRITE_BYTES: usize = 256 * 1024;
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// First reconnect pause. Unit tests start replicas before primaries and must not wait a second.
@@ -1801,7 +1805,7 @@ pub fn spawn_replica_reader(link: ReplicaLink) -> ReplicationThread {
     let join = thread::Builder::new()
         .name(format!("ruvio-replica-{}", link.shard_id))
         .spawn(move || {
-            let mut outstanding = VecDeque::new();
+            let mut outstanding = Outstanding::default();
             let mut delay = RETRY_START;
 
             while !thread_stop.load(Ordering::Acquire) {
@@ -2084,13 +2088,12 @@ fn serve_replica(
         refuse_handshake(&mut stream, HandshakeStatus::Gap)?;
         return Ok(());
     }
-    // Where the shipper stopped in the log, so each chunk continues there.
-    let mut reader = FrameCursor::default();
+    let mut log = ShipperLog::default();
     let read = if forced_snapshot {
         Ok(FrameRead::Gap)
     } else {
         read_frames_resuming(
-            &mut reader,
+            &mut log.reader,
             &shipment.data_dir,
             shipment.shard_id,
             handshake.after_sequence,
@@ -2163,7 +2166,7 @@ fn serve_replica(
                 shipment,
                 &hold,
                 stop,
-                &mut reader,
+                &mut log,
                 last_sequence,
                 through,
             )?
@@ -2177,7 +2180,7 @@ fn serve_replica(
                 &hold,
                 &copied_publishes,
                 stop,
-                &mut reader,
+                &mut log,
                 last_sent,
             );
         }
@@ -2206,16 +2209,11 @@ fn serve_replica(
         return Ok(());
     }
 
-    let mut last_sent = handshake.after_sequence;
-
-    for frame in &frames {
-        if !write_live(&mut stream, frame, stop)? {
-            return Ok(());
-        }
-
-        last_sent = frame_sequence(frame);
-        hold.advance(last_sent);
-    }
+    let last_sent = match write_frames(&mut stream, &frames, &mut log.batch, &hold, stop)? {
+        Some(Some(sequence)) => sequence,
+        Some(None) => handshake.after_sequence,
+        None => return Ok(()),
+    };
 
     let _ = stream.flush();
 
@@ -2225,7 +2223,7 @@ fn serve_replica(
         &hold,
         &copied_publishes,
         stop,
-        &mut reader,
+        &mut log,
         last_sent,
     )
 }
@@ -2319,6 +2317,8 @@ fn poll_acks(stream: &mut dyn Wire, hold: &CursorHold, pending: &mut Vec<u8>) ->
 struct AckSend {
     /// While it reports a copy in progress, nothing is sent.
     status: Arc<LinkStatus>,
+    /// The log's durable cursor, read without taking the log's lock.
+    durable: Arc<AtomicU64>,
     last: u64,
     /// When `last` was sent: it is sent again after [`ACK_HEARTBEAT`].
     sent_at: std::time::Instant,
@@ -2328,18 +2328,14 @@ struct AckSend {
 }
 
 impl AckSend {
-    fn poll(&mut self, stream: &mut dyn Wire, wal: &Mutex<WalSink>) {
+    fn poll(&mut self, stream: &mut dyn Wire) {
         // The log of a replica still copying belongs to the history it is replacing.
         if !self.queued && self.status.is_copying() {
             return;
         }
 
         if !self.queued {
-            let durable = wal
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .durable()
-                .load(Ordering::Acquire);
+            let durable = self.durable.load(Ordering::Acquire);
 
             if durable == self.last && self.sent_at.elapsed() < ACK_HEARTBEAT {
                 return;
@@ -2366,18 +2362,26 @@ impl AckSend {
     }
 }
 
+/// A replica shipper's place in the log and the buffer it gathers records into.
+#[derive(Default)]
+struct ShipperLog {
+    /// Where the shipper stopped in the log, so each chunk continues there.
+    reader: FrameCursor,
+    batch: Vec<u8>,
+}
+
 fn stream_frames_through(
     stream: &mut dyn Wire,
     shipment: &Shipment,
     hold: &CursorHold,
     stop: &AtomicBool,
-    reader: &mut FrameCursor,
+    log: &mut ShipperLog,
     mut cursor: u64,
     through: u64,
 ) -> io::Result<Option<u64>> {
     while cursor < through {
         let frames = match read_frames_resuming(
-            reader,
+            &mut log.reader,
             &shipment.data_dir,
             shipment.shard_id,
             cursor,
@@ -2388,15 +2392,74 @@ fn stream_frames_through(
             Ok(FrameRead::Frames(frames)) if !frames.is_empty() => frames,
             _ => return Ok(None),
         };
-        for frame in frames {
-            if !write_live(stream, &frame, stop)? {
-                return Ok(None);
-            }
-            cursor = frame_sequence(&frame);
-            hold.advance(cursor);
+        match write_frames(stream, &frames, &mut log.batch, hold, stop)? {
+            Some(Some(sequence)) => cursor = sequence,
+            Some(None) => {}
+            None => return Ok(None),
         }
     }
     Ok(Some(cursor))
+}
+
+/// Writes log records in order, gathered into writes of up to [`SHIPPER_WRITE_BYTES`]; a record
+/// that large is written on its own, so the buffer stays that small. The log this replica keeps
+/// retained moves past a record once the write holding it was accepted. `None` when the shipper must stop,
+/// otherwise the sequence of the last record written, if any.
+fn write_frames(
+    stream: &mut dyn Wire,
+    frames: &[Vec<u8>],
+    batch: &mut Vec<u8>,
+    hold: &CursorHold,
+    stop: &AtomicBool,
+) -> io::Result<Option<Option<u64>>> {
+    let mut last = None;
+    let mut pending = None;
+
+    batch.clear();
+
+    for frame in frames {
+        if !batch.is_empty() && batch.len() + frame.len() > SHIPPER_WRITE_BYTES {
+            if !write_live(stream, batch, stop)? {
+                return Ok(None);
+            }
+
+            batch.clear();
+            last = pending;
+            if let Some(sequence) = pending {
+                hold.advance(sequence);
+            }
+        }
+
+        if frame.len() >= SHIPPER_WRITE_BYTES {
+            if !write_live(stream, frame, stop)? {
+                return Ok(None);
+            }
+
+            let sequence = frame_sequence(frame);
+
+            last = Some(sequence);
+            pending = last;
+            hold.advance(sequence);
+            continue;
+        }
+
+        batch.extend_from_slice(frame);
+        pending = Some(frame_sequence(frame));
+    }
+
+    if !batch.is_empty() {
+        if !write_live(stream, batch, stop)? {
+            return Ok(None);
+        }
+
+        batch.clear();
+        last = pending;
+        if let Some(sequence) = pending {
+            hold.advance(sequence);
+        }
+    }
+
+    Ok(Some(last))
 }
 
 fn stream_new_frames(
@@ -2405,7 +2468,7 @@ fn stream_new_frames(
     hold: &CursorHold,
     copied_publishes: &Receiver<Vec<u8>>,
     stop: &AtomicBool,
-    reader: &mut FrameCursor,
+    log: &mut ShipperLog,
     mut last_sent: u64,
 ) -> io::Result<()> {
     let mut ack_bytes = Vec::new();
@@ -2432,10 +2495,33 @@ fn stream_new_frames(
             let _ = stream.flush();
         }
 
+        let batch = &mut log.batch;
+
+        batch.clear();
+
         while let Ok(frame) = copied_publishes.try_recv() {
-            if !write_live(stream, &frame, stop)? {
-                return Ok(());
+            if frame.len() >= SHIPPER_WRITE_BYTES {
+                if !write_live(stream, batch, stop)? || !write_live(stream, &frame, stop)? {
+                    return Ok(());
+                }
+
+                batch.clear();
+                continue;
             }
+
+            batch.extend_from_slice(&frame);
+
+            if batch.len() >= SHIPPER_WRITE_BYTES {
+                if !write_live(stream, batch, stop)? {
+                    return Ok(());
+                }
+
+                batch.clear();
+            }
+        }
+
+        if !batch.is_empty() && !write_live(stream, batch, stop)? {
+            return Ok(());
         }
 
         let through = shipment.published.load(Ordering::Acquire);
@@ -2447,7 +2533,7 @@ fn stream_new_frames(
         }
 
         let Some(sent) =
-            stream_frames_through(stream, shipment, hold, stop, reader, last_sent, through)?
+            stream_frames_through(stream, shipment, hold, stop, log, last_sent, through)?
         else {
             return Ok(());
         };
@@ -2458,7 +2544,7 @@ fn stream_new_frames(
 
 pub(crate) fn follow_primary(
     link: &ReplicaLink,
-    outstanding: &mut VecDeque<(u64, usize)>,
+    outstanding: &mut Outstanding,
     stop: &AtomicBool,
     wake: &Mutex<Option<TcpStream>>,
 ) -> (bool, bool) {
@@ -2580,7 +2666,7 @@ impl Drop for CatchupReconnect<'_> {
 fn read_primary(
     stream: &mut dyn Wire,
     link: &ReplicaLink,
-    outstanding: &mut VecDeque<(u64, usize)>,
+    outstanding: &mut Outstanding,
     stop: &AtomicBool,
 ) -> (bool, bool) {
     let requested = link.resync_sequence.load(Ordering::Acquire);
@@ -2785,8 +2871,14 @@ fn read_primary(
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(SHIPPER_POLL));
     let _ = stream.set_write_timeout(Some(SHIPPER_POLL));
+    let (segment_bytes, durable) = {
+        let wal = link.wal.lock().unwrap_or_else(|error| error.into_inner());
+
+        (wal.segment_bytes(), wal.durable())
+    };
     let mut acks = AckSend {
         status: Arc::clone(&link.status),
+        durable,
         last: 0,
         sent_at: std::time::Instant::now(),
         offset: 0,
@@ -2794,51 +2886,57 @@ fn read_primary(
         queued: false,
     };
 
-    acks.poll(stream, &link.wal);
+    acks.poll(stream);
     // The primary repeats what a durable reply needs after every handshake.
     link.status.note_control(0, false);
     link.status.mark_up();
     // Frames carry records written under the primary's limits, not this replica's; but
     // none larger than this replica's own log segment can be stored, so a declared length
     // past it is refused before it is buffered.
-    let segment_bytes = link
-        .wal
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .segment_bytes();
     let mut reader = FrameReader {
         pending: Vec::new(),
+        start: 0,
+        scratch: vec![0; RECEIVE_READ_BYTES],
         max_frame_bytes: usize::try_from(segment_bytes)
             .unwrap_or(usize::MAX)
             .min(crate::persistence::WAL_RECORD_MAX_BYTES),
     };
 
+    // Frames handed to the shard since its last wake: the shard is woken once every frame
+    // that arrived in the same read is queued, instead of once per frame.
+    let mut unwoken = false;
+
     loop {
+        if unwoken && !reader.frame_buffered() {
+            link.wake_shard.notify_one();
+            unwoken = false;
+        }
+
         if !wait_for_queue_room(link, outstanding, stop) {
             return (!stop.load(Ordering::Acquire), true);
         }
 
-        let frame =
-            match reader.next_frame(stream, stop, &link.resync_sequence, &mut acks, &link.wal) {
-                Ok(Some(frame)) => frame,
-                Ok(None) => return (false, true),
-                Err(error) => {
-                    if error.kind() == io::ErrorKind::InvalidData {
-                        warn!(%error, "replication frame rejected");
-                    }
-
-                    return (!stop.load(Ordering::Acquire), true);
+        let frame = match reader.next_frame(stream, stop, link, &mut acks) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return (false, true),
+            Err(error) => {
+                if unwoken {
+                    link.wake_shard.notify_one();
                 }
-            };
+                if error.kind() == io::ErrorKind::InvalidData {
+                    warn!(%error, "replication frame rejected");
+                }
 
-        link.status.touch();
+                return (!stop.load(Ordering::Acquire), true);
+            }
+        };
 
         if let Some((committed, ack_each)) = decode_control(&frame) {
             link.status.note_control(committed, ack_each);
             if ack_each {
                 link.wake_shard.notify_one();
             }
-            acks.poll(stream, &link.wal);
+            acks.poll(stream);
 
             continue;
         }
@@ -2851,6 +2949,7 @@ fn read_primary(
         if !enqueue_frame(link, outstanding, frame, stop) {
             return (!stop.load(Ordering::Acquire), true);
         }
+        unwoken = true;
         if let (Some(sequence), Some(through)) = (sequence, catchup.through)
             && sequence >= through
         {
@@ -2865,12 +2964,16 @@ fn read_primary(
             catchup.through = None;
         }
 
-        acks.poll(stream, &link.wal);
+        acks.poll(stream);
     }
 }
 
 struct FrameReader {
     pending: Vec<u8>,
+    /// Where the first frame not yet taken begins: taking a frame moves this offset
+    /// instead of shifting the rest of `pending`.
+    start: usize,
+    scratch: Vec<u8>,
     max_frame_bytes: usize,
 }
 
@@ -2879,14 +2982,11 @@ impl FrameReader {
         &mut self,
         stream: &mut dyn Wire,
         stop: &AtomicBool,
-        resync_sequence: &AtomicU64,
+        link: &ReplicaLink,
         acks: &mut AckSend,
-        wal: &Mutex<WalSink>,
     ) -> io::Result<Option<Vec<u8>>> {
-        let mut scratch = [0; 8192];
-
         loop {
-            if resync_sequence.load(Ordering::Acquire) != 0 {
+            if link.resync_sequence.load(Ordering::Acquire) != 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     "snapshot resync requested",
@@ -2900,7 +3000,11 @@ impl FrameReader {
                 return Ok(None);
             }
 
-            match stream.read(&mut scratch) {
+            // Only a partial frame is left: move it to the front before reading more.
+            self.pending.drain(..self.start);
+            self.start = 0;
+
+            match stream.read(&mut self.scratch) {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -2908,12 +3012,15 @@ impl FrameReader {
                     ));
                 }
 
-                Ok(read) => self.pending.extend_from_slice(&scratch[..read]),
+                Ok(read) => {
+                    self.pending.extend_from_slice(&self.scratch[..read]);
+                    link.status.touch();
+                }
                 Err(error)
                     if error.kind() == io::ErrorKind::WouldBlock
                         || error.kind() == io::ErrorKind::TimedOut =>
                 {
-                    acks.poll(stream, wal);
+                    acks.poll(stream);
                 }
 
                 Err(error) => return Err(error),
@@ -2921,12 +3028,21 @@ impl FrameReader {
         }
     }
 
+    /// Whether a whole frame is buffered, so the next call returns without reading.
+    fn frame_buffered(&self) -> bool {
+        let rest = &self.pending[self.start..];
+
+        rest.len() >= 4 && rest.len() >= u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize
+    }
+
     fn take_frame(&mut self) -> io::Result<Option<Vec<u8>>> {
-        if self.pending.len() < 4 {
+        let rest = &self.pending[self.start..];
+
+        if rest.len() < 4 {
             return Ok(None);
         }
 
-        let length = u32::from_le_bytes(self.pending[..4].try_into().unwrap()) as usize;
+        let length = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
 
         if !(32..=self.max_frame_bytes).contains(&length) {
             return Err(io::Error::new(
@@ -2935,17 +3051,21 @@ impl FrameReader {
             ));
         }
 
-        if self.pending.len() < length {
+        if rest.len() < length {
             return Ok(None);
         }
 
-        Ok(Some(self.pending.drain(..length).collect()))
+        let frame = rest[..length].to_vec();
+
+        self.start += length;
+
+        Ok(Some(frame))
     }
 }
 
 fn wait_for_queue_room(
     link: &ReplicaLink,
-    outstanding: &mut VecDeque<(u64, usize)>,
+    outstanding: &mut Outstanding,
     stop: &AtomicBool,
 ) -> bool {
     loop {
@@ -2953,11 +3073,14 @@ fn wait_for_queue_room(
             return false;
         }
 
-        let queued_bytes = reclaim_applied(link, outstanding);
+        // The log's lock is taken only when the queue looks full, not for every frame.
+        if outstanding.has_room() {
+            return true;
+        }
 
-        if outstanding.len() < QUEUE_FRAMES
-            && (outstanding.is_empty() || queued_bytes < QUEUE_BYTES)
-        {
+        reclaim_applied(link, outstanding);
+
+        if outstanding.has_room() {
             return true;
         }
 
@@ -2967,26 +3090,52 @@ fn wait_for_queue_room(
     }
 }
 
-fn reclaim_applied(link: &ReplicaLink, outstanding: &mut VecDeque<(u64, usize)>) -> usize {
+/// Frames handed to the shard and not yet seen applied, with their total size kept as
+/// they come and go.
+#[derive(Default)]
+pub(crate) struct Outstanding {
+    frames: VecDeque<(u64, usize)>,
+    bytes: usize,
+}
+
+impl Outstanding {
+    fn has_room(&self) -> bool {
+        self.frames.len() < QUEUE_FRAMES && (self.frames.is_empty() || self.bytes < QUEUE_BYTES)
+    }
+
+    fn push(&mut self, sequence: u64, len: usize) {
+        self.frames.push_back((sequence, len));
+        self.bytes += len;
+    }
+
+    fn clear(&mut self) {
+        self.frames.clear();
+        self.bytes = 0;
+    }
+
+    fn reclaim_through(&mut self, applied: u64) {
+        while let Some(&(sequence, len)) = self.frames.front()
+            && sequence <= applied
+        {
+            self.frames.pop_front();
+            self.bytes -= len;
+        }
+    }
+}
+
+fn reclaim_applied(link: &ReplicaLink, outstanding: &mut Outstanding) {
     let applied = {
         let wal = link.wal.lock().unwrap_or_else(|error| error.into_inner());
 
         wal.last_sequence()
     };
 
-    while outstanding
-        .front()
-        .is_some_and(|(sequence, _)| *sequence <= applied)
-    {
-        outstanding.pop_front();
-    }
-
-    outstanding.iter().map(|(_, len)| *len).sum()
+    outstanding.reclaim_through(applied);
 }
 
 fn enqueue_frame(
     link: &ReplicaLink,
-    outstanding: &mut VecDeque<(u64, usize)>,
+    outstanding: &mut Outstanding,
     mut frame: Vec<u8>,
     stop: &AtomicBool,
 ) -> bool {
@@ -3000,8 +3149,7 @@ fn enqueue_frame(
 
         match link.inbound.try_send(ReplicaDelivery::Frame(frame)) {
             Ok(()) => {
-                outstanding.push_back((sequence, len));
-                link.wake_shard.notify_one();
+                outstanding.push(sequence, len);
 
                 return true;
             }

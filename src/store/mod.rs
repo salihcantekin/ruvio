@@ -43,7 +43,7 @@ mod tests;
 mod value;
 pub(crate) use fill::FillState;
 pub(crate) use limit::{LIMIT_SLIDING_MAX, LIMIT_TOKENS_MAX_CAPACITY, LIMIT_TOKENS_MAX_REFILL_MS};
-pub(crate) use string::SMALL_JSON_EDIT;
+pub(crate) use string::{ReadMark, SMALL_JSON_EDIT};
 mod zset;
 
 use access::*;
@@ -1931,6 +1931,15 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         }
 
         self.record_access(key);
+    }
+
+    /// Stamps the read that [`Self::value_view_read`] described, once its view is dropped.
+    pub(crate) fn mark_read(&mut self, key: &[u8], mark: ReadMark) {
+        match mark {
+            ReadMark::Missing => {}
+            ReadMark::At(address) => self.record_access_at(address),
+            ReadMark::Key => self.touch(key),
+        }
     }
 }
 
