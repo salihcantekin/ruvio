@@ -310,10 +310,38 @@ pub struct Stats {
     last_failover_unix_ms: std::sync::atomic::AtomicU64,
     /// Per group: its state, since when, and when a warning about it was last logged.
     groups: Mutex<HashMap<String, (GroupState, Instant, Instant)>>,
+    /// Per group: lease grants a node refused, and per member when it was last warned about.
+    refused: Mutex<HashMap<String, Refusals>>,
 }
+
+/// A group's refused lease grants: how many, and when each member was last warned about.
+type Refusals = (u64, HashMap<String, Instant>);
 
 /// How often at most a group that stays without a writer is warned about.
 const WARN_EVERY: Duration = Duration::from_secs(10);
+
+/// How often at most a node that refuses lease grants is warned about.
+const REFUSED_WARN_EVERY: Duration = Duration::from_secs(60);
+
+/// What a node's refusal of `RUVIO LEASE GRANT` most likely means, when it points at the
+/// configuration. A late or superseded grant (`arrived after`, `older epoch`, `no pending
+/// BEGIN`) is an ordinary race and has none.
+fn refusal_cause(error: &str) -> Option<&'static str> {
+    if error.contains("not in primary_lease_coordinators") {
+        Some("the node's primary_lease_coordinators does not list this coordinator")
+    } else if error.contains("differs from primary_lease_coordinators") {
+        Some(
+            "the coordinator set changed or the node's primary_lease_coordinators is out of date; \
+             restart the node with the current list",
+        )
+    } else if error.contains("on a replica") {
+        Some("the node is a replica but the coordinators record it as the primary")
+    } else if error.contains("out of range") {
+        Some("primary_lease_ms or the coordinator count is out of range for the node")
+    } else {
+        None
+    }
+}
 
 impl Stats {
     /// Records that `group` is in `state`; whether a warning about it is due: when it enters
@@ -339,6 +367,34 @@ impl Stats {
                 true
             }
         }
+    }
+
+    /// Counts a lease grant `member` of `group` refused; whether a warning about that node is
+    /// due: the first time, then once per [`REFUSED_WARN_EVERY`].
+    pub fn refused_grant(&self, group: &str, member: &str, now: Instant) -> bool {
+        let mut refused = self
+            .refused
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (count, warned) = refused.entry(group.to_owned()).or_default();
+
+        *count += 1;
+        match warned.get(member) {
+            Some(last) if now.duration_since(*last) < REFUSED_WARN_EVERY => false,
+            _ => {
+                warned.insert(member.to_owned(), now);
+                true
+            }
+        }
+    }
+
+    /// Lease grants refused by `group`'s nodes since this coordinator started.
+    pub fn refused_grants(&self, group: &str) -> u64 {
+        self.refused
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(group)
+            .map_or(0, |(count, _)| *count)
     }
 
     /// `group`'s state and how long it has been in it; `None` until this coordinator led.
@@ -491,10 +547,11 @@ async fn renew(
     config: &CoordinatorConfig,
     raft: &Raft,
     machine: &StateMachine,
-    grants: &Grants,
+    sightings: &Sightings,
     group: &Group,
     primary: Primary,
 ) {
+    let grants = sightings.grants();
     let Some((lease, _)) = config.primary_lease else {
         return;
     };
@@ -554,7 +611,20 @@ async fn renew(
         )
         .await
     {
-        tracing::debug!(group = name, member, %error, "the primary refused a lease grant");
+        let due = sightings
+            .stats()
+            .refused_grant(name, member, Instant::now());
+
+        match refusal_cause(&error) {
+            Some(cause) if due => warn!(
+                group = name,
+                member,
+                %error,
+                cause,
+                "the primary refuses lease grants; it stops taking writes when its lease ends"
+            ),
+            _ => tracing::debug!(group = name, member, %error, "the primary refused a lease grant"),
+        }
     }
 }
 
@@ -571,7 +641,6 @@ pub async fn renew_leases(
     if config.primary_lease.is_none() {
         return;
     }
-    let grants = sightings.grants().clone();
     let running: Arc<Mutex<Vec<String>>> = Arc::default();
     let mut tick = tokio::time::interval(config.ping_interval);
 
@@ -597,17 +666,17 @@ pub async fn renew_leases(
                 }
                 running.push(group.name.clone());
             }
-            let (config, raft, machine, grants, running, group) = (
+            let (config, raft, machine, sightings, running, group) = (
                 Arc::clone(&config),
                 raft.clone(),
                 machine.clone(),
-                grants.clone(),
+                sightings.clone(),
                 Arc::clone(&running),
                 group.clone(),
             );
 
             tokio::spawn(async move {
-                renew(&config, &raft, &machine, &grants, &group, primary).await;
+                renew(&config, &raft, &machine, &sightings, &group, primary).await;
                 running
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
@@ -3007,5 +3076,42 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn refused_grants_warn_once_a_minute_per_node_and_only_for_configuration_causes() {
+        let stats = Stats::default();
+        let start = Instant::now();
+        let later = start + Duration::from_secs(61);
+
+        assert!(stats.refused_grant("g", "a:1", start));
+        assert!(!stats.refused_grant("g", "a:1", start + Duration::from_secs(30)));
+        assert!(
+            stats.refused_grant("g", "b:1", start),
+            "another node warns on its own"
+        );
+        assert!(stats.refused_grant("g", "a:1", later));
+        assert_eq!(stats.refused_grants("g"), 4);
+        assert_eq!(stats.refused_grants("other"), 0);
+
+        for refusal in [
+            crate::primary_lease::Refused::UnknownCoordinator,
+            crate::primary_lease::Refused::VotersMismatch,
+            crate::primary_lease::Refused::NotPrimary,
+            crate::primary_lease::Refused::Invalid,
+        ] {
+            let text = String::from_utf8_lossy(refusal.message()).into_owned();
+
+            assert!(refusal_cause(&text).is_some(), "{text}");
+        }
+        for refusal in [
+            crate::primary_lease::Refused::UnknownToken,
+            crate::primary_lease::Refused::Stale,
+            crate::primary_lease::Refused::OldEpoch,
+        ] {
+            let text = String::from_utf8_lossy(refusal.message()).into_owned();
+
+            assert!(refusal_cause(&text).is_none(), "{text}");
+        }
     }
 }
