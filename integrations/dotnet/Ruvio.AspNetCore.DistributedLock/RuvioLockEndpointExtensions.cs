@@ -118,7 +118,7 @@ public static class RuvioLockEndpointExtensions
     }
 
     /// <summary>
-    /// The lock held for the current request, or null when the endpoint is not protected. Use its
+    /// The lock held for the current request (by <c>[RuvioLock]</c> or <c>WithDistributedLock</c>), or null when the endpoint is not protected. Use its
     /// <see cref="IRuvioLock.LockLost"/> token to stop work if the lock is lost mid-request.
     /// </summary>
     /// <param name="context">The current request.</param>

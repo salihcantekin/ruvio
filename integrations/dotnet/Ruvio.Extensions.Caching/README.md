@@ -198,7 +198,8 @@ with a stale period or tags is stored as
 key/object/index overhead is additional and implementation-dependent. Persistent
 entries have no TTL; apart from tag keys (only with `Tags`) no extra metadata keys, hash fields, polling tasks, timers, or
 server changes are introduced. Sliding-only entries use only native expiry plus the
-in-value sliding duration. The provider logs no keys or values; it only adds counters on the `Ruvio.Extensions.Caching` meter.
+in-value sliding duration. The provider logs no keys or values; its
+metrics are counters without key tags (see Metrics).
 
 Defaults: 1 MiB payload and 1024 UTF-8 bytes for the **full namespaced key**.
 `MaxValueBytes` (zero allows only empty values) and `MaxKeyBytes` are configurable.
@@ -207,6 +208,18 @@ Server protocol/value/request limits and script limits must also accommodate the
 envelope and the `SET` command; increasing provider limits does not raise
 server limits. Only a sliding renewal sends `EVAL`, and that script is one fixed
 text cached on the shard.
+
+## Metrics
+
+Meter `Ruvio.Extensions.Caching` counts lookups: `ruvio.cache.hit` and `ruvio.cache.miss`, tagged `operation`
+(`get` for `Get*`/`Refresh*`, `get_or_create` for `GetOrCreate*`). An expired entry counts as a miss. The tags carry no keys
+or values. With no listener attached each lookup pays one field read. With `StaleFor`, a stale value served while
+another caller refreshes counts as a hit, a refresh as a miss, and a stale value returned because the factory threw
+adds one to `ruvio.cache.fail_safe`.
+
+```csharp
+builder.Services.AddOpenTelemetry().WithMetrics(m => m.AddMeter("Ruvio.Extensions.Caching"));
+```
 
 ## When Ruvio is unreachable
 

@@ -120,6 +120,14 @@ invalidations and bring back stale responses; this is not durable application
 state or an authorization boundary. Never enable caching of user-specific content
 without an appropriate trusted variation policy.
 
+## Metrics
+
+Meter `Ruvio.AspNetCore.OutputCaching`: `ruvio.output_cache.hit`, `ruvio.output_cache.miss` (tagged `reason`: `absent`
+when no entry is stored, `tag_evicted` when a tag of the entry was evicted since) and `ruvio.output_cache.tag_evict`
+(one per `EvictByTagAsync`), next to the existing `ruvio.output_cache.storage_calls`, `storage_commands` and
+`storage_duration` (tagged `operation` and `outcome`). No keys or tags are recorded. With no listener attached a lookup
+pays one field read.
+
 ## When Ruvio is unreachable
 
 ASP.NET Core's output-cache middleware already treats a store error on a read or a write as a miss and serves the
