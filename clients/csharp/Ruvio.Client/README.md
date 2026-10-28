@@ -712,6 +712,8 @@ pieces for that:
   open circuit, `LOADING`, `MASTERDOWN`, `CLUSTERDOWN`) from a server error reply like `WRONGTYPE`, which is never an outage.
 - `RuvioCircuitBreaker`: after `FailureThreshold` outage failures in a row it opens and `TryAcquire()` returns false for
   `BreakDuration`; then one trial call goes through and its outcome closes or reopens the circuit. Healthy, it costs a volatile read.
+  Its `StateChanged` event reports each change (previous and new state, and how long an opened circuit stays open)
+  outside the breaker's lock; a throwing handler is ignored. Changes are also counted in `ruvio_client_circuit_transitions`.
 
 ```csharp
 var outage = new RuvioOutageOptions(RuvioOutageMode.FailOpen)

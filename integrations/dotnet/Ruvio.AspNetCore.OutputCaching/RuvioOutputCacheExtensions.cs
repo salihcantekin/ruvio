@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Microsoft.AspNetCore.OutputCaching;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -27,11 +28,19 @@ public static class RuvioOutputCacheExtensions
         services.Replace(ServiceDescriptor.Singleton<IOptions<RuvioOutputCacheOptions>>(Options.Create(options)));
         services.RemoveAll<IOutputCacheStore>();
 
-        services.AddSingleton<IOutputCacheStore>(provider => new RuvioOutputCacheStore(
-            () => options.ClientKey is { } key
-                ? provider.GetRequiredKeyedService<Client.IRuvioClient>(key)
-                : provider.GetRequiredService<Client.IRuvioClient>(),
-            provider.GetRequiredService<IOptions<RuvioOutputCacheOptions>>()));
+        services.AddSingleton<IOutputCacheStore>(provider =>
+        {
+            var settings = provider.GetRequiredService<IOptions<RuvioOutputCacheOptions>>();
+            var store = new RuvioOutputCacheStore(
+                () => options.ClientKey is { } key
+                    ? provider.GetRequiredKeyedService<Client.IRuvioClient>(key)
+                    : provider.GetRequiredService<Client.IRuvioClient>(),
+                settings);
+
+            RuvioOutageLog.Attach(settings.Value.Outage, provider.GetService<ILoggerFactory>(), "Ruvio.AspNetCore.OutputCaching");
+
+            return store;
+        });
 
         return services;
     }

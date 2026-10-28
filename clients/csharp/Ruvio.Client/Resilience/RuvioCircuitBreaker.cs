@@ -1,3 +1,5 @@
+using System.Diagnostics.Metrics;
+
 namespace Ruvio.Client;
 
 /// <summary>Where a <see cref="RuvioCircuitBreaker"/> stands.</summary>
@@ -19,6 +21,8 @@ public enum RuvioCircuitState
 /// </summary>
 public sealed class RuvioCircuitBreaker
 {
+    private static readonly Meter Meter = new("Ruvio.Client");
+    private static readonly Counter<long> Transitions = Meter.CreateCounter<long>("ruvio_client_circuit_transitions");
     private readonly object _gate = new();
     private readonly int _threshold;
     private readonly TimeSpan _duration;
@@ -40,6 +44,13 @@ public sealed class RuvioCircuitBreaker
 
     /// <summary>The current state. An open circuit reports <see cref="RuvioCircuitState.Open"/> until a call asks to go through.</summary>
     public RuvioCircuitState State => (RuvioCircuitState)_state;
+
+    /// <summary>
+    /// Raised after each change of <see cref="State"/>: closed to open, open to half-open (the trial call), and
+    /// half-open to closed or back to open. Runs outside the breaker's lock, on the thread of the call that caused the
+    /// change; keep it short. An exception from a handler is ignored, so it never fails that call.
+    /// </summary>
+    public event EventHandler<RuvioCircuitStateChangedEventArgs>? StateChanged;
 
     /// <summary>How long until a trial call is let through; zero when the circuit is not open.</summary>
     public TimeSpan RetryAfter
@@ -81,7 +92,7 @@ public sealed class RuvioCircuitBreaker
                     _state = (int)RuvioCircuitState.HalfOpen;
                     _probing = true;
 
-                    return true;
+                    break;
 
                 default:
                     if (_probing)
@@ -92,6 +103,10 @@ public sealed class RuvioCircuitBreaker
                     return true;
             }
         }
+
+        Changed(RuvioCircuitState.Open, RuvioCircuitState.HalfOpen);
+
+        return true;
     }
 
     /// <summary>A call got an answer from Ruvio (including an error reply): the outage is over.</summary>
@@ -100,28 +115,40 @@ public sealed class RuvioCircuitBreaker
         if (_state == (int)RuvioCircuitState.Closed && Volatile.Read(ref _failures) == 0)
             return;
 
+        RuvioCircuitState previous;
+
         lock (_gate)
         {
             // A late answer from a call that began before the circuit opened proves nothing.
             if (_state == (int)RuvioCircuitState.Open)
                 return;
 
+            previous = (RuvioCircuitState)_state;
             _failures = 0;
             _probing = false;
             _state = (int)RuvioCircuitState.Closed;
         }
+
+        if (previous != RuvioCircuitState.Closed)
+            Changed(previous, RuvioCircuitState.Closed);
     }
 
     /// <summary>A call failed because Ruvio could not be reached.</summary>
     public void RecordFailure()
     {
+        RuvioCircuitState previous;
+
         lock (_gate)
         {
-            switch ((RuvioCircuitState)_state)
+            previous = (RuvioCircuitState)_state;
+
+            switch (previous)
             {
                 case RuvioCircuitState.Closed:
-                    if (++_failures >= _threshold)
-                        Open();
+                    if (++_failures < _threshold)
+                        return;
+
+                    Open();
 
                     break;
 
@@ -129,8 +156,13 @@ public sealed class RuvioCircuitBreaker
                     Open();
 
                     break;
+
+                default:
+                    return;
             }
         }
+
+        Changed(previous, RuvioCircuitState.Open);
     }
 
     /// <summary>A call ended without telling anything about Ruvio (the caller cancelled it): a trial call's slot is freed.</summary>
@@ -140,6 +172,32 @@ public sealed class RuvioCircuitBreaker
         {
             if (_state == (int)RuvioCircuitState.HalfOpen)
                 _probing = false;
+        }
+    }
+
+    // Called after the lock is released: counts the change and tells the listeners.
+    private void Changed(RuvioCircuitState previous, RuvioCircuitState current)
+    {
+        Transitions.Add(1, new KeyValuePair<string, object?>("state", current switch
+        {
+            RuvioCircuitState.Open => "open",
+            RuvioCircuitState.HalfOpen => "half_open",
+            _ => "closed",
+        }));
+
+        if (StateChanged is not { } handlers)
+            return;
+
+        var change = new RuvioCircuitStateChangedEventArgs(previous, current,
+            current == RuvioCircuitState.Open ? _duration : TimeSpan.Zero);
+
+        try
+        {
+            handlers(this, change);
+        }
+        catch (Exception)
+        {
+            // A listener (a log sink, a metric) must not fail the Ruvio call that moved the circuit.
         }
     }
 

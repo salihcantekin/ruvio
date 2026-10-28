@@ -148,6 +148,8 @@ builder.Services.AddOpenTelemetry()
   `outcome` (`ok` or `error`).
 - Histogram `ruvio_client_socket_phase_duration_milliseconds` (ms), tagged `backend` and `phase`.
 - Counters `ruvio_client_socket_write_calls` and `ruvio_client_socket_written_bytes`.
+- Counter `ruvio_client_circuit_transitions`, tagged `state` (`open`, `half_open` or `closed`): one per change of a
+  `RuvioCircuitBreaker` (the integrations' `Outage.CircuitBreaker`). Nothing is recorded while no breaker changes state.
 
 Keys, values and arguments are never recorded. A command span covers every command sent through the typed methods,
 `ExecuteAsync` and `ExecuteBinaryAsync`; pipelines (`ExecuteManyAsync`) get only the socket spans. With no listener on
@@ -176,6 +178,10 @@ with no listener attached an instrument costs one field read.
   `ruvio.rate_limit.storage_calls`, `ruvio.rate_limit.storage_commands` and `ruvio.rate_limit.storage_duration`.
 
 The tags of each instrument are listed in the package's README.
+
+With `Outage.CircuitBreaker` set, each of these packages (Data Protection has no breaker) also logs its circuit's
+changes through `ILogger`, with the package name as the category: `RuvioCircuitOpened` (Warning, with the break
+duration), `RuvioCircuitHalfOpen` (Information, the trial call) and `RuvioCircuitClosed` (Information).
 
 ## Coordinators
 

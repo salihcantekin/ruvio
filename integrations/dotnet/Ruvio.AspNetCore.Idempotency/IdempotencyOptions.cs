@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
@@ -175,6 +176,8 @@ public static class IdempotencyExtensions
         services.AddOptions<IdempotencyOptions>().Configure(configure)
             .Validate(o => o.IsValid(), "A namespace and scope selector are required; retention must be whole milliseconds in [1ms, 7 days], body limits in [1, 1048576], MismatchStatusCode 400-499, PendingWait at most 30 s, and KeyHeader and ReplayHeaders valid header names (at most 32, no cookie, authentication, CORS or transport header).")
             .ValidateOnStart();
+        services.AddOptions<IdempotencyOptions>().PostConfigure<IServiceProvider>(static (options, provider) =>
+            RuvioOutageLog.Attach(options.Outage, provider.GetService<ILoggerFactory>(), "Ruvio.AspNetCore.Idempotency"));
         RuvioStartupChecks.RequireAtStart<IRuvioClient>(services, "Ruvio.AspNetCore.Idempotency",
             static provider => provider.GetRequiredService<IOptions<IdempotencyOptions>>().Value.ClientKey);
         RuvioEndpointCheck.Add(services, "Ruvio.AspNetCore.Idempotency", IdempotencyMiddleware.EndpointError);

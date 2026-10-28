@@ -1,3 +1,4 @@
+using System.Diagnostics.Metrics;
 using System.Net.Sockets;
 using Xunit;
 
@@ -22,6 +23,82 @@ public class CircuitBreakerTests
         BreakDuration = TimeSpan.FromSeconds(10),
         TimeProvider = time,
     });
+
+    [Fact]
+    public void StateChangedReportsEveryTransitionOnceWithTheBreakDuration()
+    {
+        var time = new ManualTime();
+        var breaker = Create(time, threshold: 2);
+        var changes = new List<(RuvioCircuitState From, RuvioCircuitState To, TimeSpan RetryAfter)>();
+
+        breaker.StateChanged += (sender, change) =>
+        {
+            Assert.Same(breaker, sender);
+            changes.Add((change.Previous, change.Current, change.RetryAfter));
+        };
+
+        breaker.RecordFailure();
+        breaker.RecordSuccess();                          // closed, failures reset: no transition
+        breaker.RecordFailure();
+        breaker.RecordFailure();                          // threshold: opens
+        Assert.False(breaker.TryAcquire());
+        breaker.RecordFailure();                          // already open: nothing
+        time.Advance(TimeSpan.FromSeconds(10));
+        Assert.True(breaker.TryAcquire());                // trial call
+        breaker.RecordFailure();                          // trial failed: open again
+        time.Advance(TimeSpan.FromSeconds(10));
+        Assert.True(breaker.TryAcquire());
+        breaker.RecordSuccess();                          // trial passed: closed
+
+        Assert.Equal(
+        [
+            (RuvioCircuitState.Closed, RuvioCircuitState.Open, TimeSpan.FromSeconds(10)),
+            (RuvioCircuitState.Open, RuvioCircuitState.HalfOpen, TimeSpan.Zero),
+            (RuvioCircuitState.HalfOpen, RuvioCircuitState.Open, TimeSpan.FromSeconds(10)),
+            (RuvioCircuitState.Open, RuvioCircuitState.HalfOpen, TimeSpan.Zero),
+            (RuvioCircuitState.HalfOpen, RuvioCircuitState.Closed, TimeSpan.Zero),
+        ], changes);
+    }
+
+    [Fact]
+    public void AThrowingListenerDoesNotFailTheCallOrStopTheTransition()
+    {
+        var breaker = Create(new ManualTime(), threshold: 1);
+
+        breaker.StateChanged += (_, _) => throw new InvalidOperationException("listener");
+        breaker.RecordFailure();
+
+        Assert.Equal(RuvioCircuitState.Open, breaker.State);
+    }
+
+    [Fact]
+    public void TransitionsAreCountedOnTheClientMeterByNewState()
+    {
+        var breaker = Create(new ManualTime(), threshold: 1);
+        var states = new List<string>();
+        using var listener = new MeterListener();
+
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == "Ruvio.Client" && instrument.Name == "ruvio_client_circuit_transitions")
+                l.EnableMeasurementEvents(instrument);
+        };
+        listener.SetMeasurementEventCallback<long>((_, value, tags, _) =>
+        {
+            foreach (KeyValuePair<string, object?> tag in tags)
+            {
+                if (tag.Key == "state")
+                    lock (states)
+                        states.Add($"{tag.Value}:{value}");
+            }
+        });
+        listener.Start();
+
+        breaker.RecordFailure();
+
+        lock (states)
+            Assert.Contains("open:1", states);
+    }
 
     [Fact]
     public void ClosedCircuitAdmitsEveryCallAndOpensAfterTheThresholdOfFailuresInARow()

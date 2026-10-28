@@ -155,6 +155,10 @@ trial runs. With the breaker off (the default) the cost is one field read per ca
 volatile read. Each package has its own circuit, so the packages notice an outage independently. In `Throw` mode a request
 refused by an open circuit gets `RuvioCircuitOpenException`.
 
+Each change of a circuit is logged through `ILogger` under the package name: a Warning when it opens (with the break
+duration), Information for the trial call and when it closes. The client counts the changes in
+`ruvio_client_circuit_transitions`, and `RuvioCircuitBreaker.StateChanged` lets your own code react to them.
+
 Metrics: each package counts these requests in `ruvio.<feature>.outage` (`ruvio.rate_limit.outage`, `ruvio.idempotency.outage`,
 `ruvio.lock.outage`, `ruvio.output_cache.outage`, `ruvio.cache.outage`), tagged with `mode` and `reason` (`error` or
 `circuit_open`).

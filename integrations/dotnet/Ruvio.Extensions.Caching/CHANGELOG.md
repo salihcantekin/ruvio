@@ -4,6 +4,7 @@ Notable changes to the NuGet package `Ruvio.Extensions.Caching`. New entries go 
 
 ## Unreleased
 
+- With `Outage.CircuitBreaker` set, the circuit's changes are logged through `ILogger` (category `Ruvio.Extensions.Caching`): Warning when it opens, with the break duration; Information for the trial call and when it closes. Nothing is logged without a breaker. The package now references `Microsoft.Extensions.Logging.Abstractions`.
 - Startup check: host start fails when the client (or the keyed client for `ClientKey`) is not registered, instead of on the first cache call. Skipped when another `IDistributedCache` was registered first. No connection is opened for the check.
 - `ClientKey` option: names a connection registered with `AddKeyedRuvioClient`, so the cache can use its own server or database. Null (the default) keeps the unkeyed `IRuvioClient`.
 - `RuvioCacheEntryOptions.StaleFor`: stale-while-revalidate and fail-safe for `GetOrCreate*` (one caller refreshes while the rest get the stale value; a throwing factory falls back to it, counted by `ruvio.cache.fail_safe`). `RuvioCacheEntryOptions.Tags` and `RemoveByTagAsync(tag)`: remove every entry with a tag in one `DEL`. Entries that use either are written in a new format older package versions cannot read; upgrade every instance first. Entries without them are unchanged. See the README.
