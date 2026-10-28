@@ -256,25 +256,43 @@ struct LogInner {
 }
 
 impl LogInner {
-    /// Rewrites the whole log. The coordinators' log is a few small entries per failover, and
-    /// snapshots purge it, so the file stays small.
-    fn persist(&self) -> io::Result<()> {
+    /// The whole log as the file holds it. The coordinators' log is a few small entries per
+    /// failover, and snapshots purge it, so the file stays small.
+    fn encode(&self) -> io::Result<Vec<u8>> {
         let file = LogFile {
             last_purged: self.last_purged,
             entries: self.entries.values().cloned().collect(),
         };
 
-        write_durably(
-            &self.dir.join("raft-log.json"),
-            &serde_json::to_vec(&file).map_err(io_error)?,
-        )
+        serde_json::to_vec(&file).map_err(io_error)
     }
+
+    fn path(&self) -> PathBuf {
+        self.dir.join("raft-log.json")
+    }
+
+    #[cfg(test)]
+    fn persist(&self) -> io::Result<()> {
+        write_durably(&self.path(), &self.encode()?)
+    }
+}
+
+/// Runs a blocking write (two `fsync` calls) on the blocking pool and waits for it, so a slow
+/// disk holds one pool thread instead of one of the coordinator's two async workers.
+async fn write_durably_blocking(path: PathBuf, bytes: Vec<u8>) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || write_durably(&path, &bytes))
+        .await
+        .map_err(io_error)?
 }
 
 /// The Raft log and vote, kept in memory and on disk.
 #[derive(Clone)]
 pub struct LogStore {
     inner: Arc<Mutex<LogInner>>,
+    /// Held from changing the log until its file is written, so files land in the order the
+    /// log changed. `inner` is only locked for the in-memory change; readers do not wait for
+    /// the disk.
+    writing: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl LogStore {
@@ -302,6 +320,7 @@ impl LogStore {
                     .collect(),
                 vote,
             })),
+            writing: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -347,12 +366,14 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     }
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let mut inner = self.lock();
+        let _writing = self.writing.lock().await;
         let bytes = serde_json::to_vec(vote).map_err(|error| StorageIOError::write_vote(&error))?;
+        let path = self.lock().dir.join("raft-vote.json");
 
-        write_durably(&inner.dir.join("raft-vote.json"), &bytes)
+        write_durably_blocking(path, bytes)
+            .await
             .map_err(|error| StorageIOError::write_vote(&error))?;
-        inner.vote = Some(*vote);
+        self.lock().vote = Some(*vote);
         Ok(())
     }
 
@@ -369,12 +390,19 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         I: IntoIterator<Item = Entry<TypeConfig>> + Send,
         I::IntoIter: Send,
     {
-        let mut inner = self.lock();
+        let _writing = self.writing.lock().await;
+        let encoded = {
+            let mut inner = self.lock();
 
-        for entry in entries {
-            inner.entries.insert(entry.log_id.index, entry);
-        }
-        let result = inner.persist();
+            for entry in entries {
+                inner.entries.insert(entry.log_id.index, entry);
+            }
+            inner.encode().map(|bytes| (inner.path(), bytes))
+        };
+        let result = match encoded {
+            Ok((path, bytes)) => write_durably_blocking(path, bytes).await,
+            Err(error) => Err(error),
+        };
 
         callback.log_io_completed(
             result
@@ -386,22 +414,38 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     }
 
     async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let mut inner = self.lock();
+        let _writing = self.writing.lock().await;
+        let (path, bytes) = {
+            let mut inner = self.lock();
 
-        inner.entries.retain(|index, _| *index < log_id.index);
-        inner
-            .persist()
-            .map_err(|error| StorageIOError::write_logs(&error).into())
+            inner.entries.retain(|index, _| *index < log_id.index);
+            (inner.path(), inner.encode())
+        };
+
+        write_durably_blocking(
+            path,
+            bytes.map_err(|error| StorageIOError::write_logs(&error))?,
+        )
+        .await
+        .map_err(|error| StorageIOError::write_logs(&error).into())
     }
 
     async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let mut inner = self.lock();
+        let _writing = self.writing.lock().await;
+        let (path, bytes) = {
+            let mut inner = self.lock();
 
-        inner.entries.retain(|index, _| *index > log_id.index);
-        inner.last_purged = Some(log_id);
-        inner
-            .persist()
-            .map_err(|error| StorageIOError::write_logs(&error).into())
+            inner.entries.retain(|index, _| *index > log_id.index);
+            inner.last_purged = Some(log_id);
+            (inner.path(), inner.encode())
+        };
+
+        write_durably_blocking(
+            path,
+            bytes.map_err(|error| StorageIOError::write_logs(&error))?,
+        )
+        .await
+        .map_err(|error| StorageIOError::write_logs(&error).into())
     }
 }
 
@@ -1658,6 +1702,49 @@ mod tests {
                     .unwrap()
                     .last_log_id
                     .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn truncate_and_purge_write_the_log_in_order_and_do_not_block_a_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let mut store = LogStore::open(dir.path()).unwrap();
+            let id = |index| LogId::new(openraft::CommittedLeaderId::new(1, 1), index);
+
+            for index in 1..=5 {
+                store.lock().entries.insert(
+                    index,
+                    Entry {
+                        log_id: id(index),
+                        payload: EntryPayload::Blank,
+                    },
+                );
+            }
+
+            // Both run to completion in the order awaited; the file holds the last change.
+            store.truncate(id(5)).await.unwrap();
+            store.purge(id(2)).await.unwrap();
+
+            let mut reopened = LogStore::open(dir.path()).unwrap();
+            let state = reopened.get_log_state().await.unwrap();
+
+            assert_eq!(state.last_purged_log_id, Some(id(2)));
+            assert_eq!(state.last_log_id, Some(id(4)));
+            assert_eq!(
+                reopened
+                    .try_get_log_entries(0..10)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|entry| entry.log_id.index)
+                    .collect::<Vec<_>>(),
+                vec![3, 4]
             );
         });
     }
