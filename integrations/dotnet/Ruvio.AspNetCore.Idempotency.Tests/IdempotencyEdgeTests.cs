@@ -112,7 +112,7 @@ public class IdempotencyEdgeTests
         Assert.Throws<ArgumentNullException>(() => new ServiceCollection().AddRuvioIdempotency(null!));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task RegistrationValidatesOnStart()
     {
         var services = new ServiceCollection();
@@ -123,7 +123,7 @@ public class IdempotencyEdgeTests
         Assert.Throws<OptionsValidationException>(() => provider.GetRequiredService<IOptions<IdempotencyOptions>>().Value);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task IdentitySelectorDecidesTheCallerAndAnonymousAccessIsOptIn()
     {
         var (client, edge) = NewClient();
@@ -172,7 +172,7 @@ public class IdempotencyEdgeTests
         Assert.True(ran);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task KeyHeaderAndMetadataLengthAreValidatedBeforeTheStoreIsUsed()
     {
         var (client, edge) = NewClient();
@@ -212,7 +212,7 @@ public class IdempotencyEdgeTests
         });
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task AResponseThatHasAlreadyStartedOrLacksFeaturesIsRefused()
     {
         var (client, edge) = NewClient();
@@ -243,7 +243,7 @@ public class IdempotencyEdgeTests
         public IHeaderDictionary Trailers { get; set; } = new HeaderDictionary { ["X-Trailer"] = "1" };
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task UnstorableResponsesFailInsteadOfBeingRecordedWrongly()
     {
         var (client, edge) = NewClient();
@@ -284,7 +284,7 @@ public class IdempotencyEdgeTests
         Assert.Equal(1, exactLength.Response.Body.Length);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task HeaderValuesWithLineBreaksCannotBeCaptured()
     {
         var (client, _) = NewClient();
@@ -324,7 +324,7 @@ public class IdempotencyEdgeTests
         return JsonSerializer.Serialize(node);
     }
 
-    [Theory]
+    [Theory(Timeout = 30000)]
     [InlineData("null")]
     [InlineData("{\"Status\":99,\"Headers\":{},\"Body\":\"\"}")]
     [InlineData("{\"Status\":600,\"Headers\":{},\"Body\":\"\"}")]
@@ -349,7 +349,7 @@ public class IdempotencyEdgeTests
         Assert.Equal(200, context.Response.StatusCode);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task OversizedOrMalformedStoredBodiesAreNeverReplayed()
     {
         var (client, edge) = NewClient();
@@ -372,7 +372,7 @@ public class IdempotencyEdgeTests
         }
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task AValidStoredResultIsReplayedWithOnlyTheAllowedHeaders()
     {
         var (client, edge) = NewClient();
@@ -395,7 +395,7 @@ public class IdempotencyEdgeTests
         Assert.Equal(409, pending.Response.StatusCode);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task TheStoreRejectsRepliesThatAreNotAKnownState()
     {
         var (client, edge) = NewClient();
@@ -436,7 +436,7 @@ public class IdempotencyEdgeTests
         await IdempotencyStore.CompleteAsync(client, "k", "f", "o", "r", CancellationToken.None);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task RequestBufferEnforcesDeclaredAndActualSizes()
     {
         static MemoryStream Of(int count) => new(Enumerable.Repeat((byte)'a', count).ToArray());
@@ -492,7 +492,7 @@ public class IdempotencyEdgeTests
         }
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task BoundedBufferRefusesToGrowPastItsLimitAndStaysFailed()
     {
         var buffer = new BoundedBuffer(4);
@@ -531,7 +531,7 @@ public class IdempotencyEdgeTests
         Assert.Throws<IOException>(() => other.Reserve(1));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task BoundedResponseBodyBuffersWriterOutputAndFilesWithinTheLimit()
     {
         var body = new BoundedResponseBody(8);
@@ -588,7 +588,7 @@ public class IdempotencyEdgeTests
         }
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task BufferedResponseFeatureRunsStartingCallbacksLastInFirstOutAndCopiesBack()
     {
         var inner = new HttpResponseFeature { StatusCode = 200, ReasonPhrase = "OK" };

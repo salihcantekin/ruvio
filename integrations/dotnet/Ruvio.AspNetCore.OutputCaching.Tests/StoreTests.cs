@@ -26,7 +26,7 @@ public class StoreTests
         Assert.Throws<ArgumentOutOfRangeException>(() => new ServiceCollection().AddRuvioOutputCache(o => o.MaxTagsPerEntry = 33));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task InvalidInputsAndCancellationDoNotResolveTheClient()
     {
         var cache = new RuvioOutputCacheStore(() => throw new InvalidOperationException("Unexpected IO."),
@@ -49,7 +49,7 @@ public class StoreTests
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => cache.EvictByTagAsync("", source.Token).AsTask());
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task TransportErrorsAreNotRetriedAndTokensAreForwarded()
     {
         var client = DispatchProxy.Create<IRuvioClient, RejectingClient>();

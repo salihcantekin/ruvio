@@ -196,7 +196,7 @@ public class HttpPipelineTests
         {
             Interlocked.Increment(ref calls);
             entered.TrySetResult();
-            await release.Task;
+            await release.Task.WaitAsync(TimeSpan.FromSeconds(20));
 
             return Results.Created("/orders/7", new { id = 7 });
         }).WithRuvioIdempotency(a => a.PendingWaitMilliseconds = 5000);
@@ -214,7 +214,7 @@ public class HttpPipelineTests
             await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
             Task<HttpResponseMessage> secondCall = http.PostAsync("/orders", new StringContent("{}"));
 
-            await Task.Delay(100);
+            // The second call may reach the server before or after the release; both replay the first result.
             release.SetResult();
             using var first = await firstCall;
             using var second = await secondCall;
@@ -233,7 +233,7 @@ public class HttpPipelineTests
         finally { await app.StopAsync(); }
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task RealHttpReplaysJsonAndNeverSendsPartialHandlerFailure()
     {
         var (client, _) = StubClient.Create();

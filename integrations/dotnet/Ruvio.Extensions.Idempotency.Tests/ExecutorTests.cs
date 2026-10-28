@@ -112,7 +112,7 @@ public class ExecutorTests
         return (new RuvioIdempotentExecutor(client, options), (IdemClient)(object)client);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task TheFirstCallRunsAndRepeatsReplayTheBytes()
     {
         var (executor, fake) = New();
@@ -132,7 +132,7 @@ public class ExecutorTests
         Assert.Equal(TimeSpan.FromDays(1), fake.Retentions[0]);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task ARunningOrFailedCallIsPendingAndOtherInputIsAConflict()
     {
         var (executor, _) = New();
@@ -151,7 +151,7 @@ public class ExecutorTests
         Assert.Equal(0, runs);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task AbortOnExceptionFreesTheKeyForEveryOverloadAndKeepsTheException()
     {
         var (executor, fake) = New(new RuvioIdempotentExecutorOptions { AbortOnException = true });
@@ -171,7 +171,7 @@ public class ExecutorTests
         Assert.Equal(3, fake.Aborts);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task AFailedAbortKeepsTheWorksExceptionAndThePendingRecord()
     {
         var (executor, fake) = New(new RuvioIdempotentExecutorOptions { AbortOnException = true });
@@ -185,7 +185,7 @@ public class ExecutorTests
         Assert.Equal(IdempotentOutcome.Pending, await executor.ExecuteOnceAsync("f-1", null, _ => Task.CompletedTask));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task JsonResultsRoundTrip()
     {
         var (executor, _) = New(new RuvioIdempotentExecutorOptions { KeyPrefix = "pay:" });
@@ -201,7 +201,7 @@ public class ExecutorTests
         Assert.Equal(1, runs);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task WorkWithoutAResultReplaysAsReplayed()
     {
         var (executor, fake) = New();
@@ -214,7 +214,7 @@ public class ExecutorTests
         Assert.Equal(TimeSpan.FromMinutes(5), fake.Retentions[1]);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task AnExpiredRecordIsReportedAsNotStored()
     {
         var (executor, fake) = New();
@@ -230,7 +230,7 @@ public class ExecutorTests
         await Assert.ThrowsAsync<RuvioException>(async () => await executor.ExecuteOnceAsync("m-6", null, _ => Task.FromResult(new byte[] { 1 })));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task InputsAreValidatedBeforeAnythingIsSent()
     {
         var (executor, fake) = New();
@@ -250,7 +250,7 @@ public class ExecutorTests
         Assert.Equal(IdempotentOutcome.Executed, (await executor.ExecuteOnceAsync("k", new string('f', 128), work, RuvioIdempotentExecutorOptions.MaximumRetention)).Outcome);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task RegistrationUsesTheUnkeyedOrTheKeyedClient()
     {
         var keyed = DispatchProxy.Create<IRuvioClient, IdemClient>();

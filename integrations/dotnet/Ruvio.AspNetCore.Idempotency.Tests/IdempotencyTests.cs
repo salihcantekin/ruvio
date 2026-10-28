@@ -54,7 +54,7 @@ public class IdempotencyTests
     private static IdempotencyMiddleware Middleware(RequestDelegate next, IdempotencyOptions? options = null) =>
         new(next, Microsoft.Extensions.Options.Options.Create(options ?? Options()));
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task UnselectedEndpointDoesNotReadResolveValidateOrWrap()
     {
         var c = Context(selected: false);
@@ -77,7 +77,7 @@ public class IdempotencyTests
         Assert.True(called);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task CompletedResultReplaysOnceWithoutSensitiveHeaders()
     {
         var (client, stub) = StubClient.Create();
@@ -125,7 +125,7 @@ public class IdempotencyTests
         Assert.Matches("^ruvio:http-idempotency:v1:\\{[A-F0-9]{64}\\}$", stub.Records.Keys.Single());
     }
 
-    [Theory]
+    [Theory(Timeout = 30000)]
     [InlineData("body")]
     [InlineData("method")]
     [InlineData("path")]
@@ -155,7 +155,7 @@ public class IdempotencyTests
         Assert.Equal(1, calls);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task SameKeyIsIsolatedByPrincipalTenantAndNamespace()
     {
         var (client, stub) = StubClient.Create();
@@ -175,7 +175,7 @@ public class IdempotencyTests
         Assert.Equal(4, stub.Records.Count);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task AFailedAbortLeavesTheHandlersExceptionAndThePendingRecord()
     {
         // The stub refuses every call but BEGIN and COMPLETE, so the abort itself fails here.
@@ -191,14 +191,14 @@ public class IdempotencyTests
         Assert.Equal("pending", Assert.Single(stub.Records).Value.State);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task ConcurrentPendingRequestConflictsAndNeverRunsHandler()
     {
         var (client, _) = StubClient.Create();
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         int calls = 0;
-        var middleware = Middleware(async _ => { calls++; entered.SetResult(); await release.Task; });
+        var middleware = Middleware(async _ => { calls++; entered.SetResult(); await release.Task.WaitAsync(TimeSpan.FromSeconds(20)); });
 
         Task first = middleware.InvokeAsync(Context(client));
 
@@ -212,7 +212,7 @@ public class IdempotencyTests
         Assert.Equal(1, calls);
     }
 
-    [Theory]
+    [Theory(Timeout = 30000)]
     [InlineData("handler")]
     [InlineData("store")]
     [InlineData("cancellation")]
@@ -282,7 +282,7 @@ public class IdempotencyTests
         Assert.Equal(409, duplicate.Response.StatusCode);
     }
 
-    [Theory]
+    [Theory(Timeout = 30000)]
     [InlineData(false)]
     [InlineData(true)]
     public async Task OversizedRequestNeverAcquiresOrExecutes(bool contentLengthKnown)
@@ -302,7 +302,7 @@ public class IdempotencyTests
         Assert.Equal(contentLengthKnown ? 0 : 33, original.Position);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task ExactLimitsAndResponseWriterAreSupported()
     {
         var (client, _) = StubClient.Create();
@@ -323,7 +323,7 @@ public class IdempotencyTests
         Assert.Equal(32, c.Response.Body.Length);
     }
 
-    [Theory]
+    [Theory(Timeout = 30000)]
     [InlineData("GET", "valid", 405)]
     [InlineData("HEAD", "valid", 405)]
     [InlineData("POST", "", 400)]
@@ -339,7 +339,7 @@ public class IdempotencyTests
         Assert.Equal(status, c.Response.StatusCode);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task MissingSubjectOrScopeFailsClosed()
     {
         var c = Context();
@@ -352,7 +352,7 @@ public class IdempotencyTests
             Middleware(_ => throw new Exception("Must not execute")).InvokeAsync(c));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task CustomIdentitySelectorSupportsUnauthenticatedCallersAndIsolatesThem()
     {
         var (client, stub) = StubClient.Create();
@@ -382,7 +382,7 @@ public class IdempotencyTests
         Assert.Equal(200, replay.Response.StatusCode);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task AnonymousIdentityRequiresExplicitOptIn()
     {
         var (client, stub) = StubClient.Create();
@@ -404,7 +404,7 @@ public class IdempotencyTests
         Assert.Equal(200, replay.Response.StatusCode);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task AuthorizationIsRecheckedBeforeReplay()
     {
         var (client, stub) = StubClient.Create();
@@ -483,7 +483,7 @@ public class IdempotencyTests
         Assert.False(missing.IsValid());
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task ReturnedErrorResponseIsReplayedButNotReexecuted()
     {
         var (client, _) = StubClient.Create();
@@ -503,7 +503,7 @@ public class IdempotencyTests
         Assert.Equal(1, calls);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task CorruptRecordIsNotReplayed()
     {
         var (client, stub) = StubClient.Create();
@@ -520,7 +520,7 @@ public class IdempotencyTests
         Assert.False(c.Response.Headers.ContainsKey("Set-Cookie"));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task InstrumentationIsOptInAndContainsNoRequestData()
     {
         var seen = new List<Activity>();
@@ -563,7 +563,7 @@ public class IdempotencyTests
         Assert.Equal(0, allocated);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task MaximumBinaryPayloadRoundtripsWithBoundedSerialization()
     {
         var (client, stub) = StubClient.Create();
@@ -581,7 +581,7 @@ public class IdempotencyTests
         Assert.True(stub.Records.Values.Single().Result!.Length < 1_500_000);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task SendFileChecksLimitBeforeWrite()
     {
         var response = new BoundedResponseBody(32);
@@ -592,7 +592,7 @@ public class IdempotencyTests
         Assert.Equal(0, response.Buffer.Length);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task LostCompletionAcknowledgmentDoesNotRetryAndCanReplayCommittedResult()
     {
         var (client, stub) = StubClient.Create();
@@ -616,7 +616,7 @@ public class IdempotencyTests
         Assert.Equal(1, calls);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task AmbiguousAcquisitionErrorPropagatesWithoutRunningHandler()
     {
         var (client, stub) = StubClient.Create();
@@ -633,7 +633,7 @@ public class IdempotencyTests
         Assert.Equal(409, retry.Response.StatusCode);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task MultipleAndLongKeysFailBeforeAcquisition()
     {
         var (client, stub) = StubClient.Create();
@@ -651,7 +651,7 @@ public class IdempotencyTests
         Assert.Equal(0, stub.Acquisitions);
     }
 
-    [Theory]
+    [Theory(Timeout = 30000)]
     [InlineData(true)]
     [InlineData(false)]
     public async Task StartFlushAndCompleteCannotPublishBeforePersistence(bool persist)
@@ -735,7 +735,7 @@ public class IdempotencyTests
         Assert.Same(outgoing, c.Features.Get<IHttpResponseBodyFeature>());
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task HandlerExceptionPreservesOriginalResponseMetadata()
     {
         var (client, _) = StubClient.Create();
@@ -765,7 +765,7 @@ public class IdempotencyTests
         Assert.False(c.Response.Headers.ContainsKey("Set-Cookie"));
     }
 
-    [Theory]
+    [Theory(Timeout = 30000)]
     [InlineData(0)]
     [InlineData(1)]
     [InlineData(7)]
@@ -782,7 +782,7 @@ public class IdempotencyTests
         RequestBuffer.Release(result.Bytes);
     }
 
-    [Theory]
+    [Theory(Timeout = 30000)]
     [InlineData(0)]
     [InlineData(1)]
     [InlineData(4097)]
@@ -799,7 +799,7 @@ public class IdempotencyTests
         RequestBuffer.Release(result.Bytes);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task UnknownLengthRequestKeepsEveryByteAcrossGrowth()
     {
         byte[] body = Enumerable.Range(0, 20_000).Select(i => (byte)(i * 31)).ToArray();
@@ -810,7 +810,7 @@ public class IdempotencyTests
         RequestBuffer.Release(result.Bytes);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task RejectedRequestReturnsNoStorage()
     {
         var result = await RequestBuffer.ReadAsync(new MemoryStream(new byte[50]), null, 10, default);
@@ -819,7 +819,7 @@ public class IdempotencyTests
         Assert.Empty(result.Bytes);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task ResponseBufferGrowsPastItsInitialStorageWithoutLosingBytes()
     {
         var body = new BoundedResponseBody(100_000);
@@ -853,7 +853,7 @@ public class IdempotencyTests
         body.Release();
     }
 
-    [Theory]
+    [Theory(Timeout = 30000)]
     [InlineData(0)]
     [InlineData(3)]
     [InlineData(7)]
@@ -868,7 +868,7 @@ public class IdempotencyTests
         Assert.Equal(0, stub.Acquisitions);
     }
 
-    [Theory]
+    [Theory(Timeout = 30000)]
     [InlineData("byte")]
     [InlineData("span")]
     [InlineData("array")]
