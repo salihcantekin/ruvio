@@ -4,6 +4,7 @@ Notable changes to the NuGet package `Ruvio.AspNetCore.Idempotency`. New entries
 
 ## Unreleased
 
+- With `Outage.CircuitBreaker` set, the circuit's changes are logged through `ILogger` (category `Ruvio.AspNetCore.Idempotency`): Warning when it opens, with the break duration; Information for the trial call and when it closes. Nothing is logged without a breaker.
 - Startup checks: host start fails when the client (or the keyed client for `ClientKey`) is not registered or a `[RuvioIdempotency]` endpoint value is out of range (every bad endpoint is listed), and `UseRuvioIdempotency` throws without `AddRuvioIdempotency`. Before, these failed on the first matching request. No connection is opened for the checks; requests are unchanged.
 - `ClientKey` option: names a connection registered with `AddKeyedRuvioClient`, so the middleware can use its own server or database. Null (the default) keeps the unkeyed `IRuvioClient`.
 - `options.AbortOnException` (off by default): when the handler throws, the pending record is given up with `IDEM ... ABORT`, so a retry with the same key runs at once instead of getting 409 until the retention ends. Only a pending record of this request is removed. Turn it on only for handlers whose work did not take effect when they throw, or is safe to repeat. Needs a server with `IDEM ABORT`. See the README.

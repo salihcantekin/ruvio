@@ -4,6 +4,7 @@ Notable changes to the NuGet package `Ruvio.AspNetCore.DistributedLock`. New ent
 
 ## Unreleased
 
+- With `Outage.CircuitBreaker` set, the circuit's changes are logged through `ILogger` (category `Ruvio.AspNetCore.DistributedLock`): Warning when it opens, with the break duration; Information for the trial call and when it closes. Nothing is logged without a breaker.
 - Startup checks: host start fails when the client (or the keyed client for `ClientKey`) is not registered, when an endpoint's `[RuvioLock]` has a reject status outside 4xx/5xx or a negative wait, and `UseRuvioLock` throws without `AddRuvioDistributedLock`. `WithDistributedLock` checks its lease, wait and status when the endpoint is mapped. No connection is opened for the checks; requests are unchanged.
 - `ClientKey` option: names a connection registered with `AddKeyedRuvioClient`, so the lock provider can use its own server or database. Null (the default) keeps the unkeyed `IRuvioClient`.
 - `RuvioLockOptions.Fenced` (off by default): locks use the server's `LEASE`, `RENEW` and `RELEASE`, and `IRuvioLock.FencingToken` carries a number that only grows per resource, for the guarded resource to refuse writes from an owner whose lease ran out. A resource held by a plain lock counts as taken (`WRONGTYPE`). A released or expired lease removes its key on servers with that fix; older servers keep it, so use a bounded set of names there (see the README). `FencingToken` is a default interface member (null), so other `IRuvioLock` implementations keep compiling.

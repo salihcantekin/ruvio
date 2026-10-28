@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Ruvio.Client;
@@ -25,9 +26,15 @@ public static class RuvioLockServiceCollectionExtensions
 
         RuvioEndpointCheck.Add(services, "Ruvio.AspNetCore.DistributedLock", RuvioLockMiddleware.EndpointError);
         services.TryAddSingleton(provider =>
-            new RuvioLockProvider(options.ClientKey is { } key
+        {
+            var locks = new RuvioLockProvider(options.ClientKey is { } key
                 ? provider.GetRequiredKeyedService<IRuvioClient>(key)
-                : provider.GetRequiredService<IRuvioClient>(), options));
+                : provider.GetRequiredService<IRuvioClient>(), options);
+
+            RuvioOutageLog.Attach(options.Outage, provider.GetService<ILoggerFactory>(), "Ruvio.AspNetCore.DistributedLock");
+
+            return locks;
+        });
 
         return services;
     }

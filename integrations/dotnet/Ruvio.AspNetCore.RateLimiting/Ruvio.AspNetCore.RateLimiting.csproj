@@ -15,6 +15,7 @@
     <InternalsVisibleTo Include="Ruvio.AspNetCore.RateLimiting.Tests" />
     <InternalsVisibleTo Include="Ruvio.Integrations.Benchmarks" />
     <Compile Include="../Common/RuvioStartupChecks.cs" Link="Common/RuvioStartupChecks.cs" />
+    <Compile Include="../Common/RuvioOutageLog.cs" Link="Common/RuvioOutageLog.cs" />
     <Compile Include="../Common/RuvioEndpointCheck.cs" Link="Common/RuvioEndpointCheck.cs" />
     <ProjectReference Include="../../../clients/csharp/Ruvio.Client/Ruvio.Client.csproj" />
     <None Include="README.md" Pack="true" PackagePath="/" />

@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -29,15 +30,17 @@ public static class RuvioCachingServiceCollectionExtensions
 
         services.TryAddSingleton(Options.Create(options));
 
-        if (options.ClientKey is { } key)
+        services.TryAddSingleton<IDistributedCache>(provider =>
         {
-            services.TryAddSingleton<IDistributedCache>(provider => new RuvioDistributedCache(
-                provider.GetRequiredKeyedService<Ruvio.Client.IRuvioClient>(key), provider.GetRequiredService<IOptions<RuvioCacheOptions>>()));
-        }
-        else
-        {
-            services.TryAddSingleton<IDistributedCache, RuvioDistributedCache>();
-        }
+            var settings = provider.GetRequiredService<IOptions<RuvioCacheOptions>>();
+            var cache = new RuvioDistributedCache(options.ClientKey is { } key
+                ? provider.GetRequiredKeyedService<Ruvio.Client.IRuvioClient>(key)
+                : provider.GetRequiredService<Ruvio.Client.IRuvioClient>(), settings);
+
+            RuvioOutageLog.Attach(settings.Value.Outage, provider.GetService<ILoggerFactory>(), "Ruvio.Extensions.Caching");
+
+            return cache;
+        });
 
         return services;
     }
