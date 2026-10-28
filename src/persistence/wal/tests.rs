@@ -153,7 +153,7 @@ fn a_failed_fill_sync_cuts_always_records_whose_batch_is_refused() {
     let start = write(&mut sink, b"acknowledged");
     sink.sync_batch(start).unwrap();
     let start = write(&mut sink, b"refused");
-    *sink.sync_error.lock().unwrap() = Some("injected fill sync failure".into());
+    sink.sync_error.report("injected fill sync failure".into());
 
     assert!(sink.sync_batch(start).is_err());
     drop(sink);
@@ -2704,4 +2704,72 @@ fn everysec_group_is_readable_before_the_background_sync() {
         read_frames(directory.path(), 0, 0, 1, limits).unwrap(),
         FrameRead::Frames(frames) if frames.len() == 1
     ));
+}
+
+/// Records staged inside a group are encoded onto the end of the batch buffer. A record that
+/// needs a new segment, overflows the batch, or is refused must leave the batch exactly as it
+/// was: recovery returns every accepted record in order and nothing of the refused one.
+#[test]
+fn staged_records_survive_rotation_batch_overflow_and_a_refused_record() {
+    let check = |segment_bytes: u64, value_len: usize, count: u8| {
+        let directory = tempdir().unwrap();
+        let config = PersistenceConfig {
+            wal_segment_bytes: segment_bytes,
+            ..bulk_config(directory.path())
+        };
+        let limits = ProtocolLimits::default();
+        let (mut sink, _, _) = WalSink::open(config.clone(), 0, limits).unwrap();
+        let mut expected = Vec::new();
+
+        sink.begin_group();
+        for index in 0..count {
+            let key = [b'k', index];
+            let value = vec![index; value_len];
+
+            sink.record(Mutation::SetBytes {
+                key: &key,
+                value: &value,
+            })
+            .unwrap();
+            expected.push(
+                Mutation::SetBytes {
+                    key: &key,
+                    value: &value,
+                }
+                .to_owned(),
+            );
+
+            if index == count / 2 {
+                let refused = vec![0u8; segment_bytes as usize];
+                let error = sink
+                    .record(Mutation::SetBytes {
+                        key: b"refused",
+                        value: &refused,
+                    })
+                    .unwrap_err();
+
+                assert!(error.to_string().contains("segment size"), "{error}");
+            }
+        }
+        sink.end_group().unwrap();
+        sink.flush().unwrap();
+        drop(sink);
+
+        let (_sink, mutations, report) = WalSink::open(config, 0, limits).unwrap();
+        let recovered: Vec<_> = mutations
+            .into_iter()
+            .map(|(_, mutation)| mutation)
+            .collect();
+
+        assert_eq!(recovered, expected);
+        assert_eq!(report.last_sequence, u64::from(count));
+        fs::read_dir(shard_wal_directory(directory.path(), 0))
+            .unwrap()
+            .count()
+    };
+
+    // Small segments: the group rotates several times while records are staged.
+    assert!(check(4096, 64, 100) > 1);
+    // One large segment: the batch passes `WAL_GROUP_BYTES` several times.
+    assert_eq!(check(4 * 1024 * 1024, 4000, 60), 1);
 }

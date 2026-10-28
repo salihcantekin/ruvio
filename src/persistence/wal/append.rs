@@ -21,53 +21,77 @@ impl WalSink {
         self.recover_if_failed()?;
         self.observe_sync_error()?;
 
-        encode_borrowed_record_into(
-            &mut self.record,
-            self.shard_id,
-            self.next_sequence,
-            self.database,
-            &mutation,
-        )?;
-        let record = std::mem::take(&mut self.record);
+        let through = THROUGH && self.group > 0 && self.profile == DurabilityProfile::Always;
+        let record_length;
+        let written;
 
-        if record.len() > self.limits.max_command_bytes {
-            self.record = record;
+        if self.group > 0 && !through {
+            // Staged: encode straight onto the end of the batch, not into `record` and then
+            // copied over.
+            let start = self.staged.len();
+            let encoded = encode_borrowed_record_appended(
+                &mut self.staged,
+                self.shard_id,
+                self.next_sequence,
+                self.database,
+                &mutation,
+            );
+            let length = (self.staged.len() - start) as u64;
 
-            return Err(PersistenceError::Failed(
-                "encoded WAL record exceeds configured command limit".into(),
-            ));
-        }
+            if let Err(error) = encoded.and_then(|()| self.check_record_length(length)) {
+                self.staged.truncate(start);
+                return Err(error);
+            }
+            record_length = length;
 
-        let record_length = record.len() as u64;
+            let rotate = self.needs_rotation(length);
 
-        if WAL_HEADER_LEN as u64 + record_length > self.config.wal_segment_bytes {
-            self.record = record;
+            if !rotate && (start == 0 || self.staged.len() <= WAL_GROUP_BYTES) {
+                if start == 0 {
+                    self.staged_first_sequence = self.next_sequence;
+                }
+                written = Ok(());
+            } else {
+                // Rare: the record must not join this batch (a new segment, or the batch is
+                // full). Move it out and take the general path.
+                self.record.clear();
+                self.record.extend_from_slice(&self.staged[start..]);
+                self.staged.truncate(start);
 
-            // The runtime matches this prefix to answer the client with a clear error.
-            return Err(PersistenceError::Failed(format!(
-                "encoded WAL record exceeds configured segment size ({record_length} bytes, \
-                 wal_segment_bytes = {})",
-                self.config.wal_segment_bytes
-            )));
-        }
+                if rotate {
+                    self.rotate()?;
+                }
+                let record = std::mem::take(&mut self.record);
 
-        self.record = record;
-
-        if self.file_length > WAL_HEADER_LEN as u64
-            && self.file_length.saturating_add(record_length) > self.config.wal_segment_bytes
-        {
-            self.rotate()?;
-        }
-
-        let record = std::mem::take(&mut self.record);
-        let written = if THROUGH && self.group > 0 && self.profile == DurabilityProfile::Always {
-            self.publish_staged_io()
-                .and_then(|()| self.write_file(&record))
+                written = self.write_record(&record);
+                self.record = record;
+            }
         } else {
-            self.write_record(&record)
-        };
+            encode_borrowed_record_into(
+                &mut self.record,
+                self.shard_id,
+                self.next_sequence,
+                self.database,
+                &mutation,
+            )?;
+            record_length = self.record.len() as u64;
+            self.check_record_length(record_length)?;
 
-        self.record = record;
+            if self.needs_rotation(record_length) {
+                self.rotate()?;
+            }
+
+            let record = std::mem::take(&mut self.record);
+
+            written = if through {
+                self.publish_staged_io()
+                    .and_then(|()| self.write_file(&record))
+            } else {
+                self.write_record(&record)
+            };
+            self.record = record;
+        }
+
         self.record.clear();
 
         if let Err(error) = written {
@@ -150,6 +174,30 @@ impl WalSink {
         }
 
         Ok(())
+    }
+
+    fn check_record_length(&self, record_length: u64) -> Result<(), PersistenceError> {
+        if record_length > self.limits.max_command_bytes as u64 {
+            return Err(PersistenceError::Failed(
+                "encoded WAL record exceeds configured command limit".into(),
+            ));
+        }
+
+        if WAL_HEADER_LEN as u64 + record_length > self.config.wal_segment_bytes {
+            // The runtime matches this prefix to answer the client with a clear error.
+            return Err(PersistenceError::Failed(format!(
+                "encoded WAL record exceeds configured segment size ({record_length} bytes, \
+                 wal_segment_bytes = {})",
+                self.config.wal_segment_bytes
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn needs_rotation(&self, record_length: u64) -> bool {
+        self.file_length > WAL_HEADER_LEN as u64
+            && self.file_length.saturating_add(record_length) > self.config.wal_segment_bytes
     }
 
     fn write_record(&mut self, bytes: &[u8]) -> io::Result<()> {

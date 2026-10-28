@@ -419,13 +419,7 @@ impl WalSink {
             };
             return self.fail_sync(message);
         }
-        let message = self
-            .sync_error
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
-
-        if let Some(message) = message {
+        if let Some(message) = self.sync_error.take() {
             return self.fail_sync(message);
         }
 
@@ -445,12 +439,7 @@ impl WalSink {
             return;
         }
 
-        if self
-            .sync_error
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .is_some()
-        {
+        if self.sync_error.is_set() {
             return;
         }
 
@@ -527,9 +516,7 @@ impl WalSink {
                 let synced = cloned.sync_data();
 
                 if let Err(error) = synced {
-                    *sync_error
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner()) = Some(error.to_string());
+                    sync_error.report(error.to_string());
 
                     return;
                 }
