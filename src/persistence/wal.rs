@@ -16,11 +16,11 @@ use crate::{
 };
 
 use super::{
-    DurabilityProfile, PersistenceConfig, PersistenceError,
+    DurabilityProfile, DurableSequence, PersistenceConfig, PersistenceError,
     codec::{
         FORMAT_MINOR, RECORD_MIN_LEN, WAL_HEADER_LEN, decode_record, decode_segment_header,
         encode_borrowed_record_appended, encode_borrowed_record_into, encode_segment_header,
-        record_header_plausible,
+        record_header_plausible, verify_record_frame,
     },
     crash, snapshot, sync_worker,
 };
@@ -224,7 +224,7 @@ pub struct WalSink {
     hot_through: u64,
     last_recovery: Option<Instant>,
     published: Arc<AtomicU64>,
-    durable: Arc<AtomicU64>,
+    durable: Arc<DurableSequence>,
     backlog_floor: Arc<AtomicU64>,
     replica_count: Arc<AtomicU64>,
     database: u8,
@@ -298,11 +298,40 @@ pub enum FrameRead {
 /// the last record it returned, and the sequence that record's successor carries. A
 /// chunk that starts there seeks straight to it instead of decoding the segment again
 /// from its header, so following a long segment costs its length once, not per chunk.
+///
+/// The segment stays open between chunks, so a reader that keeps up with the live segment
+/// lists the directory and opens a file only when the log rolls over to a new segment.
 #[derive(Debug, Default)]
 pub(crate) struct FrameCursor {
     position: Option<(PathBuf, u64)>,
     next_sequence: u64,
+    /// The segment `position` names, still open.
+    open: Option<OpenSegment>,
 }
+
+#[derive(Debug)]
+struct OpenSegment {
+    file: io::BufReader<File>,
+    /// The file's length when last looked at; the live segment can grow past it.
+    length: u64,
+    /// Which file this is, so a compacted or replaced segment is not read on.
+    identity: FileIdentity,
+}
+
+#[cfg(unix)]
+type FileIdentity = (u64, u64);
+#[cfg(not(unix))]
+type FileIdentity = ();
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn file_identity(_: &fs::Metadata) -> FileIdentity {}
 
 struct Segment {
     path: PathBuf,

@@ -1,5 +1,6 @@
 mod codec;
 mod crash;
+mod durable_sequence;
 mod signature;
 mod snapshot;
 mod sync_worker;
@@ -39,6 +40,7 @@ pub(crate) use snapshot::{
 #[allow(unused_imports)]
 pub(crate) use snapshot::{ResyncBytes, decode_snapshot_blob, load_resync_bytes};
 
+pub use durable_sequence::DurableSequence;
 pub use signature::{BackupSeal, verify_backup_signature};
 
 pub use tooling::{
