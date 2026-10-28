@@ -222,6 +222,12 @@ pub trait StorageIndex: Debug + Send + 'static {
         self.lookup(key).map(|hit| (hit, true))
     }
 
+    /// [`Self::lookup_ttl`] plus the record's address for [`Self::access_at`], when the
+    /// index keeps a stable key log; `None` address otherwise.
+    fn lookup_ttl_at(&self, key: &[u8]) -> Option<(IndexRef<'_>, bool, Option<u32>)> {
+        self.lookup_ttl(key).map(|(hit, hint)| (hit, hint, None))
+    }
+
     /// Records that `key` has a deadline.
     fn mark_ttl(&mut self, _key: &[u8]) {}
 
@@ -247,6 +253,12 @@ pub trait StorageIndex: Debug + Send + 'static {
     /// index keeps none. Storage is allocated by the first call, so a shard that never
     /// tracks recency pays nothing.
     fn access_mut(&mut self, _key: &[u8]) -> Option<&mut u32> {
+        None
+    }
+
+    /// [`Self::access_mut`] for the record at `address` from [`Self::lookup_ttl_at`], with
+    /// no second lookup. The address holds until the index is next written.
+    fn access_at(&mut self, _address: u32) -> Option<&mut u32> {
         None
     }
 
@@ -1157,6 +1169,28 @@ impl StorageIndex for AHashIndex {
             })
     }
 
+    fn lookup_ttl_at(&self, key: &[u8]) -> Option<(IndexRef<'_>, bool, Option<u32>)> {
+        let hash = self.hash_key(key);
+        let AHashIndex {
+            keys,
+            table,
+            heaps,
+            objects,
+            slabs,
+            ..
+        } = self;
+
+        table
+            .find(hash, |record| Self::same_key(keys, record, key))
+            .map(|addr| {
+                (
+                    Self::view(*addr, keys, heaps, objects, slabs),
+                    Self::ttl_hint(keys, *addr),
+                    Some(addr.0),
+                )
+            })
+    }
+
     fn access_get(&self, key: &[u8]) -> u32 {
         if self.access.is_empty() {
             return 0;
@@ -1176,6 +1210,10 @@ impl StorageIndex for AHashIndex {
             .find(hash, |record| Self::same_key(&self.keys, record, key))
             .copied()?;
         Some(self.access.cell_mut((addr.0 >> 3) as usize))
+    }
+
+    fn access_at(&mut self, address: u32) -> Option<&mut u32> {
+        Some(self.access.cell_mut((address >> 3) as usize))
     }
 
     fn reset_access(&mut self) {
