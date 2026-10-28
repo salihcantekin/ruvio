@@ -162,6 +162,8 @@ fn spawn_reader(
     state.durable_acks.set_primary(None);
     state.durable_acks.set_following(true);
     let (inbound, outbound) = mpsc::sync_channel(crate::replication::QUEUE_FRAMES);
+    // The old queue, if any, is dropped with its frames below.
+    state.replica_publish_bytes.store(0, Ordering::Release);
     let dialed = shard_port(primary, shard_id)?;
     *state.followed.borrow_mut() = Some(match &primary_name {
         Some((host, _)) => (host.clone(), dialed.port()),
@@ -181,6 +183,7 @@ fn spawn_reader(
         limits: state.published_config.protocol,
         snapshot_max_bytes: state.published_config.persistence.snapshot_max_bytes,
         resync_sequence: Arc::clone(&state.replica_resync_sequence),
+        publish_bytes: Arc::clone(&state.replica_publish_bytes),
         data_dir: state.published_config.persistence.data_dir.clone(),
         shard_count: state.published_config.shards as u32,
         status: Arc::clone(&state.replica_link),
@@ -934,6 +937,21 @@ pub(super) fn drain_replicated(state: &ShardState) {
     }
 }
 
+/// A copied publish left the queue: give its bytes back to the reader thread's budget.
+fn release_publish_bytes(state: &ShardState, len: usize) {
+    let counter = &state.replica_publish_bytes;
+    // The count is reset when a new reader starts, so a frame of the old queue may be taken
+    // after that; saturate instead of wrapping.
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let next = current.saturating_sub(len);
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(seen) => current = seen,
+        }
+    }
+}
+
 /// Frames applied per drain. The reader thread refills the queue while it drains, so
 /// without a bound a fast primary would keep the shard away from its own clients.
 const REPLICA_DRAIN_BUDGET: usize = 256;
@@ -941,6 +959,10 @@ const REPLICA_DRAIN_BUDGET: usize = 256;
 #[inline(never)]
 fn drain_replicated_frames(state: &ShardState) {
     let taken = drain_replicated_budget(state, REPLICA_DRAIN_BUDGET);
+
+    if taken == 0 {
+        return;
+    }
 
     // A durable reply waits on the primary: make this batch durable now, not on the next
     // `everysec` tick, so the acknowledgement goes out at once.
@@ -952,10 +974,6 @@ fn drain_replicated_frames(state: &ShardState) {
             .flush()
     {
         warn!(%error, "replica log sync for a durable reply failed");
-    }
-
-    if taken == 0 {
-        return;
     }
 
     if taken >= REPLICA_DRAIN_BUDGET {
@@ -1045,6 +1063,9 @@ fn drain_replicated_budget(state: &ShardState, budget: usize) -> usize {
 
             crate::replication::ReplicaDelivery::Frame(frame) => {
                 if state.replica_resync_sequence.load(Ordering::Acquire) != 0 {
+                    if crate::replication::decode_copied_publish(&frame).is_some() {
+                        release_publish_bytes(state, frame.len());
+                    }
                     continue;
                 }
                 frame
@@ -1053,6 +1074,7 @@ fn drain_replicated_budget(state: &ShardState, budget: usize) -> usize {
 
         if let Some((sharded, channel, message)) = crate::replication::decode_copied_publish(&frame)
         {
+            release_publish_bytes(state, frame.len());
             if sharded {
                 publish_sharded(state, &channel, &message);
             } else {

@@ -110,6 +110,19 @@ internal sealed class RuvioSingletonService<TWorker> : BackgroundService
 
     private async Task RunAsync(IRuvioLock held, CancellationToken stoppingToken)
     {
+        try
+        {
+            await RunHeldAsync(held, stoppingToken).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            // Releasing is best effort (the lease expires on its own); it must never stop the host.
+            logger?.LogWarning(exception, "Singleton {Name}: releasing the lock failed; the lease will expire on its own.", name);
+        }
+    }
+
+    private async Task RunHeldAsync(IRuvioLock held, CancellationToken stoppingToken)
+    {
         await using (held.ConfigureAwait(false))
         {
             using CancellationTokenSource linked = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, held.LockLost);

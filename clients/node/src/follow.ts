@@ -80,7 +80,7 @@ function ask(addr: Addr, o: ConnectionOptions, args: string[], scope: ProbeScope
     let socket: net.Socket;
     if (o.tls) {
       const topts: tls.ConnectionOptions = o.tls === true ? {} : { ...o.tls };
-      socket = tls.connect({ host: addr.host, port: addr.port, servername: addr.host, ...topts });
+      socket = tls.connect({ host: addr.host, port: addr.port, ...(net.isIP(addr.host) === 0 ? { servername: addr.host } : {}), ...topts });
     } else {
       socket = net.connect({ host: addr.host, port: addr.port });
     }

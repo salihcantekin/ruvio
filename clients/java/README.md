@@ -212,7 +212,7 @@ pipelined commands; use `{hashtag}` keys to keep related keys in one slot.
   connection per node and subscribes one slot per command.
 * **Helpers** (locks, leases, semaphores, rate limit, `getOrCreate`, idempotency, capped list, Bloom, typed JSON)
   only issue single-key commands, so they work unchanged; `ClusterLiveTest` runs them on the cluster.
-* `ASK` redirects and `CLUSTERDOWN` handling: not implemented. Reads from replicas: see below.
+* `CLUSTERDOWN` handling: not implemented (`ASK` redirects and `TRYAGAIN` retries are, see above). Reads from replicas: see below.
 
 ## Durable replies
 
@@ -401,7 +401,7 @@ little about scaling; they are not release evidence.
 
 ## Not done / not verified
 
-* Cluster: replicas, `READONLY` replica reads, `ASK`, `CLUSTERDOWN`/`TRYAGAIN` retries, adding or removing
+* Cluster: `CLUSTERDOWN` retries, adding or removing
   nodes while running (the table is refreshed on MOVED only, there is no periodic refresh), and a cluster-wide
   `DBSIZE`/`KEYS`/`FLUSHALL` (use `onNode`) are not implemented. Cluster mode was only exercised against the
   3-shard Ruvio server (one process, `port_mode = "per-shard"`), not against a Redis Cluster.

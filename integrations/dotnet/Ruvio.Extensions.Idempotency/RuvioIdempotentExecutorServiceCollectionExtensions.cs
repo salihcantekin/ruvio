@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Ruvio.Client;
@@ -32,7 +33,8 @@ public static class RuvioIdempotentExecutorServiceCollectionExtensions
 
         services.TryAddSingleton(provider => new RuvioIdempotentExecutor(options.ClientKey is { } key
             ? provider.GetRequiredKeyedService<IRuvioClient>(key)
-            : provider.GetRequiredService<IRuvioClient>(), options));
+            : provider.GetRequiredService<IRuvioClient>(), options,
+            provider.GetService<ILoggerFactory>()?.CreateLogger("Ruvio.Extensions.Idempotency")));
 
         return services;
     }

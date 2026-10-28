@@ -89,7 +89,7 @@ byte[] page = await cache.GetOrCreateAsync(
     new DistributedCacheEntryOptions { AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(10) });
 ```
 
-It sends `FILLGET key fill_ms WAIT wait_ms`. One caller across every process runs the
+It polls plain `FILLGET`. One caller across every process runs the
 factory and stores the result with `FILLSET`; the others are held by the server and
 receive the stored value. With 20 concurrent callers the factory runs once.
 

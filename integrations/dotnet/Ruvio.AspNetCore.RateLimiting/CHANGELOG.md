@@ -4,6 +4,9 @@ Notable changes to the NuGet package `Ruvio.AspNetCore.RateLimiting`. New entrie
 
 ## Unreleased
 
+- An invalid remaining allowance in a `LIMIT` reply is no longer treated as an outage, so `FailOpen` does not let the request through for it and the circuit breaker does not count it.
+- Docs: `Retry-After` is exact for sliding and token windows, and the fail-open wording matches `Outage.Mode`.
+- Needs Ruvio.Client 0.4.0; the sliding and token modes need a server with the `LIMIT` sliding/token modes.
 - Docs: the README lists what this package checks while the host starts, and shows how to watch the circuit breaker (logs, `ruvio_client_circuit_transitions`, a `StateChanged` handler).
 - With `Outage.CircuitBreaker` set, the circuit's changes are logged through `ILogger` (category `Ruvio.AspNetCore.RateLimiting`): Warning when it opens, with the break duration; Information for the trial call and when it closes. Nothing is logged without a breaker.
 - `ClientKey` option: names a connection registered with `AddKeyedRuvioClient`, so the middleware can use its own server or database, like the other integrations. Null (the default) keeps the unkeyed `IRuvioClient`. Host start fails when no client is registered under that key.

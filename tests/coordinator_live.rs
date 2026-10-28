@@ -1224,7 +1224,14 @@ fn a_slot_range_moves_between_groups_while_a_client_keeps_writing() {
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
                     break;
                 }
+                // A frozen range is waited for, but not forever: a regression that never thaws
+                // must fail the test instead of hanging the job.
+                let patience = std::time::Instant::now();
                 loop {
+                    assert!(
+                        patience.elapsed() < PATIENCE,
+                        "write {value} got no OK within {PATIENCE:?}"
+                    );
                     match call(&address, &["SET", &busy, &value.to_string()]).as_deref() {
                         Some("OK") => {
                             acked = value;
@@ -1239,6 +1246,9 @@ fn a_slot_range_moves_between_groups_while_a_client_keeps_writing() {
                             frozen.get_or_insert_with(std::time::Instant::now);
                             std::thread::sleep(Duration::from_millis(5));
                         }
+                        // A reply that does not arrive (a slow accept on a loaded host) says
+                        // nothing either way; the same value is sent again.
+                        None => std::thread::sleep(Duration::from_millis(20)),
                         other => panic!("unexpected reply {other:?}"),
                     }
                 }
@@ -1372,7 +1382,12 @@ fn a_rebalance_evens_out_the_slots_in_moves_while_a_client_keeps_writing() {
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
                     break;
                 }
+                let patience = std::time::Instant::now();
                 loop {
+                    assert!(
+                        patience.elapsed() < PATIENCE,
+                        "write {value} got no OK within {PATIENCE:?}"
+                    );
                     match call(&address, &["SET", &busy, &value.to_string()]).as_deref() {
                         Some("OK") => {
                             acked = value;
@@ -1382,6 +1397,7 @@ fn a_rebalance_evens_out_the_slots_in_moves_while_a_client_keeps_writing() {
                         Some(reply) if reply.starts_with("TRYAGAIN") => {
                             std::thread::sleep(Duration::from_millis(5));
                         }
+                        None => std::thread::sleep(Duration::from_millis(20)),
                         other => panic!("unexpected reply {other:?}"),
                     }
                 }

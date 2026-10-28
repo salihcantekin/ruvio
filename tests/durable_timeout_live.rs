@@ -9,17 +9,14 @@ const REFUSED: &str = "ERR:NOREPLICAS Not enough good replicas to write.";
 
 #[test]
 fn replies_after_a_timeout_keep_waiting_until_a_replica_holds_the_write() {
-    // A primary with no replica at all: every wait times out.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let listen = listener.local_addr().unwrap().to_string();
+    // A primary with no replica at all: every wait times out. The replication port comes from
+    // the server's reserved block, so no other test can take it between reserve and bind.
+    let mut server = Server::start_with(&[("RUVIO_DURABILITY", "everysec")]);
+    let listen = server.ports().address_at(1).to_string();
 
-    drop(listener);
-
-    let server = Server::start_with(&[
-        ("RUVIO_REPLICATION_ROLE", "primary"),
-        ("RUVIO_REPLICATION_LISTEN", &listen),
-        ("RUVIO_DURABILITY", "everysec"),
-    ]);
+    server.set_env("RUVIO_REPLICATION_ROLE", "primary");
+    server.set_env("RUVIO_REPLICATION_LISTEN", &listen);
+    server.restart();
     let mut writer = Client::connect(&server.address);
     let mut reader = Client::connect(&server.address);
     let mut plain = Client::connect(&server.address);

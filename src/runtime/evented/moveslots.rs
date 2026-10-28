@@ -1,4 +1,4 @@
-//! `RUVIO MOVESLOTS`: moves a slot range between the shards of this process (ADR 0014).
+//! `RUVIO MOVESLOTS`: moves a slot range between the shards of this process.
 //!
 //! The source shard copies the range to the target in bounded steps while it keeps serving
 //! it, then sends the keys written meanwhile again until few are left. The hand-over is one

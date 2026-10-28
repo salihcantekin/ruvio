@@ -100,9 +100,9 @@ internal sealed class RuvioLock : IRuvioLock
             await ReleaseAsync().ConfigureAwait(false);
         }
 
-        catch (RuvioException)
+        catch (Exception exception) when (exception is not OperationCanceledException)
         {
-            // The lease expires on its own; a failed release must not hide the guarded work's result.
+            // The lease expires on its own; a failed release (server error, timeout, socket error) must not hide the guarded work's result.
         }
 
         stopRenewing.Dispose();
@@ -137,7 +137,7 @@ internal sealed class RuvioLock : IRuvioLock
                     await ExtendAsync(null, stop).ConfigureAwait(false);
                 }
 
-                catch (Exception exception) when (exception is RuvioException or IOException or ObjectDisposedException)
+                catch (Exception exception) when (exception is not OperationCanceledException)
                 {
                     if (time.GetElapsedTime(Volatile.Read(ref renewedAt)) >= currentLease)
                     {

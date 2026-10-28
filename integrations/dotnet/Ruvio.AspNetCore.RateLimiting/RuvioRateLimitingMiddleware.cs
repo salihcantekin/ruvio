@@ -223,7 +223,8 @@ public sealed class RuvioRateLimitingMiddleware
                         outcome = remaining is null ? "rejected" : "accepted";
 
                         if (remaining is < 0 || remaining >= limit.Permits)
-                            throw new RuvioException("LIMIT returned an invalid remaining allowance.");
+                            // Not a RuvioException: that would be classed as an outage and fail open.
+                            throw new InvalidOperationException("LIMIT returned an invalid remaining allowance.");
 
                         if (remaining is null)
                         {

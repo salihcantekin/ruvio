@@ -91,7 +91,7 @@ builder.Services.AddRuvioIdempotentExecutor(o =>
 });
 ```
 
-With `AbortOnException` (off by default), a work function that throws or is cancelled makes the executor send
+With `AbortOnException` (off by default; it needs a server that has `IDEM ABORT`, otherwise one warning is logged and nothing is freed), a work function that throws or is cancelled makes the executor send
 `IDEM key ABORT fingerprint owner` before the exception reaches you, so the next call with that key runs the
 work at once. The server removes the record only while it is still pending with this call's owner, so a result
 stored by another call is never removed. Turn it on only for work that throws before it takes effect, or that is

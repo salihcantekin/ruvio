@@ -626,7 +626,7 @@ export class Connection extends EventEmitter {
     let socket: net.Socket;
     if (o.tls) {
       const topts: tls.ConnectionOptions = o.tls === true ? {} : { ...o.tls };
-      socket = tls.connect({ host, port, servername: host, ...topts });
+      socket = tls.connect({ host, port, ...(net.isIP(host) === 0 ? { servername: host } : {}), ...topts });
       socket.on('data', (d: Buffer) => this.onData(d, d.length));
     } else if (o.path !== undefined) {
       socket = net.connect({ path: o.path, onread } as net.NetConnectOpts);

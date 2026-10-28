@@ -191,7 +191,7 @@ public class MiddlewareTests
         using var services = Services(client);
         var middleware = Create(_ => throw new Exception("must not run"), services);
 
-        await Assert.ThrowsAsync<RuvioException>(() => middleware.InvokeAsync(Context(services, "tenant")));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => middleware.InvokeAsync(Context(services, "tenant")));
     }
 
     [Fact]

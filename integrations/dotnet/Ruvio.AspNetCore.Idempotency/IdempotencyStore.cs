@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
+using Microsoft.Extensions.Logging;
 using Ruvio.Client;
 
 namespace Ruvio.AspNetCore.Idempotency;
@@ -73,7 +74,9 @@ internal static class IdempotencyStore
     /// Gives up the pending record after the handler threw. A failure here is counted and swallowed so the handler's
     /// own exception reaches the caller; the record then stays pending until its retention ends, as without the option.
     /// </summary>
-    internal static async Task AbortAsync(IRuvioClient client, string key, string fingerprint, string owner)
+    private static int abortUnsupportedLogged;
+
+    internal static async Task AbortAsync(IRuvioClient client, string key, string fingerprint, string owner, ILogger? logger = null)
     {
         long started = Stopwatch.GetTimestamp();
 
@@ -82,6 +85,14 @@ internal static class IdempotencyStore
             if (await MeasureStorageAsync("abort", started,
                 client.AbortIdempotencyAsync(key, fingerprint, owner, CancellationToken.None)).ConfigureAwait(false))
                 RecordState("aborted");
+        }
+        catch (RuvioException exception) when (exception.IsServerReply)
+        {
+            // Already counted with outcome "error"; a server from before IDEM ABORT answers an unknown-subcommand error.
+            if (Interlocked.Exchange(ref abortUnsupportedLogged, 1) == 0)
+            {
+                logger?.LogWarning(exception, "The Ruvio server rejected IDEM ABORT; it is older than this package needs, so AbortOnException has no effect and failed requests stay pending until their retention ends.");
+            }
         }
         catch (Exception)
         {

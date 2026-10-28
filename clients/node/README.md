@@ -275,7 +275,7 @@ and the 3-shard server shares this VM's CPUs with the benchmark, so the cluster 
 
 ## Not done / not verified
 
-- **Cluster, not done:** `ASK` redirects are not handled (Ruvio's per-shard layout has no slot migration); a plain `scan()` call is single-node (use `scanIterator()`);
+- **Cluster, not done:** `ASK` redirects and `TRYAGAIN` retries are followed (see above), but `CLUSTERDOWN` is returned as an error; a plain `scan()` call is single-node (use `scanIterator()`);
   `MOVED` inside a transaction is not retried; split `MSET`/`DEL`... are not atomic; `SELECT` is not routed (database 0 only); `CLUSTER NODES/SHARDS/INFO/MYID` go to the seed node only.
   Cluster routing is verified only against Ruvio's 3-shard `per-shard` port layout on one machine, not against a Redis Cluster.
 - **Not verified live:** TLS and unix-socket connections; `ACL LOAD`/`ACL SAVE` success (server has no acl_file; the call round-trips an error); `WAIT` with real replicas;

@@ -56,6 +56,7 @@ await RunReportAsync(held.LockLost);    // stops if the lock is lost mid-run
 A lock alone cannot stop an owner that paused (a long GC, a frozen VM) past its lease from writing after the
 next owner took over. With `Fenced` on, each lock carries a number that only grows for that resource, and the
 resource you write can refuse a write that carries a smaller number than one it already saw.
+`Fenced` needs a server that has `LEASE`, `RENEW` and `RELEASE`.
 
 ```csharp
 services.AddRuvioDistributedLock(options => options.Fenced = true);
