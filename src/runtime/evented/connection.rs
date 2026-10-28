@@ -10,6 +10,9 @@ pub(super) static DELAY_SERVED_POPS: std::sync::Mutex<Vec<std::path::PathBuf>> =
 const UNAUTHENTICATED_BUFFER_BYTES: usize = 16 * 1024;
 /// How long `SAVE` waits for the other shards to put their files in its round.
 const SAVE_ROUND_TIMEOUT: Duration = Duration::from_secs(120);
+/// A read wait whose timeout does not fit in an `Instant` waits this long, as tokio's own
+/// `timeout` does.
+const FAR_FUTURE: Duration = Duration::from_secs(86400 * 365 * 30);
 
 /// The reply to a write whose WAL record is larger than a whole segment. The write is
 /// refused before it is applied and nothing is logged; the log stays healthy.
@@ -354,6 +357,11 @@ pub(super) async fn handle_client(
     // End of stream seen by the read that started a skip.
     let mut eof_pending = false;
     let mut output = BoundedOutput::with_capacity(0, request_limits.max_output_buffer_bytes);
+    // One timer serves every read wait. A `timeout` per wait would add and remove a timer
+    // wheel entry each round; this one moves only when it fires early or must fire sooner.
+    let read_deadline = tokio::time::sleep(timeouts.idle);
+
+    tokio::pin!(read_deadline);
 
     loop {
         if shutdown.is_requested() {
@@ -379,9 +387,7 @@ pub(super) async fn handle_client(
             if state.published_config.persistence.sync_worker_active {
                 OpenWalGroup::new(&state).commit().await?;
             }
-            timeout(timeouts.write, stream.write_all(&frame))
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))??;
+            write_timed(&mut stream, &frame, timeouts.write).await?;
 
             continue;
         }
@@ -398,9 +404,7 @@ pub(super) async fn handle_client(
             if state.published_config.persistence.sync_worker_active {
                 OpenWalGroup::new(&state).commit().await?;
             }
-            timeout(timeouts.write, stream.write_all(&frame))
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))??;
+            write_timed(&mut stream, &frame, timeouts.write).await?;
 
             continue;
         }
@@ -422,49 +426,66 @@ pub(super) async fn handle_client(
         let mut close_after_parse = std::mem::take(&mut eof_pending);
 
         if !std::mem::take(&mut skip_now) {
-            tokio::select! {
-                _ = &mut notified => continue,
+            let now = tokio::time::Instant::now();
+            let due = now.checked_add(read_timeout).unwrap_or(now + FAR_FUTURE);
 
-                ready = timeout(read_timeout, stream.wait_readable(&mut read_chunk)) => {
-                    match ready {
-                        Err(_) if !input.is_empty() => {
-                            crate::admission::note_protocol_error();
-                            let _ = timeout(
-                                timeouts.write,
-                                stream.write_all(b"-ERR protocol error\r\n"),
-                            )
-                            .await;
+            if read_deadline.deadline() > due {
+                read_deadline.as_mut().reset(due);
+            }
 
-                            return Ok(());
+            let ready = loop {
+                tokio::select! {
+                    _ = &mut notified => break None,
+
+                    ready = stream.wait_readable(&mut read_chunk) => break Some(Ok(ready)),
+
+                    () = &mut read_deadline => {
+                        // Armed for an earlier wait: wait out the rest of this one's.
+                        if read_deadline.deadline() >= due {
+                            break Some(Err(()));
                         }
 
-                        Err(_) => return Ok(()),
-                        Ok(Err(error)) => return Err(error),
-                        Ok(Ok(SocketWait::Plain)) => {
-                            let before = input.len();
-                            let eof =
-                                stream.read_ready(&mut input, buffer_limit.saturating_add(1))?;
-
-                            // A refused frame cut short still gets its reply.
-                            if eof && input.len() == before && skipping.is_none() {
-                                return Ok(());
-                            }
-
-                            if input.len() == before && !eof {
-                                continue;
-                            }
-
-                            close_after_parse = eof;
-                        }
-
-                        Ok(Ok(SocketWait::Bytes(0))) if skipping.is_none() => return Ok(()),
-                        Ok(Ok(SocketWait::Bytes(0))) => close_after_parse = true,
-                        Ok(Ok(SocketWait::Bytes(read))) => {
-                            input.extend_from_slice(&read_chunk[..read]);
-                        }
+                        read_deadline.as_mut().reset(due);
                     }
                 }
             };
+            let Some(ready) = ready else {
+                continue;
+            };
+
+            match ready {
+                Err(_) if !input.is_empty() => {
+                    crate::admission::note_protocol_error();
+                    let _ =
+                        write_timed(&mut stream, b"-ERR protocol error\r\n", timeouts.write).await;
+
+                    return Ok(());
+                }
+
+                Err(_) => return Ok(()),
+                Ok(Err(error)) => return Err(error),
+                Ok(Ok(SocketWait::Plain)) => {
+                    let before = input.len();
+                    let eof = stream.read_ready(&mut input, buffer_limit.saturating_add(1))?;
+
+                    // A refused frame cut short still gets its reply.
+                    if eof && input.len() == before && skipping.is_none() {
+                        return Ok(());
+                    }
+
+                    if input.len() == before && !eof {
+                        continue;
+                    }
+
+                    close_after_parse = eof;
+                }
+
+                Ok(Ok(SocketWait::Bytes(0))) if skipping.is_none() => return Ok(()),
+                Ok(Ok(SocketWait::Bytes(0))) => close_after_parse = true,
+                Ok(Ok(SocketWait::Bytes(read))) => {
+                    input.extend_from_slice(&read_chunk[..read]);
+                }
+            }
         }
 
         state
@@ -1387,7 +1408,36 @@ async fn protocol_error(
 ) -> io::Result<()> {
     crate::admission::note_protocol_error();
     wal_group.commit().await?;
-    timeout(write_timeout, stream.write_all(b"-ERR protocol error\r\n"))
+    write_timed(stream, b"-ERR protocol error\r\n", write_timeout).await
+}
+
+/// Writes all of `buf`, failing once the socket has taken nothing for `write_timeout`.
+/// A plain socket that takes it at once, the usual case, never arms a timer.
+async fn write_timed(
+    stream: &mut ClientStream,
+    buf: &[u8],
+    write_timeout: Duration,
+) -> io::Result<()> {
+    let mut sent = 0;
+
+    if let ClientStream::Plain(socket) = stream {
+        while sent < buf.len() {
+            match socket.try_write(&buf[sent..]) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(written) => sent += written,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+
+        super::net::note_output(sent);
+
+        if sent == buf.len() {
+            return Ok(());
+        }
+    }
+
+    timeout(write_timeout, stream.write_all(&buf[sent..]))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))?
 }
@@ -1456,9 +1506,10 @@ pub(super) async fn flush_output(
         .peak_output_buffer_bytes
         .set(state.peak_output_buffer_bytes.get().max(output.len()));
     if output.exceeded() {
-        let _ = timeout(
+        let _ = write_timed(
+            stream,
+            b"-ERR output buffer limit exceeded\r\n",
             write_timeout,
-            stream.write_all(b"-ERR output buffer limit exceeded\r\n"),
         )
         .await;
 
@@ -1469,9 +1520,7 @@ pub(super) async fn flush_output(
         return Ok(());
     }
 
-    timeout(write_timeout, stream.write_all(&*output))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))??;
+    write_timed(stream, &*output, write_timeout).await?;
     output.clear();
     Ok(())
 }

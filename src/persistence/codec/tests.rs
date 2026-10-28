@@ -76,16 +76,22 @@ fn borrowed_encoding_matches_owned_encoding() {
         Mutation::FlushDatabase,
     ];
 
+    // Appended after earlier records, as the WAL batch buffer takes it.
+    let mut batch = b"earlier records".to_vec();
+
     for mutation in borrowed {
         let mut fast = Vec::new();
+        let expected = encode_record(2, 9, 1, &mutation.to_owned()).unwrap();
 
         encode_borrowed_record_into(&mut fast, 2, 9, 1, &mutation).unwrap();
-        assert_eq!(
-            fast,
-            encode_record(2, 9, 1, &mutation.to_owned()).unwrap(),
-            "{mutation:?}"
-        );
+        assert_eq!(fast, expected, "{mutation:?}");
+
+        let start = batch.len();
+
+        encode_borrowed_record_appended(&mut batch, 2, 9, 1, &mutation).unwrap();
+        assert_eq!(batch[start..], expected, "{mutation:?}");
     }
+    assert!(batch.starts_with(b"earlier records"));
 }
 
 use super::*;
