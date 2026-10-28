@@ -753,19 +753,51 @@ fn hash_tag(key: &[u8]) -> &[u8] {
     if close == 0 { key } else { &tagged[..close] }
 }
 
-fn crc16(bytes: &[u8]) -> u16 {
-    let mut crc = 0u16;
-
-    for byte in bytes {
-        crc ^= u16::from(*byte) << 8;
-
-        for _ in 0..8 {
+/// CRC16-XMODEM tables for slice-by-4: `CRC16_TABLES[k][b]` is the CRC of byte `b` followed by
+/// `k` zero bytes, so four bytes fold in with four independent lookups.
+const CRC16_TABLES: [[u16; 256]; 4] = {
+    let mut tables = [[0u16; 256]; 4];
+    let mut byte = 0;
+    while byte < 256 {
+        let mut crc = (byte as u16) << 8;
+        let mut bit = 0;
+        while bit < 8 {
             crc = if crc & 0x8000 != 0 {
                 (crc << 1) ^ 0x1021
             } else {
                 crc << 1
             };
+            bit += 1;
         }
+        tables[0][byte] = crc;
+        byte += 1;
+    }
+    let mut k = 1;
+    while k < 4 {
+        let mut byte = 0;
+        while byte < 256 {
+            let prev = tables[k - 1][byte];
+            tables[k][byte] = (prev << 8) ^ tables[0][(prev >> 8) as usize];
+            byte += 1;
+        }
+        k += 1;
+    }
+    tables
+};
+
+fn crc16(bytes: &[u8]) -> u16 {
+    let [t0, t1, t2, t3] = &CRC16_TABLES;
+    let mut crc = 0u16;
+    let mut chunks = bytes.chunks_exact(4);
+
+    for chunk in &mut chunks {
+        let high = usize::from(chunk[0] ^ (crc >> 8) as u8);
+        let low = usize::from(chunk[1] ^ crc as u8);
+        crc = t3[high] ^ t2[low] ^ t1[usize::from(chunk[2])] ^ t0[usize::from(chunk[3])];
+    }
+
+    for byte in chunks.remainder() {
+        crc = (crc << 8) ^ t0[usize::from(*byte ^ (crc >> 8) as u8)];
     }
 
     crc
@@ -774,6 +806,81 @@ fn crc16(bytes: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bitwise_crc16(bytes: &[u8]) -> u16 {
+        let mut crc = 0u16;
+        for byte in bytes {
+            crc ^= u16::from(*byte) << 8;
+            for _ in 0..8 {
+                crc = if crc & 0x8000 != 0 {
+                    (crc << 1) ^ 0x1021
+                } else {
+                    crc << 1
+                };
+            }
+        }
+        crc
+    }
+
+    #[test]
+    fn crc16_matches_known_xmodem_values() {
+        for (input, expected) in [
+            (b"".as_slice(), 0x0000),
+            (b"A".as_slice(), 0x58E5),
+            (b"123456789".as_slice(), 0x31C3),
+            (b"user:1000".as_slice(), bitwise_crc16(b"user:1000")),
+            (
+                b"\xff\xff\xff\xff\xff".as_slice(),
+                bitwise_crc16(b"\xff\xff\xff\xff\xff"),
+            ),
+        ] {
+            assert_eq!(crc16(input), expected, "{input:?}");
+        }
+        assert_eq!(bitwise_crc16(b"A"), 0x58E5);
+        assert_eq!(bitwise_crc16(b"123456789"), 0x31C3);
+    }
+
+    #[test]
+    fn table_crc16_equals_bitwise_for_all_lengths() {
+        // Fixed-seed xorshift: the same bytes on every run.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut buffer = [0u8; 64];
+        for _ in 0..64 {
+            for byte in &mut buffer {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *byte = state as u8;
+            }
+            for len in 0..=buffer.len() {
+                let bytes = &buffer[..len];
+                assert_eq!(crc16(bytes), bitwise_crc16(bytes), "{bytes:?}");
+            }
+        }
+        for byte in 0..=255u8 {
+            assert_eq!(crc16(&[byte]), bitwise_crc16(&[byte]));
+            assert_eq!(crc16(&[byte; 7]), bitwise_crc16(&[byte; 7]));
+        }
+    }
+
+    #[test]
+    fn hash_tag_edge_cases_hash_like_redis() {
+        for (key, hashed) in [
+            (b"{}".as_slice(), b"{}".as_slice()),
+            (b"{a".as_slice(), b"{a".as_slice()),
+            (b"a}{b}".as_slice(), b"b".as_slice()),
+            (b"{a}{b}".as_slice(), b"a".as_slice()),
+            (b"{{a}}".as_slice(), b"{a".as_slice()),
+            (b"}{".as_slice(), b"}{".as_slice()),
+        ] {
+            assert_eq!(hash_tag(key), hashed, "{key:?}");
+            assert_eq!(
+                hash_slot(key),
+                bitwise_crc16(hashed) % HASH_SLOT_COUNT as u16,
+                "{key:?}"
+            );
+        }
+    }
 
     #[test]
     fn matches_known_redis_slot_and_hash_tags() {
