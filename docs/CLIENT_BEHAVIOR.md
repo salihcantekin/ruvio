@@ -129,6 +129,30 @@ Every client has a scripted test (nodes that answer `ROLE`, refuse writes with `
 
 Every client also has a live test under real coordinators: `scripts/run_with_servers.sh` starts a group of two data nodes (`RUVIO_COORDINATOR_GROUP_ADDRS`, primary first, and their pids in `RUVIO_COORDINATOR_GROUP_PIDS`) watched by three `ruvio coordinator` processes (`RUVIO_COORDINATOR_ADDRS`, the group named in `RUVIO_COORDINATOR_MASTER`; ping 200 ms, down after 1 s, no secret). The test writes through a client with the coordinator option and through one with the two data nodes as seeds, waits until the replica holds both writes, kills the primary with SIGKILL, and has both clients write at once until each succeeds; each first write must come within 5 s of the kill (the writes keep trying for 15 s, so a slow one fails on the bound, not on a timeout). Then it checks that the surviving node answers `master` and holds both writes. The kill is not undone, so the group serves one test per run of the script. Measured on a Mac with a debug server: the coordinator client wrote again about 0.9-1.6 s after the kill. The seeds client took about 5 s (Java) to 7.2 s (the others) while the rounds avoided the refusing replica even once it was the primary; since it is taken once it is promoted (step 4 of the round), it writes about as soon as the coordinator client (1.56 s for both in one Linux run of the Rust test).
 
+## TLS
+
+TLS is off in every client; plain TCP is the default and nothing changes without the option. With it on, the contract is the same everywhere:
+
+- **Verified by default.** The server certificate chain and the host name are checked against the system roots, or against the private CA the caller gives. A refused certificate fails the connect.
+- **Every socket.** The first connect, reconnects, pooled and dedicated sockets, per-shard and cluster node sockets, replica sockets, Pub/Sub sockets and the probes of the follow-primary rounds (`ROLE`, `SENTINEL`, coordinator lookups) all use the same TLS settings. A probe never falls back to plain TCP.
+- **The handshake is part of the connect.** It is bounded by the connect timeout where the client has one.
+- **Disabling verification is explicit.** One option named for it (`InsecureSkipVerify` and its equivalents below) accepts any certificate and removes the protection against someone in the middle. Use it for throwaway tests only; it is never the default and is not implied by any other option.
+- **Private CA and mutual TLS.** A CA file or certificate list trusts a private CA; a client certificate and key answer a server that sets `tls_client_auth`.
+- **Server name.** The name checked is the host being dialed. When the host is an IP address and the certificate carries a name, set the server name option. Node does not send an IP address as the TLS server name (it would print a deprecation warning).
+
+| Client | Turn on | Private CA | Client certificate | Server name | Skip verification |
+| --- | --- | --- | --- | --- | --- |
+| Rust (cargo feature `tls`) | `ClientOptions::tls: Some(TlsOptions)` | `ca_pem` | `client_cert_pem`, `client_key_pem` | `server_name` | `insecure_skip_verify` |
+| C# | `RuvioClientOptions.Tls = new RuvioTlsOptions()` | `TrustedCertificates` | `ClientCertificates` | `ServerName` | `InsecureSkipVerify` |
+| Go | `Options.TLS` (`*tls.Config`) | `RootCAs` | `Certificates` | `ServerName` | `InsecureSkipVerify` |
+| Java | `tls()`, `tls(SSLContext)` | `RuvioTls.context(caPem, ...)` | `RuvioTls.context(..., certPem, keyPem)` | `tlsServerName(name)` | `tlsInsecure()` |
+| Node | `tls: true` or `tls.ConnectionOptions` | `ca` | `cert`, `key` | `servername` | `rejectUnauthorized: false` |
+| Python | `tls=True` (or an `ssl.SSLContext`), `ruvios://`, `rediss://` | `tls_ca_file` | `tls_cert_file`, `tls_key_file` | `tls_server_name` | `tls_insecure_skip_verify` |
+
+Differences: Go ignores `Options.TLS` when `Options.Dial` is set (return your own `*tls.Conn` from `Dial`); Rust without the `tls` feature fails the connect with `Error::Protocol` when `tls` is set; Python raises `ValueError` for a TLS option without `tls=True` or with a unix socket; C# ignores `DedicatedReaderThread` with TLS on.
+
+Tests: Go, Java, Python, Rust and C# have live TLS tests against a server started with TLS. The Node TLS path has not been verified against a live server; Node's own `tls` module does the work, and the connect code is the only part Ruvio owns. The latency TLS adds is measured for Go and Rust only (a handshake of about 1 ms and 3-6 µs per command); for the others it is not measured.
+
 ## Differences
 
 | Topic | Rust | C# | Go | Java | Node | Python |

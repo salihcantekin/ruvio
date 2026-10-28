@@ -4,6 +4,7 @@ Notable changes to the Ruvio server (`ruvio`, `ruvio-ctl`, the Docker image and 
 
 ## Unreleased
 
+- Docs: `docs/CLIENT_BEHAVIOR.md` has a TLS section: what the six clients verify by default, which sockets use TLS (including follow-primary probes), how to disable verification, and the option names per client (issue #323).
 - Fixed: a replica's receive queue counted copied `PUBLISH` messages against nothing after the stall fix below, so a burst of large messages could hold up to 1,024 frames of any size; they now count against the queue's 16 MB budget like records. A replica no longer syncs its log on every drain while `CLIENT DURABILITY` is in use when nothing arrived. Nothing changes on the primary or on disk.
 - Fixed: a connection with `CLIENT DURABILITY` whose wait timed out had every byte still in its output buffer rewritten to `-NOREPLICAS`, including a reply the socket had taken in part and replies an earlier wait had already cleared; a client reading slowly then saw the refusal inside a bulk payload and lost sync with its replies. Only the replies of the timed-out batch are refused now.
 - `COORDINATOR ADD` and `COORDINATOR REMOVE` are refused while `primary_lease_ms` is set: data nodes take grants only from the coordinators in their `primary_lease_coordinators`, so a changed set stopped writes on every primary until each node restarted with the new list. `docs/COORDINATOR.md` (*Primary lease*) gives the order for changing the set with the lease off.
