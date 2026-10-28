@@ -26,8 +26,9 @@ and must be called out in the release notes.
 ## Records added after minor 0
 
 `wal-minor<N>-*.hex` hold one record for each record type added by format minor `N`
-(1 to 6), and `wal-header-minor<N>.hex` the segment header of that minor. They were written
-with the encoder of the release that added the minor and are checked byte for byte
+(1 to 6), and `wal-header-minor<N>.hex` the segment header of that minor. They were generated once
+with the encoder of the release that added them (not by the older releases themselves; the
+0.3.4 directory below is the check against a real older release) and are checked byte for byte
 (`later_minor_wal_record_fixtures_stay_stable`). A new record type or minor needs fixtures
 here; regenerate with the command above.
 
