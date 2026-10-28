@@ -98,6 +98,8 @@ pub const QUEUE_BYTES: usize = 16 * 1024 * 1024;
 const SHIPPER_READ_BYTES: usize = 16 * 1024 * 1024;
 /// One socket read on the replica: large enough to take many small frames at once.
 const RECEIVE_READ_BYTES: usize = 64 * 1024;
+/// Log records gathered into one write to a replica: one syscall per batch, not per record.
+const SHIPPER_WRITE_BYTES: usize = 256 * 1024;
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// First reconnect pause. Unit tests start replicas before primaries and must not wait a second.
@@ -2086,13 +2088,12 @@ fn serve_replica(
         refuse_handshake(&mut stream, HandshakeStatus::Gap)?;
         return Ok(());
     }
-    // Where the shipper stopped in the log, so each chunk continues there.
-    let mut reader = FrameCursor::default();
+    let mut log = ShipperLog::default();
     let read = if forced_snapshot {
         Ok(FrameRead::Gap)
     } else {
         read_frames_resuming(
-            &mut reader,
+            &mut log.reader,
             &shipment.data_dir,
             shipment.shard_id,
             handshake.after_sequence,
@@ -2165,7 +2166,7 @@ fn serve_replica(
                 shipment,
                 &hold,
                 stop,
-                &mut reader,
+                &mut log,
                 last_sequence,
                 through,
             )?
@@ -2179,7 +2180,7 @@ fn serve_replica(
                 &hold,
                 &copied_publishes,
                 stop,
-                &mut reader,
+                &mut log,
                 last_sent,
             );
         }
@@ -2208,16 +2209,11 @@ fn serve_replica(
         return Ok(());
     }
 
-    let mut last_sent = handshake.after_sequence;
-
-    for frame in &frames {
-        if !write_live(&mut stream, frame, stop)? {
-            return Ok(());
-        }
-
-        last_sent = frame_sequence(frame);
-        hold.advance(last_sent);
-    }
+    let last_sent = match write_frames(&mut stream, &frames, &mut log.batch, &hold, stop)? {
+        Some(Some(sequence)) => sequence,
+        Some(None) => handshake.after_sequence,
+        None => return Ok(()),
+    };
 
     let _ = stream.flush();
 
@@ -2227,7 +2223,7 @@ fn serve_replica(
         &hold,
         &copied_publishes,
         stop,
-        &mut reader,
+        &mut log,
         last_sent,
     )
 }
@@ -2366,18 +2362,26 @@ impl AckSend {
     }
 }
 
+/// A replica shipper's place in the log and the buffer it gathers records into.
+#[derive(Default)]
+struct ShipperLog {
+    /// Where the shipper stopped in the log, so each chunk continues there.
+    reader: FrameCursor,
+    batch: Vec<u8>,
+}
+
 fn stream_frames_through(
     stream: &mut dyn Wire,
     shipment: &Shipment,
     hold: &CursorHold,
     stop: &AtomicBool,
-    reader: &mut FrameCursor,
+    log: &mut ShipperLog,
     mut cursor: u64,
     through: u64,
 ) -> io::Result<Option<u64>> {
     while cursor < through {
         let frames = match read_frames_resuming(
-            reader,
+            &mut log.reader,
             &shipment.data_dir,
             shipment.shard_id,
             cursor,
@@ -2388,15 +2392,74 @@ fn stream_frames_through(
             Ok(FrameRead::Frames(frames)) if !frames.is_empty() => frames,
             _ => return Ok(None),
         };
-        for frame in frames {
-            if !write_live(stream, &frame, stop)? {
-                return Ok(None);
-            }
-            cursor = frame_sequence(&frame);
-            hold.advance(cursor);
+        match write_frames(stream, &frames, &mut log.batch, hold, stop)? {
+            Some(Some(sequence)) => cursor = sequence,
+            Some(None) => {}
+            None => return Ok(None),
         }
     }
     Ok(Some(cursor))
+}
+
+/// Writes log records in order, gathered into writes of up to [`SHIPPER_WRITE_BYTES`]; a record
+/// that large is written on its own, so the buffer stays that small. The log this replica keeps
+/// retained moves past a record once the write holding it was accepted. `None` when the shipper must stop,
+/// otherwise the sequence of the last record written, if any.
+fn write_frames(
+    stream: &mut dyn Wire,
+    frames: &[Vec<u8>],
+    batch: &mut Vec<u8>,
+    hold: &CursorHold,
+    stop: &AtomicBool,
+) -> io::Result<Option<Option<u64>>> {
+    let mut last = None;
+    let mut pending = None;
+
+    batch.clear();
+
+    for frame in frames {
+        if !batch.is_empty() && batch.len() + frame.len() > SHIPPER_WRITE_BYTES {
+            if !write_live(stream, batch, stop)? {
+                return Ok(None);
+            }
+
+            batch.clear();
+            last = pending;
+            if let Some(sequence) = pending {
+                hold.advance(sequence);
+            }
+        }
+
+        if frame.len() >= SHIPPER_WRITE_BYTES {
+            if !write_live(stream, frame, stop)? {
+                return Ok(None);
+            }
+
+            let sequence = frame_sequence(frame);
+
+            last = Some(sequence);
+            pending = last;
+            hold.advance(sequence);
+            continue;
+        }
+
+        batch.extend_from_slice(frame);
+        pending = Some(frame_sequence(frame));
+    }
+
+    if !batch.is_empty() {
+        if !write_live(stream, batch, stop)? {
+            return Ok(None);
+        }
+
+        batch.clear();
+        last = pending;
+        if let Some(sequence) = pending {
+            hold.advance(sequence);
+        }
+    }
+
+    Ok(Some(last))
 }
 
 fn stream_new_frames(
@@ -2405,7 +2468,7 @@ fn stream_new_frames(
     hold: &CursorHold,
     copied_publishes: &Receiver<Vec<u8>>,
     stop: &AtomicBool,
-    reader: &mut FrameCursor,
+    log: &mut ShipperLog,
     mut last_sent: u64,
 ) -> io::Result<()> {
     let mut ack_bytes = Vec::new();
@@ -2432,10 +2495,33 @@ fn stream_new_frames(
             let _ = stream.flush();
         }
 
+        let batch = &mut log.batch;
+
+        batch.clear();
+
         while let Ok(frame) = copied_publishes.try_recv() {
-            if !write_live(stream, &frame, stop)? {
-                return Ok(());
+            if frame.len() >= SHIPPER_WRITE_BYTES {
+                if !write_live(stream, batch, stop)? || !write_live(stream, &frame, stop)? {
+                    return Ok(());
+                }
+
+                batch.clear();
+                continue;
             }
+
+            batch.extend_from_slice(&frame);
+
+            if batch.len() >= SHIPPER_WRITE_BYTES {
+                if !write_live(stream, batch, stop)? {
+                    return Ok(());
+                }
+
+                batch.clear();
+            }
+        }
+
+        if !batch.is_empty() && !write_live(stream, batch, stop)? {
+            return Ok(());
         }
 
         let through = shipment.published.load(Ordering::Acquire);
@@ -2447,7 +2533,7 @@ fn stream_new_frames(
         }
 
         let Some(sent) =
-            stream_frames_through(stream, shipment, hold, stop, reader, last_sent, through)?
+            stream_frames_through(stream, shipment, hold, stop, log, last_sent, through)?
         else {
             return Ok(());
         };
