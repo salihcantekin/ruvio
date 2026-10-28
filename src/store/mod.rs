@@ -1009,11 +1009,15 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
 
     /// Makes `database` the map every key method uses. A map is created on first use.
     /// Parked maps do not change, so their totals are cached until they are entered again.
+    #[inline]
     pub(crate) fn enter(&mut self, database: u8) {
-        if database == self.active {
-            return;
+        if database != self.active {
+            self.switch_database(database);
         }
+    }
 
+    #[inline(never)]
+    fn switch_database(&mut self, database: u8) {
         let next = self
             .slot(database)
             .take()
@@ -1866,6 +1870,12 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
     #[cfg(test)]
     pub(crate) fn take_notices(&mut self) -> Vec<(u8, Box<[u8]>, crate::notify::KeyEvent)> {
         self.notify.take()
+    }
+
+    /// Nothing for `drain_notices` to hand out.
+    #[inline]
+    pub(crate) fn notices_idle(&self) -> bool {
+        self.notify.is_idle()
     }
 
     /// One borrow for the connection loop: the notices to publish and the keys expiry or

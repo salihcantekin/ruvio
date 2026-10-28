@@ -1084,7 +1084,13 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
                 .is_none_or(|soonest| soonest <= self.now_unix_millis())
     }
 
+    #[inline]
     pub fn expire_due(&mut self) -> usize {
+        // Checked here as well, so a store with no TTLs skips the call.
+        if self.expiration.keys_with_ttl == 0 {
+            return 0;
+        }
+
         self.expire_cycle(self.active_expire_keys)
     }
 
