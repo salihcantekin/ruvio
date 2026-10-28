@@ -1187,10 +1187,13 @@ This is a coroutine: ``ps = await client.pubsub()``.
         ttl_ms: int,
         fn: Callable[[], Union[str, bytes, Awaitable[Union[str, bytes]]]],
         owner: Optional[str] = None,
+        abort_on_error: bool = False,
     ) -> Tuple[str, Any]:
         """Runs ``fn`` (sync or async) at most once per key, using ``IDEM BEGIN``/``COMPLETE``.
 
-        See :meth:`ruvio.Ruvio.idempotent`. If ``fn`` raises, the record stays pending until ``ttl_ms``.
+        See :meth:`ruvio.Ruvio.idempotent`. If ``fn`` raises, the record stays pending until ``ttl_ms``,
+        unless ``abort_on_error=True`` sends ``IDEM ABORT`` first (a failed abort is ignored and ``fn``'s
+        exception still propagates). Use it only when a failed ``fn`` did not take effect or is safe to run again.
 
         Args:
             key: Operation key, scoped to the tenant and operation.
@@ -1198,6 +1201,7 @@ This is a coroutine: ``ps = await client.pubsub()``.
             ttl_ms: Retention in milliseconds, 1 to 604800000.
             fn: Zero-argument function or coroutine function returning the result (``str`` or ``bytes``).
             owner: Attempt token; random when omitted.
+            abort_on_error: Release the reservation with ``IDEM ABORT`` when ``fn`` raises. Default ``False``.
 
         Returns:
             ``("executed", result)``, ``("completed", stored_result)``, ``("pending", None)`` or ``("conflict", None)``.
@@ -1205,9 +1209,17 @@ This is a coroutine: ``ps = await client.pubsub()``.
         owner = owner or uuid.uuid4().hex
         r = await self.idem_begin(key, fingerprint, owner, ttl_ms)
         if r.state == "acquired":
-            result = fn()
-            if inspect.isawaitable(result):
-                result = await result
+            try:
+                result = fn()
+                if inspect.isawaitable(result):
+                    result = await result
+            except BaseException:
+                if abort_on_error:
+                    try:
+                        await self.idem_abort(key, fingerprint, owner)
+                    except Exception:
+                        pass  # the record stays pending until ttl_ms; fn's error is the one raised
+                raise
             await self.idem_complete(key, fingerprint, owner, result)
             return "executed", result
         return r.state, r.result

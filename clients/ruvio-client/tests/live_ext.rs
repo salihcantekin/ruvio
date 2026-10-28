@@ -1063,6 +1063,70 @@ fn helpers_cache_idempotency_recent() {
         IdemState::Completed(vec![0, 1, 255])
     );
 
+    // Abort frees a pending record; a completed one is kept; another owner cannot abort.
+    assert_eq!(
+        db.idem_begin("pay:3", "fp", "worker-a", Duration::from_secs(60))
+            .unwrap(),
+        IdemState::Acquired
+    );
+    assert!(!db.idem_abort("pay:3", "fp", "worker-b").unwrap());
+    assert!(!db.idem_abort("pay:3", "other", "worker-a").unwrap());
+    assert!(db.idem_abort("pay:3", "fp", "worker-a").unwrap());
+    assert_eq!(
+        db.idem_begin("pay:3", "fp", "worker-b", Duration::from_secs(60))
+            .unwrap(),
+        IdemState::Acquired
+    );
+    assert!(
+        db.idem_complete("pay:3", "fp", "worker-b", b"done")
+            .unwrap()
+    );
+    assert!(!db.idem_abort("pay:3", "fp", "worker-b").unwrap());
+    assert_eq!(
+        db.idem_begin("pay:3", "fp", "worker-c", Duration::from_secs(60))
+            .unwrap(),
+        IdemState::Completed(b"done".to_vec())
+    );
+
+    // The helper with abort_on_error frees the key after a failing work function; the plain
+    // helper leaves it pending.
+    let failed = db.idempotent_abort_on_error(
+        "pay:4",
+        "fp",
+        "worker-a",
+        Duration::from_secs(60),
+        || -> Result<Vec<u8>, Error> { Err(Error::Protocol("boom".into())) },
+    );
+    assert!(failed.is_err());
+    assert_eq!(
+        db.idempotent("pay:4", "fp", "worker-b", Duration::from_secs(60), || Ok::<
+            _,
+            Error,
+        >(
+            b"ok:4".to_vec()
+        ))
+        .unwrap(),
+        IdemOutcome::Executed(b"ok:4".to_vec())
+    );
+    let failed = db.idempotent(
+        "pay:5",
+        "fp",
+        "worker-a",
+        Duration::from_secs(60),
+        || -> Result<Vec<u8>, Error> { Err(Error::Protocol("boom".into())) },
+    );
+    assert!(failed.is_err());
+    assert_eq!(
+        db.idempotent("pay:5", "fp", "worker-b", Duration::from_secs(60), || Ok::<
+            _,
+            Error,
+        >(
+            Vec::new()
+        ))
+        .unwrap(),
+        IdemOutcome::Pending
+    );
+
     // Recent items.
     for item in ["a", "b", "c", "d"] {
         db.push_recent("recent", 3, item).unwrap();

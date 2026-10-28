@@ -64,7 +64,7 @@ const W = {
   EX: w('EX'), PX: w('PX'), EXAT: w('EXAT'), PXAT: w('PXAT'), KEEPTTL: w('KEEPTTL'), NX: w('NX'), XX: w('XX'),
   GET: w('GET'), IFEQ: w('IFEQ'), IFGT: w('IFGT'), IFLT: w('IFLT'), MAX: w('MAX'), WAIT: w('WAIT'), SWR: w('SWR'), BEGIN: w('BEGIN'),
   SLIDING: w('SLIDING'), TOKENS: w('TOKENS'), COST: w('COST'), WITHRETRY: w('WITHRETRY'),
-  COMPLETE: w('COMPLETE'), START: w('START'), MATCH: w('MATCH'), COUNT: w('COUNT'), TYPE: w('TYPE'),
+  ABORT: w('ABORT'), COMPLETE: w('COMPLETE'), START: w('START'), MATCH: w('MATCH'), COUNT: w('COUNT'), TYPE: w('TYPE'),
   ASYNC: w('ASYNC'), REPLACE: w('REPLACE'), ABSTTL: w('ABSTTL'), IDLETIME: w('IDLETIME'), FREQ: w('FREQ'),
   SAMPLES: w('SAMPLES'), DB: w('DB'), RANK: w('RANK'), MAXLEN: w('MAXLEN'), LIMIT: w('LIMIT'),
   WITHSCORES: w('WITHSCORES'), WITHVALUES: w('WITHVALUES'), BYSCORE: w('BYSCORE'), BYLEX: w('BYLEX'), REV: w('REV'),
@@ -1568,6 +1568,27 @@ export abstract class Commands {
    */
   idemComplete(key: Key, fingerprint: Value, owner: Value, result: Value): R<number> {
     return this._v(null, C.IDEM, [key, W.COMPLETE, fingerprint, owner, result]);
+  }
+  /**
+   * Gives up a pending idempotent operation (`IDEM key ABORT fingerprint owner`, Ruvio extension), so the next
+   * {@link idemBegin} acquires the key at once. A completed record is never removed.
+   *
+   * Abort only when the work did not take effect or is safe to run again; a retry after an abort runs it again.
+   *
+   * @param key Idempotency key.
+   * @param fingerprint Same fingerprint used in {@link idemBegin}.
+   * @param owner Same owner used in {@link idemBegin}.
+   * @returns `true` when the pending record of this owner and fingerprint was removed; `false` when nothing changed
+   * (the key is missing or expired, the record is completed, or another owner or fingerprint holds it).
+   * @throws {@link ReplyError} for tokens out of range, or a key that holds no idempotency record.
+   *
+   * @example
+   * ```ts
+   * await client.idemAbort('pay:123', hash, owner); // true
+   * ```
+   */
+  idemAbort(key: Key, fingerprint: Value, owner: Value): R<boolean> {
+    return this._v(T.bool, C.IDEM, [key, W.ABORT, fingerprint, owner]);
   }
   /**
    * Marks "first time only" (`ONCE key ttlMs`, Ruvio extension).

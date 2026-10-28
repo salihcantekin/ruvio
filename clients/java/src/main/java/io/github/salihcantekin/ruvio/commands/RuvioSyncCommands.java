@@ -1008,6 +1008,28 @@ public abstract class RuvioSyncCommands<K, V> {
     }
 
     /**
+     * Sends {@code IDEM key ABORT fingerprint owner}: gives up the pending record that this attempt got from
+     * {@link #idemBegin}, so the next {@code BEGIN} acquires the key at once. A completed record is never
+     * removed. Abort only when the work did not take effect or is safe to run again; a retry after an abort
+     * runs it again.
+     *
+     * <pre>{@code
+     * boolean freed = client.idemAbort("order:42", digest, attemptToken); // true
+     * }</pre>
+     *
+     * @param key the idempotency key
+     * @param fingerprint the same fingerprint used in {@code idemBegin}
+     * @param owner the same owner token used in {@code idemBegin}
+     * @return {@code true} when the pending record of this owner and fingerprint was removed; {@code false} when
+     * nothing changed (the key is missing or expired, the record is completed, or another owner or fingerprint holds it)
+     * @throws RuvioServerException {@code ERR} for invalid tokens; {@code INVALID} or {@code WRONGTYPE} for a key
+     * that holds no IDEM record
+     */
+    public Boolean idemAbort(K key, String fingerprint, String owner) {
+        return await(async.idemAbort(key, fingerprint, owner));
+    }
+
+    /**
      * Like {@link #idemComplete(Object, String, String, byte[])} with the result given as text (sent as UTF-8).
      *
      * @param key the idempotency key

@@ -271,6 +271,7 @@ var (
 	cZSCORE            = preEnc("ZSCORE")
 	cZUNION            = preEnc("ZUNION")
 	cZUNIONSTORE       = preEnc("ZUNIONSTORE")
+	tABORT             = preEnc("ABORT")
 	tABSTTL            = preEnc("ABSTTL")
 	tADDR              = preEnc("ADDR")
 	tAFTER             = preEnc("AFTER")

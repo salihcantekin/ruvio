@@ -663,6 +663,18 @@ func (c *cmds) IdemComplete(ctx context.Context, key, fingerprint, owner string,
 	return c.intR(ctx, newCmd(6, cIDEM).s(key).t(tCOMPLETE).s(fingerprint).s(owner).b(result))
 }
 
+// IdemAbort gives up the pending record that this fingerprint and owner began (Ruvio
+// IDEM key ABORT fingerprint owner), so the next IdemBegin acquires the key at once. It
+// returns true when the record was removed and false when nothing changed: the key is
+// missing or expired, the record is completed (its result is never removed), or it is
+// held by another owner or fingerprint.
+//
+// Abort only when the work did not take effect or is safe to run again; a retry after an
+// abort runs it again. Idempotent does this for you with WithAbortOnError.
+func (c *cmds) IdemAbort(ctx context.Context, key, fingerprint, owner string) (bool, error) {
+	return c.boolR(ctx, newCmd(5, cIDEM).s(key).t(tABORT).s(fingerprint).s(owner))
+}
+
 // ChangesStart arms the in-memory change feed of the shard that answers and returns the
 // cursor to pass to Changes (Ruvio CHANGES START). Notes are only collected after the
 // first call. The feed is kept in memory per shard and is lost on restart.

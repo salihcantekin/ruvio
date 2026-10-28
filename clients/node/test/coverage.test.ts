@@ -54,6 +54,7 @@ const OPTIONS: [string, string][] = [
   ['GETEX key ms', 'getex'],
   ['DELEX key IFEQ v', 'delex'],
   ['IDEM COMPLETE', 'idemComplete'],
+  ['IDEM ABORT', 'idemAbort'],
   ['JSON.INDEX DROP', 'jsonIndexDrop'],
   ['JSON.INDEX LIST', 'jsonIndexList'],
   ['CHANGES START', 'changesStart'],

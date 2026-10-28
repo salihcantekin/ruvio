@@ -333,6 +333,25 @@ impl Client {
         self.integer(["IDEM", key, "COMPLETE", fingerprint, owner, result])
     }
 
+    /// Sends `IDEM key ABORT fingerprint owner`: removes a pending record. See
+    /// [`Client::idem_abort`] for the typed wrapper.
+    ///
+    /// # Arguments
+    /// * `key`, `fingerprint`, `owner` - as passed to [`Client::idempotency_begin`].
+    ///
+    /// # Returns
+    /// `1` when the pending record of this owner and fingerprint was removed; `0` when the key is
+    /// missing, already completed (its result is never removed), or held by another owner or
+    /// fingerprint.
+    pub fn idempotency_abort(
+        &mut self,
+        key: &str,
+        fingerprint: &str,
+        owner: &str,
+    ) -> Result<i64, Error> {
+        self.integer(["IDEM", key, "ABORT", fingerprint, owner])
+    }
+
     /// Sends `TAKE key count` (Ruvio): subtracts from an integer only if the key holds enough.
     ///
     /// # Arguments

@@ -577,13 +577,53 @@ public final class RuvioClient<K, V> extends RuvioSyncCommands<K, V> implements 
      *         still running the action after {@code waitMillis}
      */
     public String idempotent(K key, String fingerprint, long ttlMillis, long waitMillis, Supplier<String> action) {
+        return idempotent(key, fingerprint, ttlMillis, waitMillis, action, false);
+    }
+
+    /**
+     * Like {@link #idempotent(Object, String, long, long, Supplier)}; with {@code abortOnError} set, an
+     * exception from {@code action} first sends {@code IDEM ABORT}, so a retry runs the action again at
+     * once instead of finding the key pending until {@code ttlMillis}, and then rethrows the original
+     * exception. A failed abort (for example Ruvio unreachable) is ignored and the record stays pending.
+     * Use it only when a failed action did not take effect or is safe to run again.
+     *
+     * <pre>{@code
+     * String receipt = client.idempotent("pay:order-9", fingerprintOf(request), 86_400_000, 5_000,
+     *         () -> charge(request), true);
+     * }</pre>
+     *
+     * @param key the idempotency key
+     * @param fingerprint a hash of the request
+     * @param ttlMillis how long the record lives, in milliseconds
+     * @param waitMillis how long a concurrent caller polls for the winner's result, in milliseconds
+     * @param action the work to run
+     * @param abortOnError {@code true} to release the reservation when {@code action} throws; {@code false}
+     *        (what the overload without this parameter uses) leaves it pending
+     * @return the action's result, or the stored result of the first successful run
+     * @throws RuvioException when the key is reserved for a different fingerprint, or another caller is
+     *         still running the action after {@code waitMillis}
+     */
+    public String idempotent(K key, String fingerprint, long ttlMillis, long waitMillis, Supplier<String> action,
+            boolean abortOnError) {
         String owner = newToken();
         long deadline = System.nanoTime() + waitMillis * 1_000_000L;
         for (int attempt = 0; ; attempt++) {
             IdemResult r = await(async.idemBegin(key, fingerprint, owner, ttlMillis));
             switch (r.state()) {
                 case ACQUIRED: {
-                    String result = action.get();
+                    String result;
+                    try {
+                        result = action.get();
+                    } catch (RuntimeException | Error e) {
+                        if (abortOnError) {
+                            try {
+                                await(async.idemAbort(key, fingerprint, owner));
+                            } catch (RuntimeException ignored) {
+                                // the record stays pending until its retention; the action's error wins
+                            }
+                        }
+                        throw e;
+                    }
                     await(async.idemComplete(key, fingerprint, owner, result.getBytes(StandardCharsets.UTF_8)));
                     return result;
                 }

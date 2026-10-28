@@ -31,7 +31,7 @@ dependencies and needs Python 3.9 or newer. It ships type information (`py.typed
   The methods also cover the options that change Ruvio's behaviour: `SET … IFEQ`,
   `INCRBY … MAX`, `FILLGET … WAIT`, `FILLSET … SWR`, `GETEX` in milliseconds,
   `DELEX key IFEQ v`, `LPUSHCAP`/`RPUSHCAP`, `BF.*`, `JSON.*` (including `JSON.INDEX` and
-  `JSON.FIND`), `IDEM BEGIN/COMPLETE`, `LEASE`/`RELEASE`, `SEMAPHORE`, `ONCE`, `TAKE`, `TRANSFER`/`HTRANSFER`, `SETV`,
+  `JSON.FIND`), `IDEM BEGIN/COMPLETE/ABORT`, `LEASE`/`RELEASE`, `SEMAPHORE`, `ONCE`, `TAKE`, `TRANSFER`/`HTRANSFER`, `SETV`,
   `CHANGES`, `LIMIT` and `XADD … DELAY`.
 - Pipelines, MULTI/EXEC transactions, Pub/Sub on a dedicated connection, and RESP3 through
   `HELLO 3`, including push messages.
@@ -181,7 +181,8 @@ to `on_push=callback` and never reach a command's reply.
 | `r.limit_sliding(key, max, window_ms)`, `r.limit_tokens(key, capacity, refill_ms, cost=1)` | `LIMIT ... SLIDING`, `LIMIT ... TOKENS` | remaining, or `None` |
 | `r.limit_sliding_with_retry(...)`, `r.limit_tokens_with_retry(...)` | `LIMIT ... WITHRETRY` | `(allowed, remaining, retry_after_ms)` |
 | `r.get_or_create(key, factory, ttl_ms, fill_ms=…, swr_ms=…)` | `FILLGET` / `FILLSET` | Exactly one caller runs `factory` (sync or async). Waiters poll plain `FILLGET` with backoff from 5 ms up to 100 ms instead of `WAIT`, which would park the shared connection |
-| `r.idempotent(key, fingerprint, ttl_ms, fn)` | `IDEM BEGIN` / `COMPLETE` | `("executed", result)`, `("completed", stored)`, `("pending", None)` or `("conflict", None)` |
+| `r.idempotent(key, fingerprint, ttl_ms, fn, abort_on_error=False)` | `IDEM BEGIN` / `COMPLETE` (+ `ABORT`) | `("executed", result)`, `("completed", stored)`, `("pending", None)` or `("conflict", None)`. If `fn` raises the record stays pending until `ttl_ms`; with `abort_on_error=True` it sends `IDEM ABORT` first, so a retry runs `fn` again at once, and the original exception still propagates (a failed abort is ignored). Use it only when a failed `fn` did not take effect or is safe to run again |
+| `r.idem_abort(key, fingerprint, owner)` | `IDEM ABORT` | `True` when the pending record of that owner and fingerprint was removed; `False` for a missing key, a completed record (its result is never removed) or another owner. Abort only when the work did not take effect or is safe to run again; a retry after an abort runs it again |
 | `r.scan_iter()` / `hscan_iter` / `sscan_iter` / `zscan_iter` | `SCAN` family | Lazy and driven by the cursor; async iterators on the asyncio client |
 | `r.json_set_obj` / `json_get_obj` / `json_mget_obj` | `JSON.SET` / `JSON.GET` / `JSON.MGET` | Uses the standard `json` module |
 | `r.push_recent(key, value, keep)` | `LPUSHCAP` | Newest first, keeps at most `keep` items |
