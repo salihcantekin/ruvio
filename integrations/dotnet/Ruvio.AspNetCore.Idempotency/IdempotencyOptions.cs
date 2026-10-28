@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using Ruvio.Client;
+using Ruvio.Integrations;
 
 namespace Ruvio.AspNetCore.Idempotency;
 
@@ -174,13 +175,26 @@ public static class IdempotencyExtensions
         services.AddOptions<IdempotencyOptions>().Configure(configure)
             .Validate(o => o.IsValid(), "A namespace and scope selector are required; retention must be whole milliseconds in [1ms, 7 days], body limits in [1, 1048576], MismatchStatusCode 400-499, PendingWait at most 30 s, and KeyHeader and ReplayHeaders valid header names (at most 32, no cookie, authentication, CORS or transport header).")
             .ValidateOnStart();
+        RuvioStartupChecks.RequireAtStart<IRuvioClient>(services, "Ruvio.AspNetCore.Idempotency",
+            static provider => provider.GetRequiredService<IOptions<IdempotencyOptions>>().Value.ClientKey);
+        RuvioEndpointCheck.Add(services, "Ruvio.AspNetCore.Idempotency", IdempotencyMiddleware.EndpointError);
 
         return services;
     }
 
     /// <summary>Install after UseRouting, UseAuthentication AND UseAuthorization, before endpoint execution.</summary>
-    public static IApplicationBuilder UseRuvioIdempotency(this IApplicationBuilder app) =>
-        app.UseMiddleware<IdempotencyMiddleware>();
+    /// <exception cref="InvalidOperationException"><see cref="AddRuvioIdempotency"/> was not called.</exception>
+    public static IApplicationBuilder UseRuvioIdempotency(this IApplicationBuilder app)
+    {
+        ArgumentNullException.ThrowIfNull(app);
+
+        // Runs while the pipeline is set up, so a missing AddRuvioIdempotency fails before the server takes a request.
+        if (app.ApplicationServices.GetService<IServiceProviderIsService>() is { } services
+            && !services.IsService(typeof(RuvioEndpointCheckMarker)))
+            throw new InvalidOperationException("UseRuvioIdempotency needs services.AddRuvioIdempotency(...) first.");
+
+        return app.UseMiddleware<IdempotencyMiddleware>();
+    }
 }
 
 /// <summary>Enables idempotency on minimal API endpoints and groups without writing the attribute by hand.</summary>

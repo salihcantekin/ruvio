@@ -4,6 +4,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Ruvio.Client;
+using Ruvio.Integrations;
 
 namespace Ruvio.AspNetCore.DataProtection;
 
@@ -16,9 +17,13 @@ public static class RuvioDataProtectionExtensions
     /// </summary>
     public static IDataProtectionBuilder PersistKeysToRuvio(this IDataProtectionBuilder builder,
         Action<RuvioDataProtectionOptions>? configure = null)
-        => Persist(builder, configure, static (provider, options) => options.ClientKey is { } key
-            ? provider.GetRequiredKeyedService<IRuvioConnection>(key)
-            : provider.GetRequiredService<IRuvioConnection>());
+        => Persist(builder, configure, static (provider, options) =>
+            // Data Protection loads the key ring while the host starts; a missing connection fails there with the fix named.
+            RuvioStartupChecks.Missing<IRuvioConnection>(provider, "Ruvio.AspNetCore.DataProtection", options.ClientKey) is { } missing
+                ? throw new InvalidOperationException(missing)
+                : options.ClientKey is { } key
+                    ? provider.GetRequiredKeyedService<IRuvioConnection>(key)
+                    : provider.GetRequiredService<IRuvioConnection>());
 
     /// <summary>Uses a caller-owned connection, for example a keyed service targeting durable, non-evicting storage.</summary>
     public static IDataProtectionBuilder PersistKeysToRuvio(this IDataProtectionBuilder builder,

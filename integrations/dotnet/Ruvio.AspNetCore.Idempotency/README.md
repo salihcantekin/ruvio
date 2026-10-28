@@ -152,8 +152,8 @@ app.MapPost("/emails", Send).WithRuvioIdempotency(e => e.KeyRequired = false);
 
 `KeyRequired = false` lets a request without the key header run unchecked, before
 any body is read; a request that sends the key is checked as usual. Endpoint
-values are validated on each request (a wrong one throws), since endpoint
-metadata is not seen at startup.
+values are checked while the host starts: a value out of range stops start and
+names the endpoint. The same check also runs on each request.
 
 ## State and failure model (not downstream exactly-once)
 
@@ -232,7 +232,8 @@ builder.Services.AddRuvioIdempotency(o =>
 });
 ```
 
-The keyed client is looked up per request that the middleware handles, from the request's services.
+The keyed client is looked up per request that the middleware handles, from the request's services. Host start fails
+when no client is registered under that key.
 
 ## When Ruvio is unreachable
 

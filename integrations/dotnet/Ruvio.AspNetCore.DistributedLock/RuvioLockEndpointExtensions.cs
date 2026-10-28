@@ -84,6 +84,16 @@ public static class RuvioLockEndpointExtensions
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentNullException.ThrowIfNull(resource);
 
+        // Same rules as RuvioLockOptions, checked while the endpoint is mapped instead of on its first conflict.
+        if (lease is { } leaseValue && leaseValue < TimeSpan.FromMilliseconds(1))
+            throw new ArgumentOutOfRangeException(nameof(lease), "The lease must be at least one millisecond.");
+
+        if (wait < TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(wait), "The wait must not be negative.");
+
+        if (conflictStatusCode is < 400 or > 599)
+            throw new ArgumentOutOfRangeException(nameof(conflictStatusCode), "The conflict status must be a 4xx or 5xx status.");
+
         builder.AddEndpointFilter(async (invocation, next) =>
         {
             HttpContext context = invocation.HttpContext;

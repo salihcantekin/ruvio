@@ -36,7 +36,7 @@ const ecosystemDetails: Record<string, EcosystemDetails> = {
     base: {
       package: "Ruvio.Client.AspNetCore",
       docs: "/docs/clients/csharp-aspnetcore/",
-      note: "registers the shared connection and IRuvioClient once; every package below borrows it.",
+      note: "registers the shared connection and IRuvioClient once; every package below borrows it, and stops the app at startup with the fix named when it is missing.",
     },
   },
 };

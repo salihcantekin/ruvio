@@ -2,6 +2,7 @@ using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
+using Ruvio.Integrations;
 
 namespace Ruvio.Extensions.Caching;
 
@@ -21,6 +22,11 @@ public static class RuvioCachingServiceCollectionExtensions
 
         configure?.Invoke(options);
         options.Validate();
+
+        // An existing IDistributedCache stays, so this registration needs no Ruvio client then.
+        if (!services.Any(static descriptor => descriptor.ServiceType == typeof(IDistributedCache)))
+            RuvioStartupChecks.RequireAtStart<Ruvio.Client.IRuvioClient>(services, "Ruvio.Extensions.Caching", _ => options.ClientKey);
+
         services.TryAddSingleton(Options.Create(options));
 
         if (options.ClientKey is { } key)

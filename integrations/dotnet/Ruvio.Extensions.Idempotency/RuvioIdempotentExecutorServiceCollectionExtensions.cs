@@ -1,6 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Ruvio.Client;
+using Ruvio.Integrations;
 
 namespace Ruvio.Extensions.Idempotency;
 
@@ -24,6 +25,11 @@ public static class RuvioIdempotentExecutorServiceCollectionExtensions
 
         configure?.Invoke(options);
         options.Validate();
+
+        // An existing executor registration stays, and so does the client it was built for.
+        if (!services.Any(static descriptor => descriptor.ServiceType == typeof(RuvioIdempotentExecutor)))
+            RuvioStartupChecks.RequireAtStart<IRuvioClient>(services, "Ruvio.Extensions.Idempotency", _ => options.ClientKey);
+
         services.TryAddSingleton(provider => new RuvioIdempotentExecutor(options.ClientKey is { } key
             ? provider.GetRequiredKeyedService<IRuvioClient>(key)
             : provider.GetRequiredService<IRuvioClient>(), options));

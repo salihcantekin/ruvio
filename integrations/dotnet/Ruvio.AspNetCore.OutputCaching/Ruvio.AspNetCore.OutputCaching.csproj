@@ -12,6 +12,7 @@
   </PropertyGroup>
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <Compile Include="../Common/RuvioStartupChecks.cs" Link="Common/RuvioStartupChecks.cs" />
     <ProjectReference Include="../../../clients/csharp/Ruvio.Client/Ruvio.Client.csproj" />
     <None Include="README.md" Pack="true" PackagePath="/" />
     <None Include="../../../brand/ruvio-icon-square.png" Pack="true" PackagePath="ruvio-icon.png" />

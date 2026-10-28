@@ -14,6 +14,7 @@
     <PackageReference Include="Microsoft.Extensions.Caching.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.Options" />
+    <Compile Include="../Common/RuvioStartupChecks.cs" Link="Common/RuvioStartupChecks.cs" />
     <ProjectReference Include="../../../clients/csharp/Ruvio.Client/Ruvio.Client.csproj" />
     <None Include="README.md" Pack="true" PackagePath="/" />
     <None Include="../../../brand/ruvio-icon-square.png" Pack="true" PackagePath="ruvio-icon.png" />

@@ -70,7 +70,8 @@ builder.Services.AddRuvioRateLimiting(options =>
 app.MapPost("/orders", HandleOrder).WithRuvioRateLimit("create-order");   // or [RuvioRateLimit("create-order")]
 ```
 
-An unknown name throws `InvalidOperationException` when the request arrives, before Ruvio is called. A duplicate name or
+An unknown name stops host start with `InvalidOperationException` listing every such endpoint (an endpoint added after
+start fails its request instead, before Ruvio is called). A duplicate name or
 a non-positive permit count or window is rejected in `AddPolicy`. The inline forms (`WithRuvioRateLimit("p", 100, window)`
 and `[RuvioRateLimit("p", 100, 60)]`) need no registration and keep working; a named policy and an inline one with the same
 name share one bucket, so keep their settings the same.
