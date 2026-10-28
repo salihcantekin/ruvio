@@ -675,6 +675,14 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         Some(charge.key_bytes + charge.value_bytes + charge.collection_bytes)
     }
 
+    /// What every lookup of `key` computes first (its hash under the index's fixed
+    /// hasher). It stays valid while the index changes, so a command that looks the key
+    /// up more than once (read, then write) hashes it once.
+    #[inline]
+    pub(crate) fn key_hint(&self, key: &[u8]) -> u64 {
+        self.entries.lookup_hint(key)
+    }
+
     fn entry_charge(&self, key: &[u8]) -> EntryCharge {
         let Some((stored_key, hit)) = self.entries.get_key_value(key) else {
             return EntryCharge::default();

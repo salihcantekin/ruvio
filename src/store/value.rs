@@ -1314,7 +1314,7 @@ impl ValueLog {
 
     /// Bytes of a span. The page path is one bounds check on the extent table and one
     /// on the span; large spans and empty reads (offset 0 may name no extent) go cold.
-    #[inline]
+    #[inline(always)]
     pub(super) fn bytes(&self, offset: u32, len: usize) -> &[u8] {
         let start = offset as usize;
         let at = start % EXTENT_BYTES;
@@ -1440,6 +1440,7 @@ impl ValueLog {
         }
     }
 
+    #[inline(always)]
     pub(crate) fn slice(&self, offset: u32, len: u16) -> &[u8] {
         self.bytes(offset, len as usize)
     }
