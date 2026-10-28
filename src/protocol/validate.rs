@@ -104,6 +104,11 @@ pub(super) fn validate_command_payloads(
             fingerprint,
             owner,
             ..
+        }
+        | Command::IdempotencyAbort {
+            key,
+            fingerprint,
+            owner,
         } => {
             validate_key(key, limits)?;
             validate_value(fingerprint, limits)?;

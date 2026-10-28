@@ -625,9 +625,10 @@ fn parse_limit_mode(
 }
 
 pub(in crate::protocol) fn cmd_idem<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
-    if args.len() != 5 {
+    let abort = args.len() == 4 && args.bytes(1).eq_ignore_ascii_case(b"ABORT");
+    if args.len() != 5 && !abort {
         return Err(ProtocolError::Invalid(
-            "IDEM expects key BEGIN fingerprint owner ttl_ms or key COMPLETE fingerprint owner result",
+            "IDEM expects key BEGIN fingerprint owner ttl_ms, key COMPLETE fingerprint owner result or key ABORT fingerprint owner",
         ));
     }
     let action = args.bytes(1);
@@ -637,6 +638,13 @@ pub(in crate::protocol) fn cmd_idem<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
         return Err(ProtocolError::Invalid(
             "IDEM fingerprint and owner must contain 1-128 bytes",
         ));
+    }
+    if abort {
+        return Ok(Command::IdempotencyAbort {
+            key: args.arg(0),
+            fingerprint: args.arg(2),
+            owner: args.arg(3),
+        });
     }
     let value = args.bytes(4);
     if action.eq_ignore_ascii_case(b"BEGIN") {
@@ -665,7 +673,7 @@ pub(in crate::protocol) fn cmd_idem<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
         });
     }
     Err(ProtocolError::Invalid(
-        "IDEM action must be BEGIN or COMPLETE",
+        "IDEM action must be BEGIN, COMPLETE or ABORT",
     ))
 }
 

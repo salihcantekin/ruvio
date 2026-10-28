@@ -123,6 +123,14 @@ public partial class CommandSurfaceTests
         await session.Expect("IDEM", "request", "BEGIN", "fp", "retry", "1000");
         await session.Reply("*2\r\n$9\r\ncompleted\r\n$0\r\n\r\n");
         Assert.Empty((await acquire).Items![1].Bytes!);
+        ValueTask<bool> abort = session.Client.AbortIdempotencyAsync("request", "fp", "owner");
+        await session.Expect("IDEM", "request", "ABORT", "fp", "owner");
+        await session.Reply(":0\r\n");
+        Assert.False(await abort);
+        abort = ((IRuvioClient)session.Client).AbortIdempotencyAsync("other", "fp", "owner");
+        await session.Expect("IDEM", "other", "ABORT", "fp", "owner");
+        await session.Reply(":1\r\n");
+        Assert.True(await abort);
     }
 
     [Fact(Timeout = 15000)]

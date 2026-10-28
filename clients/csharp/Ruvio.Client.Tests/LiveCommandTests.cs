@@ -154,6 +154,11 @@ public sealed class LiveCommandTests(ITestOutputHelper output)
         Assert.Equal(IdempotencyState.Completed, replay.State);
         Assert.Equal("done"u8.ToArray(), replay.Result);
         Assert.Equal(IdempotencyState.Conflict, (await db.TryBeginIdempotencyAsync("idem", "other", "you", TimeSpan.FromSeconds(10))).State);
+        Assert.False(await db.AbortIdempotencyAsync("idem", "fp", "me"));
+        Assert.Equal(IdempotencyState.Acquired, (await db.TryBeginIdempotencyAsync("idem-abort", "fp", "me", TimeSpan.FromSeconds(10))).State);
+        Assert.False(await db.AbortIdempotencyAsync("idem-abort", "fp", "you"));
+        Assert.True(await db.AbortIdempotencyAsync("idem-abort", "fp", "me"));
+        Assert.Equal(IdempotencyState.Acquired, (await db.TryBeginIdempotencyAsync("idem-abort", "fp", "retry", TimeSpan.FromSeconds(10))).State);
 
         long cursor = await db.StartChangesAsync();
         Assert.True(await db.SetAsync("changed", "1"));

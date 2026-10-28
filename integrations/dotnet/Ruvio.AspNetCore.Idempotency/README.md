@@ -161,7 +161,8 @@ Native `IDEM key BEGIN ...` creates a **pending** record with a random ownership
 token and one retention TTL. An existing pending request returns 409 (after
 `PendingWait`, when set), including
 after crashes, cancellation, response overflow or uncertain downstream outcomes.
-It is not deleted, renewed, stolen or retried by this package. Completion checks
+It is not renewed, stolen or retried by this package, and it is deleted only by
+the opt-in `AbortOnException` below. Completion checks
 the exact owner, fingerprint, pending state and positive remaining TTL, atomically
 stores the result and changes state to **completed**, preserving the original
 expiration. A lost owner/expired record fails completion. Nothing is sent from
@@ -188,6 +189,32 @@ Old hash records fail closed until they expire; they are not overwritten,
 converted or replayed via Lua. Drain old admissions, handlers and retry retention
 before switching all application instances. Do not delete old keys or change
 namespace to bypass this safety barrier. See [the native contract](../../../docs/IDEM.md).
+
+### Freeing the key after a handler exception
+
+By default a handler that throws leaves its record pending, so every retry with
+that key gets 409 until `Retention` ends (24 hours by default). For handlers that
+throw before their work takes effect, or whose work is safe to repeat, turn on
+`AbortOnException`:
+
+```csharp
+builder.Services.AddRuvioIdempotency(options =>
+{
+    options.Namespace = "orders";
+    options.AbortOnException = true;
+});
+```
+
+When the handler throws, the middleware sends `IDEM key ABORT fingerprint owner`
+before the exception continues up the pipeline. The record is removed only if it
+is still pending with this request's owner, so a result stored by another
+request is never removed, and the next retry runs the handler again. A response
+the handler returns, 5xx included, is stored and replayed exactly as before. If
+the abort itself fails (Ruvio unreachable), the handler's exception still
+reaches the caller and the record stays pending until its retention ends. Each
+removed record counts as state `aborted` on `ruvio.idempotency.states`, and each
+attempt as operation `abort` on `ruvio.idempotency.storage_calls`. Needs a
+server with `IDEM ... ABORT`.
 
 ## When Ruvio is unreachable
 
