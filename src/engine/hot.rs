@@ -164,7 +164,8 @@ pub fn execute_hot_into_with_sink<C: Clock, I: StorageIndex, S: MutationSink>(
     Ok(())
 }
 
-#[inline]
+// Always inlined: the default policy's GET must cost what it did before the split.
+#[inline(always)]
 fn write_get(
     output: &mut impl Write,
     view: Result<Option<ByteView<'_>>, crate::store::WrongType>,
