@@ -22,7 +22,7 @@ independent servers mean two clients, each opened with its own address.
 A client moves to another process only within one deployment: to the new
 primary of a replication group after a failover (when it was given several seed
 addresses or the coordinators), and to the group that owns a key in a
-multi-node cluster (`MOVED`, `ASK`). See [Cluster and failover](CLUSTER.md).
+multi-node cluster (`MOVED`, `TRYAGAIN` while a range moves). See [Cluster and failover](CLUSTER.md).
 
 ## Shards
 

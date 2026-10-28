@@ -109,6 +109,9 @@ struct ShardState {
     /// Signalled by that thread for every delivery, and by a drain that ran out of budget.
     replica_wake: Arc<tokio::sync::Notify>,
     replica_resync_sequence: Arc<AtomicU64>,
+    /// Bytes of copied `PUBLISH` frames waiting in `replica_frames`; they are never logged, so
+    /// the reader thread bounds them here instead of by the log's applied sequence.
+    replica_publish_bytes: Arc<std::sync::atomic::AtomicUsize>,
     /// Slot ranges whose keys a background drop is still removing; a range arriving from
     /// another node waits until its drop is done.
     dropping: RefCell<Vec<(u16, u16)>>,
@@ -1245,6 +1248,7 @@ async fn serve_async(
         key_stats: RefCell::new(crate::keystats::KeyStats::default()),
         persistence: Arc::new(Mutex::new(sink)),
         replica_frames: RefCell::new(None),
+        replica_publish_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         replica_reader: RefCell::new(None),
         replica_wake: Arc::new(tokio::sync::Notify::new()),
         replica_link: Arc::new(crate::replication::LinkStatus::default()),

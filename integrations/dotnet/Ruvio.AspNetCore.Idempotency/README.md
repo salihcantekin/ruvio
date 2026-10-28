@@ -195,7 +195,8 @@ namespace to bypass this safety barrier. See [the native contract](../../../docs
 By default a handler that throws leaves its record pending, so every retry with
 that key gets 409 until `Retention` ends (24 hours by default). For handlers that
 throw before their work takes effect, or whose work is safe to repeat, turn on
-`AbortOnException`:
+`AbortOnException` (it needs a server that has `IDEM ABORT`; an older server answers an
+error, which is logged once as a warning and the record then stays pending):
 
 ```csharp
 builder.Services.AddRuvioIdempotency(options =>

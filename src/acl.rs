@@ -351,6 +351,19 @@ impl AclUser {
         };
 
         for token in rules.split_whitespace() {
+            // A rule on a subcommand this server does not check never matched a command; a
+            // release before this one stored it anyway (and wrote it back on `ACL SAVE`), so a
+            // file from that release still loads: the rule is dropped with a warning. `ACL
+            // SETUSER` refuses it.
+            if is_unknown_subcommand_rule(token) {
+                tracing::warn!(
+                    user = name,
+                    rule = token,
+                    "ACL rule names no checked subcommand; dropped"
+                );
+                continue;
+            }
+
             apply_rule(&mut user, token)?;
         }
 
@@ -945,6 +958,21 @@ const ACL_SUBCOMMANDS: &[&str] = &[
     "ruvio|moveslots",
     "ruvio|topology",
 ];
+
+/// `+parent|sub` or `-parent|sub` on a known parent and a subcommand that is not checked.
+fn is_unknown_subcommand_rule(token: &str) -> bool {
+    let Some(name) = token.strip_prefix(['+', '-']) else {
+        return false;
+    };
+    let Some((parent, _)) = name.split_once('|') else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+
+    !name.starts_with('@')
+        && is_known_command(&parent.to_ascii_lowercase())
+        && known_subcommand(&lower).is_none()
+}
 
 fn known_subcommand(name: &str) -> Option<&'static str> {
     ACL_SUBCOMMANDS.iter().copied().find(|known| *known == name)
@@ -1736,14 +1764,25 @@ mod tests {
     /// A rule on a subcommand no command maps to is refused: it could never match, and each
     /// distinct name used to be kept for the life of the process (issue #38).
     #[test]
+    fn a_file_rule_on_an_unchecked_subcommand_is_dropped_not_refused() {
+        let user = AclUser::parse("app", "on nopass ~* +@all -client|setname -config|get").unwrap();
+
+        assert!(user.rules.denied_subcommands.contains("config|get"));
+        assert!(!user.rules.denied_subcommands.contains("client|setname"));
+        assert!(AclUser::parse("app", "on -nosuch|thing").is_err());
+    }
+
+    #[test]
     fn unknown_subcommand_rules_are_refused() {
-        let error = AclUser::parse("u", "on nopass ~* +get|anything").unwrap_err();
+        // `ACL SETUSER` applies rules one by one and refuses an unchecked subcommand.
+        let mut user = AclUser::parse("u", "on nopass ~*").unwrap();
+        let error = apply_rule(&mut user, "+get|anything").unwrap_err();
 
         assert!(
             error.contains("unknown ACL subcommand `get|anything`"),
             "{error}"
         );
-        assert!(AclUser::parse("u", "on nopass ~* -config|nosuch").is_err());
+        assert!(apply_rule(&mut user, "-config|nosuch").is_err());
         AclUser::parse("u", "on nopass ~* +config|get -client|kill").unwrap();
     }
 

@@ -1675,6 +1675,7 @@ fn link_to(
             limits: ProtocolLimits::default(),
             snapshot_max_bytes: 1024 * 1024,
             resync_sequence: Arc::new(AtomicU64::new(0)),
+            publish_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             data_dir: data_dir.to_path_buf(),
             shard_count: 1,
             status: Arc::new(LinkStatus::default()),

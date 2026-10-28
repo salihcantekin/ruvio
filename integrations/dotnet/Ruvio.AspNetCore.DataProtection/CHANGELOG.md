@@ -4,6 +4,7 @@ Notable changes to the NuGet package `Ruvio.AspNetCore.DataProtection`. New entr
 
 ## Unreleased
 
+- Needs Ruvio.Client 0.4.0.
 - Docs: the README lists what this package checks while the host starts.
 - A missing `IRuvioConnection` (or keyed one for `ClientKey`) now fails host start with a message naming `AddRuvioClient` / `AddKeyedRuvioClient`, instead of the container's generic error.
 - `ClientKey` option: names a connection registered with `AddKeyedRuvioClient`, so the key-ring repository can use its own server or database. Null (the default) keeps the unkeyed `IRuvioClient`.

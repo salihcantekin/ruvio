@@ -260,7 +260,7 @@ def run(SCEN):
             nodes[0].send_signal(signal.SIGKILL); nodes[0].wait(); stop_flag.set(); th.join(timeout=5)
             assert wait(lambda: primary_index(COORDS[0][1]) not in (None, 0), 20)
             new = primary_index(COORDS[0][1]); time.sleep(0.5)
-            keys = subprocess.run(["redis-cli", "-p", str(NODES[new][0])], input="".join(f"EXISTS {k}\n" for k in acked), capture_output=True, text=True).stdout.split()
+            keys = subprocess.run(["redis-cli", "-p", str(NODES[new][0])], input="".join(f"EXISTS {k}\n" for k in acked), capture_output=True, text=True, timeout=30).stdout.split()
             lost = keys.count("0")
             print(f"acknowledged writes {len(acked)}, missing on the new primary {lost}")
             if SCEN == "durable":

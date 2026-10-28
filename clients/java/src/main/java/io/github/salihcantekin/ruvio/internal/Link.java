@@ -56,6 +56,9 @@ public final class Link implements AutoCloseable {
     private final boolean follow;
     /** Serializes the rounds that follow a {@code READONLY} reply. */
     private final Object followLock = new Object();
+    /** Commands refused with READONLY that wait for the primary search. */
+    private final java.util.concurrent.ConcurrentLinkedQueue<Refused> refused = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    private final java.util.concurrent.atomic.AtomicBoolean draining = new java.util.concurrent.atomic.AtomicBoolean();
     /** Called after the connection moved to another node, to drop what was opened to the old one. */
     private volatile Runnable onMove;
     /** Index of the address the connection is (or was last) on; written under the lock or before publication. */
@@ -366,10 +369,60 @@ public final class Link implements AutoCloseable {
      * @param error the {@code READONLY} error
      */
     void followReadonly(Request<?> r, byte[] command, Connection refusedOn, Throwable error) {
+        refused.add(new Refused(r, command, refusedOn, error));
+        scheduleDrain();
+    }
+
+    /** A command a replica refused, kept until the primary is found. */
+    private record Refused(Request<?> r, byte[] command, Connection refusedOn, Throwable error) { }
+
+    private void scheduleDrain() {
+        if (!draining.compareAndSet(false, true)) {
+            return;
+        }
         try {
-            BACKGROUND.execute(() -> sendAgain(r, command, refusedOn, error));
+            BACKGROUND.execute(this::drainRefused);
         } catch (RejectedExecutionException e) {
-            r.completeExceptionally(error);
+            draining.set(false);
+            Refused f;
+            while ((f = refused.poll()) != null) {
+                f.r.completeExceptionally(f.error);
+            }
+        }
+    }
+
+    /** One task per link sends every refused command again, so a burst of refusals needs one thread and one search. */
+    private void drainRefused() {
+        try {
+            Refused f;
+            Connection lastRefusedOn = null;
+            Connection lastTarget = null;
+            boolean lastFailed = false;
+            RuntimeException lastError = null;
+            while ((f = refused.poll()) != null) {
+                if (f.refusedOn != lastRefusedOn) {
+                    lastRefusedOn = f.refusedOn;
+                    lastFailed = false;
+                    lastError = null;
+                    try {
+                        lastTarget = moveAfterReadonly(f.refusedOn);
+                    } catch (RuntimeException e) {
+                        lastTarget = null;
+                        lastFailed = true;
+                        lastError = e;
+                    }
+                }
+                if (lastFailed) {
+                    f.r.completeExceptionally(lastError); // a refused AUTH, as when connecting
+                } else {
+                    sendAgain(f.r, f.command, lastTarget, f.error);
+                }
+            }
+        } finally {
+            draining.set(false);
+            if (!refused.isEmpty()) {
+                scheduleDrain();
+            }
         }
     }
 
@@ -393,14 +446,7 @@ public final class Link implements AutoCloseable {
         }
     }
 
-    private void sendAgain(Request<?> r, byte[] command, Connection refusedOn, Throwable error) {
-        Connection target;
-        try {
-            target = moveAfterReadonly(refusedOn);
-        } catch (RuntimeException e) {
-            r.completeExceptionally(e); // a refused AUTH, as when connecting
-            return;
-        }
+    private void sendAgain(Request<?> r, byte[] command, Connection target, Throwable error) {
         if (target == null) {
             r.completeExceptionally(error);
             return;

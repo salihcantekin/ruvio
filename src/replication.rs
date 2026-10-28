@@ -1796,6 +1796,9 @@ pub struct ReplicaLink {
     pub snapshot_max_bytes: u64,
     /// Sequence of the first rejected frame, or zero when ordinary streaming is safe.
     pub resync_sequence: Arc<AtomicU64>,
+    /// Bytes of copied `PUBLISH` frames queued and not yet taken by the shard. They are
+    /// never logged, so `Outstanding` cannot reclaim them; this keeps them under `QUEUE_BYTES`.
+    pub publish_bytes: Arc<std::sync::atomic::AtomicUsize>,
     pub data_dir: PathBuf,
     pub shard_count: u32,
     pub status: Arc<LinkStatus>,
@@ -3173,10 +3176,25 @@ fn enqueue_frame(
             return false;
         }
 
+        // A copied publish waits while the ones already queued hold the byte budget; one
+        // alone always goes through, however large, so a message bigger than the budget
+        // is not stuck forever.
+        if sequence.is_none() {
+            let queued = link.publish_bytes.load(Ordering::Acquire);
+            if queued != 0 && queued.saturating_add(len) > QUEUE_BYTES {
+                link.wake_shard.notify_one();
+                thread::park_timeout(SHIPPER_POLL);
+                continue;
+            }
+        }
+
         match link.inbound.try_send(ReplicaDelivery::Frame(frame)) {
             Ok(()) => {
-                if let Some(sequence) = sequence {
-                    outstanding.push(sequence, len);
+                match sequence {
+                    Some(sequence) => outstanding.push(sequence, len),
+                    None => {
+                        link.publish_bytes.fetch_add(len, Ordering::AcqRel);
+                    }
                 }
 
                 return true;

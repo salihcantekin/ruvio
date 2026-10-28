@@ -148,10 +148,12 @@ There is no change to the server's ordinary GET/SET/INCR paths.
 
 Use the same permit count and window for every endpoint/instance sharing a policy.
 Changing settings during a live window does not reset its stored state. Rejected
-requests return 429 and a conservative full-window `Retry-After`, not an exact reset
-time. Backend failures propagate to the application's exception handler; configure
-that handler to return an appropriate 503. The middleware never silently fails open
-or retries a possibly-applied `LIMIT`.
+requests return 429. For the sliding and token windows `Retry-After` is exact (the server
+says when the same call would pass); for the fixed window it is the full window, a
+conservative delay. By default backend failures propagate to the application's exception
+handler; configure that handler to return an appropriate 503. The middleware fails open
+only when you set `Outage.Mode = RuvioOutageMode.FailOpen`, and never retries a
+possibly-applied `LIMIT`.
 
 Fixed window is the default. To avoid the burst at a window edge, pick another
 algorithm: `[RuvioRateLimit("api", 100, 60, Algorithm = RuvioRateLimitAlgorithm.SlidingWindow)]`

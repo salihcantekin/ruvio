@@ -29,7 +29,7 @@ Clients follow a failover on their own: with several seed addresses, or with the
 
 ## Multi-node cluster
 
-Several replication groups share the hash slots, each group on its own machines. Every data node starts with the same `cluster_topology` map and its own `cluster_group`; the coordinators keep the map current after each failover or slot move and send it to every node. A node answers keys of another group with `MOVED` naming that group's primary, and a range being moved with `ASK`, so cluster clients follow it. `COORDINATOR MOVE` moves a slot range between groups while both serve, and `COORDINATOR REBALANCE` plans and runs moves that even out the groups.
+Several replication groups share the hash slots, each group on its own machines. Every data node starts with the same `cluster_topology` map and its own `cluster_group`; the coordinators keep the map current after each failover or slot move and send it to every node. A node answers keys of another group with `MOVED` naming that group's primary, and a range being moved with `TRYAGAIN` while it is frozen, so cluster clients follow or retry. `COORDINATOR MOVE` moves a slot range between groups while both serve, and `COORDINATOR REBALANCE` plans and runs moves that even out the groups.
 
 ## Where to go next
 

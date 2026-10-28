@@ -578,6 +578,12 @@ impl Api {
         if voters.contains(&id) {
             return Value::Error(format!("ERR coordinator {id} already votes"));
         }
+        if self.config.primary_lease.is_some() {
+            return Value::Error(
+                "ERR the primary lease is on: data nodes take grants only from the coordinators in their primary_lease_coordinators, so a changed set stops writes until every node lists it. Turn primary-lease off on the nodes, change the coordinators, update the list and restart the nodes, then turn it on again"
+                    .into(),
+            );
+        }
         if self.config.primary_lease.is_some()
             && voters.len() >= crate::primary_lease::MAX_VOTERS as usize
         {
@@ -615,6 +621,12 @@ impl Api {
 
         if !members.remove(&id) {
             return Value::Error(format!("ERR coordinator {id} does not vote"));
+        }
+        if self.config.primary_lease.is_some() {
+            return Value::Error(
+                "ERR the primary lease is on: data nodes take grants only from the coordinators in their primary_lease_coordinators, so a changed set stops writes until every node lists it. Turn primary-lease off on the nodes, change the coordinators, update the list and restart the nodes, then turn it on again"
+                    .into(),
+            );
         }
         if members.is_empty() {
             return Value::Error("ERR cannot remove the last coordinator".into());

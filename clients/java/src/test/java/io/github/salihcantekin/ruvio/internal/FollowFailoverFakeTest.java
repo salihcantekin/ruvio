@@ -239,6 +239,41 @@ class FollowFailoverFakeTest {
     }
 
     @Test
+    @org.junit.jupiter.api.Timeout(60)
+    void aBurstOfRefusedWritesUsesFewFollowThreads() throws Exception {
+        Node old = node(MASTER);
+        Node next = node(REPLICA);
+        try (RuvioClient<String, String> c = RuvioClient.connect(seeds(old.address(), next.address()).build())) {
+            c.ping();
+            old.mode = replicaOf(next.fake);
+            next.mode = MASTER;
+            int n = 500;
+            List<CompletableFuture<Void>> all = new ArrayList<>();
+            int peak = 0;
+            for (int i = 0; i < n; i++) {
+                all.add(c.async().set("k" + i, "v"));
+                peak = Math.max(peak, followThreads());
+            }
+            for (CompletableFuture<Void> f : all) {
+                f.get(30, TimeUnit.SECONDS);
+                peak = Math.max(peak, followThreads());
+            }
+            assertEquals(n, next.seen("SET"));
+            assertTrue(peak < 8, "follow threads: " + peak);
+        }
+    }
+
+    private static int followThreads() {
+        int count = 0;
+        for (Thread t : Thread.getAllStackTraces().keySet()) {
+            if (t.getName().startsWith("ruvio-follow")) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    @Test
     void aHealthyConnectionSendsNothingExtra() throws Exception {
         Node node = node(MASTER);
         Node other = node(REPLICA);

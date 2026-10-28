@@ -89,13 +89,21 @@ pub(super) async fn hold_until_durable(
             shard.replies.commit(*target);
         }
 
+        output.approve_all();
+
         return Ok(());
     }
 
-    let refused = refuse_replies(output);
+    // Bytes before `approved` were sent in part or passed an earlier wait: a reply cut by
+    // the socket must not be rewritten, or the client reads the refusal as its payload.
+    let approved = output.approved();
+    let refused = refuse_replies(&output[approved..]);
 
-    output.clear();
-    output.write_all(&refused)
+    output.truncate_to(approved);
+    output.write_all(&refused)?;
+    output.approve_all();
+
+    Ok(())
 }
 
 /// Tells the shards' replicas to sync and acknowledge every batch while it lives.
@@ -213,6 +221,28 @@ mod tests {
         expected.extend_from_slice(line);
 
         assert_eq!(refused, expected);
+    }
+
+    #[test]
+    fn a_partly_sent_reply_at_the_front_is_left_alone() {
+        let mut output = BoundedOutput::with_capacity(0, 1 << 16);
+
+        output.write_all(b"$6\r\nabcdef\r\n+OK\r\n").unwrap();
+        output.approve_all();
+        // The socket took the header and half of the payload.
+        output.consume_front(7);
+        output.write_all(b":1\r\n").unwrap();
+
+        let approved = output.approved();
+        let refused = refuse_replies(&output[approved..]);
+
+        output.truncate_to(approved);
+        output.write_all(&refused).unwrap();
+
+        assert_eq!(
+            &output[..],
+            b"def\r\n+OK\r\n-NOREPLICAS Not enough good replicas to write.\r\n".as_slice()
+        );
     }
 
     #[test]

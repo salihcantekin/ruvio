@@ -223,7 +223,7 @@ jobs:
             done'
       - name: Go client
         timeout-minutes: 15
-        run: scripts/run_with_servers.sh "$PWD/target/debug/ruvio" 17440 -- bash -c 'cd clients/go && go test -race -count=1 ./...'
+        run: scripts/run_with_servers.sh "$PWD/target/debug/ruvio" 17440 -- bash -c 'cd clients/go && go test -race -count=1 -timeout 600s ./...'
       - name: Java client
         timeout-minutes: 15
         run: scripts/run_with_servers.sh "$PWD/target/debug/ruvio" 17460 -- mvn -B -f clients/java/pom.xml verify

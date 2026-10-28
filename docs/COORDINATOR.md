@@ -264,12 +264,13 @@ old lease length after each restart, so no coordinator reports a lease ended by 
 length while a grant of the old length runs.
 
 Changing the coordinators (`COORDINATOR ADD`/`REMOVE`, see *Adding and removing coordinators*):
-each grant names its sender's coordinator count, and a primary needs a majority of the
-largest count among its running grants. Adding coordinators raises the bar at once. After removing
-some, the grants of the larger count keep the higher bar until they end, at most `primary_lease_ms`
-after the last one was sent; until then the primary refuses writes unless a majority of the old count
-still grants it. To avoid that pause, turn `primary-lease` off on the data nodes for the change, or
-remove a coordinator only while a majority of the larger set still runs.
+a data node takes a grant only from the ids in its `primary_lease_coordinators` and only when the
+grant's coordinator count equals that list's length, and the list changes only with a restart. So
+while the lease is on, `COORDINATOR ADD` and `COORDINATOR REMOVE` are refused: a changed set would
+stop writes on every primary until each node restarted with the new list. To change the set, turn
+`primary-lease` off on the data nodes (`CONFIG SET primary-lease no`), add or remove the coordinator,
+put the new list in every node's `primary_lease_coordinators`, restart the nodes one at a time
+(replicas first, then the primary, which fails over), and turn the lease on again.
 
 Checked with Docker (debug build, `ping_interval_ms` 500, `down_after_ms` 3000, `primary_lease_ms`
 2000, `min-replicas-to-write 1` on every node), the old primary and one replica on one network, the

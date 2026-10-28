@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization.Metadata;
+using Microsoft.Extensions.Logging;
 using Ruvio.Client;
 
 namespace Ruvio.Extensions.Idempotency;
@@ -32,12 +33,24 @@ public sealed class RuvioIdempotentExecutor
     private readonly string keyPrefix;
     private readonly long defaultRetention;
     private readonly bool abortOnException;
+    private readonly ILogger? logger;
+    private static int abortUnsupportedLogged;
 
     /// <summary>Creates an executor on <paramref name="client"/>.</summary>
     /// <param name="client">The client the records live on.</param>
     /// <param name="options">Key prefix and default retention; the defaults when null.</param>
     public RuvioIdempotentExecutor(IRuvioClient client, RuvioIdempotentExecutorOptions? options = null)
+        : this(client, options, null)
     {
+    }
+
+    /// <summary>Creates an executor on <paramref name="client"/> that reports problems to <paramref name="logger"/>.</summary>
+    /// <param name="client">The client the records live on.</param>
+    /// <param name="options">Key prefix and default retention; the defaults when null.</param>
+    /// <param name="logger">Receives a warning when the server cannot abort records; none when null.</param>
+    public RuvioIdempotentExecutor(IRuvioClient client, RuvioIdempotentExecutorOptions? options, ILogger? logger)
+    {
+        this.logger = logger;
         ArgumentNullException.ThrowIfNull(client);
         options ??= new RuvioIdempotentExecutorOptions();
         options.Validate();
@@ -253,6 +266,14 @@ public sealed class RuvioIdempotentExecutor
                 && Outcomes.Enabled)
             {
                 Outcomes.Add(1, new TagList { { "outcome", "aborted" } });
+            }
+        }
+        catch (RuvioException exception) when (exception.IsServerReply)
+        {
+            // A server from before IDEM ABORT answers an unknown-subcommand error.
+            if (Interlocked.Exchange(ref abortUnsupportedLogged, 1) == 0)
+            {
+                logger?.LogWarning(exception, "The Ruvio server rejected IDEM ABORT; it is older than this package needs, so AbortOnException has no effect and failed work stays pending until its retention ends.");
             }
         }
         catch (Exception)

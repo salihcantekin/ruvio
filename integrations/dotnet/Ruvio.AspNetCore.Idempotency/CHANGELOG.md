@@ -4,6 +4,8 @@ Notable changes to the NuGet package `Ruvio.AspNetCore.Idempotency`. New entries
 
 ## Unreleased
 
+- When the server rejects `IDEM ABORT` (a server from before it), `AbortOnException` logs one warning per process instead of failing silently.
+- Needs Ruvio.Client 0.4.0; `AbortOnException` needs a server with `IDEM ABORT`.
 - Docs: the README lists what this package checks while the host starts, and shows how to watch the circuit breaker (logs, `ruvio_client_circuit_transitions`, a `StateChanged` handler).
 - With `Outage.CircuitBreaker` set, the circuit's changes are logged through `ILogger` (category `Ruvio.AspNetCore.Idempotency`): Warning when it opens, with the break duration; Information for the trial call and when it closes. Nothing is logged without a breaker.
 - Startup checks: host start fails when the client (or the keyed client for `ClientKey`) is not registered or a `[RuvioIdempotency]` endpoint value is out of range (every bad endpoint is listed), and `UseRuvioIdempotency` throws without `AddRuvioIdempotency`. Before, these failed on the first matching request. No connection is opened for the checks; requests are unchanged.

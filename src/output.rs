@@ -7,6 +7,9 @@ pub(crate) struct BoundedOutput {
     bytes: Vec<u8>,
     maximum: usize,
     exceeded: bool,
+    /// Bytes at the front already cleared to leave: sent in part, or passed by an earlier
+    /// durability wait. A later wait that times out refuses only the replies after them.
+    approved: usize,
 }
 
 impl BoundedOutput {
@@ -15,21 +18,35 @@ impl BoundedOutput {
             bytes: Vec::with_capacity(capacity.min(maximum)),
             maximum,
             exceeded: false,
+            approved: 0,
         }
     }
 
     pub(crate) fn clear(&mut self) {
         self.bytes.clear();
         self.exceeded = false;
+        self.approved = 0;
     }
 
     /// Drops the first `count` bytes, which were sent; the limit then counts only the rest.
     pub(crate) fn consume_front(&mut self, count: usize) {
         self.bytes.drain(..count);
+        self.approved = self.approved.saturating_sub(count);
     }
 
     pub(crate) fn truncate_to(&mut self, length: usize) {
         self.bytes.truncate(length);
+        self.approved = self.approved.min(length);
+    }
+
+    /// Where the replies not yet cleared by a durability wait begin.
+    pub(crate) fn approved(&self) -> usize {
+        self.approved.min(self.bytes.len())
+    }
+
+    /// Every byte held now may leave; a later wait looks only at what comes after.
+    pub(crate) fn approve_all(&mut self) {
+        self.approved = self.bytes.len();
     }
 
     pub(crate) fn release_idle(&mut self) {
