@@ -172,6 +172,24 @@ user/key tags. No exporters or telemetry worker are installed by this package.
 Build/package with `dotnet pack -c Release`. Targets .NET 8; requires the client
 and server `LIMIT` command. The package is versioned separately from the server.
 
+## A separate connection
+
+By default the middleware uses the unkeyed `IRuvioClient`. To give it a connection of its
+own (another server, database or set of options), register one with
+`AddKeyedRuvioClient` from `Ruvio.Client.AspNetCore` and name it in `ClientKey`:
+
+```csharp
+builder.Services.AddKeyedRuvioClient("limits", "limits-host", 6379);
+builder.Services.AddRuvioRateLimiting(o =>
+{
+    o.ClientKey = "limits";
+    o.PartitionKey = context => context.User.Identity?.Name ?? "anonymous";
+});
+```
+
+The keyed client is looked up per limited request, from the request's services. Host start fails
+when no client is registered under that key.
+
 ## When Ruvio is unreachable
 
 By default a storage error reaches your exception handling (`Outage.Mode = Throw`). Choose what to do instead:

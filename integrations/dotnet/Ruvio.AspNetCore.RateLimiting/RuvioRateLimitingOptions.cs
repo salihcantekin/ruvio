@@ -10,6 +10,12 @@ public sealed class RuvioRateLimitingOptions
     public string KeyPrefix { get; set; } = "ruvio:rate:v1:";
 
     /// <summary>
+    /// The key of a connection registered with <c>AddKeyedRuvioClient</c>. Null (the default) uses the unkeyed
+    /// <c>IRuvioClient</c>.
+    /// </summary>
+    public string? ClientKey { get; set; }
+
+    /// <summary>
     /// Required trusted tenant/user identifier, or an explicit constant for a global budget.
     /// Runs after authentication/authorization. Do not trust arbitrary forwarded headers.
     /// </summary>

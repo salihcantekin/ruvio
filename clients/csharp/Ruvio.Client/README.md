@@ -736,6 +736,37 @@ catch (Exception error) when (outage.Failed(error, token) && outage.Mode == Ruvi
 
 See [the integrations README](../../../integrations/dotnet/README.md#when-ruvio-is-unreachable) for what each package does.
 
+### Retry policies of your own (Polly and others)
+
+`RuvioErrors` sorts what a call throws, so a retry or circuit-breaker policy from any library (Polly,
+`Microsoft.Extensions.Resilience`, a plain loop) handles the right errors. The client needs no extra package for it.
+
+- `RuvioErrors.IsTransient(exception, token)`: trying again later can succeed. True for an outage (as `IsOutage`)
+  and for `TRYAGAIN`, `READONLY` and `NOREPLICAS`; false for `WRONGTYPE`, `OOM`, syntax errors and the caller's own
+  cancellation.
+- `RuvioErrors.MayHaveRun(exception)`: the failed call may have changed data. False only for an open circuit and a
+  server error reply (the server refused the command), except `NOREPLICAS`: the write was applied and only the replica
+  confirmation timed out. A dropped connection or a timeout may have run, even with `ClosedBeforeReply`.
+
+The client already follows `MOVED`/`ASK`, waits out `TRYAGAIN` during a slot move and finds a new primary after a
+failover; these helpers judge what still reaches you. Repeat a write only when it is safe to repeat or did not run:
+
+```csharp
+// Polly v8. INCR is not safe to repeat, so it is retried only when it surely did not run.
+var pipeline = new ResiliencePipelineBuilder()
+    .AddRetry(new RetryStrategyOptions
+    {
+        ShouldHandle = args => ValueTask.FromResult(args.Outcome.Exception is { } e
+            && RuvioErrors.IsTransient(e) && !RuvioErrors.MayHaveRun(e)),
+        MaxRetryAttempts = 3,
+    })
+    .Build();
+
+long visits = await pipeline.ExecuteAsync(async token => await db.IncrementAsync("visits"), cancellationToken);
+```
+
+For a read, `ShouldHandle` can use `RuvioErrors.IsTransient(e)` alone.
+
 ## Options
 
 | Command | Methods |

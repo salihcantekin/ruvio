@@ -147,7 +147,9 @@ public sealed class RuvioRateLimitingMiddleware
                 partitions[index] = Partition(context, limits[index], policy.Policy);
         }
 
-        var client = context.RequestServices.GetRequiredService<IRuvioClient>();
+        var client = options.ClientKey is { } clientKey
+            ? context.RequestServices.GetRequiredKeyedService<IRuvioClient>(clientKey)
+            : context.RequestServices.GetRequiredService<IRuvioClient>();
         var outage = options.Outage;
 
         if (!outage.TryEnter())

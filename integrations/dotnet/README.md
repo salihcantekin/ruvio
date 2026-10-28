@@ -59,7 +59,7 @@ cache stores expiring session contents; Data Protection retains the encryption
 key ring without TTL. The latter requires an encryptor by default and must use
 persistent, backed-up, non-evicting storage. Register that durable server with
 `AddKeyedRuvioClient("key-ring", ...)` and set `ClientKey = "key-ring"`; every
-integration has the same `ClientKey` option, so the cache, output cache, locks and
+integration has the same `ClientKey` option, so the cache, output cache, locks, rate limiting and
 idempotency can each use their own connection too. Sharing the ring and `SetApplicationName`
 allows instances to decrypt each other's session/authentication cookies. The
 Data Protection package includes a Session composition example, exercised across
