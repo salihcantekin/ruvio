@@ -87,6 +87,15 @@ impl<'a, 's> Args<'a, 's> {
     pub(crate) fn rest(&self, from: usize) -> Vec<Bytes<'a>> {
         (from..self.len()).map(|index| self.arg(index)).collect()
     }
+
+    /// Arguments `from..` like [`Self::rest`], with a single argument kept inline.
+    pub(crate) fn rest_one_or_many(&self, from: usize) -> OneOrMany<Bytes<'a>> {
+        if self.len() == from + 1 {
+            OneOrMany::One(self.arg(from))
+        } else {
+            OneOrMany::Many(self.rest(from))
+        }
+    }
 }
 
 pub(crate) type ParseFn = for<'a, 's> fn(&Args<'a, 's>) -> Result<Command<'a>, ProtocolError>;
