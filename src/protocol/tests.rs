@@ -957,6 +957,63 @@ fn borrows_hot_command_arguments_from_the_input_buffer() {
 }
 
 #[test]
+fn sends_other_names_to_the_general_parser_before_reading_them() {
+    for name in [
+        "LPUSH", "lpush", "HSET", "SADD", "ZADD", "RPUSH", "HGET", "MGET", "EXISTS", "EXPIRE",
+        "TYPE", "TTL", "LPOP", "SCARD", "INFO", "SETNX", "DECRBX",
+    ] {
+        let frame = format!("*2\r\n${}\r\n{name}\r\n$1\r\nk\r\n", name.len());
+
+        assert_eq!(
+            parse_hot_command(frame.as_bytes()).unwrap(),
+            HotParse::Fallback,
+            "{name}"
+        );
+    }
+
+    for name in [
+        "GET", "gEt", "DEL", "dEl", "INCR", "InCr", "DECR", "dEcR", "UNLINK", "uNlInK",
+    ] {
+        let frame = format!("*2\r\n${}\r\n{name}\r\n$1\r\nk\r\n", name.len());
+
+        assert!(
+            matches!(
+                parse_hot_command(frame.as_bytes()).unwrap(),
+                HotParse::Complete(..)
+            ),
+            "{name}"
+        );
+    }
+
+    for frame in [
+        &b"*1\r\n$4\r\nPiNg\r\n"[..],
+        b"*3\r\n$3\r\nsEt\r\n$1\r\nk\r\n$1\r\nv\r\n",
+        b"*4\r\n$5\r\nSeTeX\r\n$1\r\nk\r\n$1\r\n1\r\n$1\r\nv\r\n",
+        b"*3\r\n$6\r\niNcRbY\r\n$1\r\nk\r\n$1\r\n1\r\n",
+        b"*3\r\n$6\r\nDeCrBy\r\n$1\r\nk\r\n$1\r\n1\r\n",
+    ] {
+        assert!(
+            matches!(parse_hot_command(frame).unwrap(), HotParse::Complete(..)),
+            "{}",
+            String::from_utf8_lossy(frame)
+        );
+    }
+
+    // A hot-looking name without its CRLF is refused, not read past.
+    assert!(parse_hot_command(b"*2\r\n$3\r\nGETX\r\n$1\r\nk\r\n").is_err());
+
+    let get = b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n";
+
+    for split in 0..get.len() {
+        assert_eq!(
+            parse_hot_command(&get[..split]).unwrap(),
+            HotParse::Incomplete,
+            "split at byte {split}"
+        );
+    }
+}
+
+#[test]
 fn treats_every_truncated_hot_frame_as_incomplete() {
     let frame = b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n";
 
