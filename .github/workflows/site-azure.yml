@@ -42,6 +42,10 @@ jobs:
           cache-dependency-path: site-next/package-lock.json
       - name: Build
         working-directory: site-next
+        # Optional. Set the repository variable PUBLIC_GA_ID to a GA4 ID (G-XXXXXXXXXX) to enable analytics;
+        # when it is empty the build emits no analytics code.
+        env:
+          PUBLIC_GA_ID: ${{ vars.PUBLIC_GA_ID }}
         run: |
           npm ci
           npm run check

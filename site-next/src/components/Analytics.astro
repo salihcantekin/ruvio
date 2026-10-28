@@ -1,0 +1,33 @@
+---
+// Google Analytics 4, rendered in the <head> of every page (marketing, docs and 404).
+// The measurement ID comes from the build environment (PUBLIC_GA_ID, a G-XXXXXXXXXX value).
+// Without a valid ID this renders nothing, so the site ships no analytics code.
+// Consent Mode starts denied: GA sets no cookies until a visitor consents, and no consent
+// banner exists yet, so only cookieless measurement is sent.
+const measurementId = (import.meta.env.PUBLIC_GA_ID ?? "").trim();
+const isValid = /^G-[A-Z0-9]+$/.test(measurementId);
+---
+
+{
+  isValid && (
+    <>
+      <script is:inline define:vars={{ measurementId }}>
+        window.dataLayer = window.dataLayer || [];
+        function gtag() {
+          dataLayer.push(arguments);
+        }
+        gtag("consent", "default", {
+          analytics_storage: "denied",
+          ad_storage: "denied",
+          ad_user_data: "denied",
+          ad_personalization: "denied",
+        });
+        gtag("js", new Date());
+      </script>
+      <script async src={`https://www.googletagmanager.com/gtag/js?id=${measurementId}`}></script>
+      <script is:inline define:vars={{ measurementId }}>
+        gtag("config", measurementId);
+      </script>
+    </>
+  )
+}

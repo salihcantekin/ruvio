@@ -49,6 +49,7 @@ export default defineConfig({
         MobileMenuFooter: "./src/components/docs/DocsMobileMenuFooter.astro",
         PageTitle: "./src/components/docs/DocsPageTitle.astro",
         PageSidebar: "./src/components/docs/DocsPageSidebar.astro",
+        Head: "./src/components/docs/DocsHead.astro",
       },
     }),
   ],

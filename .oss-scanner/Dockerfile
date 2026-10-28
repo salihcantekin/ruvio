@@ -9,7 +9,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential git python3 \
     && rm -rf /var/lib/apt/lists/*
 
-# scanner contract: the checkout lives inside the image, at /src
+# scanner contract: the checkout lives inside the image, at /src.
+# Dockerfile.dockerignore next to this file replaces the root .dockerignore, which
+# leaves out docs/ and clients/ that the library tests include at compile time.
 COPY . /src
 WORKDIR /src
 

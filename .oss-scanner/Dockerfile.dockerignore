@@ -1,0 +1,3 @@
+# Used instead of the repository .dockerignore when this Dockerfile is built.
+# The library tests read docs/ and clients/testdata at compile time, so both must be in the image.
+target
