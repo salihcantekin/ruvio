@@ -279,20 +279,22 @@ fn evented_pipeline_set_get_and_info_on_the_owning_thread() {
     let (address, stop, server) = serve_on_ephemeral();
     let text = String::from_utf8(request(
             address,
-            b"*1\r\n$4\r\nPING\r\n*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n*1\r\n$4\r\nINFO\r\n",
+            b"*1\r\n$4\r\nPING\r\n*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n*2\r\n$4\r\nINCR\r\n$3\r\nkey\r\n*1\r\n$4\r\nINFO\r\n",
         ))
         .unwrap();
 
     assert!(
-        text.starts_with("+PONG\r\n+OK\r\n$5\r\nvalue\r\n$"),
+        text.starts_with("+PONG\r\n+OK\r\n$5\r\nvalue\r\n-ERR"),
         "{text:?}"
     );
     assert!(text.contains("ruvio_backend:evented"), "{text}");
+    // Every command ahead of INFO in the same batch is counted, the refused INCR too.
     for field in [
-        "total_commands_processed:",
-        "get_commands:1",
-        "set_commands:1",
-        "other_commands:",
+        "total_commands_processed:4\r\n",
+        "get_commands:1\r\n",
+        "set_commands:1\r\n",
+        "increment_commands:1\r\n",
+        "other_commands:1\r\n",
         "index_memory_bytes:",
         "pooled_value_bytes:",
     ] {
