@@ -27,9 +27,11 @@ internal sealed class BoundedBuffer(int limit) : Stream
     {
         ArgumentOutOfRangeException.ThrowIfNegative(sizeHint);
 
-        int needed = Math.Max(1, sizeHint);
+        // A hint is only a hint: it may exceed the space left, and only a write past the limit fails.
+        Check(1);
 
-        Check(needed);
+        int needed = Math.Min(Math.Max(1, sizeHint), limit - length);
+
         Grow(length + needed);
 
         // Never hand out room past the limit, even when the pool rented a larger array.
