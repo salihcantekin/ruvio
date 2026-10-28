@@ -28,6 +28,7 @@ Most scripts take the path to a built `ruvio` binary and start their own server.
 | `run_client_suites.py` | Rust and C# client suites plus the .NET integrations against one server |
 | `check_compatibility_matrix.py` | Matrix against the parser, the table, the docs, coverage files, client manifests, and command counts stated in the site and READMEs |
 | `check_instruction_baseline.py` | iai-callgrind counts against `benchmark/baselines/instructions.json` (PR gate, +2%) |
+| `check_hygiene.sh` | Scans the lines a branch adds (`check_hygiene.sh . origin/dev`, after `git add -N .`) or the whole tree for planning ids, Turkish text and misnamed tests |
 | `check_package_metadata.py` | Package descriptions, links and licenses (Python 3.11+) |
 | `resp_conformance.py` | RESP2 conformance smoke |
 | `redis_differential.py`, `geo_differential.py`, `slab_fuzz.py` | Replies compared with a Redis instance |

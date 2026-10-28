@@ -192,6 +192,21 @@ public class IdempotencyTests
     }
 
     [Fact(Timeout = 30000)]
+    public async Task AResponseOverTheLimitKeepsTheRecordPendingEvenWithAbortOnException()
+    {
+        var (client, stub) = StubClient.Create();
+        var options = Options();
+
+        options.AbortOnException = true;
+        options.MaxResponseBodyBytes = 8;
+        var middleware = Middleware(async context => await context.Response.Body.WriteAsync(new byte[9]), options);
+
+        await Assert.ThrowsAsync<IOException>(() => middleware.InvokeAsync(Context(client)));
+
+        Assert.Equal("pending", Assert.Single(stub.Records).Value.State);
+    }
+
+    [Fact(Timeout = 30000)]
     public async Task ConcurrentPendingRequestConflictsAndNeverRunsHandler()
     {
         var (client, _) = StubClient.Create();
@@ -253,7 +268,11 @@ public class IdempotencyTests
                 ctx.Response.OnStarting(() => throw new InvalidOperationException("starting"));
 
             if (failure == "writer-overflow")
+            {
+                // A hint past the limit is fine; advancing past it is the overflow.
                 ctx.Response.BodyWriter.GetMemory(33);
+                ctx.Response.BodyWriter.Advance(33);
+            }
 
             if (failure is "overflow" or "caught-overflow")
             {
@@ -842,13 +861,15 @@ public class IdempotencyTests
     }
 
     [Fact]
-    public void ResponseBufferRejectsAHintBeyondItsLimitEvenWhenStorageIsLarger()
+    public void ResponseBufferAcceptsAHintBeyondItsLimitAndFailsOnlyOnAWritePastIt()
     {
         var body = new BoundedResponseBody(10);
 
         body.Buffer.Write(new byte[4]);
-        // The pool may rent more than 10 bytes; the limit, not the array, decides.
-        Assert.Throws<IOException>(() => body.Buffer.Reserve(7));
+        // The pool may rent more than 10 bytes; the limit decides, and only a write past it fails.
+        Assert.Equal(6, body.Buffer.Reserve(7).Length);
+        Assert.False(body.Buffer.Failed);
+        Assert.Throws<IOException>(() => body.Buffer.Advance(7));
         Assert.True(body.Buffer.Failed);
         body.Release();
     }

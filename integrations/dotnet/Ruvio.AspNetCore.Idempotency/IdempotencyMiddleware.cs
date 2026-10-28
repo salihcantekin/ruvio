@@ -278,7 +278,8 @@ public sealed class IdempotencyMiddleware
             {
                 await next(context);
             }
-            catch (Exception) when (options.AbortOnException)
+            // A body over the limit is not the handler's failure: its work took effect, so the record stays pending.
+            catch (Exception) when (options.AbortOnException && !responseBody.Buffer.Failed)
             {
                 await IdempotencyStore.AbortAsync(client, storageKey, fingerprint, owner,
                     context.RequestServices.GetService<ILoggerFactory>()?.CreateLogger("Ruvio.AspNetCore.Idempotency"));
