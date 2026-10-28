@@ -5,14 +5,8 @@
       "args": [
         "acl",
         "SETUSER",
-        "INCRBY"
-      ],
-      "keys": []
-    },
-    {
-      "args": [
-        "acl",
-        "CAT"
+        "ON",
+        "b3"
       ],
       "keys": []
     },
@@ -20,35 +14,27 @@
       "args": [
         "acl",
         "SETUSER",
+        "10",
         "0",
-        "a3",
-        "f4",
-        "REFCOUNT"
-      ],
-      "keys": []
-    },
-    {
-      "args": [
-        "acl",
-        "SETUSER",
-        "a2",
-        "1.5",
-        "BYRADIUS",
         "-",
-        "$.a",
-        "10"
-      ],
-      "keys": []
-    },
-    {
-      "args": [
-        "acl",
-        "SETUSER",
-        "a2",
-        ">",
-        "1.5",
         "2",
-        "1.5"
+        "f6",
+        "a7"
+      ],
+      "keys": []
+    },
+    {
+      "args": [
+        "acl",
+        "LIST"
+      ],
+      "keys": []
+    },
+    {
+      "args": [
+        "acl",
+        "GETUSER",
+        "2"
       ],
       "keys": []
     },
@@ -56,8 +42,21 @@
       "args": [
         "acl",
         "SETUSER",
-        "km",
-        "*"
+        "+",
+        "a3",
+        "-1"
+      ],
+      "keys": []
+    },
+    {
+      "args": [
+        "acl",
+        "SETUSER",
+        "b2",
+        "REFCOUNT",
+        "-",
+        "1.5",
+        "a6"
       ],
       "keys": []
     },
@@ -74,7 +73,7 @@
     {
       "args": [
         "auth",
-        "BYRADIUS"
+        "u8"
       ],
       "keys": []
     },
@@ -89,21 +88,21 @@
     {
       "args": [
         "auth",
-        "INFO"
+        "GETUSER"
       ],
       "keys": []
     },
     {
       "args": [
         "auth",
-        "STORE"
+        "SHARDS"
       ],
       "keys": []
     },
     {
       "args": [
         "auth",
-        "SET"
+        "REFCOUNT"
       ],
       "keys": []
     },
@@ -127,10 +126,10 @@
     {
       "args": [
         "bf.card",
-        "FROMLONLAT"
+        "BEGIN"
       ],
       "keys": [
-        "FROMLONLAT"
+        "BEGIN"
       ]
     },
     {
@@ -146,10 +145,10 @@
     {
       "args": [
         "bf.info",
-        "WHOAMI"
+        "$.a"
       ],
       "keys": [
-        "WHOAMI"
+        "$.a"
       ]
     },
     {
@@ -166,11 +165,11 @@
     {
       "args": [
         "bf.madd",
-        "DOCS",
-        "INFO"
+        "i8",
+        "BLOCK"
       ],
       "keys": [
-        "DOCS"
+        "i8"
       ]
     },
     {
@@ -188,7 +187,7 @@
       "args": [
         "bf.madd",
         "COMPLETE",
-        "STORE",
+        "EXISTS",
         "b3",
         "$"
       ],
@@ -215,9 +214,9 @@
         "1",
         "k2",
         "*",
-        "GET",
+        "MIN",
         "$",
-        "STREAM"
+        "DOCS"
       ],
       "keys": [
         "1"
@@ -228,7 +227,7 @@
         "bf.madd",
         "v1",
         "a2",
-        "TRACKING",
+        "SUBSCRIBE",
         "1",
         ">",
         "b6",
@@ -241,34 +240,34 @@
     {
       "args": [
         "bf.mexists",
-        "ENCODING",
-        "KILL"
+        "NODES",
+        "STREAM"
       ],
       "keys": [
-        "ENCODING"
+        "NODES"
       ]
     },
     {
       "args": [
         "bf.mexists",
-        "IDLETIME",
+        "RELEASE",
         "k2",
         "10"
       ],
       "keys": [
-        "IDLETIME"
+        "RELEASE"
       ]
     },
     {
       "args": [
         "bf.mexists",
-        "SHARDS",
-        "$.a",
-        "STATUS",
+        "INFO",
+        "RELEASE",
+        "COMPLETE",
         "10"
       ],
       "keys": [
-        "SHARDS"
+        "INFO"
       ]
     },
     {
@@ -276,8 +275,8 @@
         "bf.mexists",
         "b1",
         "v2",
-        "LOAD",
-        "MYID",
+        "SLOTS",
+        "FREQ",
         "a5"
       ],
       "keys": [
@@ -287,15 +286,15 @@
     {
       "args": [
         "bf.mexists",
-        "PATTERN",
+        "DOCS",
         "$",
-        "LEFT",
+        "TRACKING",
         "10",
-        "ACQUIRE",
+        "i8",
         "k6"
       ],
       "keys": [
-        "PATTERN"
+        "DOCS"
       ]
     },
     {
@@ -316,12 +315,12 @@
     {
       "args": [
         "bf.reserve",
-        "GROUP",
+        "MAX",
         "1",
         "2"
       ],
       "keys": [
-        "GROUP"
+        "MAX"
       ]
     },
     {
@@ -333,10 +332,10 @@
     {
       "args": [
         "bitcount",
-        "USERS"
+        "CREATECONSUMER"
       ],
       "keys": [
-        "USERS"
+        "CREATECONSUMER"
       ]
     },
     {
@@ -351,19 +350,19 @@
     {
       "args": [
         "bitcount",
-        "STREAM"
+        "GROUPS"
       ],
       "keys": [
-        "STREAM"
+        "GROUPS"
       ]
     },
     {
       "args": [
         "bitcount",
-        "EXISTS"
+        "SHARDS"
       ],
       "keys": [
-        "EXISTS"
+        "SHARDS"
       ]
     },
     {
@@ -378,28 +377,28 @@
     {
       "args": [
         "bitcount",
-        "SETID"
+        "$"
       ],
       "keys": [
-        "SETID"
+        "$"
       ]
     },
     {
       "args": [
         "bitfield",
-        "SAVE"
+        "MAXLEN"
       ],
       "keys": [
-        "SAVE"
+        "MAXLEN"
       ]
     },
     {
       "args": [
         "bitfield",
-        "GET"
+        "$"
       ],
       "keys": [
-        "GET"
+        "$"
       ]
     },
     {
@@ -414,28 +413,46 @@
     {
       "args": [
         "bitfield",
-        "RESET"
+        "GET"
       ],
       "keys": [
-        "RESET"
+        "GET"
       ]
     },
     {
       "args": [
         "bitfield",
-        "LATEST"
+        "DELETE"
       ],
       "keys": [
-        "LATEST"
+        "DELETE"
       ]
     },
     {
       "args": [
         "bitfield",
-        "OVERFLOW"
+        "EXISTS"
       ],
       "keys": [
-        "OVERFLOW"
+        "EXISTS"
+      ]
+    },
+    {
+      "args": [
+        "bitfield_ro",
+        "NODES"
+      ],
+      "keys": [
+        "NODES"
+      ]
+    },
+    {
+      "args": [
+        "bitfield_ro",
+        "MIN"
+      ],
+      "keys": [
+        "MIN"
       ]
     },
     {
@@ -450,46 +467,28 @@
     {
       "args": [
         "bitfield_ro",
-        "MYID"
+        "TRACKING"
       ],
       "keys": [
-        "MYID"
+        "TRACKING"
       ]
     },
     {
       "args": [
         "bitfield_ro",
-        "INCRBY"
+        "DOCS"
       ],
       "keys": [
-        "INCRBY"
+        "DOCS"
       ]
     },
     {
       "args": [
         "bitfield_ro",
-        "DELCONSUMER"
+        "SUBSCRIBE"
       ],
       "keys": [
-        "DELCONSUMER"
-      ]
-    },
-    {
-      "args": [
-        "bitfield_ro",
-        "REFCOUNT"
-      ],
-      "keys": [
-        "REFCOUNT"
-      ]
-    },
-    {
-      "args": [
-        "bitfield_ro",
-        "STREAMS"
-      ],
-      "keys": [
-        "STREAMS"
+        "SUBSCRIBE"
       ]
     },
     {
@@ -556,11 +555,11 @@
     {
       "args": [
         "bitpos",
-        "MAX",
+        "COMPLETE",
         "1"
       ],
       "keys": [
-        "MAX"
+        "COMPLETE"
       ]
     },
     {
@@ -578,11 +577,11 @@
     {
       "args": [
         "bitpos",
-        "OVERFLOW",
+        "BLOCK",
         "0"
       ],
       "keys": [
-        "OVERFLOW"
+        "BLOCK"
       ]
     },
     {
@@ -642,8 +641,8 @@
     {
       "args": [
         "blpop",
-        "MIN",
-        "LOAD",
+        "BEGIN",
+        "IDLETIME",
         ">",
         "+",
         "0"
@@ -651,8 +650,8 @@
       "keys": [
         "+",
         ">",
-        "LOAD",
-        "MIN"
+        "BEGIN",
+        "IDLETIME"
       ]
     },
     {
@@ -660,8 +659,8 @@
         "blpop",
         ">",
         "-1",
-        "MAXLEN",
-        "DESTROY",
+        "FROMLONLAT",
+        "ON",
         ">",
         "$",
         "-1",
@@ -673,43 +672,43 @@
         "-1",
         ">",
         ">",
-        "DESTROY",
-        "MAXLEN"
+        "FROMLONLAT",
+        "ON"
       ]
     },
     {
       "args": [
         "blpop",
-        "GROUPS",
+        "SET",
         "USERS",
         "1.5"
       ],
       "keys": [
-        "GROUPS",
+        "SET",
         "USERS"
       ]
     },
     {
       "args": [
         "blpop",
-        "DOCS",
-        "$.a",
+        "GETNAME",
+        "KILL",
         "+",
         "10"
       ],
       "keys": [
-        "$.a",
         "+",
-        "DOCS"
+        "GETNAME",
+        "KILL"
       ]
     },
     {
       "args": [
         "blpop",
-        "DELCONSUMER",
+        "WRAP",
         "v2",
-        "GROUP",
-        "REFCOUNT",
+        "CONSUMERS",
+        "LATEST",
         "$",
         "f6",
         "0",
@@ -718,9 +717,9 @@
       "keys": [
         "$",
         "0",
-        "DELCONSUMER",
-        "GROUP",
-        "REFCOUNT",
+        "CONSUMERS",
+        "LATEST",
+        "WRAP",
         "f6",
         "v2"
       ]
@@ -740,7 +739,7 @@
     {
       "args": [
         "brpop",
-        "u8",
+        "KEYSLOT",
         "k2",
         "f3",
         ">",
@@ -750,16 +749,16 @@
       "keys": [
         "$",
         ">",
+        "KEYSLOT",
         "f3",
-        "k2",
-        "u8"
+        "k2"
       ]
     },
     {
       "args": [
         "brpop",
-        "STREAMS",
-        "FIND",
+        "KEYSLOT",
+        "LEN",
         "2",
         "1",
         "10",
@@ -773,80 +772,80 @@
         "1.5",
         "10",
         "2",
-        "FIND",
+        "KEYSLOT",
+        "LEN"
+      ]
+    },
+    {
+      "args": [
+        "brpop",
+        "SAVE",
+        "$",
+        "1.5"
+      ],
+      "keys": [
+        "$",
+        "SAVE"
+      ]
+    },
+    {
+      "args": [
+        "brpop",
+        "SLOTS",
+        "+",
+        "STREAMS",
+        "2",
+        "1.5"
+      ],
+      "keys": [
+        "+",
+        "2",
+        "SLOTS",
         "STREAMS"
       ]
     },
     {
       "args": [
         "brpop",
-        "LEFT",
-        "$",
-        "1.5"
-      ],
-      "keys": [
-        "$",
-        "LEFT"
-      ]
-    },
-    {
-      "args": [
-        "brpop",
-        "SETUSER",
-        "+",
-        "RIGHT",
-        "2",
-        "1.5"
-      ],
-      "keys": [
-        "+",
-        "2",
-        "RIGHT",
-        "SETUSER"
-      ]
-    },
-    {
-      "args": [
-        "brpop",
-        "CAT",
+        "OFF",
         "2"
       ],
       "keys": [
-        "CAT"
+        "OFF"
       ]
     },
     {
       "args": [
         "bzpopmax",
-        "LATEST",
-        "LOAD",
+        "FLUSH",
+        "ENCODING",
         "1",
-        "CREATECONSUMER",
+        "BLOCK",
         "1"
       ],
       "keys": [
         "1",
-        "CREATECONSUMER",
-        "LATEST",
-        "LOAD"
+        "BLOCK",
+        "ENCODING",
+        "FLUSH"
       ]
     },
     {
       "args": [
         "bzpopmax",
         ">",
-        "STREAMS",
+        "STORE",
         "10",
         "v4",
-        "COUNT",
+        "SHARDS",
         "k6",
         "0"
       ],
       "keys": [
         "10",
         ">",
-        "COUNT",
-        "STREAMS",
+        "SHARDS",
+        "STORE",
         "k6",
         "v4"
       ]
@@ -854,7 +853,7 @@
     {
       "args": [
         "bzpopmax",
-        "BYRADIUS",
+        "LATEST",
         "1",
         "f3",
         "1",
@@ -863,19 +862,19 @@
       "keys": [
         "1",
         "1",
-        "BYRADIUS",
+        "LATEST",
         "f3"
       ]
     },
     {
       "args": [
         "bzpopmax",
-        "FROMLONLAT",
+        "BLOCK",
         "*",
         "k3",
         "v4",
         "0",
-        "KEYSLOT",
+        "MYID",
         "1",
         "1.5"
       ],
@@ -883,8 +882,8 @@
         "*",
         "0",
         "1",
-        "FROMLONLAT",
-        "KEYSLOT",
+        "BLOCK",
+        "MYID",
         "k3",
         "v4"
       ]
@@ -892,14 +891,14 @@
     {
       "args": [
         "bzpopmax",
-        "GROUP",
+        "BEGIN",
         "-",
         "k3",
         "10"
       ],
       "keys": [
         "-",
-        "GROUP",
+        "BEGIN",
         "k3"
       ]
     },
@@ -934,69 +933,69 @@
     {
       "args": [
         "bzpopmin",
-        "u8",
+        "SLOTS",
         "a2",
-        "USAGE",
+        "PATTERN",
         "v4",
         "1",
         "1",
-        "DESTROY",
+        "FREQ",
         "2"
       ],
       "keys": [
         "1",
         "1",
-        "DESTROY",
-        "USAGE",
+        "FREQ",
+        "PATTERN",
+        "SLOTS",
         "a2",
-        "u8",
         "v4"
       ]
     },
     {
       "args": [
         "bzpopmin",
-        "ENCODING",
+        "WRAP",
         "2"
       ],
       "keys": [
-        "ENCODING"
+        "WRAP"
       ]
     },
     {
       "args": [
         "bzpopmin",
-        "SETID",
+        "CREATE",
         "f2",
         "1",
         "1"
       ],
       "keys": [
         "1",
-        "SETID",
+        "CREATE",
         "f2"
       ]
     },
     {
       "args": [
         "bzpopmin",
-        "ACQUIRE",
+        "SHARDS",
         "2"
       ],
       "keys": [
-        "ACQUIRE"
+        "SHARDS"
       ]
     },
     {
       "args": [
         "bzpopmin",
-        "INFO",
+        "SLOTS",
         "a2",
         "a3",
         "0"
       ],
       "keys": [
-        "INFO",
+        "SLOTS",
         "a2",
         "a3"
       ]
@@ -1025,8 +1024,16 @@
     {
       "args": [
         "client",
+        "SETNAME",
+        "1"
+      ],
+      "keys": []
+    },
+    {
+      "args": [
+        "client",
         "KILL",
-        "0"
+        "-"
       ],
       "keys": []
     },
@@ -1040,30 +1047,14 @@
     {
       "args": [
         "client",
-        "GETNAME"
-      ],
-      "keys": []
-    },
-    {
-      "args": [
-        "client",
-        "SETNAME",
-        "f2"
-      ],
-      "keys": []
-    },
-    {
-      "args": [
-        "client",
         "ID"
       ],
       "keys": []
     },
     {
       "args": [
-        "cluster",
-        "KEYSLOT",
-        "a2"
+        "client",
+        "GETNAME"
       ],
       "keys": []
     },
@@ -1077,14 +1068,14 @@
     {
       "args": [
         "cluster",
-        "MYID"
+        "SHARDS"
       ],
       "keys": []
     },
     {
       "args": [
         "cluster",
-        "NODES"
+        "MYID"
       ],
       "keys": []
     },
@@ -1098,7 +1089,15 @@
     {
       "args": [
         "cluster",
-        "SHARDS"
+        "NODES"
+      ],
+      "keys": []
+    },
+    {
+      "args": [
+        "cluster",
+        "KEYSLOT",
+        "*"
       ],
       "keys": []
     },
@@ -1119,22 +1118,10 @@
       "args": [
         "command",
         "INFO",
-        "-1",
-        "1.5",
-        "f4",
-        "b5"
-      ],
-      "keys": []
-    },
-    {
-      "args": [
-        "command",
-        "INFO",
-        "k2",
-        "-1",
-        "1",
-        "CREATECONSUMER",
-        "*"
+        ">",
+        "-",
+        "INCRBY",
+        "LOAD"
       ],
       "keys": []
     },
@@ -1142,15 +1129,24 @@
       "args": [
         "command",
         "DOCS",
-        "v2",
-        "f3"
+        "*",
+        "1.5"
       ],
       "keys": []
     },
     {
       "args": [
         "command",
-        "INFO"
+        "DOCS"
+      ],
+      "keys": []
+    },
+    {
+      "args": [
+        "command",
+        "INFO",
+        "+",
+        "k3"
       ],
       "keys": []
     },
@@ -1158,10 +1154,10 @@
       "args": [
         "config",
         "SET",
-        "$",
-        "KEYSLOT",
+        "0",
+        "-1",
         "v4",
-        "INCRBY"
+        "RESET"
       ],
       "keys": []
     },
@@ -1169,8 +1165,16 @@
       "args": [
         "config",
         "SET",
-        "2",
-        "a3"
+        "10",
+        "2"
+      ],
+      "keys": []
+    },
+    {
+      "args": [
+        "config",
+        "GET",
+        "STORE"
       ],
       "keys": []
     },
@@ -1179,64 +1183,56 @@
         "config",
         "SET",
         "b2",
-        "LATEST",
-        "LOAD",
-        "2",
-        "f6",
-        "1"
-      ],
-      "keys": []
-    },
-    {
-      "args": [
-        "config",
-        "GET",
-        "-1"
+        "TRACKING",
+        "1.5",
+        "IDLETIME",
+        "*",
+        "-"
       ],
       "keys": []
     },
     {
       "args": [
         "copy",
-        "COUNT",
+        "CREATECONSUMER",
         "v2"
       ],
       "keys": [
-        "COUNT",
+        "CREATECONSUMER",
         "v2"
       ]
     },
     {
       "args": [
         "copy",
-        "GETKEYS",
-        "TRACKING"
+        "MIN",
+        "IDLETIME"
       ],
       "keys": [
-        "GETKEYS",
-        "TRACKING"
+        "IDLETIME",
+        "MIN"
       ]
     },
     {
       "args": [
         "copy",
         "*",
-        "BEGIN"
+        "DROP"
       ],
       "keys": [
         "*",
-        "BEGIN"
+        "DROP"
       ]
     },
     {
       "args": [
         "copy",
-        "BEGIN",
-        "RELEASE"
+        "MYID",
+        "STREAM"
       ],
       "keys": [
-        "BEGIN",
-        "RELEASE"
+        "MYID",
+        "STREAM"
       ]
     },
     {
@@ -1270,20 +1266,20 @@
     {
       "args": [
         "decr",
-        "MIN"
+        "DROP"
       ],
       "keys": [
-        "MIN"
+        "DROP"
       ]
     },
     {
       "args": [
         "decrby",
-        "u8",
+        "COMPLETE",
         "2"
       ],
       "keys": [
-        "u8"
+        "COMPLETE"
       ]
     },
     {
@@ -1302,10 +1298,10 @@
     {
       "args": [
         "del",
-        "FREQ"
+        "BEGIN"
       ],
       "keys": [
-        "FREQ"
+        "BEGIN"
       ]
     },
     {
@@ -1337,31 +1333,31 @@
         "del",
         ">",
         "0",
-        "FIND",
+        "BYRADIUS",
         "f4"
       ],
       "keys": [
         "0",
         ">",
-        "FIND",
+        "BYRADIUS",
         "f4"
       ]
     },
     {
       "args": [
         "del",
-        "DOCS",
-        "STREAMS",
-        "COUNT",
+        "ID",
+        "SET",
+        "DROP",
         "1.5",
         "*"
       ],
       "keys": [
         "*",
         "1.5",
-        "COUNT",
-        "DOCS",
-        "STREAMS"
+        "DROP",
+        "ID",
+        "SET"
       ]
     },
     {
@@ -1384,10 +1380,10 @@
     {
       "args": [
         "dump",
-        "km"
+        "SAVE"
       ],
       "keys": [
-        "km"
+        "SAVE"
       ]
     },
     {
@@ -1415,7 +1411,7 @@
     {
       "args": [
         "eval",
-        "DESTROY",
+        "$",
         "0",
         "k3",
         "v4",
@@ -1426,13 +1422,13 @@
     {
       "args": [
         "eval",
-        "LEFT",
+        "RIGHT",
         "1",
         ">",
-        "COUNT",
+        "ENCODING",
         "0",
         "v6",
-        "i8"
+        "RESET"
       ],
       "keys": [
         ">"
@@ -1441,13 +1437,13 @@
     {
       "args": [
         "eval",
-        "DESTROY",
+        "BYRADIUS",
         "0",
-        "$.a",
+        "DESTROY",
         "COMPLETE",
         "b5",
-        "MIN",
-        "FLUSH",
+        "INCRBY",
+        "$",
         "-1"
       ],
       "keys": []
@@ -1458,8 +1454,8 @@
         "$",
         "0",
         "$",
-        "ENCODING",
-        "INCRBY",
+        "BEGIN",
+        "OVERFLOW",
         "1",
         "f7"
       ],
@@ -1468,7 +1464,7 @@
     {
       "args": [
         "eval",
-        "KILL",
+        "COMPLETE",
         "0",
         "1"
       ],
@@ -1491,21 +1487,21 @@
         "evalsha",
         "-",
         "1",
-        "GETUSER",
+        "SET",
         "1.5"
       ],
       "keys": [
-        "GETUSER"
+        "SET"
       ]
     },
     {
       "args": [
         "evalsha",
-        "PATTERN",
+        "DELETE",
         "0",
         "$",
         "k4",
-        "km",
+        "COMPLETE",
         "10"
       ],
       "keys": []
@@ -1513,23 +1509,23 @@
     {
       "args": [
         "evalsha",
-        "TRACKING",
+        "SUBSCRIBE",
         "0",
         "1.5",
         "f4",
-        "ACQUIRE"
+        "GROUP"
       ],
       "keys": []
     },
     {
       "args": [
         "evalsha",
-        "FIND",
+        "GET",
         "2",
         "1.5",
         "10",
         "10",
-        "CONSUMERS"
+        "LOAD"
       ],
       "keys": [
         "1.5",
@@ -1539,7 +1535,7 @@
     {
       "args": [
         "evalsha",
-        "COMPLETE",
+        "LEN",
         "0"
       ],
       "keys": []
@@ -1553,20 +1549,20 @@
     {
       "args": [
         "exists",
-        "SAVE"
+        "GETNAME"
       ],
       "keys": [
-        "SAVE"
+        "GETNAME"
       ]
     },
     {
       "args": [
         "exists",
-        "SET",
+        "FIND",
         "v2"
       ],
       "keys": [
-        "SET",
+        "FIND",
         "v2"
       ]
     },
@@ -1586,14 +1582,14 @@
     {
       "args": [
         "exists",
-        "NODES",
+        "USERS",
         "v2",
         "f3",
         ">"
       ],
       "keys": [
         ">",
-        "NODES",
+        "USERS",
         "f3",
         "v2"
       ]
@@ -1601,7 +1597,7 @@
     {
       "args": [
         "exists",
-        "IDLETIME",
+        "MINID",
         "1",
         "1",
         "f4",
@@ -1611,7 +1607,7 @@
         "+",
         "1",
         "1",
-        "IDLETIME",
+        "MINID",
         "f4"
       ]
     },
@@ -1621,8 +1617,8 @@
         "10",
         "2",
         "10",
-        "MIN",
-        "STATUS",
+        "SAVE",
+        "MINID",
         "+"
       ],
       "keys": [
@@ -1630,38 +1626,38 @@
         "10",
         "10",
         "2",
-        "MIN",
-        "STATUS"
+        "MINID",
+        "SAVE"
       ]
     },
     {
       "args": [
         "expire",
-        "USAGE",
+        "SETUSER",
         "-1"
       ],
       "keys": [
-        "USAGE"
+        "SETUSER"
       ]
     },
     {
       "args": [
         "expire",
-        "ON",
+        "FIND",
         "-1"
       ],
       "keys": [
-        "ON"
+        "FIND"
       ]
     },
     {
       "args": [
         "expire",
-        "STATUS",
+        "ENCODING",
         "0"
       ],
       "keys": [
-        "STATUS"
+        "ENCODING"
       ]
     },
     {
@@ -1687,11 +1683,11 @@
     {
       "args": [
         "expire",
-        "km",
+        "WHOAMI",
         "-1"
       ],
       "keys": [
-        "km"
+        "WHOAMI"
       ]
     },
     {
@@ -1717,18 +1713,8 @@
     {
       "args": [
         "expireat",
-        "LATEST",
-        "-1"
-      ],
-      "keys": [
-        "LATEST"
-      ]
-    },
-    {
-      "args": [
-        "expireat",
         "u8",
-        "10"
+        "-1"
       ],
       "keys": [
         "u8"
@@ -1737,30 +1723,40 @@
     {
       "args": [
         "expireat",
-        "FIND",
-        "1"
+        "BYRADIUS",
+        "10"
       ],
       "keys": [
-        "FIND"
+        "BYRADIUS"
       ]
     },
     {
       "args": [
         "expireat",
-        "INFO",
+        "MAX",
+        "1"
+      ],
+      "keys": [
+        "MAX"
+      ]
+    },
+    {
+      "args": [
+        "expireat",
+        "2",
         "10"
       ],
       "keys": [
-        "INFO"
+        "2"
       ]
     },
     {
       "args": [
         "expiretime",
-        "USERS"
+        "CAT"
       ],
       "keys": [
-        "USERS"
+        "CAT"
       ]
     },
     {
@@ -1775,19 +1771,19 @@
     {
       "args": [
         "expiretime",
-        "CREATECONSUMER"
+        "GROUPS"
       ],
       "keys": [
-        "CREATECONSUMER"
+        "GROUPS"
       ]
     },
     {
       "args": [
         "expiretime",
-        "LEFT"
+        "STATUS"
       ],
       "keys": [
-        "LEFT"
+        "STATUS"
       ]
     },
     {
@@ -1802,10 +1798,10 @@
     {
       "args": [
         "expiretime",
-        "ENCODING"
+        "COUNT"
       ],
       "keys": [
-        "ENCODING"
+        "COUNT"
       ]
     },
     {
@@ -1825,7 +1821,7 @@
     {
       "args": [
         "fcall",
-        "WHOAMI",
+        "PATTERN",
         "0",
         "1"
       ],
@@ -1834,34 +1830,34 @@
     {
       "args": [
         "fcall",
-        "RESET",
+        "WHOAMI",
         "2",
         "2",
-        "ID",
+        "CONSUMERS",
         "k5"
       ],
       "keys": [
         "2",
-        "ID"
+        "CONSUMERS"
       ]
     },
     {
       "args": [
         "fcall",
-        "ACQUIRE",
+        "u8",
         "2",
-        "CREATE",
+        "NODES",
         "-"
       ],
       "keys": [
         "-",
-        "CREATE"
+        "NODES"
       ]
     },
     {
       "args": [
         "fcall",
-        "DESTROY",
+        "MAXLEN",
         "0",
         "10"
       ],
@@ -1877,38 +1873,38 @@
         "$",
         "v6",
         "k7",
-        "GROUPS"
+        "BEGIN"
       ],
       "keys": []
     },
     {
       "args": [
         "fillget",
-        "SETID",
+        "RELEASE",
         "2"
       ],
       "keys": [
-        "SETID"
+        "RELEASE"
       ]
     },
     {
       "args": [
         "fillget",
-        "GETKEYS",
+        "GROUP",
         "10"
       ],
       "keys": [
-        "GETKEYS"
+        "GROUP"
       ]
     },
     {
       "args": [
         "fillget",
-        "LOAD",
+        "ABORT",
         "2"
       ],
       "keys": [
-        "LOAD"
+        "ABORT"
       ]
     },
     {
@@ -1956,49 +1952,49 @@
     {
       "args": [
         "fillset",
-        "BEGIN",
+        "KILL",
         ">",
         "10",
         "1"
       ],
       "keys": [
-        "BEGIN"
+        "KILL"
       ]
     },
     {
       "args": [
         "fillset",
-        "LIST",
+        "ON",
         "+",
         "1",
         "1"
       ],
       "keys": [
-        "LIST"
+        "ON"
+      ]
+    },
+    {
+      "args": [
+        "fillset",
+        "MIN",
+        "*",
+        "2",
+        "2"
+      ],
+      "keys": [
+        "MIN"
       ]
     },
     {
       "args": [
         "fillset",
         "CREATECONSUMER",
-        "*",
-        "2",
-        "2"
-      ],
-      "keys": [
-        "CREATECONSUMER"
-      ]
-    },
-    {
-      "args": [
-        "fillset",
-        "SETID",
         "-",
         "10",
         "10"
       ],
       "keys": [
-        "SETID"
+        "CREATECONSUMER"
       ]
     },
     {
@@ -2028,23 +2024,6 @@
     {
       "args": [
         "function",
-        "LOAD",
-        ">",
-        "a3"
-      ],
-      "keys": []
-    },
-    {
-      "args": [
-        "function",
-        "DELETE",
-        "1.5"
-      ],
-      "keys": []
-    },
-    {
-      "args": [
-        "function",
         "LIST"
       ],
       "keys": []
@@ -2052,8 +2031,16 @@
     {
       "args": [
         "function",
+        "DELETE",
+        "LATEST"
+      ],
+      "keys": []
+    },
+    {
+      "args": [
+        "function",
         "LOAD",
-        "STREAM",
+        "1.5",
         "f3"
       ],
       "keys": []
@@ -2062,8 +2049,8 @@
       "args": [
         "function",
         "LOAD",
-        "DELETE",
-        "ID"
+        "1.5",
+        "BEGIN"
       ],
       "keys": []
     },
@@ -2071,8 +2058,17 @@
       "args": [
         "function",
         "LOAD",
-        "1",
-        "1.5"
+        "k2",
+        "f3"
+      ],
+      "keys": []
+    },
+    {
+      "args": [
+        "function",
+        "LOAD",
+        "10",
+        "k3"
       ],
       "keys": []
     },
@@ -2091,7 +2087,7 @@
     {
       "args": [
         "geoadd",
-        "FLUSH",
+        "$",
         "1.5",
         "-1",
         "+",
@@ -2100,19 +2096,19 @@
         "$"
       ],
       "keys": [
-        "FLUSH"
+        "$"
       ]
     },
     {
       "args": [
         "geoadd",
-        "FREQ",
+        "EXISTS",
         "0",
         "0",
         ">"
       ],
       "keys": [
-        "FREQ"
+        "EXISTS"
       ]
     },
     {
@@ -2130,13 +2126,13 @@
     {
       "args": [
         "geoadd",
-        "MIN",
+        "ID",
         "2",
         "-1",
         "1"
       ],
       "keys": [
-        "MIN"
+        "ID"
       ]
     },
     {
@@ -2154,19 +2150,19 @@
     {
       "args": [
         "geodist",
-        "ID",
+        "GROUPS",
         "v2",
         "b3"
       ],
       "keys": [
-        "ID"
+        "GROUPS"
       ]
     },
     {
       "args": [
         "geodist",
         "k1",
-        "COMPLETE",
+        "BEGIN",
         "f3"
       ],
       "keys": [
@@ -2176,12 +2172,12 @@
     {
       "args": [
         "geodist",
-        "INCRBY",
+        "OVERFLOW",
         "1.5",
         ">"
       ],
       "keys": [
-        "INCRBY"
+        "OVERFLOW"
       ]
     },
     {
@@ -2189,7 +2185,7 @@
         "geodist",
         ">",
         "-",
-        "RIGHT"
+        "FREQ"
       ],
       "keys": [
         ">"
@@ -2198,12 +2194,12 @@
     {
       "args": [
         "geodist",
-        "DESTROY",
+        "KEYSLOT",
         "k2",
         "b3"
       ],
       "keys": [
-        "DESTROY"
+        "KEYSLOT"
       ]
     },
     {
@@ -2220,11 +2216,11 @@
     {
       "args": [
         "geohash",
-        "FREQ",
+        "KEYSLOT",
         "$"
       ],
       "keys": [
-        "FREQ"
+        "KEYSLOT"
       ]
     },
     {
@@ -2241,26 +2237,26 @@
     {
       "args": [
         "geohash",
-        "STREAMS",
+        "OFF",
         "b2",
-        "DOCS",
+        "CAT",
         "*"
       ],
       "keys": [
-        "STREAMS"
+        "OFF"
       ]
     },
     {
       "args": [
         "geohash",
-        "GETUSER",
+        "BLOCK",
         "b2",
         ">",
         "v4",
         "+"
       ],
       "keys": [
-        "GETUSER"
+        "BLOCK"
       ]
     },
     {
@@ -2283,7 +2279,7 @@
         "0",
         "2",
         "-",
-        "LATEST",
+        "MAX",
         "1.5",
         "-1",
         "v7"
@@ -2295,11 +2291,11 @@
     {
       "args": [
         "geopos",
-        "SLOTS",
+        "BYRADIUS",
         "-1"
       ],
       "keys": [
-        "SLOTS"
+        "BYRADIUS"
       ]
     },
     {
@@ -2317,8 +2313,8 @@
       "args": [
         "geopos",
         ">",
-        "ID",
-        "SLOTS",
+        "LOAD",
+        "OFF",
         "2"
       ],
       "keys": [
@@ -2328,14 +2324,14 @@
     {
       "args": [
         "geopos",
-        "i8",
+        "SETUSER",
         "1",
         "a3",
         "b4",
-        "RIGHT"
+        "FLUSH"
       ],
       "keys": [
-        "i8"
+        "SETUSER"
       ]
     },
     {
@@ -2346,7 +2342,7 @@
         "$",
         ">",
         "1.5",
-        "EXISTS"
+        "CREATE"
       ],
       "keys": [
         "k1"
@@ -2355,16 +2351,16 @@
     {
       "args": [
         "geopos",
-        "DROP",
+        "SETID",
         "1.5",
-        "REFCOUNT",
-        "MAX",
+        "BYRADIUS",
+        "STREAM",
         "*",
         "v6",
-        "MYID"
+        "IDLETIME"
       ],
       "keys": [
-        "DROP"
+        "SETID"
       ]
     },
     {
@@ -2518,11 +2514,11 @@
     {
       "args": [
         "getex",
-        "ACQUIRE",
+        "CREATE",
         "2"
       ],
       "keys": [
-        "ACQUIRE"
+        "CREATE"
       ]
     },
     {
@@ -2538,11 +2534,11 @@
     {
       "args": [
         "getex",
-        "GROUP",
+        "km",
         "1"
       ],
       "keys": [
-        "GROUP"
+        "km"
       ]
     },
     {
@@ -2558,21 +2554,21 @@
     {
       "args": [
         "getex",
-        "CREATE",
+        "IDLETIME",
         "1"
       ],
       "keys": [
-        "CREATE"
+        "IDLETIME"
       ]
     },
     {
       "args": [
         "getex",
-        "GROUPS",
+        "COMPLETE",
         "1"
       ],
       "keys": [
-        "GROUPS"
+        "COMPLETE"
       ]
     },
     {
@@ -2589,45 +2585,45 @@
     {
       "args": [
         "getrange",
-        "INCRBY",
+        "FIND",
         "10",
         "0"
       ],
       "keys": [
-        "INCRBY"
+        "FIND"
       ]
     },
     {
       "args": [
         "getrange",
-        "STORE",
+        "SAVE",
         "1",
         "2"
       ],
       "keys": [
-        "STORE"
+        "SAVE"
       ]
     },
     {
       "args": [
         "getrange",
-        "MIN",
+        "TRACKING",
         "10",
         "0"
       ],
       "keys": [
-        "MIN"
+        "TRACKING"
       ]
     },
     {
       "args": [
         "getrange",
-        "FREQ",
+        "ACQUIRE",
         "2",
         "10"
       ],
       "keys": [
-        "FREQ"
+        "ACQUIRE"
       ]
     },
     {
@@ -2654,18 +2650,18 @@
     {
       "args": [
         "hdel",
-        "GETUSER",
+        "SAVE",
         "10"
       ],
       "keys": [
-        "GETUSER"
+        "SAVE"
       ]
     },
     {
       "args": [
         "hdel",
         "b1",
-        "DELCONSUMER",
+        "OFF",
         "*"
       ],
       "keys": [
@@ -2688,7 +2684,7 @@
       "args": [
         "hdel",
         ">",
-        "DELCONSUMER",
+        "CREATECONSUMER",
         ">",
         "+",
         "1.5"
@@ -2700,15 +2696,15 @@
     {
       "args": [
         "hdel",
-        "EXISTS",
+        "COMPLETE",
         "-1",
         "k3",
-        "REFCOUNT",
+        "OFF",
         "-",
         "v6"
       ],
       "keys": [
-        "EXISTS"
+        "COMPLETE"
       ]
     },
     {
@@ -2718,9 +2714,9 @@
         "-1",
         "-",
         "1",
-        "SETID",
+        "GETKEYS",
         "b6",
-        "i8"
+        "STREAMS"
       ],
       "keys": [
         "1.5"
@@ -2762,21 +2758,21 @@
     {
       "args": [
         "hexists",
-        "RESET",
+        "ID",
         "+"
       ],
       "keys": [
-        "RESET"
+        "ID"
       ]
     },
     {
       "args": [
         "hexists",
-        "COMPLETE",
+        "USERS",
         "0"
       ],
       "keys": [
-        "COMPLETE"
+        "USERS"
       ]
     },
     {
@@ -2792,11 +2788,11 @@
     {
       "args": [
         "hexists",
-        "SETUSER",
+        "DELCONSUMER",
         "1"
       ],
       "keys": [
-        "SETUSER"
+        "DELCONSUMER"
       ]
     },
     {
@@ -2860,41 +2856,41 @@
     {
       "args": [
         "hget",
-        "REFCOUNT",
-        "NODES"
+        "LOAD",
+        "WHOAMI"
       ],
       "keys": [
-        "REFCOUNT"
+        "LOAD"
       ]
     },
     {
       "args": [
         "hget",
-        "OFF",
+        "OVERFLOW",
         "b2"
       ],
       "keys": [
-        "OFF"
+        "OVERFLOW"
       ]
     },
     {
       "args": [
         "hget",
-        "USERS",
+        "SET",
         "10"
       ],
       "keys": [
-        "USERS"
+        "SET"
       ]
     },
     {
       "args": [
         "hget",
-        "$.a",
+        "DOCS",
         "1"
       ],
       "keys": [
-        "$.a"
+        "DOCS"
       ]
     },
     {
@@ -2910,7 +2906,7 @@
       "args": [
         "hincrby",
         "f1",
-        "DOCS",
+        "MIN",
         "1"
       ],
       "keys": [
@@ -2920,108 +2916,31 @@
     {
       "args": [
         "hincrby",
-        "SAVE",
+        "SUBSCRIBE",
         "*",
         "-1"
       ],
       "keys": [
-        "SAVE"
+        "SUBSCRIBE"
       ]
     },
     {
       "args": [
         "hincrby",
-        "BEGIN",
+        "IDLETIME",
         "*",
         "1"
       ],
       "keys": [
-        "BEGIN"
+        "IDLETIME"
       ]
     },
     {
       "args": [
         "hincrby",
-        "CREATECONSUMER",
+        "WHOAMI",
         "$",
         "1"
-      ],
-      "keys": [
-        "CREATECONSUMER"
-      ]
-    },
-    {
-      "args": [
-        "hincrby",
-        "$.a",
-        "2",
-        "10"
-      ],
-      "keys": [
-        "$.a"
-      ]
-    },
-    {
-      "args": [
-        "hincrby",
-        "CAT",
-        "DELETE",
-        "1"
-      ],
-      "keys": [
-        "CAT"
-      ]
-    },
-    {
-      "args": [
-        "hincrbyfloat",
-        "TRACKING",
-        "2",
-        "-1"
-      ],
-      "keys": [
-        "TRACKING"
-      ]
-    },
-    {
-      "args": [
-        "hincrbyfloat",
-        "FLUSH",
-        "SLOTS",
-        "1.5"
-      ],
-      "keys": [
-        "FLUSH"
-      ]
-    },
-    {
-      "args": [
-        "hincrbyfloat",
-        "KILL",
-        "REFCOUNT",
-        "1.5"
-      ],
-      "keys": [
-        "KILL"
-      ]
-    },
-    {
-      "args": [
-        "hincrbyfloat",
-        "BEGIN",
-        "v2",
-        "1.5"
-      ],
-      "keys": [
-        "BEGIN"
-      ]
-    },
-    {
-      "args": [
-        "hincrbyfloat",
-        "WHOAMI",
-        "1",
-        "-1"
       ],
       "keys": [
         "WHOAMI"
@@ -3029,13 +2948,90 @@
     },
     {
       "args": [
+        "hincrby",
+        "RESET",
+        "2",
+        "10"
+      ],
+      "keys": [
+        "RESET"
+      ]
+    },
+    {
+      "args": [
+        "hincrby",
+        "ENCODING",
+        "WRAP",
+        "1"
+      ],
+      "keys": [
+        "ENCODING"
+      ]
+    },
+    {
+      "args": [
         "hincrbyfloat",
-        "u8",
+        "DELCONSUMER",
+        "2",
+        "-1"
+      ],
+      "keys": [
+        "DELCONSUMER"
+      ]
+    },
+    {
+      "args": [
+        "hincrbyfloat",
+        "STREAMS",
+        "SUBSCRIBE",
+        "1.5"
+      ],
+      "keys": [
+        "STREAMS"
+      ]
+    },
+    {
+      "args": [
+        "hincrbyfloat",
+        "BYRADIUS",
+        "CREATE",
+        "1.5"
+      ],
+      "keys": [
+        "BYRADIUS"
+      ]
+    },
+    {
+      "args": [
+        "hincrbyfloat",
+        "DESTROY",
+        "v2",
+        "1.5"
+      ],
+      "keys": [
+        "DESTROY"
+      ]
+    },
+    {
+      "args": [
+        "hincrbyfloat",
+        "CONSUMERS",
+        "1",
+        "-1"
+      ],
+      "keys": [
+        "CONSUMERS"
+      ]
+    },
+    {
+      "args": [
+        "hincrbyfloat",
+        "PATTERN",
         "10",
         "1.5"
       ],
       "keys": [
-        "u8"
+        "PATTERN"
       ]
     },
     {
@@ -3059,61 +3055,61 @@
     {
       "args": [
         "hmget",
-        "MAX",
+        "FREQ",
         "-1"
       ],
       "keys": [
-        "MAX"
+        "FREQ"
       ]
     },
     {
       "args": [
         "hmget",
-        "i8",
+        "INFO",
         "2",
         "0"
       ],
       "keys": [
-        "i8"
+        "INFO"
       ]
     },
     {
       "args": [
         "hmget",
-        "GETKEYS",
+        "CONSUMERS",
         ">",
         "10",
         "$"
       ],
       "keys": [
-        "GETKEYS"
+        "CONSUMERS"
       ]
     },
     {
       "args": [
         "hmget",
-        "TRACKING",
+        "KEYSLOT",
         "$",
-        "CONSUMERS",
+        "DELCONSUMER",
         "1.5",
         "a5"
       ],
       "keys": [
-        "TRACKING"
+        "KEYSLOT"
       ]
     },
     {
       "args": [
         "hmget",
-        "OFF",
+        "CREATECONSUMER",
         "f2",
-        "GET",
+        "OVERFLOW",
         "-",
         "-",
         "1.5"
       ],
       "keys": [
-        "OFF"
+        "CREATECONSUMER"
       ]
     },
     {
@@ -3122,9 +3118,9 @@
         "$",
         "a2",
         "2",
-        "USERS",
+        "SUBSCRIBE",
         ">",
-        "SLOTS",
+        "GROUPS",
         ">"
       ],
       "keys": [
@@ -3135,7 +3131,7 @@
       "args": [
         "hmset",
         "+",
-        "DELETE",
+        "STREAMS",
         "1.5"
       ],
       "keys": [
@@ -3145,14 +3141,14 @@
     {
       "args": [
         "hmset",
-        "GROUP",
+        "WRAP",
         "0",
         "*",
         "2",
         "a5"
       ],
       "keys": [
-        "GROUP"
+        "WRAP"
       ]
     },
     {
@@ -3161,9 +3157,9 @@
         "1",
         "+",
         "+",
-        "USERS",
+        "i8",
         "1.5",
-        "$.a",
+        "WRAP",
         "v7"
       ],
       "keys": [
@@ -3184,29 +3180,29 @@
     {
       "args": [
         "hmset",
-        "STORE",
-        "OFF",
+        "EXISTS",
+        "GROUP",
         "$",
         "$",
         "f5"
       ],
       "keys": [
-        "STORE"
+        "EXISTS"
       ]
     },
     {
       "args": [
         "hmset",
-        "km",
+        "IDLETIME",
         "*",
         "2",
         "1",
         "$",
-        "FREQ",
+        "ACQUIRE",
         "-1"
       ],
       "keys": [
-        "km"
+        "IDLETIME"
       ]
     },
     {
@@ -3274,19 +3270,19 @@
     {
       "args": [
         "hrandfield",
-        "$.a"
+        "STREAMS"
       ],
       "keys": [
-        "$.a"
+        "STREAMS"
       ]
     },
     {
       "args": [
         "hrandfield",
-        "USAGE"
+        "LOAD"
       ],
       "keys": [
-        "USAGE"
+        "LOAD"
       ]
     },
     {
@@ -3301,59 +3297,59 @@
     {
       "args": [
         "hrandfield",
-        "STORE",
+        "OVERFLOW",
         "10"
       ],
       "keys": [
-        "STORE"
+        "OVERFLOW"
       ]
     },
     {
       "args": [
         "hrandfield",
-        "FIND"
+        "SHARDS"
       ],
       "keys": [
-        "FIND"
+        "SHARDS"
       ]
     },
     {
       "args": [
         "hrandfield",
-        "DOCS"
+        "km"
       ],
       "keys": [
-        "DOCS"
+        "km"
       ]
     },
     {
       "args": [
         "hscan",
-        "GETKEYS",
+        "GET",
         "1"
       ],
       "keys": [
-        "GETKEYS"
+        "GET"
       ]
     },
     {
       "args": [
         "hscan",
-        "INCRBY",
+        "MIN",
         "2"
       ],
       "keys": [
-        "INCRBY"
+        "MIN"
       ]
     },
     {
       "args": [
         "hscan",
-        "LEN",
+        "SAVE",
         "0"
       ],
       "keys": [
-        "LEN"
+        "SAVE"
       ]
     },
     {
@@ -3379,32 +3375,71 @@
     {
       "args": [
         "hscan",
-        "LIST",
+        "SETUSER",
         "1"
       ],
       "keys": [
-        "LIST"
+        "SETUSER"
       ]
     },
     {
       "args": [
         "hset",
-        "DESTROY",
+        "ACQUIRE",
         "a2",
-        "NODES"
+        "SAVE"
       ],
       "keys": [
-        "DESTROY"
+        "ACQUIRE"
+      ]
+    },
+    {
+      "args": [
+        "hset",
+        "EXISTS",
+        ">",
+        "+",
+        "-",
+        "1.5"
+      ],
+      "keys": [
+        "EXISTS"
+      ]
+    },
+    {
+      "args": [
+        "hset",
+        "MINID",
+        "-",
+        "SLOTS",
+        "1.5",
+        "DROP",
+        "CREATECONSUMER",
+        "-1"
+      ],
+      "keys": [
+        "MINID"
+      ]
+    },
+    {
+      "args": [
+        "hset",
+        "TRACKING",
+        "2",
+        "-1"
+      ],
+      "keys": [
+        "TRACKING"
       ]
     },
     {
       "args": [
         "hset",
         "SLOTS",
-        ">",
-        "+",
-        "-",
-        "1.5"
+        "a2",
+        "b3",
+        "10",
+        "-1"
       ],
       "keys": [
         "SLOTS"
@@ -3413,55 +3448,16 @@
     {
       "args": [
         "hset",
-        "GROUPS",
-        "-",
-        "SUBSCRIBE",
-        "1.5",
-        "COUNT",
-        "TRACKING",
-        "-1"
-      ],
-      "keys": [
-        "GROUPS"
-      ]
-    },
-    {
-      "args": [
-        "hset",
-        "KEYSLOT",
-        "2",
-        "-1"
-      ],
-      "keys": [
-        "KEYSLOT"
-      ]
-    },
-    {
-      "args": [
-        "hset",
-        "LIST",
-        "a2",
-        "b3",
-        "10",
-        "-1"
-      ],
-      "keys": [
-        "LIST"
-      ]
-    },
-    {
-      "args": [
-        "hset",
-        "SETNAME",
-        "km",
-        "REFCOUNT",
+        "LEFT",
+        "GETUSER",
+        "SHARDS",
         ">",
         "10",
         "1.5",
         "10"
       ],
       "keys": [
-        "SETNAME"
+        "LEFT"
       ]
     },
     {
@@ -3489,12 +3485,12 @@
     {
       "args": [
         "hsetnx",
-        "MIN",
+        "$",
         "-",
         "b3"
       ],
       "keys": [
-        "MIN"
+        "$"
       ]
     },
     {
@@ -3511,40 +3507,30 @@
     {
       "args": [
         "hsetnx",
-        "GROUP",
+        "ENCODING",
         "10",
         "0"
       ],
       "keys": [
-        "GROUP"
+        "ENCODING"
       ]
     },
     {
       "args": [
         "hsetnx",
-        "SETID",
+        "IDLETIME",
         "10",
         "-1"
       ],
       "keys": [
-        "SETID"
-      ]
-    },
-    {
-      "args": [
-        "hstrlen",
-        "MINID",
-        "$"
-      ],
-      "keys": [
-        "MINID"
+        "IDLETIME"
       ]
     },
     {
       "args": [
         "hstrlen",
         "MIN",
-        "v2"
+        "$"
       ],
       "keys": [
         "MIN"
@@ -3553,8 +3539,18 @@
     {
       "args": [
         "hstrlen",
+        "KILL",
+        "v2"
+      ],
+      "keys": [
+        "KILL"
+      ]
+    },
+    {
+      "args": [
+        "hstrlen",
         "*",
-        "LOAD"
+        "DROP"
       ],
       "keys": [
         "*"
@@ -3563,21 +3559,21 @@
     {
       "args": [
         "hstrlen",
-        "MIN",
+        "STREAMS",
         ">"
       ],
       "keys": [
-        "MIN"
+        "STREAMS"
       ]
     },
     {
       "args": [
         "hstrlen",
-        "OVERFLOW",
-        "LEFT"
+        "ABORT",
+        "BLOCK"
       ],
       "keys": [
-        "OVERFLOW"
+        "ABORT"
       ]
     },
     {
@@ -3605,37 +3601,37 @@
     {
       "args": [
         "htransfer",
-        "WHOAMI",
+        "TRACKING",
         "-",
-        "RIGHT",
+        "u8",
         "10"
       ],
       "keys": [
-        "WHOAMI"
+        "TRACKING"
       ]
     },
     {
       "args": [
         "htransfer",
-        "LATEST",
+        "GET",
         "10",
         "k3",
         "10"
       ],
       "keys": [
-        "LATEST"
+        "GET"
       ]
     },
     {
       "args": [
         "htransfer",
-        "CONSUMERS",
+        "INCRBY",
         "f2",
         "b3",
         "2"
       ],
       "keys": [
-        "CONSUMERS"
+        "INCRBY"
       ]
     },
     {
@@ -3643,7 +3639,7 @@
         "htransfer",
         "2",
         "0",
-        "STREAM",
+        "GET",
         "10"
       ],
       "keys": [
@@ -3653,13 +3649,13 @@
     {
       "args": [
         "htransfer",
-        "MIN",
-        "INCRBY",
+        "SETID",
+        "$.a",
         "b3",
         "1"
       ],
       "keys": [
-        "MIN"
+        "SETID"
       ]
     },
     {
@@ -3677,29 +3673,78 @@
     {
       "args": [
         "hvals",
-        "KEYSLOT"
+        "i8"
       ],
       "keys": [
-        "KEYSLOT"
+        "i8"
+      ]
+    },
+    {
+      "args": [
+        "idem",
+        "-1",
+        "ABORT",
+        "+",
+        "-1"
+      ],
+      "keys": [
+        "-1"
+      ]
+    },
+    {
+      "args": [
+        "idem",
+        "$.a",
+        "COMPLETE",
+        "STREAMS",
+        "a4",
+        "0"
+      ],
+      "keys": [
+        "$.a"
+      ]
+    },
+    {
+      "args": [
+        "idem",
+        "SETUSER",
+        "ABORT",
+        "k3",
+        "-1"
+      ],
+      "keys": [
+        "SETUSER"
+      ]
+    },
+    {
+      "args": [
+        "idem",
+        "v1",
+        "ABORT",
+        "*",
+        "1.5"
+      ],
+      "keys": [
+        "v1"
       ]
     },
     {
       "args": [
         "incr",
-        "CONSUMERS"
+        "SETID"
       ],
       "keys": [
-        "CONSUMERS"
+        "SETID"
       ]
     },
     {
       "args": [
         "incrby",
-        "KEYSLOT",
+        "SETID",
         "1"
       ],
       "keys": [
-        "KEYSLOT"
+        "SETID"
       ]
     },
     {
@@ -3728,23 +3773,23 @@
     {
       "args": [
         "jmerge",
-        "SET",
-        "SETNAME",
-        "RESET"
+        "KILL",
+        "MAX",
+        "KILL"
       ],
       "keys": [
-        "SET"
+        "KILL"
       ]
     },
     {
       "args": [
         "jmerge",
-        "BLOCK",
+        "WHOAMI",
         ">",
-        "DESTROY"
+        "RIGHT"
       ],
       "keys": [
-        "BLOCK"
+        "WHOAMI"
       ]
     },
     {
@@ -3763,7 +3808,7 @@
         "jmerge",
         ">",
         "-",
-        "ID"
+        "COMPLETE"
       ],
       "keys": [
         ">"
@@ -3772,12 +3817,12 @@
     {
       "args": [
         "jmerge",
-        "USERS",
+        "CAT",
         "2",
         "1"
       ],
       "keys": [
-        "USERS"
+        "CAT"
       ]
     },
     {
@@ -3785,7 +3830,7 @@
         "jmerge",
         "k1",
         "-1",
-        "DELETE"
+        "MYID"
       ],
       "keys": [
         "k1"
@@ -3794,21 +3839,21 @@
     {
       "args": [
         "json.arrappend",
-        "BLOCK",
+        "SHARDS",
         "1",
         "*"
       ],
       "keys": [
-        "BLOCK"
+        "SHARDS"
       ]
     },
     {
       "args": [
         "json.arrappend",
         "k1",
-        "KEYSLOT",
-        "STREAM",
-        "GET"
+        "KILL",
+        "FIND",
+        "LOAD"
       ],
       "keys": [
         "k1"
@@ -3817,14 +3862,14 @@
     {
       "args": [
         "json.arrappend",
-        "ON",
+        "ENCODING",
         "v2",
         "1",
         "1.5",
         "2"
       ],
       "keys": [
-        "ON"
+        "ENCODING"
       ]
     },
     {
@@ -3834,7 +3879,7 @@
         "+",
         "f3",
         "a4",
-        "LATEST",
+        "SETUSER",
         "1"
       ],
       "keys": [
@@ -3844,39 +3889,39 @@
     {
       "args": [
         "json.arrappend",
-        "SHARDS",
+        "$",
         "-1",
-        "SLOTS",
+        "TRACKING",
         "b4",
-        "DROP",
+        "MYID",
         "f6",
         "1.5"
       ],
       "keys": [
-        "SHARDS"
+        "$"
       ]
     },
     {
       "args": [
         "json.arrappend",
-        "DOCS",
-        "OVERFLOW",
+        "DROP",
+        "SLOTS",
         "1",
         "k4",
         "*",
         "f6",
-        "FREQ",
+        "DOCS",
         "a8"
       ],
       "keys": [
-        "DOCS"
+        "DROP"
       ]
     },
     {
       "args": [
         "json.arrindex",
         "a1",
-        "STREAMS",
+        "LIST",
         "-"
       ],
       "keys": [
@@ -3887,7 +3932,7 @@
       "args": [
         "json.arrindex",
         "SUBSCRIBE",
-        "CREATECONSUMER",
+        "MINID",
         "-",
         "2"
       ],
@@ -3898,14 +3943,14 @@
     {
       "args": [
         "json.arrindex",
-        "KEYSLOT",
+        "EXISTS",
         "1",
         "$",
         "b4",
         "*"
       ],
       "keys": [
-        "KEYSLOT"
+        "EXISTS"
       ]
     },
     {
@@ -3922,33 +3967,33 @@
     {
       "args": [
         "json.arrindex",
-        "RIGHT",
-        "EXISTS",
+        "DELCONSUMER",
+        "WHOAMI",
         "1.5",
         "+"
       ],
       "keys": [
-        "RIGHT"
+        "DELCONSUMER"
       ]
     },
     {
       "args": [
         "json.arrindex",
-        "DOCS",
+        "OVERFLOW",
         "0",
         "v3",
         "-1",
         "f5"
       ],
       "keys": [
-        "DOCS"
+        "OVERFLOW"
       ]
     },
     {
       "args": [
         "json.arrinsert",
         "a1",
-        "SET",
+        "RELEASE",
         "v3",
         "1.5"
       ],
@@ -3959,14 +4004,14 @@
     {
       "args": [
         "json.arrinsert",
-        "GET",
+        "ABORT",
         "a2",
         "b3",
-        "SHARDS",
+        "km",
         "1"
       ],
       "keys": [
-        "GET"
+        "ABORT"
       ]
     },
     {
@@ -3986,7 +4031,7 @@
     {
       "args": [
         "json.arrinsert",
-        "OFF",
+        "GETNAME",
         "10",
         "a3",
         "10",
@@ -3995,7 +4040,7 @@
         "f7"
       ],
       "keys": [
-        "OFF"
+        "GETNAME"
       ]
     },
     {
@@ -4005,7 +4050,7 @@
         "k2",
         "-",
         "+",
-        "MYID",
+        "RIGHT",
         "1",
         ">",
         "+"
@@ -4017,13 +4062,13 @@
     {
       "args": [
         "json.arrinsert",
-        "MIN",
+        "STATUS",
         "-1",
         "-",
-        "USAGE"
+        "DELCONSUMER"
       ],
       "keys": [
-        "MIN"
+        "STATUS"
       ]
     },
     {
@@ -4038,20 +4083,20 @@
     {
       "args": [
         "json.arrlen",
-        "FREQ",
+        "LIST",
         "10"
       ],
       "keys": [
-        "FREQ"
+        "LIST"
       ]
     },
     {
       "args": [
         "json.arrlen",
-        "GET"
+        "SETID"
       ],
       "keys": [
-        "GET"
+        "SETID"
       ]
     },
     {
@@ -4067,39 +4112,39 @@
     {
       "args": [
         "json.arrlen",
-        "TRACKING"
+        "ENCODING"
       ],
       "keys": [
-        "TRACKING"
+        "ENCODING"
       ]
     },
     {
       "args": [
         "json.arrlen",
-        "SAVE",
+        "SETNAME",
         "a2"
       ],
       "keys": [
-        "SAVE"
+        "SETNAME"
       ]
     },
     {
       "args": [
         "json.arrpop",
-        "STORE"
+        "CREATE"
       ],
       "keys": [
-        "STORE"
+        "CREATE"
       ]
     },
     {
       "args": [
         "json.arrpop",
-        "km",
+        "OVERFLOW",
         "*"
       ],
       "keys": [
-        "km"
+        "OVERFLOW"
       ]
     },
     {
@@ -4116,10 +4161,10 @@
     {
       "args": [
         "json.arrpop",
-        "RESET"
+        "SETID"
       ],
       "keys": [
-        "RESET"
+        "SETID"
       ]
     },
     {
@@ -4147,8 +4192,8 @@
       "args": [
         "json.arrtrim",
         "v1",
-        "LOAD",
-        "USERS",
+        "WHOAMI",
+        "GETNAME",
         "-"
       ],
       "keys": [
@@ -4159,8 +4204,8 @@
       "args": [
         "json.arrtrim",
         "1.5",
-        "i8",
-        "LEFT",
+        "MINID",
+        "INCRBY",
         "1"
       ],
       "keys": [
@@ -4170,13 +4215,13 @@
     {
       "args": [
         "json.arrtrim",
-        "SETNAME",
+        "COMPLETE",
         "$",
         "1.5",
         "10"
       ],
       "keys": [
-        "SETNAME"
+        "COMPLETE"
       ]
     },
     {
@@ -4185,7 +4230,7 @@
         "$",
         "2",
         "$",
-        "FIND"
+        "GETUSER"
       ],
       "keys": [
         "$"
@@ -4195,7 +4240,7 @@
       "args": [
         "json.arrtrim",
         "$",
-        "WRAP",
+        "SLOTS",
         "10",
         "+"
       ],
@@ -4218,17 +4263,45 @@
     {
       "args": [
         "json.clear",
-        "FREQ"
+        "LATEST"
       ],
       "keys": [
-        "FREQ"
+        "LATEST"
       ]
     },
     {
       "args": [
         "json.clear",
-        "MAX",
+        "BYRADIUS",
         "b2"
+      ],
+      "keys": [
+        "BYRADIUS"
+      ]
+    },
+    {
+      "args": [
+        "json.clear",
+        "GET"
+      ],
+      "keys": [
+        "GET"
+      ]
+    },
+    {
+      "args": [
+        "json.clear",
+        "FROMLONLAT",
+        "2"
+      ],
+      "keys": [
+        "FROMLONLAT"
+      ]
+    },
+    {
+      "args": [
+        "json.clear",
+        "MAX"
       ],
       "keys": [
         "MAX"
@@ -4237,48 +4310,20 @@
     {
       "args": [
         "json.clear",
-        "USERS"
-      ],
-      "keys": [
-        "USERS"
-      ]
-    },
-    {
-      "args": [
-        "json.clear",
-        "FIND",
+        "MYID",
         "2"
       ],
       "keys": [
-        "FIND"
-      ]
-    },
-    {
-      "args": [
-        "json.clear",
         "MYID"
-      ],
-      "keys": [
-        "MYID"
-      ]
-    },
-    {
-      "args": [
-        "json.clear",
-        "MIN",
-        "2"
-      ],
-      "keys": [
-        "MIN"
       ]
     },
     {
       "args": [
         "json.del",
-        "WHOAMI"
+        "REFCOUNT"
       ],
       "keys": [
-        "WHOAMI"
+        "REFCOUNT"
       ]
     },
     {
@@ -4322,19 +4367,19 @@
     {
       "args": [
         "json.del",
-        "u8",
+        "GROUPS",
         "b2"
       ],
       "keys": [
-        "u8"
+        "GROUPS"
       ]
     },
     {
       "args": [
         "json.find",
-        "km",
-        "SAVE",
-        "GETNAME"
+        "SETNAME",
+        "OVERFLOW",
+        "CAT"
       ],
       "keys": []
     },
@@ -4351,7 +4396,7 @@
     {
       "args": [
         "json.find",
-        "INFO",
+        "SAVE",
         "b2",
         "1",
         "10",
@@ -4363,8 +4408,8 @@
       "args": [
         "json.find",
         "-1",
-        "USERS",
-        "GETUSER",
+        "RIGHT",
+        "REFCOUNT",
         "f4",
         "k5",
         ">"
@@ -4374,12 +4419,12 @@
     {
       "args": [
         "json.find",
-        "INFO",
-        "PATTERN",
+        "STORE",
+        "BEGIN",
         "b3",
         "b4",
         "10",
-        "RIGHT",
+        "SET",
         ">"
       ],
       "keys": []
@@ -4388,106 +4433,20 @@
       "args": [
         "json.find",
         "+",
-        "$.a",
+        "SETNAME",
         "-",
         "+",
-        "u8",
+        "FREQ",
         "v6",
         "*",
-        "NODES"
+        "STREAM"
       ],
       "keys": []
     },
     {
       "args": [
         "json.forget",
-        "GETUSER"
-      ],
-      "keys": [
-        "GETUSER"
-      ]
-    },
-    {
-      "args": [
-        "json.forget",
-        "CAT",
-        "$"
-      ],
-      "keys": [
-        "CAT"
-      ]
-    },
-    {
-      "args": [
-        "json.forget",
-        "MINID"
-      ],
-      "keys": [
-        "MINID"
-      ]
-    },
-    {
-      "args": [
-        "json.forget",
-        "CAT",
-        "1"
-      ],
-      "keys": [
-        "CAT"
-      ]
-    },
-    {
-      "args": [
-        "json.forget",
-        "EXISTS"
-      ],
-      "keys": [
-        "EXISTS"
-      ]
-    },
-    {
-      "args": [
-        "json.forget",
-        "ENCODING",
-        "-"
-      ],
-      "keys": [
-        "ENCODING"
-      ]
-    },
-    {
-      "args": [
-        "json.get",
-        "SETNAME"
-      ],
-      "keys": [
-        "SETNAME"
-      ]
-    },
-    {
-      "args": [
-        "json.get",
-        "BYRADIUS",
-        "COMPLETE"
-      ],
-      "keys": [
-        "BYRADIUS"
-      ]
-    },
-    {
-      "args": [
-        "json.get",
-        "CREATE"
-      ],
-      "keys": [
-        "CREATE"
-      ]
-    },
-    {
-      "args": [
-        "json.get",
-        "INFO",
-        "-1"
+        "INFO"
       ],
       "keys": [
         "INFO"
@@ -4495,7 +4454,17 @@
     },
     {
       "args": [
-        "json.get",
+        "json.forget",
+        "LEN",
+        "$"
+      ],
+      "keys": [
+        "LEN"
+      ]
+    },
+    {
+      "args": [
+        "json.forget",
         "ACQUIRE"
       ],
       "keys": [
@@ -4504,20 +4473,102 @@
     },
     {
       "args": [
+        "json.forget",
+        "SETID",
+        "1"
+      ],
+      "keys": [
+        "SETID"
+      ]
+    },
+    {
+      "args": [
+        "json.forget",
+        "WRAP"
+      ],
+      "keys": [
+        "WRAP"
+      ]
+    },
+    {
+      "args": [
+        "json.forget",
+        "KILL",
+        "-"
+      ],
+      "keys": [
+        "KILL"
+      ]
+    },
+    {
+      "args": [
         "json.get",
-        "SETUSER",
+        "RELEASE"
+      ],
+      "keys": [
+        "RELEASE"
+      ]
+    },
+    {
+      "args": [
+        "json.get",
+        "RELEASE",
+        "INCRBY"
+      ],
+      "keys": [
+        "RELEASE"
+      ]
+    },
+    {
+      "args": [
+        "json.get",
+        "STATUS"
+      ],
+      "keys": [
+        "STATUS"
+      ]
+    },
+    {
+      "args": [
+        "json.get",
+        "MAXLEN",
+        "-1"
+      ],
+      "keys": [
+        "MAXLEN"
+      ]
+    },
+    {
+      "args": [
+        "json.get",
+        "RIGHT"
+      ],
+      "keys": [
+        "RIGHT"
+      ]
+    },
+    {
+      "args": [
+        "json.get",
+        "EXISTS",
         "$"
       ],
       "keys": [
-        "SETUSER"
+        "EXISTS"
       ]
     },
     {
       "args": [
         "json.index",
-        "LIST",
-        "-",
-        "1"
+        "DROP"
+      ],
+      "keys": []
+    },
+    {
+      "args": [
+        "json.index",
+        "DROP",
+        "-1"
       ],
       "keys": []
     },
@@ -4525,8 +4576,8 @@
       "args": [
         "json.index",
         "CREATE",
-        "RESET",
-        "v3",
+        "*",
+        "*",
         "10"
       ],
       "keys": []
@@ -4534,34 +4585,21 @@
     {
       "args": [
         "json.index",
-        "CREATE",
-        "WRAP",
-        "10",
-        "DESTROY",
-        "k5",
-        "-",
-        "2"
-      ],
-      "keys": []
-    },
-    {
-      "args": [
-        "json.index",
-        "LIST"
-      ],
-      "keys": []
-    },
-    {
-      "args": [
-        "json.index",
         "DROP",
+        "1.5",
+        "1.5"
+      ],
+      "keys": []
+    },
+    {
+      "args": [
+        "json.index",
+        "LIST",
+        "0",
+        "LEN",
         ">",
-        ">",
-        "a4",
-        ">",
-        ">",
-        "-",
-        "*"
+        "$",
+        "1"
       ],
       "keys": []
     },
@@ -4569,31 +4607,29 @@
       "args": [
         "json.index",
         "CREATE",
-        "REFCOUNT",
-        "1.5",
-        "a4",
-        "*",
+        ">",
         "1",
-        "v7"
+        "USAGE",
+        "1.5"
       ],
       "keys": []
     },
     {
       "args": [
         "json.merge",
-        "DROP",
+        "DELETE",
         "-1",
-        "INFO"
+        "STREAM"
       ],
       "keys": [
-        "DROP"
+        "DELETE"
       ]
     },
     {
       "args": [
         "json.merge",
         "+",
-        "STATUS",
+        "REFCOUNT",
         "v3"
       ],
       "keys": [
@@ -4604,7 +4640,7 @@
       "args": [
         "json.merge",
         "k1",
-        "STATUS",
+        "REFCOUNT",
         "k3"
       ],
       "keys": [
@@ -4659,71 +4695,71 @@
     {
       "args": [
         "json.mget",
-        "MYID",
+        "RESET",
         "v2"
       ],
       "keys": [
-        "MYID"
+        "RESET"
       ]
     },
     {
       "args": [
         "json.mget",
-        "ENCODING",
+        "$",
         "f2",
         "0"
       ],
       "keys": [
-        "ENCODING",
+        "$",
         "f2"
       ]
     },
     {
       "args": [
         "json.mget",
-        "DELCONSUMER",
-        "LIST",
+        "STREAM",
+        "FROMLONLAT",
         "1.5",
         "10"
       ],
       "keys": [
         "1.5",
-        "DELCONSUMER",
-        "LIST"
+        "FROMLONLAT",
+        "STREAM"
       ]
     },
     {
       "args": [
         "json.mget",
-        "GET",
+        "REFCOUNT",
         "v2",
-        "ID",
+        "u8",
         "+",
-        "SET"
+        "STREAMS"
       ],
       "keys": [
         "+",
-        "GET",
-        "ID",
+        "REFCOUNT",
+        "u8",
         "v2"
       ]
     },
     {
       "args": [
         "json.mget",
-        "i8",
+        "DELETE",
         "f2",
         "b3",
         "*",
-        "FROMLONLAT",
+        "WHOAMI",
         "k6"
       ],
       "keys": [
         "*",
-        "FROMLONLAT",
+        "DELETE",
+        "WHOAMI",
         "b3",
-        "f2",
-        "i8"
+        "f2"
       ]
     },
     {
@@ -4740,12 +4776,12 @@
     {
       "args": [
         "json.numincrby",
-        "LEN",
+        "FIND",
         "-",
         "+"
       ],
       "keys": [
-        "LEN"
+        "FIND"
       ]
     },
     {
@@ -4762,12 +4798,12 @@
     {
       "args": [
         "json.numincrby",
-        "LEFT",
+        "USERS",
         "v2",
         "2"
       ],
       "keys": [
-        "LEFT"
+        "USERS"
       ]
     },
     {
@@ -4784,12 +4820,12 @@
     {
       "args": [
         "json.numincrby",
-        "RIGHT",
+        "GET",
         "-",
         "f3"
       ],
       "keys": [
-        "RIGHT"
+        "GET"
       ]
     },
     {
@@ -4797,7 +4833,7 @@
         "json.nummultby",
         "k1",
         ">",
-        "OVERFLOW"
+        "RIGHT"
       ],
       "keys": [
         "k1"
@@ -4807,7 +4843,7 @@
       "args": [
         "json.nummultby",
         "2",
-        "DESTROY",
+        "OFF",
         "0"
       ],
       "keys": [
@@ -4817,54 +4853,54 @@
     {
       "args": [
         "json.nummultby",
-        "SAVE",
+        "USAGE",
         "-",
         "a3"
       ],
       "keys": [
-        "SAVE"
+        "USAGE"
       ]
     },
     {
       "args": [
         "json.nummultby",
-        "DELCONSUMER",
+        "ENCODING",
         "1",
         "b3"
       ],
       "keys": [
-        "DELCONSUMER"
+        "ENCODING"
       ]
     },
     {
       "args": [
         "json.nummultby",
-        "LEFT",
+        "LOAD",
         "0",
         "+"
       ],
       "keys": [
-        "LEFT"
+        "LOAD"
       ]
     },
     {
       "args": [
         "json.nummultby",
-        "GROUP",
-        "FROMLONLAT",
-        "DOCS"
+        "WHOAMI",
+        "i8",
+        "STREAM"
       ],
       "keys": [
-        "GROUP"
+        "WHOAMI"
       ]
     },
     {
       "args": [
         "json.objkeys",
-        "LEN"
+        "CREATECONSUMER"
       ],
       "keys": [
-        "LEN"
+        "CREATECONSUMER"
       ]
     },
     {
@@ -4889,8 +4925,84 @@
     {
       "args": [
         "json.objkeys",
-        "WHOAMI",
+        "FLUSH",
+        "$"
+      ],
+      "keys": [
+        "FLUSH"
+      ]
+    },
+    {
+      "args": [
+        "json.objkeys",
+        "ABORT"
+      ],
+      "keys": [
+        "ABORT"
+      ]
+    },
+    {
+      "args": [
+        "json.objkeys",
+        "KILL",
+        "WHOAMI"
+      ],
+      "keys": [
+        "KILL"
+      ]
+    },
+    {
+      "args": [
+        "json.objlen",
         "WRAP"
+      ],
+      "keys": [
+        "WRAP"
+      ]
+    },
+    {
+      "args": [
+        "json.objlen",
+        "DOCS",
+        "-1"
+      ],
+      "keys": [
+        "DOCS"
+      ]
+    },
+    {
+      "args": [
+        "json.objlen",
+        "CONSUMERS"
+      ],
+      "keys": [
+        "CONSUMERS"
+      ]
+    },
+    {
+      "args": [
+        "json.objlen",
+        "-1",
+        "SET"
+      ],
+      "keys": [
+        "-1"
+      ]
+    },
+    {
+      "args": [
+        "json.objlen",
+        "REFCOUNT"
+      ],
+      "keys": [
+        "REFCOUNT"
+      ]
+    },
+    {
+      "args": [
+        "json.objlen",
+        "WHOAMI",
+        "$"
       ],
       "keys": [
         "WHOAMI"
@@ -4898,111 +5010,35 @@
     },
     {
       "args": [
-        "json.objkeys",
-        "CAT"
-      ],
-      "keys": [
-        "CAT"
-      ]
-    },
-    {
-      "args": [
-        "json.objkeys",
-        "SETNAME",
-        "OVERFLOW"
-      ],
-      "keys": [
-        "SETNAME"
-      ]
-    },
-    {
-      "args": [
-        "json.objlen",
-        "COMPLETE"
-      ],
-      "keys": [
-        "COMPLETE"
-      ]
-    },
-    {
-      "args": [
-        "json.objlen",
-        "LATEST",
-        "-1"
-      ],
-      "keys": [
-        "LATEST"
-      ]
-    },
-    {
-      "args": [
-        "json.objlen",
-        "DESTROY"
-      ],
-      "keys": [
-        "DESTROY"
-      ]
-    },
-    {
-      "args": [
-        "json.objlen",
-        "-1",
-        "LATEST"
-      ],
-      "keys": [
-        "-1"
-      ]
-    },
-    {
-      "args": [
-        "json.objlen",
-        "KILL"
-      ],
-      "keys": [
-        "KILL"
-      ]
-    },
-    {
-      "args": [
-        "json.objlen",
-        "EXISTS",
-        "$"
-      ],
-      "keys": [
-        "EXISTS"
-      ]
-    },
-    {
-      "args": [
         "json.set",
-        "NODES",
+        "GETKEYS",
         "f2",
         "*"
       ],
       "keys": [
-        "NODES"
+        "GETKEYS"
       ]
     },
     {
       "args": [
         "json.set",
-        "COUNT",
+        "COMPLETE",
         "*",
-        "u8"
+        "FIND"
       ],
       "keys": [
-        "COUNT"
+        "COMPLETE"
       ]
     },
     {
       "args": [
         "json.set",
-        "MYID",
-        "ACQUIRE",
+        "STORE",
+        "SLOTS",
         "a3"
       ],
       "keys": [
-        "MYID"
+        "STORE"
       ]
     },
     {
@@ -5019,12 +5055,12 @@
     {
       "args": [
         "json.set",
-        "COUNT",
+        "NODES",
         "f2",
         "2"
       ],
       "keys": [
-        "COUNT"
+        "NODES"
       ]
     },
     {
@@ -5052,12 +5088,12 @@
     {
       "args": [
         "json.strappend",
-        "km",
-        "ID",
-        "CONSUMERS"
+        "SETUSER",
+        "BYRADIUS",
+        "NODES"
       ],
       "keys": [
-        "km"
+        "SETUSER"
       ]
     },
     {
@@ -5076,7 +5112,7 @@
         "json.strappend",
         "*",
         "0",
-        "NODES"
+        "WRAP"
       ],
       "keys": [
         "*"
@@ -5085,12 +5121,12 @@
     {
       "args": [
         "json.strappend",
-        "SLOTS",
+        "PATTERN",
         "k2",
         "-"
       ],
       "keys": [
-        "SLOTS"
+        "PATTERN"
       ]
     },
     {
@@ -5107,20 +5143,20 @@
     {
       "args": [
         "json.strlen",
-        "LEN"
+        "LIST"
       ],
       "keys": [
-        "LEN"
+        "LIST"
       ]
     },
     {
       "args": [
         "json.strlen",
-        "MAX",
+        "LOAD",
         "a2"
       ],
       "keys": [
-        "MAX"
+        "LOAD"
       ]
     },
     {
@@ -5136,7 +5172,7 @@
       "args": [
         "json.strlen",
         "f1",
-        "ENCODING"
+        "INCRBY"
       ],
       "keys": [
         "f1"
@@ -5145,58 +5181,58 @@
     {
       "args": [
         "json.strlen",
-        "ID"
+        "OVERFLOW"
       ],
       "keys": [
-        "ID"
+        "OVERFLOW"
       ]
     },
     {
       "args": [
         "json.strlen",
-        "GETKEYS",
+        "$",
         "10"
       ],
       "keys": [
-        "GETKEYS"
+        "$"
       ]
     },
     {
       "args": [
         "json.toggle",
-        "FROMLONLAT"
+        "STREAMS"
       ],
       "keys": [
-        "FROMLONLAT"
+        "STREAMS"
       ]
     },
     {
       "args": [
         "json.toggle",
-        "CAT",
+        "INFO",
         "+"
       ],
       "keys": [
-        "CAT"
+        "INFO"
       ]
     },
     {
       "args": [
         "json.toggle",
-        "SET"
+        "km"
       ],
       "keys": [
-        "SET"
+        "km"
       ]
     },
     {
       "args": [
         "json.toggle",
-        "MAX",
-        "LATEST"
+        "ON",
+        "COUNT"
       ],
       "keys": [
-        "MAX"
+        "ON"
       ]
     },
     {
@@ -5211,30 +5247,30 @@
     {
       "args": [
         "json.toggle",
-        "STORE",
+        "COUNT",
         "a2"
       ],
       "keys": [
-        "STORE"
+        "COUNT"
       ]
     },
     {
       "args": [
         "json.type",
-        "GETNAME"
+        "SLOTS"
       ],
       "keys": [
-        "GETNAME"
+        "SLOTS"
       ]
     },
     {
       "args": [
         "json.type",
-        "RESET",
+        "COUNT",
         "*"
       ],
       "keys": [
-        "RESET"
+        "COUNT"
       ]
     },
     {
@@ -5249,36 +5285,36 @@
     {
       "args": [
         "json.type",
-        "DELETE",
+        "CREATECONSUMER",
         "-1"
       ],
       "keys": [
-        "DELETE"
+        "CREATECONSUMER"
       ]
     },
     {
       "args": [
         "json.type",
-        "COMPLETE"
+        "USAGE"
       ],
       "keys": [
-        "COMPLETE"
+        "USAGE"
       ]
     },
     {
       "args": [
         "json.type",
-        "RIGHT",
+        "SUBSCRIBE",
         "-1"
       ],
       "keys": [
-        "RIGHT"
+        "SUBSCRIBE"
       ]
     },
     {
       "args": [
         "keys",
-        "STATUS"
+        "DELETE"
       ],
       "keys": []
     },
@@ -5292,31 +5328,31 @@
     {
       "args": [
         "lease",
-        "km",
+        "BYRADIUS",
         "2"
       ],
       "keys": [
-        "km"
+        "BYRADIUS"
       ]
     },
     {
       "args": [
         "lease",
-        "FIND",
+        "WRAP",
         "2"
       ],
       "keys": [
-        "FIND"
+        "WRAP"
       ]
     },
     {
       "args": [
         "lease",
-        "INFO",
+        "FROMLONLAT",
         "2"
       ],
       "keys": [
-        "INFO"
+        "FROMLONLAT"
       ]
     },
     {
@@ -5332,32 +5368,32 @@
     {
       "args": [
         "lease",
-        "BEGIN",
+        "MAX",
         "1"
       ],
       "keys": [
-        "BEGIN"
+        "MAX"
       ]
     },
     {
       "args": [
         "lease",
-        "SUBSCRIBE",
+        "WHOAMI",
         "1"
       ],
       "keys": [
-        "SUBSCRIBE"
+        "WHOAMI"
       ]
     },
     {
       "args": [
         "limit",
-        "FROMLONLAT",
+        "LIST",
         "10",
         "2"
       ],
       "keys": [
-        "FROMLONLAT"
+        "LIST"
       ]
     },
     {
@@ -5374,12 +5410,12 @@
     {
       "args": [
         "limit",
-        "$",
+        "ABORT",
         "10",
         "10"
       ],
       "keys": [
-        "$"
+        "ABORT"
       ]
     },
     {
@@ -5396,12 +5432,12 @@
     {
       "args": [
         "limit",
-        "km",
+        "GET",
         "2",
         "10"
       ],
       "keys": [
-        "km"
+        "GET"
       ]
     },
     {
@@ -5488,29 +5524,29 @@
     {
       "args": [
         "lpop",
-        "LOAD"
+        "COUNT"
       ],
       "keys": [
-        "LOAD"
+        "COUNT"
       ]
     },
     {
       "args": [
         "lpop",
-        "STATUS",
+        "DESTROY",
         "10"
       ],
       "keys": [
-        "STATUS"
+        "DESTROY"
       ]
     },
     {
       "args": [
         "lpop",
-        "KILL"
+        "SUBSCRIBE"
       ],
       "keys": [
-        "KILL"
+        "SUBSCRIBE"
       ]
     },
     {
@@ -5525,20 +5561,20 @@
     {
       "args": [
         "lpop",
-        "INCRBY",
+        "ACQUIRE",
         "10"
       ],
       "keys": [
-        "INCRBY"
+        "ACQUIRE"
       ]
     },
     {
       "args": [
         "lpop",
-        "USAGE"
+        "SETID"
       ],
       "keys": [
-        "USAGE"
+        "SETID"
       ]
     },
     {
@@ -5595,7 +5631,7 @@
       "args": [
         "lpos",
         "2",
-        "DOCS"
+        "GETNAME"
       ],
       "keys": [
         "2"
@@ -5604,11 +5640,11 @@
     {
       "args": [
         "lpush",
-        "BEGIN",
+        "CREATECONSUMER",
         "10"
       ],
       "keys": [
-        "BEGIN"
+        "CREATECONSUMER"
       ]
     },
     {
@@ -5616,7 +5652,7 @@
         "lpush",
         "k1",
         "$",
-        "FROMLONLAT"
+        "SET"
       ],
       "keys": [
         "k1"
@@ -5626,7 +5662,7 @@
       "args": [
         "lpush",
         "10",
-        "LIST",
+        "BEGIN",
         "$",
         "b4"
       ],
@@ -5639,7 +5675,7 @@
         "lpush",
         "v1",
         "0",
-        "LEN",
+        "BYRADIUS",
         "b4",
         "-"
       ],
@@ -5650,7 +5686,7 @@
     {
       "args": [
         "lpush",
-        "NODES",
+        "ACQUIRE",
         "k2",
         "k3",
         "*",
@@ -5658,59 +5694,59 @@
         "b6"
       ],
       "keys": [
-        "NODES"
+        "ACQUIRE"
       ]
     },
     {
       "args": [
         "lpush",
-        "CREATECONSUMER",
-        "STREAM",
+        "MAX",
+        "USAGE",
         "v3",
         "10",
-        "SLOTS",
+        "GROUP",
         "a6",
         "2"
       ],
       "keys": [
-        "CREATECONSUMER"
+        "MAX"
       ]
     },
     {
       "args": [
         "lpushcap",
-        "RESET",
+        "ENCODING",
         "10",
         "b3"
       ],
       "keys": [
-        "RESET"
+        "ENCODING"
       ]
     },
     {
       "args": [
         "lpushcap",
-        "OVERFLOW",
+        "DELETE",
         "2",
-        "GETKEYS",
-        "km",
+        "MAX",
+        "GET",
         "*"
       ],
       "keys": [
-        "OVERFLOW"
+        "DELETE"
       ]
     },
     {
       "args": [
         "lpushcap",
-        "TRACKING",
+        "ID",
         "10",
         "$",
         "-1",
         "0"
       ],
       "keys": [
-        "TRACKING"
+        "ID"
       ]
     },
     {
@@ -5721,7 +5757,7 @@
         "+",
         "2",
         "-",
-        "BLOCK",
+        "IDLETIME",
         "1.5"
       ],
       "keys": [
@@ -5735,7 +5771,7 @@
         "10",
         "0",
         "-1",
-        "MAXLEN",
+        "SAVE",
         "*"
       ],
       "keys": [
@@ -5747,8 +5783,8 @@
         "lpushcap",
         "v1",
         "2",
-        "WRAP",
-        "BLOCK",
+        "RIGHT",
+        "USERS",
         "-1"
       ],
       "keys": [
@@ -5779,46 +5815,46 @@
     {
       "args": [
         "lpushx",
-        "SLOTS",
+        "RELEASE",
         "f2",
         "f3",
         "1.5"
       ],
       "keys": [
-        "SLOTS"
+        "RELEASE"
       ]
     },
     {
       "args": [
         "lpushx",
-        "LATEST",
-        "STORE",
-        "SETID",
+        "USAGE",
+        "INCRBY",
+        "BYRADIUS",
         "1.5",
         "+"
       ],
       "keys": [
-        "LATEST"
+        "USAGE"
       ]
     },
     {
       "args": [
         "lpushx",
-        "WHOAMI",
+        "SAVE",
         "0",
-        "RIGHT",
+        "MIN",
         "1.5",
         "-1",
         "1.5"
       ],
       "keys": [
-        "WHOAMI"
+        "SAVE"
       ]
     },
     {
       "args": [
         "lpushx",
-        "MINID",
+        "SET",
         "b2",
         "v3",
         "v4",
@@ -5827,14 +5863,69 @@
         "2"
       ],
       "keys": [
-        "MINID"
+        "SET"
       ]
     },
     {
       "args": [
         "lrange",
-        "FIND",
+        "CAT",
         "10",
+        "1"
+      ],
+      "keys": [
+        "CAT"
+      ]
+    },
+    {
+      "args": [
+        "lrem",
+        "USAGE",
+        "1",
+        "MAX"
+      ],
+      "keys": [
+        "USAGE"
+      ]
+    },
+    {
+      "args": [
+        "lrem",
+        "u8",
+        "2",
+        "-"
+      ],
+      "keys": [
+        "u8"
+      ]
+    },
+    {
+      "args": [
+        "lrem",
+        "$",
+        "10",
+        "1.5"
+      ],
+      "keys": [
+        "$"
+      ]
+    },
+    {
+      "args": [
+        "lrem",
+        "COMPLETE",
+        "10",
+        "b3"
+      ],
+      "keys": [
+        "COMPLETE"
+      ]
+    },
+    {
+      "args": [
+        "lrem",
+        "FIND",
+        "-1",
         "1"
       ],
       "keys": [
@@ -5844,20 +5935,20 @@
     {
       "args": [
         "lrem",
-        "SHARDS",
-        "1",
-        "MYID"
+        "KEYSLOT",
+        "0",
+        "+"
       ],
       "keys": [
-        "SHARDS"
+        "KEYSLOT"
       ]
     },
     {
       "args": [
-        "lrem",
+        "lset",
         "$",
         "2",
-        "-"
+        "*"
       ],
       "keys": [
         "$"
@@ -5865,68 +5956,13 @@
     },
     {
       "args": [
-        "lrem",
-        "MIN",
-        "10",
-        "1.5"
-      ],
-      "keys": [
-        "MIN"
-      ]
-    },
-    {
-      "args": [
-        "lrem",
-        "km",
-        "10",
-        "b3"
-      ],
-      "keys": [
-        "km"
-      ]
-    },
-    {
-      "args": [
-        "lrem",
-        "CREATE",
-        "-1",
-        "1"
-      ],
-      "keys": [
-        "CREATE"
-      ]
-    },
-    {
-      "args": [
-        "lrem",
-        "OVERFLOW",
-        "0",
-        "+"
-      ],
-      "keys": [
-        "OVERFLOW"
-      ]
-    },
-    {
-      "args": [
         "lset",
-        "$.a",
-        "2",
-        "*"
-      ],
-      "keys": [
-        "$.a"
-      ]
-    },
-    {
-      "args": [
-        "lset",
-        "ID",
+        "USAGE",
         "2",
         "+"
       ],
       "keys": [
-        "ID"
+        "USAGE"
       ]
     },
     {
@@ -5943,12 +5979,12 @@
     {
       "args": [
         "lset",
-        "LOAD",
+        "LEN",
         "2",
         "+"
       ],
       "keys": [
-        "LOAD"
+        "LEN"
       ]
     },
     {
@@ -5956,7 +5992,7 @@
         "lset",
         "f1",
         "-1",
-        "BEGIN"
+        "STREAM"
       ],
       "keys": [
         "f1"
@@ -5965,33 +6001,33 @@
     {
       "args": [
         "lset",
-        "NODES",
+        "CREATE",
         "10",
         "0"
       ],
       "keys": [
-        "NODES"
+        "CREATE"
       ]
     },
     {
       "args": [
         "ltrim",
-        "MIN",
+        "CREATECONSUMER",
         "0",
         "0"
       ],
       "keys": [
-        "MIN"
+        "CREATECONSUMER"
       ]
     },
     {
       "args": [
         "memory",
         "USAGE",
-        "1"
+        "LEN"
       ],
       "keys": [
-        "1"
+        "LEN"
       ]
     },
     {
@@ -6006,74 +6042,74 @@
     {
       "args": [
         "mget",
-        "DELETE",
+        "LATEST",
         "b2"
       ],
       "keys": [
-        "DELETE",
+        "LATEST",
         "b2"
       ]
     },
     {
       "args": [
         "mget",
-        "SETUSER",
-        "CONSUMERS",
+        "STORE",
+        "TRACKING",
         "a3"
       ],
       "keys": [
-        "CONSUMERS",
-        "SETUSER",
+        "STORE",
+        "TRACKING",
         "a3"
       ]
     },
     {
       "args": [
         "mget",
-        "CREATECONSUMER",
-        "LIST",
+        "i8",
+        "INFO",
         ">",
         "b4"
       ],
       "keys": [
         ">",
-        "CREATECONSUMER",
-        "LIST",
-        "b4"
+        "INFO",
+        "b4",
+        "i8"
       ]
     },
     {
       "args": [
         "mget",
-        "CAT",
+        "STREAMS",
         "1.5",
-        "INCRBY",
+        "SAVE",
         ">",
         "b5"
       ],
       "keys": [
         "1.5",
         ">",
-        "CAT",
-        "INCRBY",
+        "SAVE",
+        "STREAMS",
         "b5"
       ]
     },
     {
       "args": [
         "mget",
-        "SETNAME",
+        "GROUP",
         "v2",
         "-",
         "1",
-        "GROUP",
+        "GROUPS",
         "a6"
       ],
       "keys": [
         "-",
         "1",
         "GROUP",
-        "SETNAME",
+        "GROUPS",
         "a6",
         "v2"
       ]
@@ -6081,21 +6117,21 @@
     {
       "args": [
         "move",
-        "SAVE",
+        "i8",
         "2"
       ],
       "keys": [
-        "SAVE"
+        "i8"
       ]
     },
     {
       "args": [
         "move",
-        "SHARDS",
+        "u8",
         "10"
       ],
       "keys": [
-        "SHARDS"
+        "u8"
       ]
     },
     {
@@ -6111,11 +6147,11 @@
     {
       "args": [
         "move",
-        "REFCOUNT",
+        "INCRBY",
         "2"
       ],
       "keys": [
-        "REFCOUNT"
+        "INCRBY"
       ]
     },
     {
@@ -6131,11 +6167,11 @@
     {
       "args": [
         "move",
-        "EXISTS",
+        "FIND",
         "0"
       ],
       "keys": [
-        "EXISTS"
+        "FIND"
       ]
     },
     {
@@ -6167,20 +6203,20 @@
     {
       "args": [
         "mset",
-        "OVERFLOW",
+        "DESTROY",
         "+",
         "1",
         "1"
       ],
       "keys": [
         "1",
-        "OVERFLOW"
+        "DESTROY"
       ]
     },
     {
       "args": [
         "mset",
-        "RELEASE",
+        "i8",
         "$",
         "v3",
         "-",
@@ -6189,26 +6225,26 @@
       ],
       "keys": [
         "-",
-        "RELEASE",
+        "i8",
         "v3"
       ]
     },
     {
       "args": [
         "mset",
-        "OVERFLOW",
-        "OFF",
+        "WRAP",
+        "WHOAMI",
         "*",
         "1.5",
         "1.5",
-        "BLOCK",
+        "ABORT",
         "v7",
         "2"
       ],
       "keys": [
         "*",
         "1.5",
-        "OVERFLOW",
+        "WRAP",
         "v7"
       ]
     },
@@ -6238,49 +6274,49 @@
     {
       "args": [
         "msetnx",
-        "CREATE",
+        "PATTERN",
         "1",
         ">",
         "v4"
       ],
       "keys": [
         ">",
-        "CREATE"
+        "PATTERN"
       ]
     },
     {
       "args": [
         "msetnx",
-        "SAVE",
-        "ENCODING",
+        "GET",
+        "FIND",
         "10",
-        "STORE",
+        "DROP",
         "a5",
         "1.5"
       ],
       "keys": [
         "10",
-        "SAVE",
+        "GET",
         "a5"
       ]
     },
     {
       "args": [
         "msetnx",
-        "SETID",
+        "STREAM",
         "k2",
         "1.5",
-        "INFO",
+        "SET",
         "1.5",
         "10",
-        "SHARDS",
-        "MAXLEN"
+        "CREATE",
+        "GETNAME"
       ],
       "keys": [
         "1.5",
         "1.5",
-        "SETID",
-        "SHARDS"
+        "CREATE",
+        "STREAM"
       ]
     },
     {
@@ -6292,61 +6328,61 @@
     {
       "args": [
         "object",
+        "IDLETIME",
+        "-"
+      ],
+      "keys": [
+        "-"
+      ]
+    },
+    {
+      "args": [
+        "object",
         "ENCODING",
-        "k2"
+        "ENCODING"
       ],
       "keys": [
-        "k2"
+        "ENCODING"
       ]
     },
     {
       "args": [
         "object",
         "FREQ",
-        "b2"
+        "LEFT"
       ],
       "keys": [
-        "b2"
-      ]
-    },
-    {
-      "args": [
-        "object",
-        "FREQ",
-        "1.5"
-      ],
-      "keys": [
-        "1.5"
-      ]
-    },
-    {
-      "args": [
-        "object",
-        "FREQ",
-        "SUBSCRIBE"
-      ],
-      "keys": [
-        "SUBSCRIBE"
+        "LEFT"
       ]
     },
     {
       "args": [
         "object",
         "IDLETIME",
-        "-1"
+        "10"
       ],
       "keys": [
-        "-1"
+        "10"
       ]
     },
     {
       "args": [
         "object",
-        "FREQ",
-        "LEN"
+        "ENCODING",
+        "1"
       ],
       "keys": [
-        "LEN"
+        "1"
+      ]
+    },
+    {
+      "args": [
+        "object",
+        "ENCODING",
+        "1.5"
+      ],
+      "keys": [
+        "1.5"
       ]
     },
     {
@@ -6392,40 +6428,40 @@
     {
       "args": [
         "once",
-        "FROMLONLAT",
+        "SHARDS",
         "2"
       ],
       "keys": [
-        "FROMLONLAT"
+        "SHARDS"
       ]
     },
     {
       "args": [
         "once",
-        "ACQUIRE",
+        "OFF",
         "10"
       ],
       "keys": [
-        "ACQUIRE"
+        "OFF"
       ]
     },
     {
       "args": [
         "persist",
-        "INFO"
+        "MYID"
       ],
       "keys": [
-        "INFO"
+        "MYID"
       ]
     },
     {
       "args": [
         "pexpire",
-        "MYID",
+        "GROUP",
         "10"
       ],
       "keys": [
-        "MYID"
+        "GROUP"
       ]
     },
     {
@@ -6451,31 +6487,31 @@
     {
       "args": [
         "pexpire",
-        "DOCS",
+        "u8",
         "2"
       ],
       "keys": [
-        "DOCS"
+        "u8"
       ]
     },
     {
       "args": [
         "pexpire",
-        "RESET",
+        "$",
         "10"
       ],
       "keys": [
-        "RESET"
+        "$"
       ]
     },
     {
       "args": [
         "pexpire",
-        "SETNAME",
-        "0"
+        "NODES",
+        "10"
       ],
       "keys": [
-        "SETNAME"
+        "NODES"
       ]
     },
     {
@@ -6501,31 +6537,21 @@
     {
       "args": [
         "pexpireat",
-        "MAXLEN",
+        "SAVE",
         "-1"
       ],
       "keys": [
-        "MAXLEN"
+        "SAVE"
       ]
     },
     {
       "args": [
         "pexpireat",
-        "i8",
+        "SAVE",
         "10"
       ],
       "keys": [
-        "i8"
-      ]
-    },
-    {
-      "args": [
-        "pexpireat",
-        "TRACKING",
-        "-1"
-      ],
-      "keys": [
-        "TRACKING"
+        "SAVE"
       ]
     },
     {
@@ -6540,11 +6566,21 @@
     },
     {
       "args": [
-        "pexpiretime",
-        "INCRBY"
+        "pexpireat",
+        "10",
+        "1"
       ],
       "keys": [
-        "INCRBY"
+        "10"
+      ]
+    },
+    {
+      "args": [
+        "pexpiretime",
+        "REFCOUNT"
+      ],
+      "keys": [
+        "REFCOUNT"
       ]
     },
     {
@@ -6568,10 +6604,10 @@
     {
       "args": [
         "pexpiretime",
-        "LOAD"
+        "$.a"
       ],
       "keys": [
-        "LOAD"
+        "$.a"
       ]
     },
     {
@@ -6586,10 +6622,10 @@
     {
       "args": [
         "pexpiretime",
-        "$.a"
+        "$"
       ],
       "keys": [
-        "$.a"
+        "$"
       ]
     },
     {
@@ -6614,12 +6650,12 @@
     {
       "args": [
         "pfadd",
-        "GETUSER",
+        "MAX",
         "a2",
         "1"
       ],
       "keys": [
-        "GETUSER"
+        "MAX"
       ]
     },
     {
@@ -6627,7 +6663,7 @@
         "pfadd",
         "k1",
         "0",
-        "COUNT",
+        "TRACKING",
         "k4"
       ],
       "keys": [
@@ -6637,28 +6673,28 @@
     {
       "args": [
         "pfadd",
-        "RELEASE",
-        "$.a",
+        "STREAM",
+        "GROUP",
         "1",
         "0",
         "k5"
       ],
       "keys": [
-        "RELEASE"
+        "STREAM"
       ]
     },
     {
       "args": [
         "pfadd",
-        "BEGIN",
+        "CREATECONSUMER",
         ">",
         "0",
-        "DELCONSUMER",
+        "GETUSER",
         "-1",
         ">"
       ],
       "keys": [
-        "BEGIN"
+        "CREATECONSUMER"
       ]
     },
     {
@@ -6673,12 +6709,12 @@
     {
       "args": [
         "pfcount",
-        "INCRBY",
+        "KEYSLOT",
         "2"
       ],
       "keys": [
         "2",
-        "INCRBY"
+        "KEYSLOT"
       ]
     },
     {
@@ -6697,7 +6733,7 @@
     {
       "args": [
         "pfcount",
-        "CREATECONSUMER",
+        "DOCS",
         ">",
         "k3",
         "1"
@@ -6705,14 +6741,14 @@
       "keys": [
         "1",
         ">",
-        "CREATECONSUMER",
+        "DOCS",
         "k3"
       ]
     },
     {
       "args": [
         "pfcount",
-        "KEYSLOT",
+        "GETNAME",
         "v2",
         "10",
         "1",
@@ -6722,7 +6758,7 @@
         "1",
         "1.5",
         "10",
-        "KEYSLOT",
+        "GETNAME",
         "v2"
       ]
     },
@@ -6748,49 +6784,49 @@
     {
       "args": [
         "pfmerge",
-        "FREQ"
+        "u8"
       ],
       "keys": [
-        "FREQ"
+        "u8"
       ]
     },
     {
       "args": [
         "pfmerge",
-        "STORE",
+        "FLUSH",
         "1.5"
       ],
       "keys": [
         "1.5",
-        "STORE"
+        "FLUSH"
       ]
     },
     {
       "args": [
         "pfmerge",
-        "INCRBY",
+        "DELCONSUMER",
         "$",
         "f3"
       ],
       "keys": [
         "$",
-        "INCRBY",
+        "DELCONSUMER",
         "f3"
       ]
     },
     {
       "args": [
         "pfmerge",
-        "CAT",
+        "GET",
         "b2",
         "a3",
-        "GROUPS"
+        "u8"
       ],
       "keys": [
-        "CAT",
-        "GROUPS",
+        "GET",
         "a3",
-        "b2"
+        "b2",
+        "u8"
       ]
     },
     {
@@ -6800,14 +6836,14 @@
         "$",
         "10",
         "*",
-        "DELETE"
+        "DELCONSUMER"
       ],
       "keys": [
         "$",
         "*",
         "*",
         "10",
-        "DELETE"
+        "DELCONSUMER"
       ]
     },
     {
@@ -6838,41 +6874,41 @@
     {
       "args": [
         "ping",
-        "DELETE"
+        "SETNAME"
       ],
       "keys": []
     },
     {
       "args": [
         "psetex",
-        "TRACKING",
+        "NODES",
         "1",
         "$"
       ],
       "keys": [
-        "TRACKING"
+        "NODES"
       ]
     },
     {
       "args": [
         "psubscribe",
-        "ACQUIRE"
+        "USAGE"
       ],
       "keys": []
     },
     {
       "args": [
         "psubscribe",
-        "MYID",
-        "STREAMS"
+        "REFCOUNT",
+        "DOCS"
       ],
       "keys": []
     },
     {
       "args": [
         "psubscribe",
-        "TRACKING",
-        "OFF",
+        "ENCODING",
+        "i8",
         "1.5"
       ],
       "keys": []
@@ -6880,17 +6916,17 @@
     {
       "args": [
         "psubscribe",
-        "GETUSER",
+        "RIGHT",
         "k2",
         "f3",
-        "WRAP"
+        "DELCONSUMER"
       ],
       "keys": []
     },
     {
       "args": [
         "psubscribe",
-        "SETNAME",
+        "STREAMS",
         ">",
         "+",
         "1.5",
@@ -6905,7 +6941,7 @@
         "0",
         ">",
         "v4",
-        "SUBSCRIBE",
+        "DELCONSUMER",
         "f6"
       ],
       "keys": []
@@ -6913,16 +6949,16 @@
     {
       "args": [
         "pttl",
-        "i8"
+        "ON"
       ],
       "keys": [
-        "i8"
+        "ON"
       ]
     },
     {
       "args": [
         "publish",
-        "RELEASE",
+        "SETUSER",
         "0"
       ],
       "keys": []
@@ -6930,7 +6966,7 @@
     {
       "args": [
         "publish",
-        "i8",
+        "STATUS",
         "-"
       ],
       "keys": []
@@ -6938,7 +6974,7 @@
     {
       "args": [
         "publish",
-        "DELETE",
+        "EXISTS",
         "f2"
       ],
       "keys": []
@@ -6946,8 +6982,8 @@
     {
       "args": [
         "publish",
-        "MYID",
-        "TRACKING"
+        "ENCODING",
+        "ON"
       ],
       "keys": []
     },
@@ -6962,7 +6998,7 @@
     {
       "args": [
         "publish",
-        "GET",
+        "STORE",
         "a2"
       ],
       "keys": []
@@ -6976,7 +7012,15 @@
     {
       "args": [
         "punsubscribe",
-        "RIGHT"
+        "KILL"
+      ],
+      "keys": []
+    },
+    {
+      "args": [
+        "punsubscribe",
+        "SET",
+        "CREATE"
       ],
       "keys": []
     },
@@ -6984,25 +7028,17 @@
       "args": [
         "punsubscribe",
         "TRACKING",
-        "$.a"
+        "USERS",
+        "STREAM"
       ],
       "keys": []
     },
     {
       "args": [
         "punsubscribe",
-        "KILL",
-        "$",
-        "ID"
-      ],
-      "keys": []
-    },
-    {
-      "args": [
-        "punsubscribe",
-        "BLOCK",
+        "MAX",
         "f2",
-        "TRACKING",
+        "PATTERN",
         "-1"
       ],
       "keys": []
@@ -7010,10 +7046,10 @@
     {
       "args": [
         "punsubscribe",
-        "TRACKING",
+        "LEN",
         "-1",
         "1.5",
-        "USAGE",
+        "GETNAME",
         "0"
       ],
       "keys": []
@@ -7039,11 +7075,11 @@
     {
       "args": [
         "release",
-        "COMPLETE",
+        "LIST",
         "10"
       ],
       "keys": [
-        "COMPLETE"
+        "LIST"
       ]
     },
     {
@@ -7069,21 +7105,21 @@
     {
       "args": [
         "release",
-        "MINID",
+        "RELEASE",
         "2"
       ],
       "keys": [
-        "MINID"
+        "RELEASE"
       ]
     },
     {
       "args": [
         "release",
-        "RELEASE",
+        "ABORT",
         "0"
       ],
       "keys": [
-        "RELEASE"
+        "ABORT"
       ]
     },
     {
@@ -7099,56 +7135,56 @@
     {
       "args": [
         "rename",
-        "IDLETIME",
+        "GETUSER",
         "-1"
       ],
       "keys": [
         "-1",
-        "IDLETIME"
+        "GETUSER"
       ]
     },
     {
       "args": [
         "rename",
-        "DOCS",
+        "KEYSLOT",
         "b2"
       ],
       "keys": [
-        "DOCS",
+        "KEYSLOT",
         "b2"
       ]
     },
     {
       "args": [
         "rename",
-        "km",
+        "REFCOUNT",
         "$"
       ],
       "keys": [
         "$",
-        "km"
+        "REFCOUNT"
       ]
     },
     {
       "args": [
         "rename",
-        "RIGHT",
+        "SETID",
         "$"
       ],
       "keys": [
         "$",
-        "RIGHT"
+        "SETID"
       ]
     },
     {
       "args": [
         "rename",
-        "FLUSH",
+        "CREATE",
         "0"
       ],
       "keys": [
         "0",
-        "FLUSH"
+        "CREATE"
       ]
     },
     {
@@ -7165,67 +7201,67 @@
     {
       "args": [
         "renamenx",
-        "STATUS",
+        "GROUP",
         "1"
       ],
       "keys": [
         "1",
-        "STATUS"
+        "GROUP"
       ]
     },
     {
       "args": [
         "renamenx",
-        "STREAM",
+        "KEYSLOT",
         "b2"
       ],
       "keys": [
-        "STREAM",
+        "KEYSLOT",
         "b2"
       ]
     },
     {
       "args": [
         "renamenx",
-        "DOCS",
+        "KILL",
         "v2"
       ],
       "keys": [
-        "DOCS",
+        "KILL",
         "v2"
       ]
     },
     {
       "args": [
         "renamenx",
-        "EXISTS",
+        "COUNT",
         "10"
       ],
       "keys": [
         "10",
-        "EXISTS"
+        "COUNT"
       ]
     },
     {
       "args": [
         "renamenx",
-        "FIND",
+        "GROUPS",
         "1.5"
       ],
       "keys": [
         "1.5",
-        "FIND"
+        "GROUPS"
       ]
     },
     {
       "args": [
         "renamenx",
         "+",
-        "$.a"
+        "DESTROY"
       ],
       "keys": [
-        "$.a",
-        "+"
+        "+",
+        "DESTROY"
       ]
     },
     {
@@ -7275,23 +7311,23 @@
     {
       "args": [
         "renew",
-        "MYID",
+        "SETUSER",
         "0",
         "2"
       ],
       "keys": [
-        "MYID"
+        "SETUSER"
       ]
     },
     {
       "args": [
         "renew",
-        "FREQ",
+        "DROP",
         "0",
         "10"
       ],
       "keys": [
-        "FREQ"
+        "DROP"
       ]
     },
     {
@@ -7305,23 +7341,23 @@
     {
       "args": [
         "restore",
-        "STATUS",
+        "ID",
         "2",
-        "GROUP"
+        "SHARDS"
       ],
       "keys": [
-        "STATUS"
+        "ID"
       ]
     },
     {
       "args": [
         "restore",
-        "OFF",
+        "DROP",
         "-1",
         "k3"
       ],
       "keys": [
-        "OFF"
+        "DROP"
       ]
     },
     {
@@ -7349,23 +7385,23 @@
     {
       "args": [
         "restore",
-        "MAXLEN",
+        "GROUP",
         "1",
         "1"
       ],
       "keys": [
-        "MAXLEN"
+        "GROUP"
       ]
     },
     {
       "args": [
         "restore",
-        "MAX",
+        "MIN",
         "-1",
         "+"
       ],
       "keys": [
-        "MAX"
+        "MIN"
       ]
     },
     {
@@ -7395,10 +7431,10 @@
     {
       "args": [
         "rpop",
-        "CREATECONSUMER"
+        "DOCS"
       ],
       "keys": [
-        "CREATECONSUMER"
+        "DOCS"
       ]
     },
     {
@@ -7414,29 +7450,29 @@
     {
       "args": [
         "rpop",
-        "OVERFLOW"
+        "RIGHT"
       ],
       "keys": [
-        "OVERFLOW"
+        "RIGHT"
       ]
     },
     {
       "args": [
         "rpop",
-        "DELETE"
+        "GET"
       ],
       "keys": [
-        "DELETE"
+        "GET"
       ]
     },
     {
       "args": [
         "rpoplpush",
-        "COUNT",
+        "INFO",
         "a2"
       ],
       "keys": [
-        "COUNT",
+        "INFO",
         "a2"
       ]
     },
@@ -7465,23 +7501,23 @@
     {
       "args": [
         "rpoplpush",
-        "GETKEYS",
-        "EXISTS"
+        "ENCODING",
+        "INCRBY"
       ],
       "keys": [
-        "EXISTS",
-        "GETKEYS"
+        "ENCODING",
+        "INCRBY"
       ]
     },
     {
       "args": [
         "rpoplpush",
-        "GETUSER",
+        "INCRBY",
         "*"
       ],
       "keys": [
         "*",
-        "GETUSER"
+        "INCRBY"
       ]
     },
     {
@@ -7498,11 +7534,11 @@
     {
       "args": [
         "rpush",
-        "COMPLETE",
+        "EXISTS",
         "-1"
       ],
       "keys": [
-        "COMPLETE"
+        "EXISTS"
       ]
     },
     {
@@ -7510,7 +7546,7 @@
         "rpush",
         "0",
         "b2",
-        "SET"
+        "SETID"
       ],
       "keys": [
         "0"
@@ -7519,13 +7555,13 @@
     {
       "args": [
         "rpush",
-        "TRACKING",
+        "SAVE",
         "2",
         "-",
         "-1"
       ],
       "keys": [
-        "TRACKING"
+        "SAVE"
       ]
     },
     {
@@ -7562,7 +7598,7 @@
         "+",
         "a3",
         "-",
-        "i8",
+        "MAX",
         ">",
         "2"
       ],
@@ -7602,8 +7638,8 @@
         "2",
         "v3",
         "-",
-        "RELEASE",
-        "MYID",
+        "RIGHT",
+        "LIST",
         "-1",
         "f8"
       ],
@@ -7635,7 +7671,7 @@
         "k4",
         "$",
         "-1",
-        "DOCS",
+        "SAVE",
         "a8"
       ],
       "keys": [
@@ -7647,7 +7683,7 @@
         "rpushcap",
         "-1",
         "1",
-        "FIND",
+        "BLOCK",
         "f4",
         "f5"
       ],
@@ -7658,22 +7694,22 @@
     {
       "args": [
         "rpushx",
-        "LOAD",
-        "OFF"
+        "RIGHT",
+        "ACQUIRE"
       ],
       "keys": [
-        "LOAD"
+        "RIGHT"
       ]
     },
     {
       "args": [
         "rpushx",
-        "CAT",
+        "CONSUMERS",
         ">",
-        "GETKEYS"
+        "BLOCK"
       ],
       "keys": [
-        "CAT"
+        "CONSUMERS"
       ]
     },
     {
@@ -7691,14 +7727,14 @@
     {
       "args": [
         "rpushx",
-        "GETUSER",
+        "EXISTS",
         "+",
         "*",
         "10",
         "k5"
       ],
       "keys": [
-        "GETUSER"
+        "EXISTS"
       ]
     },
     {
@@ -7707,9 +7743,9 @@
         "v1",
         "STREAM",
         "*",
-        "MAXLEN",
-        "FLUSH",
-        "KILL"
+        "REFCOUNT",
+        "FROMLONLAT",
+        "DOCS"
       ],
       "keys": [
         "v1"
@@ -7718,7 +7754,7 @@
     {
       "args": [
         "rpushx",
-        "CREATECONSUMER",
+        "STATUS",
         "+",
         "k3",
         "1",
@@ -7727,7 +7763,7 @@
         "+"
       ],
       "keys": [
-        "CREATECONSUMER"
+        "STATUS"
       ]
     },
     {
@@ -7739,41 +7775,41 @@
     {
       "args": [
         "ruvio",
-        "SHARDS"
+        "USAGE"
       ],
       "keys": []
     },
     {
       "args": [
         "sadd",
-        "BYRADIUS",
-        "MAX"
+        "u8",
+        "IDLETIME"
       ],
       "keys": [
-        "BYRADIUS"
+        "u8"
       ]
     },
     {
       "args": [
         "sadd",
-        "NODES",
-        "MIN",
-        "INFO"
+        "GETUSER",
+        "FREQ",
+        "WRAP"
       ],
       "keys": [
-        "NODES"
+        "GETUSER"
       ]
     },
     {
       "args": [
         "sadd",
-        "OFF",
+        "USERS",
         "b2",
         "k3",
         "0"
       ],
       "keys": [
-        "OFF"
+        "USERS"
       ]
     },
     {
@@ -7781,8 +7817,8 @@
         "sadd",
         "b1",
         "-1",
-        "LATEST",
-        "LIST",
+        "EXISTS",
+        "u8",
         ">"
       ],
       "keys": [
@@ -7792,21 +7828,21 @@
     {
       "args": [
         "sadd",
-        "COUNT",
+        "FIND",
         "1",
         "$",
-        "GROUP",
+        "CAT",
         "a5",
         "v6"
       ],
       "keys": [
-        "COUNT"
+        "FIND"
       ]
     },
     {
       "args": [
         "sadd",
-        "SLOTS",
+        "COUNT",
         "a2",
         "v3",
         "b4",
@@ -7815,7 +7851,7 @@
         "$"
       ],
       "keys": [
-        "SLOTS"
+        "COUNT"
       ]
     },
     {
@@ -7855,15 +7891,34 @@
     {
       "args": [
         "scard",
-        "FLUSH"
+        "SET"
       ],
       "keys": [
-        "FLUSH"
+        "SET"
       ]
     },
     {
       "args": [
         "script",
+        "EXISTS",
+        "*"
+      ],
+      "keys": []
+    },
+    {
+      "args": [
+        "script",
+        "EXISTS",
+        "-",
+        "v3",
+        "a4",
+        "1.5"
+      ],
+      "keys": []
+    },
+    {
+      "args": [
+        "script",
         "FLUSH"
       ],
       "keys": []
@@ -7872,7 +7927,18 @@
       "args": [
         "script",
         "EXISTS",
-        "OVERFLOW"
+        "10",
+        "b3",
+        "0",
+        "-",
+        "MAX"
+      ],
+      "keys": []
+    },
+    {
+      "args": [
+        "script",
+        "KILL"
       ],
       "keys": []
     },
@@ -7880,80 +7946,49 @@
       "args": [
         "script",
         "EXISTS",
+        "MINID",
         "1",
-        "10",
-        "b4",
-        "1"
-      ],
-      "keys": []
-    },
-    {
-      "args": [
-        "script",
-        "LOAD",
-        ">"
-      ],
-      "keys": []
-    },
-    {
-      "args": [
-        "script",
-        "EXISTS",
-        "0",
-        "SLOTS",
-        "$"
-      ],
-      "keys": []
-    },
-    {
-      "args": [
-        "script",
-        "EXISTS",
-        "0",
-        "LOAD",
-        "10",
-        "10",
-        "GET"
+        "f4"
       ],
       "keys": []
     },
     {
       "args": [
         "sdiff",
-        "SETID"
+        "SETUSER"
       ],
       "keys": [
-        "SETID"
+        "SETUSER"
       ]
     },
     {
       "args": [
         "sdiff",
-        "OVERFLOW",
+        "BEGIN",
         "f2"
       ],
       "keys": [
-        "OVERFLOW",
+        "BEGIN",
         "f2"
       ]
     },
     {
       "args": [
         "sdiff",
-        "LATEST",
+        "SETID",
         "k2",
         "10"
       ],
       "keys": [
         "10",
-        "LATEST",
+        "SETID",
         "k2"
       ]
     },
     {
       "args": [
         "sdiff",
-        "CREATE",
+        "LEFT",
         "-1",
         "2",
         "-1"
@@ -7962,14 +7997,14 @@
         "-1",
         "-1",
         "2",
-        "CREATE"
+        "LEFT"
       ]
     },
     {
       "args": [
         "sdiff",
-        "LATEST",
-        "DROP",
+        "CREATE",
+        "STREAMS",
         "2",
         "k4",
         "2"
@@ -7977,38 +8012,38 @@
       "keys": [
         "2",
         "2",
-        "DROP",
-        "LATEST",
+        "CREATE",
+        "STREAMS",
         "k4"
       ]
     },
     {
       "args": [
         "sdiff",
-        "STREAMS",
+        "LATEST",
         ">",
         "*",
         "f4",
-        "STREAMS",
+        "GROUPS",
         "-1"
       ],
       "keys": [
         "*",
         "-1",
         ">",
-        "STREAMS",
-        "STREAMS",
+        "GROUPS",
+        "LATEST",
         "f4"
       ]
     },
     {
       "args": [
         "sdiffstore",
-        "SETUSER",
+        "STREAM",
         "v2"
       ],
       "keys": [
-        "SETUSER",
+        "STREAM",
         "v2"
       ]
     },
@@ -8028,23 +8063,23 @@
     {
       "args": [
         "sdiffstore",
-        "GET",
+        "STREAMS",
         "b2",
-        "STREAM",
-        "INFO"
+        "RESET",
+        "SETUSER"
       ],
       "keys": [
-        "GET",
-        "INFO",
-        "STREAM",
+        "RESET",
+        "SETUSER",
+        "STREAMS",
         "b2"
       ]
     },
     {
       "args": [
         "sdiffstore",
-        "km",
-        "TRACKING",
+        "LATEST",
+        "u8",
         "v3",
         "2",
         "-1"
@@ -8052,26 +8087,26 @@
       "keys": [
         "-1",
         "2",
-        "TRACKING",
-        "km",
+        "LATEST",
+        "u8",
         "v3"
       ]
     },
     {
       "args": [
         "sdiffstore",
-        "GETNAME",
+        "COUNT",
         "b2",
         "b3",
         "+",
-        "$",
+        "NODES",
         "-1"
       ],
       "keys": [
-        "$",
         "+",
         "-1",
-        "GETNAME",
+        "COUNT",
+        "NODES",
         "b2",
         "b3"
       ]
@@ -8079,12 +8114,12 @@
     {
       "args": [
         "sdiffstore",
-        "ACQUIRE",
+        "SLOTS",
         "+",
-        "WHOAMI",
+        "ACQUIRE",
         "2",
         "-1",
-        "SLOTS",
+        "LIST",
         "*"
       ],
       "keys": [
@@ -8093,8 +8128,8 @@
         "-1",
         "2",
         "ACQUIRE",
-        "SLOTS",
-        "WHOAMI"
+        "LIST",
+        "SLOTS"
       ]
     },
     {
@@ -8118,34 +8153,34 @@
     {
       "args": [
         "semaphore",
-        "BYRADIUS",
+        "USAGE",
         "2",
         "2"
       ],
       "keys": [
-        "BYRADIUS"
+        "USAGE"
       ]
     },
     {
       "args": [
         "semaphore",
-        "FLUSH",
+        "MAX",
         "1",
         "1"
       ],
       "keys": [
-        "FLUSH"
+        "MAX"
       ]
     },
     {
       "args": [
         "semaphore",
-        "SETNAME",
+        "PATTERN",
         "1",
         "1"
       ],
       "keys": [
-        "SETNAME"
+        "PATTERN"
       ]
     },
     {
@@ -8197,22 +8232,22 @@
     {
       "args": [
         "set",
-        "MAXLEN",
+        "CREATE",
         "f2"
       ],
       "keys": [
-        "MAXLEN"
+        "CREATE"
       ]
     },
     {
       "args": [
         "set",
-        "1.5",
-        "SETID",
+        ">",
+        "+",
         "GET"
       ],
       "keys": [
-        "1.5"
+        ">"
       ]
     },
     {
@@ -8240,34 +8275,34 @@
     {
       "args": [
         "setbit",
-        "WHOAMI",
+        "COMPLETE",
         "1",
         "0"
       ],
       "keys": [
-        "WHOAMI"
+        "COMPLETE"
       ]
     },
     {
       "args": [
         "setbit",
-        "FIND",
+        "TRACKING",
         "2",
         "1"
       ],
       "keys": [
-        "FIND"
+        "TRACKING"
       ]
     },
     {
       "args": [
         "setbit",
-        "RIGHT",
+        "STREAM",
         "0",
         "0"
       ],
       "keys": [
-        "RIGHT"
+        "STREAM"
       ]
     },
     {
@@ -8284,12 +8319,12 @@
     {
       "args": [
         "setex",
-        "CREATE",
+        "SETNAME",
         "1",
-        "SHARDS"
+        "INCRBY"
       ],
       "keys": [
-        "CREATE"
+        "SETNAME"
       ]
     },
     {
@@ -8305,45 +8340,45 @@
     {
       "args": [
         "setrange",
-        "RESET",
+        "DELCONSUMER",
         "10",
-        "DESTROY"
+        "FROMLONLAT"
       ],
       "keys": [
-        "RESET"
+        "DELCONSUMER"
       ]
     },
     {
       "args": [
         "setrange",
-        "IDLETIME",
+        "SET",
         "0",
-        "DROP"
+        "u8"
       ],
       "keys": [
-        "IDLETIME"
+        "SET"
       ]
     },
     {
       "args": [
         "setrange",
-        "i8",
+        "LEFT",
         "10",
         "+"
       ],
       "keys": [
-        "i8"
+        "LEFT"
       ]
     },
     {
       "args": [
         "setrange",
-        "WHOAMI",
+        "MAXLEN",
         "0",
         "*"
       ],
       "keys": [
-        "WHOAMI"
+        "MAXLEN"
       ]
     },
     {
@@ -8351,7 +8386,7 @@
         "setrange",
         "2",
         "2",
-        "KEYSLOT"
+        "GROUPS"
       ],
       "keys": [
         "2"
@@ -8360,22 +8395,22 @@
     {
       "args": [
         "setrange",
-        "CONSUMERS",
+        "DOCS",
         "2",
         "a3"
       ],
       "keys": [
-        "CONSUMERS"
+        "DOCS"
       ]
     },
     {
       "args": [
         "setv",
-        "ACQUIRE",
+        "DELETE",
         "1"
       ],
       "keys": [
-        "ACQUIRE"
+        "DELETE"
       ]
     },
     {
@@ -8401,11 +8436,11 @@
     {
       "args": [
         "setv",
-        "STATUS",
+        "NODES",
         "$"
       ],
       "keys": [
-        "STATUS"
+        "NODES"
       ]
     },
     {
@@ -8441,46 +8476,46 @@
       "args": [
         "sinter",
         "$",
-        "$.a"
+        "DELETE"
       ],
       "keys": [
         "$",
-        "$.a"
+        "DELETE"
       ]
     },
     {
       "args": [
         "sinter",
-        "NODES",
+        "INCRBY",
         "10",
         "f3"
       ],
       "keys": [
         "10",
-        "NODES",
+        "INCRBY",
         "f3"
       ]
     },
     {
       "args": [
         "sinter",
-        "GROUPS",
+        "COUNT",
         "1",
-        "u8",
+        "OVERFLOW",
         "-"
       ],
       "keys": [
         "-",
         "1",
-        "GROUPS",
-        "u8"
+        "COUNT",
+        "OVERFLOW"
       ]
     },
     {
       "args": [
         "sinter",
-        "GROUP",
-        "STATUS",
+        "MINID",
+        "FROMLONLAT",
         "*",
         "$",
         "*"
@@ -8489,16 +8524,16 @@
         "$",
         "*",
         "*",
-        "GROUP",
-        "STATUS"
+        "FROMLONLAT",
+        "MINID"
       ]
     },
     {
       "args": [
         "sinter",
-        "GROUP",
+        "CREATECONSUMER",
         "0",
-        "RIGHT",
+        "BYRADIUS",
         "*",
         "$",
         "v6"
@@ -8507,8 +8542,8 @@
         "$",
         "*",
         "0",
-        "GROUP",
-        "RIGHT",
+        "BYRADIUS",
+        "CREATECONSUMER",
         "v6"
       ]
     },
@@ -8530,97 +8565,97 @@
       "args": [
         "sintercard",
         "2",
-        "OVERFLOW",
-        "MYID"
-      ],
-      "keys": [
-        "MYID",
-        "OVERFLOW"
-      ]
-    },
-    {
-      "args": [
-        "sintercard",
-        "1",
-        "$"
-      ],
-      "keys": [
-        "$"
-      ]
-    },
-    {
-      "args": [
-        "sintercard",
-        "1",
-        "2"
-      ],
-      "keys": [
-        "2"
-      ]
-    },
-    {
-      "args": [
-        "sintercard",
-        "1",
-        "f2"
-      ],
-      "keys": [
-        "f2"
-      ]
-    },
-    {
-      "args": [
-        "sintercard",
-        "1",
-        "-"
-      ],
-      "keys": [
-        "-"
-      ]
-    },
-    {
-      "args": [
-        "sinterstore",
-        "*",
-        ">"
-      ],
-      "keys": [
-        "*",
-        ">"
-      ]
-    },
-    {
-      "args": [
-        "sinterstore",
-        "SLOTS",
-        "10",
-        "a3"
-      ],
-      "keys": [
-        "10",
-        "SLOTS",
-        "a3"
-      ]
-    },
-    {
-      "args": [
-        "sinterstore",
-        "LEN",
-        "+",
-        "COMPLETE",
-        "ENCODING"
-      ],
-      "keys": [
-        "+",
-        "COMPLETE",
-        "ENCODING",
-        "LEN"
-      ]
-    },
-    {
-      "args": [
-        "sinterstore",
         "NODES",
+        "ID"
+      ],
+      "keys": [
+        "ID",
+        "NODES"
+      ]
+    },
+    {
+      "args": [
+        "sintercard",
+        "1",
+        "$"
+      ],
+      "keys": [
+        "$"
+      ]
+    },
+    {
+      "args": [
+        "sintercard",
+        "1",
+        "2"
+      ],
+      "keys": [
+        "2"
+      ]
+    },
+    {
+      "args": [
+        "sintercard",
+        "1",
+        "f2"
+      ],
+      "keys": [
+        "f2"
+      ]
+    },
+    {
+      "args": [
+        "sintercard",
+        "1",
+        "-"
+      ],
+      "keys": [
+        "-"
+      ]
+    },
+    {
+      "args": [
+        "sinterstore",
+        "*",
+        ">"
+      ],
+      "keys": [
+        "*",
+        ">"
+      ]
+    },
+    {
+      "args": [
+        "sinterstore",
+        "u8",
+        "10",
+        "a3"
+      ],
+      "keys": [
+        "10",
+        "a3",
+        "u8"
+      ]
+    },
+    {
+      "args": [
+        "sinterstore",
+        "CAT",
+        "+",
+        "LATEST",
+        "GROUP"
+      ],
+      "keys": [
+        "+",
+        "CAT",
+        "GROUP",
+        "LATEST"
+      ]
+    },
+    {
+      "args": [
+        "sinterstore",
+        "STORE",
         "1.5",
         "2",
         "f4",
@@ -8630,7 +8665,7 @@
         "-1",
         "1.5",
         "2",
-        "NODES",
+        "STORE",
         "f4"
       ]
     },
@@ -8640,27 +8675,27 @@
         "*",
         ">",
         "*",
-        "STREAMS",
+        "i8",
         "10",
-        "WHOAMI"
+        "ENCODING"
       ],
       "keys": [
         "*",
         "*",
         "10",
         ">",
-        "STREAMS",
-        "WHOAMI"
+        "ENCODING",
+        "i8"
       ]
     },
     {
       "args": [
         "sinterstore",
-        "GROUP",
+        "INCRBY",
         "a2",
-        "INFO",
+        "OVERFLOW",
         ">",
-        "SLOTS",
+        "OFF",
         "+",
         "+"
       ],
@@ -8668,26 +8703,34 @@
         "+",
         "+",
         ">",
-        "GROUP",
-        "INFO",
-        "SLOTS",
+        "INCRBY",
+        "OFF",
+        "OVERFLOW",
         "a2"
       ]
     },
     {
       "args": [
         "sismember",
-        "SLOTS",
+        "km",
         "f2"
       ],
       "keys": [
-        "SLOTS"
+        "km"
       ]
     },
     {
       "args": [
         "slowlog",
         "LEN"
+      ],
+      "keys": []
+    },
+    {
+      "args": [
+        "slowlog",
+        "GET",
+        "0"
       ],
       "keys": []
     },
@@ -8704,7 +8747,7 @@
       "args": [
         "smismember",
         "+",
-        "INCRBY"
+        "GETNAME"
       ],
       "keys": [
         "+"
@@ -8724,20 +8767,20 @@
     {
       "args": [
         "smismember",
-        "OFF",
-        "IDLETIME",
-        "u8",
+        "FLUSH",
+        "SLOTS",
+        "GETNAME",
         "1"
       ],
       "keys": [
-        "OFF"
+        "FLUSH"
       ]
     },
     {
       "args": [
         "smismember",
         "1.5",
-        "CREATECONSUMER",
+        "BYRADIUS",
         "10",
         "-1",
         "a5"
@@ -8749,21 +8792,21 @@
     {
       "args": [
         "smismember",
-        "DESTROY",
-        "DESTROY",
+        "WHOAMI",
+        "DELCONSUMER",
         "-1",
         "1.5",
-        "WHOAMI",
+        "OVERFLOW",
         "*"
       ],
       "keys": [
-        "DESTROY"
+        "WHOAMI"
       ]
     },
     {
       "args": [
         "smismember",
-        "ON",
+        "PATTERN",
         "0",
         "$",
         "b4",
@@ -8772,54 +8815,54 @@
         "1.5"
       ],
       "keys": [
-        "ON"
+        "PATTERN"
       ]
     },
     {
       "args": [
         "smove",
-        "BLOCK",
+        "DOCS",
         "0",
         "10"
       ],
       "keys": [
         "0",
-        "BLOCK"
+        "DOCS"
       ]
     },
     {
       "args": [
         "smove",
-        "SETID",
-        "SUBSCRIBE",
-        "INCRBY"
+        "SET",
+        "ENCODING",
+        "km"
       ],
       "keys": [
-        "SETID",
-        "SUBSCRIBE"
+        "ENCODING",
+        "SET"
       ]
     },
     {
       "args": [
         "smove",
         ">",
-        "EXISTS",
+        "CREATECONSUMER",
         "+"
       ],
       "keys": [
         ">",
-        "EXISTS"
+        "CREATECONSUMER"
       ]
     },
     {
       "args": [
         "smove",
-        "LEFT",
+        "CAT",
         "b2",
-        "GETUSER"
+        "ID"
       ],
       "keys": [
-        "LEFT",
+        "CAT",
         "b2"
       ]
     },
@@ -8827,80 +8870,80 @@
       "args": [
         "smove",
         "-1",
-        "DOCS",
+        "RELEASE",
         "+"
       ],
       "keys": [
         "-1",
-        "DOCS"
+        "RELEASE"
       ]
     },
     {
       "args": [
         "smove",
-        "GROUPS",
+        "WHOAMI",
         "v2",
         "1"
       ],
       "keys": [
-        "GROUPS",
+        "WHOAMI",
         "v2"
       ]
     },
     {
       "args": [
         "spop",
-        "PATTERN"
+        "ABORT"
       ],
       "keys": [
-        "PATTERN"
+        "ABORT"
       ]
     },
     {
       "args": [
         "spop",
-        "COMPLETE",
+        "STATUS",
         "0"
       ],
       "keys": [
-        "COMPLETE"
+        "STATUS"
       ]
     },
     {
       "args": [
         "spop",
-        "CONSUMERS"
+        "DESTROY"
       ],
       "keys": [
-        "CONSUMERS"
+        "DESTROY"
       ]
     },
     {
       "args": [
         "spop",
-        "FLUSH",
+        "DROP",
         "0"
       ],
       "keys": [
-        "FLUSH"
+        "DROP"
       ]
     },
     {
       "args": [
         "spop",
-        "IDLETIME"
+        "KILL"
       ],
       "keys": [
-        "IDLETIME"
+        "KILL"
       ]
     },
     {
       "args": [
         "spop",
-        "SETNAME"
+        "STORE"
       ],
       "keys": [
-        "SETNAME"
+        "STORE"
       ]
     },
     {
@@ -8914,7 +8957,7 @@
     {
       "args": [
         "spublish",
-        "RELEASE",
+        "SHARDS",
         "k2"
       ],
       "keys": []
@@ -8923,14 +8966,14 @@
       "args": [
         "spublish",
         "b1",
-        "ENCODING"
+        "NODES"
       ],
       "keys": []
     },
     {
       "args": [
         "spublish",
-        "OVERFLOW",
+        "RIGHT",
         "*"
       ],
       "keys": []
@@ -8954,10 +8997,10 @@
     {
       "args": [
         "srandmember",
-        "DROP"
+        "DELCONSUMER"
       ],
       "keys": [
-        "DROP"
+        "DELCONSUMER"
       ]
     },
     {
@@ -8972,20 +9015,29 @@
     {
       "args": [
         "srandmember",
-        "BYRADIUS",
+        "CREATECONSUMER",
         "10"
       ],
       "keys": [
-        "BYRADIUS"
+        "CREATECONSUMER"
       ]
     },
     {
       "args": [
         "srandmember",
-        "KEYSLOT"
+        "LOAD"
       ],
       "keys": [
-        "KEYSLOT"
+        "LOAD"
+      ]
+    },
+    {
+      "args": [
+        "srandmember",
+        "LATEST"
+      ],
+      "keys": [
+        "LATEST"
       ]
     },
     {
@@ -8995,25 +9047,16 @@
       ],
       "keys": [
         "+"
-      ]
-    },
-    {
-      "args": [
-        "srandmember",
-        "k1"
-      ],
-      "keys": [
-        "k1"
       ]
     },
     {
       "args": [
         "srem",
-        "LIST",
+        "NODES",
         "1"
       ],
       "keys": [
-        "LIST"
+        "NODES"
       ]
     },
     {
@@ -9030,13 +9073,13 @@
     {
       "args": [
         "srem",
-        "STORE",
-        "ENCODING",
+        "SLOTS",
+        "ABORT",
         "a3",
-        "DELCONSUMER"
+        "ACQUIRE"
       ],
       "keys": [
-        "STORE"
+        "SLOTS"
       ]
     },
     {
@@ -9044,7 +9087,7 @@
         "srem",
         "-",
         "k2",
-        "STORE",
+        "COMPLETE",
         "f4",
         "0"
       ],
@@ -9055,30 +9098,30 @@
     {
       "args": [
         "srem",
-        "COUNT",
+        "FROMLONLAT",
         ">",
         "0",
-        "SUBSCRIBE",
+        "KILL",
         "b5",
         "1"
       ],
       "keys": [
-        "COUNT"
+        "FROMLONLAT"
       ]
     },
     {
       "args": [
         "srem",
-        "ON",
+        "SHARDS",
         "-",
         "2",
         "*",
-        "$",
+        "IDLETIME",
         "2",
         "+"
       ],
       "keys": [
-        "ON"
+        "SHARDS"
       ]
     },
     {
@@ -9094,11 +9137,11 @@
     {
       "args": [
         "sscan",
-        "DOCS",
+        "i8",
         "0"
       ],
       "keys": [
-        "DOCS"
+        "i8"
       ]
     },
     {
@@ -9124,11 +9167,11 @@
     {
       "args": [
         "sscan",
-        "NODES",
+        "DESTROY",
         "2"
       ],
       "keys": [
-        "NODES"
+        "DESTROY"
       ]
     },
     {
@@ -9144,14 +9187,14 @@
     {
       "args": [
         "ssubscribe",
-        "FIND"
+        "WHOAMI"
       ],
       "keys": []
     },
     {
       "args": [
         "ssubscribe",
-        "GET",
+        "i8",
         "1"
       ],
       "keys": []
@@ -9168,9 +9211,9 @@
     {
       "args": [
         "ssubscribe",
-        "GET",
+        "GETNAME",
         "-",
-        "OFF",
+        "CREATECONSUMER",
         "a4"
       ],
       "keys": []
@@ -9178,7 +9221,7 @@
     {
       "args": [
         "ssubscribe",
-        "SHARDS",
+        "FIND",
         "0",
         "1.5",
         "b4",
@@ -9189,7 +9232,7 @@
     {
       "args": [
         "ssubscribe",
-        "OVERFLOW",
+        "SUBSCRIBE",
         "1",
         "*",
         "v4",
@@ -9201,10 +9244,10 @@
     {
       "args": [
         "strlen",
-        "DELETE"
+        "CREATECONSUMER"
       ],
       "keys": [
-        "DELETE"
+        "CREATECONSUMER"
       ]
     },
     {
@@ -9217,17 +9260,17 @@
     {
       "args": [
         "subscribe",
-        "FLUSH",
-        "MYID"
+        "FROMLONLAT",
+        "COUNT"
       ],
       "keys": []
     },
     {
       "args": [
         "subscribe",
-        "CREATE",
+        "BEGIN",
         "v2",
-        "INCRBY"
+        "USAGE"
       ],
       "keys": []
     },
@@ -9236,15 +9279,15 @@
         "subscribe",
         "b1",
         "+",
-        "DELCONSUMER",
-        "COUNT"
+        "DELETE",
+        "GETNAME"
       ],
       "keys": []
     },
     {
       "args": [
         "subscribe",
-        "CREATE",
+        "SETUSER",
         "*",
         "+",
         "-",
@@ -9255,8 +9298,8 @@
     {
       "args": [
         "subscribe",
-        "GETKEYS",
-        "MINID",
+        "DELETE",
+        "DELCONSUMER",
         "10",
         "v4",
         "10",
@@ -9278,12 +9321,12 @@
     {
       "args": [
         "substr",
-        "IDLETIME",
+        "u8",
         "10",
         "1"
       ],
       "keys": [
-        "IDLETIME"
+        "u8"
       ]
     },
     {
@@ -9300,34 +9343,34 @@
     {
       "args": [
         "substr",
-        "WHOAMI",
+        "DELETE",
         "10",
         "10"
       ],
       "keys": [
-        "WHOAMI"
+        "DELETE"
       ]
     },
     {
       "args": [
         "substr",
-        "WHOAMI",
+        "CREATECONSUMER",
         "-1",
         "0"
       ],
       "keys": [
-        "WHOAMI"
+        "CREATECONSUMER"
       ]
     },
     {
       "args": [
         "substr",
-        "DELCONSUMER",
+        "GETUSER",
         "1",
         "-1"
       ],
       "keys": [
-        "DELCONSUMER"
+        "GETUSER"
       ]
     },
     {
@@ -9343,45 +9386,45 @@
       "args": [
         "sunion",
         "1.5",
-        "COUNT"
+        "GETNAME"
       ],
       "keys": [
         "1.5",
-        "COUNT"
+        "GETNAME"
       ]
     },
     {
       "args": [
         "sunion",
         "1.5",
-        "SET",
-        "DELCONSUMER"
+        "ABORT",
+        "ACQUIRE"
       ],
       "keys": [
         "1.5",
-        "DELCONSUMER",
-        "SET"
+        "ABORT",
+        "ACQUIRE"
       ]
     },
     {
       "args": [
         "sunion",
-        "SETID",
-        "STREAM",
+        "COMPLETE",
+        "DROP",
         ">",
         "2"
       ],
       "keys": [
         "2",
         ">",
-        "SETID",
-        "STREAM"
+        "COMPLETE",
+        "DROP"
       ]
     },
     {
       "args": [
         "sunion",
-        "PATTERN",
+        "FROMLONLAT",
         "2",
         "10",
         "-1",
@@ -9392,7 +9435,7 @@
         "0",
         "10",
         "2",
-        "PATTERN"
+        "FROMLONLAT"
       ]
     },
     {
@@ -9400,7 +9443,7 @@
         "sunion",
         "2",
         "b2",
-        "MAX",
+        "i8",
         "1.5",
         "1",
         "v6"
@@ -9409,8 +9452,8 @@
         "1",
         "1.5",
         "2",
-        "MAX",
         "b2",
+        "i8",
         "v6"
       ]
     },
@@ -9429,26 +9472,26 @@
       "args": [
         "sunionstore",
         "+",
-        "CONSUMERS",
+        "SUBSCRIBE",
         "a3"
       ],
       "keys": [
         "+",
-        "CONSUMERS",
+        "SUBSCRIBE",
         "a3"
       ]
     },
     {
       "args": [
         "sunionstore",
-        "MIN",
+        "USERS",
         "a2",
         "a3",
         "1"
       ],
       "keys": [
         "1",
-        "MIN",
+        "USERS",
         "a2",
         "a3"
       ]
@@ -9459,14 +9502,14 @@
         "b1",
         "$",
         "$",
-        "GROUPS",
-        "GET"
+        "OVERFLOW",
+        "LEFT"
       ],
       "keys": [
         "$",
         "$",
-        "GET",
-        "GROUPS",
+        "LEFT",
+        "OVERFLOW",
         "b1"
       ]
     },
@@ -9476,14 +9519,14 @@
         "0",
         "k2",
         "v3",
-        "RESET",
-        "SETUSER",
+        "GROUP",
+        "MINID",
         "k6"
       ],
       "keys": [
         "0",
-        "RESET",
-        "SETUSER",
+        "GROUP",
+        "MINID",
         "k2",
         "k6",
         "v3"
@@ -9492,22 +9535,22 @@
     {
       "args": [
         "sunionstore",
-        "MYID",
-        "KILL",
-        "BEGIN",
+        "FROMLONLAT",
+        "SUBSCRIBE",
+        "SHARDS",
         "+",
         "1",
-        "INCRBY",
+        "SAVE",
         ">"
       ],
       "keys": [
         "+",
         "1",
         ">",
-        "BEGIN",
-        "INCRBY",
-        "KILL",
-        "MYID"
+        "FROMLONLAT",
+        "SAVE",
+        "SHARDS",
+        "SUBSCRIBE"
       ]
     },
     {
@@ -9534,7 +9577,7 @@
     {
       "args": [
         "sunsubscribe",
-        "GETKEYS",
+        "TRACKING",
         "1.5",
         "2"
       ],
@@ -9543,7 +9586,7 @@
     {
       "args": [
         "sunsubscribe",
-        "ID",
+        "STREAM",
         "f2",
         "*",
         "b4"
@@ -9553,11 +9596,11 @@
     {
       "args": [
         "sunsubscribe",
-        "STORE",
+        "STREAM",
         "2",
         "*",
         "+",
-        "COUNT"
+        "DOCS"
       ],
       "keys": []
     },
@@ -9572,31 +9615,31 @@
     {
       "args": [
         "take",
-        "REFCOUNT",
+        "SETID",
         "2"
       ],
       "keys": [
-        "REFCOUNT"
+        "SETID"
       ]
     },
     {
       "args": [
         "take",
-        "FIND",
+        "DOCS",
         "1"
       ],
       "keys": [
-        "FIND"
+        "DOCS"
       ]
     },
     {
       "args": [
         "take",
-        "DELCONSUMER",
+        "GET",
         "2"
       ],
       "keys": [
-        "DELCONSUMER"
+        "GET"
       ]
     },
     {
@@ -9612,40 +9655,40 @@
     {
       "args": [
         "take",
-        "RIGHT",
+        "SETNAME",
         "2"
       ],
       "keys": [
-        "RIGHT"
+        "SETNAME"
       ]
     },
     {
       "args": [
         "take",
-        "CONSUMERS",
+        "STREAMS",
         "1"
       ],
       "keys": [
-        "CONSUMERS"
+        "STREAMS"
       ]
     },
     {
       "args": [
         "touch",
-        "KEYSLOT"
+        "GETUSER"
       ],
       "keys": [
-        "KEYSLOT"
+        "GETUSER"
       ]
     },
     {
       "args": [
         "touch",
-        "LATEST",
+        "PATTERN",
         "v2"
       ],
       "keys": [
-        "LATEST",
+        "PATTERN",
         "v2"
       ]
     },
@@ -9665,7 +9708,7 @@
     {
       "args": [
         "touch",
-        "ACQUIRE",
+        "RIGHT",
         "+",
         "1.5",
         "f4"
@@ -9673,79 +9716,79 @@
       "keys": [
         "+",
         "1.5",
-        "ACQUIRE",
+        "RIGHT",
         "f4"
       ]
     },
     {
       "args": [
         "touch",
-        "EXISTS",
-        "EXISTS",
-        "CREATE",
-        "WRAP",
+        "CONSUMERS",
+        "CONSUMERS",
+        "KEYSLOT",
+        "DOCS",
         "10"
       ],
       "keys": [
         "10",
-        "CREATE",
-        "EXISTS",
-        "EXISTS",
-        "WRAP"
+        "CONSUMERS",
+        "CONSUMERS",
+        "DOCS",
+        "KEYSLOT"
       ]
     },
     {
       "args": [
         "touch",
-        "CONSUMERS",
+        "GROUP",
         "f2",
         "-",
-        "STREAM",
+        "RELEASE",
         "-1",
-        "FROMLONLAT"
+        "ON"
       ],
       "keys": [
         "-",
         "-1",
-        "CONSUMERS",
-        "FROMLONLAT",
-        "STREAM",
+        "GROUP",
+        "ON",
+        "RELEASE",
         "f2"
       ]
     },
     {
       "args": [
         "transfer",
-        "CREATE",
-        "$.a",
+        "CONSUMERS",
+        "SETNAME",
         "1"
       ],
       "keys": [
-        "$.a",
-        "CREATE"
+        "CONSUMERS",
+        "SETNAME"
       ]
     },
     {
       "args": [
         "transfer",
-        "LOAD",
+        "FLUSH",
         "-",
         "2"
       ],
       "keys": [
         "-",
-        "LOAD"
+        "FLUSH"
       ]
     },
     {
       "args": [
         "transfer",
-        "ID",
+        "BLOCK",
         "a2",
         "10"
       ],
       "keys": [
-        "ID",
+        "BLOCK",
         "a2"
       ]
     },
@@ -9806,32 +9849,32 @@
     {
       "args": [
         "unlink",
-        "PATTERN"
+        "INFO"
       ],
       "keys": [
-        "PATTERN"
+        "INFO"
       ]
     },
     {
       "args": [
         "unlink",
-        "RESET",
+        "SHARDS",
         "-"
       ],
       "keys": [
         "-",
-        "RESET"
+        "SHARDS"
       ]
     },
     {
       "args": [
         "unlink",
-        "DELCONSUMER",
+        "SHARDS",
         "k2",
         "a3"
       ],
       "keys": [
-        "DELCONSUMER",
+        "SHARDS",
         "a3",
         "k2"
       ]
@@ -9840,14 +9883,14 @@
       "args": [
         "unlink",
         "f1",
-        "RIGHT",
+        "GETKEYS",
         "0",
         ">"
       ],
       "keys": [
         "0",
         ">",
-        "RIGHT",
+        "GETKEYS",
         "f1"
       ]
     },
@@ -9855,35 +9898,35 @@
       "args": [
         "unlink",
         "a1",
-        "MINID",
-        "SETNAME",
+        "OFF",
+        "DESTROY",
         "*",
-        "SHARDS"
+        "DELETE"
       ],
       "keys": [
         "*",
-        "MINID",
-        "SETNAME",
-        "SHARDS",
+        "DELETE",
+        "DESTROY",
+        "OFF",
         "a1"
       ]
     },
     {
       "args": [
         "unlink",
-        "SLOTS",
+        "CONSUMERS",
         "10",
-        "RESET",
+        "REFCOUNT",
         "-1",
         "b5",
-        "GET"
+        "KEYSLOT"
       ],
       "keys": [
         "-1",
         "10",
-        "GET",
-        "RESET",
-        "SLOTS",
+        "CONSUMERS",
+        "KEYSLOT",
+        "REFCOUNT",
         "b5"
       ]
     },
@@ -9896,14 +9939,14 @@
     {
       "args": [
         "unsubscribe",
-        "ID"
+        "OVERFLOW"
       ],
       "keys": []
     },
     {
       "args": [
         "unsubscribe",
-        "ON",
+        "RIGHT",
         "+"
       ],
       "keys": []
@@ -9911,7 +9954,7 @@
     {
       "args": [
         "unsubscribe",
-        "USERS",
+        "STREAMS",
         "k2",
         "f3"
       ],
@@ -9920,7 +9963,7 @@
     {
       "args": [
         "unsubscribe",
-        "FREQ",
+        "MYID",
         "v2",
         ">",
         "-1"
@@ -9930,10 +9973,10 @@
     {
       "args": [
         "unsubscribe",
-        "MAX",
+        "FROMLONLAT",
         "1",
         "1",
-        "i8",
+        "IDLETIME",
         ">"
       ],
       "keys": []
@@ -9987,49 +10030,49 @@
     {
       "args": [
         "watch",
-        "LEFT"
+        "ABORT"
       ],
       "keys": [
-        "LEFT"
+        "ABORT"
       ]
     },
     {
       "args": [
         "watch",
-        "LOAD",
+        "SETUSER",
         ">"
       ],
       "keys": [
         ">",
-        "LOAD"
+        "SETUSER"
       ]
     },
     {
       "args": [
         "watch",
-        "CREATE",
-        "LEN",
+        "SUBSCRIBE",
+        "GETKEYS",
         "10"
       ],
       "keys": [
         "10",
-        "CREATE",
-        "LEN"
+        "GETKEYS",
+        "SUBSCRIBE"
       ]
     },
     {
       "args": [
         "watch",
-        "GROUP",
-        "INFO",
+        "NODES",
+        "ABORT",
         "1.5",
         "-1"
       ],
       "keys": [
         "-1",
         "1.5",
-        "GROUP",
-        "INFO"
+        "ABORT",
+        "NODES"
       ]
     },
     {
@@ -10052,19 +10095,19 @@
     {
       "args": [
         "watch",
-        "STORE",
+        "i8",
         "v2",
-        "KEYSLOT",
-        "CAT",
+        "USAGE",
+        "i8",
         "+",
-        "DESTROY"
+        "RIGHT"
       ],
       "keys": [
         "+",
-        "CAT",
-        "DESTROY",
-        "KEYSLOT",
-        "STORE",
+        "RIGHT",
+        "USAGE",
+        "i8",
+        "i8",
         "v2"
       ]
     },
@@ -10096,19 +10139,19 @@
     {
       "args": [
         "xadd",
-        "NODES",
+        "DROP",
         "*",
         "k3",
         "k4"
       ],
       "keys": [
-        "NODES"
+        "DROP"
       ]
     },
     {
       "args": [
         "xadd",
-        "NODES",
+        "KEYSLOT",
         "*",
         "+",
         "10",
@@ -10116,7 +10159,7 @@
         "k6"
       ],
       "keys": [
-        "NODES"
+        "KEYSLOT"
       ]
     },
     {
@@ -10134,17 +10177,17 @@
     {
       "args": [
         "xadd",
-        "OVERFLOW",
+        "CREATECONSUMER",
         "*",
         "0",
         "f4",
         ">",
-        "FLUSH",
+        "DELETE",
         "a7",
         "k8"
       ],
       "keys": [
-        "OVERFLOW"
+        "CREATECONSUMER"
       ]
     },
     {
@@ -10153,7 +10196,7 @@
         "a1",
         "*",
         "10",
-        "SETNAME"
+        "LATEST"
       ],
       "keys": [
         "a1"
@@ -10198,34 +10241,33 @@
     {
       "args": [
         "xgroup",
-        "CREATECONSUMER",
-        "10",
-        "v3",
-        "-1"
+        "DELCONSUMER",
+        "v2",
+        "SUBSCRIBE",
+        "SETUSER"
       ],
       "keys": [
-        "10"
+        "v2"
       ]
     },
     {
       "args": [
         "xgroup",
         "CREATECONSUMER",
-        "b2",
-        "-1",
-        "GETKEYS"
+        "FLUSH",
+        "ABORT",
+        "2"
       ],
       "keys": [
-        "b2"
+        "FLUSH"
       ]
     },
     {
       "args": [
         "xgroup",
-        "CREATECONSUMER",
+        "DESTROY",
         "2",
-        "WRAP",
-        "NODES"
+        "FIND"
       ],
       "keys": [
         "2"
@@ -10234,22 +10276,20 @@
     {
       "args": [
         "xgroup",
-        "SETID",
-        "-",
-        "0",
-        "$"
+        "DESTROY",
+        "b2",
+        "-"
       ],
       "keys": [
-        "-"
+        "b2"
       ]
     },
     {
       "args": [
         "xgroup",
-        "CREATECONSUMER",
+        "DESTROY",
         "+",
-        "-",
-        "*"
+        "STATUS"
       ],
       "keys": [
         "+"
@@ -10258,51 +10298,20 @@
     {
       "args": [
         "xgroup",
-        "DELCONSUMER",
-        "k2",
+        "DESTROY",
         ">",
-        "1"
+        "BYRADIUS"
       ],
       "keys": [
-        "k2"
-      ]
-    },
-    {
-      "args": [
-        "xinfo",
-        "GROUPS",
-        "STATUS"
-      ],
-      "keys": [
-        "STATUS"
+        ">"
       ]
     },
     {
       "args": [
         "xinfo",
         "CONSUMERS",
-        "-",
-        "1"
-      ],
-      "keys": [
-        "-"
-      ]
-    },
-    {
-      "args": [
-        "xinfo",
-        "STREAM",
-        "1"
-      ],
-      "keys": [
-        "1"
-      ]
-    },
-    {
-      "args": [
-        "xinfo",
-        "GROUPS",
-        "+"
+        "+",
+        "f3"
       ],
       "keys": [
         "+"
@@ -10311,23 +10320,53 @@
     {
       "args": [
         "xinfo",
-        "CONSUMERS",
-        "STREAM",
-        "v3"
+        "GROUPS",
+        "a2"
       ],
       "keys": [
-        "STREAM"
+        "a2"
       ]
     },
     {
       "args": [
         "xinfo",
         "CONSUMERS",
-        "10",
-        "0"
+        "f2",
+        "MIN"
       ],
       "keys": [
-        "10"
+        "f2"
+      ]
+    },
+    {
+      "args": [
+        "xinfo",
+        "STREAM",
+        "BLOCK"
+      ],
+      "keys": [
+        "BLOCK"
+      ]
+    },
+    {
+      "args": [
+        "xinfo",
+        "STREAM",
+        "b2"
+      ],
+      "keys": [
+        "b2"
+      ]
+    },
+    {
+      "args": [
+        "xinfo",
+        "CONSUMERS",
+        "1.5",
+        "1.5"
+      ],
+      "keys": [
+        "1.5"
       ]
     },
     {
@@ -10342,11 +10381,11 @@
     {
       "args": [
         "xpending",
-        "MINID",
-        "GROUPS"
+        "FROMLONLAT",
+        "$"
       ],
       "keys": [
-        "MINID"
+        "FROMLONLAT"
       ]
     },
     {
@@ -10372,42 +10411,42 @@
     {
       "args": [
         "xpending",
-        "FROMLONLAT",
+        "STREAM",
         "f2"
       ],
       "keys": [
-        "FROMLONLAT"
+        "STREAM"
       ]
     },
     {
       "args": [
         "xpending",
-        "RESET",
-        "KILL"
+        "WRAP",
+        "ENCODING"
       ],
       "keys": [
-        "RESET"
+        "WRAP"
       ]
     },
     {
       "args": [
         "xpending",
-        "DELETE",
-        "MAXLEN"
+        "STREAM",
+        "GETUSER"
       ],
       "keys": [
-        "DELETE"
+        "STREAM"
       ]
     },
     {
       "args": [
         "xrange",
-        "IDLETIME",
+        "LIST",
         "-",
         "-"
       ],
       "keys": [
-        "IDLETIME"
+        "LIST"
       ]
     },
     {
@@ -10424,23 +10463,23 @@
     {
       "args": [
         "xrange",
-        "km",
+        "CREATE",
         "-",
         "-"
       ],
       "keys": [
-        "km"
+        "CREATE"
       ]
     },
     {
       "args": [
         "xrange",
-        "u8",
+        "RELEASE",
         "-",
         "+"
       ],
       "keys": [
-        "u8"
+        "RELEASE"
       ]
     },
     {
@@ -10527,23 +10566,23 @@
     {
       "args": [
         "xrevrange",
-        "CONSUMERS",
+        "GET",
         "+",
         "-"
       ],
       "keys": [
-        "CONSUMERS"
+        "GET"
       ]
     },
     {
       "args": [
         "xrevrange",
-        "EXISTS",
+        "MAX",
         "-",
         "+"
       ],
       "keys": [
-        "EXISTS"
+        "MAX"
       ]
     },
     {
@@ -10560,23 +10599,23 @@
     {
       "args": [
         "xrevrange",
-        "SAVE",
+        "DELETE",
         "+",
         "-"
       ],
       "keys": [
-        "SAVE"
+        "DELETE"
       ]
     },
     {
       "args": [
         "xrevrange",
-        "SLOTS",
+        "FLUSH",
         "+",
         "-"
       ],
       "keys": [
-        "SLOTS"
+        "FLUSH"
       ]
     },
     {
@@ -10625,23 +10664,23 @@
     {
       "args": [
         "zadd",
-        "SETID",
+        "STREAM",
         "1",
         "b3"
       ],
       "keys": [
-        "SETID"
+        "STREAM"
       ]
     },
     {
       "args": [
         "zadd",
-        "LOAD",
+        "RESET",
         "0",
         "f3"
       ],
       "keys": [
-        "LOAD"
+        "RESET"
       ]
     },
     {
@@ -10658,23 +10697,23 @@
     {
       "args": [
         "zadd",
-        "TRACKING",
+        "USAGE",
         "2",
         "1.5"
       ],
       "keys": [
-        "TRACKING"
+        "USAGE"
       ]
     },
     {
       "args": [
         "zadd",
-        "DOCS",
+        "WRAP",
         "2",
         "f3"
       ],
       "keys": [
-        "DOCS"
+        "WRAP"
       ]
     },
     {
@@ -10682,7 +10721,7 @@
         "zadd",
         "k1",
         "1.5",
-        "STREAM",
+        "CREATE",
         "0",
         "b5",
         "-1",
@@ -10695,10 +10734,10 @@
     {
       "args": [
         "zcard",
-        "SHARDS"
+        "COUNT"
       ],
       "keys": [
-        "SHARDS"
+        "COUNT"
       ]
     },
     {
@@ -10715,56 +10754,56 @@
     {
       "args": [
         "zcount",
-        "WRAP",
+        "RELEASE",
         "2",
         "1.5"
       ],
       "keys": [
-        "WRAP"
+        "RELEASE"
       ]
     },
     {
       "args": [
         "zcount",
-        "LOAD",
+        "DROP",
+        "-1",
+        "-1"
+      ],
+      "keys": [
+        "DROP"
+      ]
+    },
+    {
+      "args": [
+        "zcount",
+        "COUNT",
         "-1",
         "0"
       ],
       "keys": [
-        "LOAD"
+        "COUNT"
       ]
     },
     {
       "args": [
         "zcount",
-        "ID",
+        "KILL",
         "10",
         "2"
       ],
       "keys": [
-        "ID"
+        "KILL"
       ]
     },
     {
       "args": [
         "zcount",
-        "STREAM",
+        "GET",
         "2",
         "1"
       ],
       "keys": [
-        "STREAM"
-      ]
-    },
-    {
-      "args": [
-        "zcount",
-        "ACQUIRE",
-        "1.5",
-        "1"
-      ],
-      "keys": [
-        "ACQUIRE"
+        "GET"
       ]
     },
     {
@@ -10794,20 +10833,20 @@
       "args": [
         "zdiff",
         "1",
-        "TRACKING"
+        "PATTERN"
       ],
       "keys": [
-        "TRACKING"
+        "PATTERN"
       ]
     },
     {
       "args": [
         "zdiff",
         "1",
-        "SLOTS"
+        "EXISTS"
       ],
       "keys": [
-        "SLOTS"
+        "EXISTS"
       ]
     },
     {
@@ -10875,26 +10914,26 @@
     {
       "args": [
         "zdiffstore",
-        "IDLETIME",
+        "OFF",
         "1",
-        "SETNAME"
+        "km"
       ],
       "keys": [
-        "IDLETIME",
-        "SETNAME"
+        "OFF",
+        "km"
       ]
     },
     {
       "args": [
         "zdiffstore",
-        "ID",
+        "NODES",
         "2",
         "1",
         "f4"
       ],
       "keys": [
         "1",
-        "ID",
+        "NODES",
         "f4"
       ]
     },
@@ -10903,13 +10942,13 @@
         "zdiffstore",
         "*",
         "2",
-        "i8",
-        "DESTROY"
+        "RELEASE",
+        "SHARDS"
       ],
       "keys": [
         "*",
-        "DESTROY",
-        "i8"
+        "RELEASE",
+        "SHARDS"
       ]
     },
     {
@@ -10926,12 +10965,12 @@
     {
       "args": [
         "zincrby",
-        "RELEASE",
+        "BEGIN",
         "1",
         "$"
       ],
       "keys": [
-        "RELEASE"
+        "BEGIN"
       ]
     },
     {
@@ -10948,12 +10987,12 @@
     {
       "args": [
         "zincrby",
-        "OVERFLOW",
+        "MYID",
         "0",
-        "u8"
+        "GROUPS"
       ],
       "keys": [
-        "OVERFLOW"
+        "MYID"
       ]
     },
     {
@@ -10970,12 +11009,12 @@
     {
       "args": [
         "zincrby",
-        "DESTROY",
+        "CREATE",
         "-1",
         "a3"
       ],
       "keys": [
-        "DESTROY"
+        "CREATE"
       ]
     },
     {
@@ -11029,12 +11068,12 @@
       "args": [
         "zinter",
         "2",
-        "SET",
+        "GROUPS",
         "-1"
       ],
       "keys": [
         "-1",
-        "SET"
+        "GROUPS"
       ]
     },
     {
@@ -11068,14 +11107,14 @@
     {
       "args": [
         "zinterstore",
-        "RIGHT",
+        "GETUSER",
         "2",
         "-",
         "k4"
       ],
       "keys": [
         "-",
-        "RIGHT",
+        "GETUSER",
         "k4"
       ]
     },
@@ -11084,25 +11123,25 @@
         "zinterstore",
         "v1",
         "2",
-        "KILL",
+        "FREQ",
         "0"
       ],
       "keys": [
         "0",
-        "KILL",
+        "FREQ",
         "v1"
       ]
     },
     {
       "args": [
         "zinterstore",
-        "REFCOUNT",
+        "SAVE",
         "2",
         "k3",
         "f4"
       ],
       "keys": [
-        "REFCOUNT",
+        "SAVE",
         "f4",
         "k3"
       ]
@@ -11124,22 +11163,22 @@
         "zinterstore",
         "f1",
         "1",
-        "SETID"
+        "FIND"
       ],
       "keys": [
-        "SETID",
+        "FIND",
         "f1"
       ]
     },
     {
       "args": [
         "zlexcount",
-        "SETID",
+        "ABORT",
         "+",
         "+"
       ],
       "keys": [
-        "SETID"
+        "ABORT"
       ]
     },
     {
@@ -11156,12 +11195,12 @@
     {
       "args": [
         "zlexcount",
-        "SLOTS",
+        "LEN",
         "-",
         "-"
       ],
       "keys": [
-        "SLOTS"
+        "LEN"
       ]
     },
     {
@@ -11179,12 +11218,12 @@
     {
       "args": [
         "zmovedue",
-        "ACQUIRE",
+        "DOCS",
         "f2",
         "1"
       ],
       "keys": [
-        "ACQUIRE",
+        "DOCS",
         "f2"
       ]
     },
@@ -11192,23 +11231,23 @@
       "args": [
         "zmovedue",
         "b1",
-        "DROP",
+        "SAVE",
         "0"
       ],
       "keys": [
-        "DROP",
+        "SAVE",
         "b1"
       ]
     },
     {
       "args": [
         "zmovedue",
-        "BYRADIUS",
+        "LATEST",
         "k2",
         "1"
       ],
       "keys": [
-        "BYRADIUS",
+        "LATEST",
         "k2"
       ]
     },
@@ -11216,11 +11255,11 @@
       "args": [
         "zmovedue",
         "f1",
-        "GETKEYS",
+        "RESET",
         "1.5"
       ],
       "keys": [
-        "GETKEYS",
+        "RESET",
         "f1"
       ]
     },
@@ -11239,11 +11278,11 @@
     {
       "args": [
         "zmscore",
-        "INCRBY",
+        "SET",
         "f2"
       ],
       "keys": [
-        "INCRBY"
+        "SET"
       ]
     },
     {
@@ -11263,7 +11302,7 @@
         "0",
         "10",
         "1",
-        "DROP"
+        "FREQ"
       ],
       "keys": [
         "0"
@@ -11272,35 +11311,35 @@
     {
       "args": [
         "zmscore",
-        "STORE",
-        "$.a",
+        "ACQUIRE",
+        "SLOTS",
         "-1",
         "1",
         "b5"
       ],
       "keys": [
-        "STORE"
+        "ACQUIRE"
       ]
     },
     {
       "args": [
         "zmscore",
-        "FIND",
+        "FROMLONLAT",
         "2",
-        "EXISTS",
+        "MAXLEN",
         "1.5",
         "a5",
         "+"
       ],
       "keys": [
-        "FIND"
+        "FROMLONLAT"
       ]
     },
     {
       "args": [
         "zmscore",
-        "TRACKING",
-        "SETUSER",
+        "OFF",
+        "REFCOUNT",
         "1",
         "1.5",
         "+",
@@ -11308,7 +11347,7 @@
         "v7"
       ],
       "keys": [
-        "TRACKING"
+        "OFF"
       ]
     },
     {
@@ -11324,21 +11363,21 @@
     {
       "args": [
         "zpopbyscore",
-        "SLOTS",
+        "INFO",
         "1"
       ],
       "keys": [
-        "SLOTS"
+        "INFO"
       ]
     },
     {
       "args": [
         "zpopbyscore",
-        "km",
+        "ENCODING",
         "1"
       ],
       "keys": [
-        "km"
+        "ENCODING"
       ]
     },
     {
@@ -11354,11 +11393,11 @@
     {
       "args": [
         "zpopbyscore",
-        "GETUSER",
+        "SAVE",
         "0"
       ],
       "keys": [
-        "GETUSER"
+        "SAVE"
       ]
     },
     {
@@ -11374,10 +11413,10 @@
     {
       "args": [
         "zpopmax",
-        "REFCOUNT"
+        "WRAP"
       ],
       "keys": [
-        "REFCOUNT"
+        "WRAP"
       ]
     },
     {
@@ -11392,19 +11431,19 @@
     {
       "args": [
         "zpopmax",
-        "STORE"
+        "RELEASE"
       ],
       "keys": [
-        "STORE"
+        "RELEASE"
       ]
     },
     {
       "args": [
         "zpopmax",
-        "CREATE"
+        "PATTERN"
       ],
       "keys": [
-        "CREATE"
+        "PATTERN"
       ]
     },
     {
@@ -11420,19 +11459,19 @@
     {
       "args": [
         "zpopmax",
-        "ON"
+        "CAT"
       ],
       "keys": [
-        "ON"
+        "CAT"
       ]
     },
     {
       "args": [
         "zpopmin",
-        "CONSUMERS"
+        "STORE"
       ],
       "keys": [
-        "CONSUMERS"
+        "STORE"
       ]
     },
     {
@@ -11447,10 +11486,10 @@
     {
       "args": [
         "zpopmin",
-        "SUBSCRIBE"
+        "GETUSER"
       ],
       "keys": [
-        "SUBSCRIBE"
+        "GETUSER"
       ]
     },
     {
@@ -11475,10 +11514,10 @@
     {
       "args": [
         "zpopmin",
-        "OFF"
+        "$"
       ],
       "keys": [
-        "OFF"
+        "$"
       ]
     },
     {
@@ -11493,20 +11532,11 @@
     {
       "args": [
         "zrandmember",
-        "MYID",
+        "CREATE",
         "2"
       ],
       "keys": [
-        "MYID"
-      ]
-    },
-    {
-      "args": [
-        "zrandmember",
-        "DOCS"
-      ],
-      "keys": [
-        "DOCS"
+        "CREATE"
       ]
     },
     {
@@ -11521,20 +11551,29 @@
     {
       "args": [
         "zrandmember",
-        "PATTERN",
+        "STORE"
+      ],
+      "keys": [
+        "STORE"
+      ]
+    },
+    {
+      "args": [
+        "zrandmember",
+        "$",
         "0"
       ],
       "keys": [
-        "PATTERN"
+        "$"
       ]
     },
     {
       "args": [
         "zrandmember",
-        "DELCONSUMER"
+        "RIGHT"
       ],
       "keys": [
-        "DELCONSUMER"
+        "RIGHT"
       ]
     },
     {
@@ -11562,12 +11601,12 @@
     {
       "args": [
         "zrange",
-        "GETUSER",
+        "RELEASE",
         "0",
         "2"
       ],
       "keys": [
-        "GETUSER"
+        "RELEASE"
       ]
     },
     {
@@ -11617,12 +11656,12 @@
     {
       "args": [
         "zrangebyscore",
-        "WRAP",
+        "STREAMS",
         "0",
         "2"
       ],
       "keys": [
-        "WRAP"
+        "STREAMS"
       ]
     },
     {
@@ -11650,23 +11689,23 @@
     {
       "args": [
         "zrangebyscore",
-        "WHOAMI",
+        "MINID",
         "1",
         "2"
       ],
       "keys": [
-        "WHOAMI"
+        "MINID"
       ]
     },
     {
       "args": [
         "zrangebyscore",
-        "LIST",
+        "ABORT",
         "0",
         "10"
       ],
       "keys": [
-        "LIST"
+        "ABORT"
       ]
     },
     {
@@ -11683,31 +11722,31 @@
     {
       "args": [
         "zrank",
-        "WRAP",
+        "LIST",
         "b2"
       ],
       "keys": [
-        "WRAP"
+        "LIST"
       ]
     },
     {
       "args": [
         "zrank",
-        "RIGHT",
+        "FIND",
         "$"
       ],
       "keys": [
-        "RIGHT"
+        "FIND"
       ]
     },
     {
       "args": [
         "zrank",
-        "KILL",
+        "LIST",
         "-1"
       ],
       "keys": [
-        "KILL"
+        "LIST"
       ]
     },
     {
@@ -11723,18 +11762,18 @@
     {
       "args": [
         "zrank",
-        "OFF",
+        "WHOAMI",
         "-"
       ],
       "keys": [
-        "OFF"
+        "WHOAMI"
       ]
     },
     {
       "args": [
         "zrank",
         "1.5",
-        "SET"
+        "RESET"
       ],
       "keys": [
         "1.5"
@@ -11753,99 +11792,99 @@
     {
       "args": [
         "zrem",
-        "$.a",
+        "COUNT",
         "v2",
         "1.5"
       ],
       "keys": [
-        "$.a"
+        "COUNT"
       ]
     },
     {
       "args": [
         "zrem",
-        "STREAM",
+        "FREQ",
         "10",
         "a3",
         "1.5"
       ],
       "keys": [
-        "STREAM"
+        "FREQ"
       ]
     },
     {
       "args": [
         "zrem",
-        "LATEST",
+        "i8",
         "-1",
         "k3",
-        "RIGHT",
+        "FLUSH",
         "$"
       ],
       "keys": [
-        "LATEST"
+        "i8"
       ]
     },
     {
       "args": [
         "zrem",
-        "STREAMS",
+        "u8",
         "-",
         "1",
         "1",
         "f5",
-        "ID"
+        "FIND"
       ],
       "keys": [
-        "STREAMS"
+        "u8"
       ]
     },
     {
       "args": [
         "zrem",
-        "MYID",
+        "BLOCK",
         "v2",
         "1.5",
         "+",
         "a5",
         "1.5",
-        "BYRADIUS"
+        "EXISTS"
       ],
       "keys": [
-        "MYID"
+        "BLOCK"
       ]
     },
     {
       "args": [
         "zremrangebylex",
-        "BEGIN",
+        "CAT",
         "+",
         "-"
       ],
       "keys": [
-        "BEGIN"
+        "CAT"
       ]
     },
     {
       "args": [
         "zremrangebylex",
-        "DELCONSUMER",
+        "TRACKING",
         "+",
         "+"
       ],
       "keys": [
-        "DELCONSUMER"
+        "TRACKING"
       ]
     },
     {
       "args": [
         "zremrangebylex",
-        "STREAMS",
+        "CONSUMERS",
         "+",
         "+"
       ],
       "keys": [
-        "STREAMS"
+        "CONSUMERS"
       ]
     },
     {
@@ -11884,23 +11923,23 @@
     {
       "args": [
         "zremrangebyrank",
-        "USAGE",
+        "FROMLONLAT",
         "10",
         "-1"
       ],
       "keys": [
-        "USAGE"
+        "FROMLONLAT"
       ]
     },
     {
       "args": [
         "zremrangebyrank",
-        "FREQ",
+        "CREATE",
         "2",
         "-1"
       ],
       "keys": [
-        "FREQ"
+        "CREATE"
       ]
     },
     {
@@ -11928,9 +11967,20 @@
     {
       "args": [
         "zremrangebyscore",
-        "LEN",
+        "i8",
         "10",
         "0"
+      ],
+      "keys": [
+        "i8"
+      ]
+    },
+    {
+      "args": [
+        "zremrangebyscore",
+        "LEN",
+        "-1",
+        "10"
       ],
       "keys": [
         "LEN"
@@ -11939,23 +11989,12 @@
     {
       "args": [
         "zremrangebyscore",
-        "IDLETIME",
-        "-1",
-        "10"
-      ],
-      "keys": [
-        "IDLETIME"
-      ]
-    },
-    {
-      "args": [
-        "zremrangebyscore",
-        "KILL",
+        "GET",
         "2",
         "1"
       ],
       "keys": [
-        "KILL"
+        "GET"
       ]
     },
     {
@@ -11983,12 +12022,12 @@
     {
       "args": [
         "zrevrange",
-        "$",
+        "GROUPS",
         "2",
         "0"
       ],
       "keys": [
-        "$"
+        "GROUPS"
       ]
     },
     {
@@ -12005,12 +12044,12 @@
     {
       "args": [
         "zrevrange",
-        "EXISTS",
+        "SUBSCRIBE",
         "-1",
         "10"
       ],
       "keys": [
-        "EXISTS"
+        "SUBSCRIBE"
       ]
     },
     {
@@ -12027,45 +12066,45 @@
     {
       "args": [
         "zrevrange",
-        "ON",
+        "ID",
         "0",
         "1"
       ],
       "keys": [
-        "ON"
+        "ID"
       ]
     },
     {
       "args": [
         "zrevrange",
-        "RESET",
+        "FROMLONLAT",
         "0",
         "-1"
       ],
       "keys": [
-        "RESET"
+        "FROMLONLAT"
       ]
     },
     {
       "args": [
         "zrevrangebylex",
-        "SET",
+        "SHARDS",
         "-",
         "-"
       ],
       "keys": [
-        "SET"
+        "SHARDS"
       ]
     },
     {
       "args": [
         "zrevrangebylex",
-        "OFF",
+        "RELEASE",
         "+",
         "+"
       ],
       "keys": [
-        "OFF"
+        "RELEASE"
       ]
     },
     {
@@ -12104,12 +12143,12 @@
     {
       "args": [
         "zrevrangebylex",
-        "USERS",
+        "km",
         "+",
         "-"
       ],
       "keys": [
-        "USERS"
+        "km"
       ]
     },
     {
@@ -12135,58 +12174,68 @@
     {
       "args": [
         "zrevrank",
-        "REFCOUNT",
+        "ON",
         "*"
       ],
       "keys": [
-        "REFCOUNT"
+        "ON"
       ]
     },
     {
       "args": [
         "zrevrank",
-        "FLUSH",
-        "FREQ"
+        "TRACKING",
+        "PATTERN"
       ],
       "keys": [
-        "FLUSH"
+        "TRACKING"
       ]
     },
     {
       "args": [
         "zrevrank",
-        "SETNAME",
+        "BLOCK",
         "f2"
       ],
       "keys": [
-        "SETNAME"
+        "BLOCK"
       ]
     },
     {
       "args": [
         "zrevrank",
-        "NODES",
-        "LIST"
+        "SET",
+        "EXISTS"
       ],
       "keys": [
-        "NODES"
+        "SET"
       ]
     },
     {
       "args": [
         "zscan",
-        "ACQUIRE",
+        "RIGHT",
         "2"
       ],
       "keys": [
-        "ACQUIRE"
+        "RIGHT"
+      ]
+    },
+    {
+      "args": [
+        "zscan",
+        "DELETE",
+        "10"
+      ],
+      "keys": [
+        "DELETE"
       ]
     },
     {
       "args": [
         "zscan",
         "SHARDS",
-        "10"
+        "1"
       ],
       "keys": [
         "SHARDS"
@@ -12195,21 +12244,11 @@
     {
       "args": [
         "zscan",
-        "ENCODING",
-        "1"
-      ],
-      "keys": [
-        "ENCODING"
-      ]
-    },
-    {
-      "args": [
-        "zscan",
-        "FREQ",
+        "SETID",
         "2"
       ],
       "keys": [
-        "FREQ"
+        "SETID"
       ]
     },
     {
@@ -12236,7 +12275,7 @@
       "args": [
         "zscore",
         "2",
-        "PATTERN"
+        "SET"
       ],
       "keys": [
         "2"
@@ -12255,11 +12294,11 @@
     {
       "args": [
         "zscore",
-        "FIND",
-        "DROP"
+        "RESET",
+        "FREQ"
       ],
       "keys": [
-        "FIND"
+        "RESET"
       ]
     },
     {
@@ -12275,11 +12314,11 @@
     {
       "args": [
         "zscore",
-        "SETID",
+        "EXISTS",
         "0"
       ],
       "keys": [
-        "SETID"
+        "EXISTS"
       ]
     },
     {
@@ -12338,10 +12377,10 @@
       "args": [
         "zunion",
         "1",
-        "SETUSER"
+        "BLOCK"
       ],
       "keys": [
-        "SETUSER"
+        "BLOCK"
       ]
     },
     {
@@ -12349,11 +12388,11 @@
         "zunion",
         "2",
         ">",
-        "INCRBY"
+        "DELCONSUMER"
       ],
       "keys": [
         ">",
-        "INCRBY"
+        "DELCONSUMER"
       ]
     },
     {
@@ -12400,15 +12439,15 @@
     {
       "args": [
         "zunionstore",
-        "$.a",
+        "RIGHT",
         "2",
         "1.5",
-        "RELEASE"
+        "ABORT"
       ],
       "keys": [
-        "$.a",
         "1.5",
-        "RELEASE"
+        "ABORT",
+        "RIGHT"
       ]
     },
     {
@@ -12417,11 +12456,11 @@
         "f1",
         "2",
         "1.5",
-        "LATEST"
+        "FROMLONLAT"
       ],
       "keys": [
         "1.5",
-        "LATEST",
+        "FROMLONLAT",
         "f1"
       ]
     },
@@ -12430,25 +12469,25 @@
         "zunionstore",
         "1",
         "2",
-        "$.a",
+        "REFCOUNT",
         "-"
       ],
       "keys": [
-        "$.a",
         "-",
-        "1"
+        "1",
+        "REFCOUNT"
       ]
     },
     {
       "args": [
         "zunionstore",
-        "INFO",
+        "GETNAME",
         "1",
         "1"
       ],
       "keys": [
         "1",
-        "INFO"
+        "GETNAME"
       ]
     }
   ]

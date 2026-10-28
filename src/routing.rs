@@ -288,6 +288,7 @@ pub fn command_slot(command: &Command<'_>) -> Result<Option<u16>, CrossSlot> {
         | Command::Once { key, .. }
         | Command::IdempotencyBegin { key, .. }
         | Command::IdempotencyComplete { key, .. }
+        | Command::IdempotencyAbort { key, .. }
         | Command::Take { key, .. }
         | Command::SetIfEq { key, .. }
         | Command::SetIfCmp { key, .. }
@@ -583,6 +584,7 @@ pub fn command_keys<'a>(command: &'a Command<'_>) -> Vec<&'a [u8]> {
         | Command::Once { key, .. }
         | Command::IdempotencyBegin { key, .. }
         | Command::IdempotencyComplete { key, .. }
+        | Command::IdempotencyAbort { key, .. }
         | Command::Take { key, .. }
         | Command::SetIfEq { key, .. }
         | Command::SetIfCmp { key, .. }

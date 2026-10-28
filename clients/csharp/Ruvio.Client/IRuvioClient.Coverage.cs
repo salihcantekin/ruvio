@@ -1278,4 +1278,23 @@ public partial interface IRuvioClient
     /// </example>
     ValueTask<IdempotencyBegin> TryBeginIdempotencyAsync(string key, string fingerprint, string owner, TimeSpan ttl, CancellationToken cancellationToken = default)
         => RespRead.Idempotency(ExecuteAsync(new RespCommand("IDEM", key, "BEGIN", fingerprint, owner, RespRead.Milliseconds(ttl)).AsList(), cancellationToken));
+
+    /// <summary>
+    /// Sends <c>IDEM key ABORT fingerprint owner</c>: gives up a pending record this owner acquired, so the next
+    /// <see cref="TryBeginIdempotencyAsync"/> acquires it at once instead of waiting for the retention to end.
+    /// </summary>
+    /// <param name="key">The key.</param>
+    /// <param name="fingerprint">The fingerprint used in the begin call.</param>
+    /// <param name="owner">The owner token used in the begin call.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
+    /// <returns><see langword="true"/> when the pending record was removed; <see langword="false"/> when it is missing or expired, the owner or fingerprint differs, or it is already completed (a stored result is never removed).</returns>
+    /// <exception cref="RuvioException">A token is out of range, or the key holds a non-IDEM value.</exception>
+    /// <remarks>Abort only when the work did not take effect, or is safe to run again: a retry after an abort runs it again.</remarks>
+    /// <example>
+    /// <code>
+    /// await db.AbortIdempotencyAsync("pay:42", "sha256:ab", "worker-1");
+    /// </code>
+    /// </example>
+    ValueTask<bool> AbortIdempotencyAsync(string key, string fingerprint, string owner, CancellationToken cancellationToken = default)
+        => RespRead.Flag(ExecuteAsync(new RespCommand("IDEM", key, "ABORT", fingerprint, owner).AsList(), cancellationToken), "IDEM");
 }

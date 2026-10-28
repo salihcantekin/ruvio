@@ -340,4 +340,8 @@ public sealed partial class RuvioClient
     /// <inheritdoc />
     public ValueTask<IdempotencyBegin> TryBeginIdempotencyAsync(string key, string fingerprint, string owner, TimeSpan ttl, CancellationToken cancellationToken = default)
         => RespRead.Idempotency(ExecuteCommandAsync(new RespCommand("IDEM", key, "BEGIN", fingerprint, owner, RespRead.Milliseconds(ttl)), cancellationToken));
+
+    /// <inheritdoc />
+    public ValueTask<bool> AbortIdempotencyAsync(string key, string fingerprint, string owner, CancellationToken cancellationToken = default)
+        => RespRead.Flag(ExecuteCommandAsync(new RespCommand("IDEM", key, "ABORT", fingerprint, owner), cancellationToken), "IDEM");
 }

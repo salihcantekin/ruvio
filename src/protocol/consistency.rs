@@ -84,6 +84,7 @@ pub(super) const WORDS: &[&str] = &[
     "RELEASE",
     "BEGIN",
     "COMPLETE",
+    "ABORT",
     "$.a",
     "$",
 ];

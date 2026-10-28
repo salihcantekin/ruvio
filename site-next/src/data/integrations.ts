@@ -151,7 +151,7 @@ app.MapGet("/health", () => "ok").DisableRuvioRateLimit();     // never limited`
   },
   "Ruvio.AspNetCore.Idempotency": {
     summary:
-      "HTTP request deduplication and response replay on the native IDEM command. A retried request with the same Idempotency-Key gets the stored response instead of running twice. Choose what happens when Ruvio is unreachable: throw, answer 503, or run unchecked, with an optional circuit breaker.",
+      "HTTP request deduplication and response replay on the native IDEM command. A retried request with the same Idempotency-Key gets the stored response instead of running twice. Choose what happens when Ruvio is unreachable: throw, answer 503, or run unchecked, with an optional circuit breaker. Optionally free the key when the handler throws, so a retry runs at once.",
     useCases: ["idempotency"],
     example: cs(`builder.Services.AddRuvioClient(builder.Configuration.GetSection("Ruvio"));
 builder.Services.AddRuvioIdempotency(options =>
@@ -159,6 +159,8 @@ builder.Services.AddRuvioIdempotency(options =>
     options.Namespace = "orders-production-v1"; // stable across replicas
     options.ScopeSelector = context => context.User.FindFirst("tenant_id")?.Value;
     options.Retention = TimeSpan.FromHours(24);
+    // Optional: if the handler throws before doing its work, let a retry run at once instead of getting 409.
+    options.AbortOnException = true;
 });
 
 app.UseRouting();

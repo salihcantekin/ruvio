@@ -9,6 +9,7 @@ remains the lighter TTL marker and its behavior is unchanged.
 ```text
 IDEM key BEGIN fingerprint owner ttl_ms
 IDEM key COMPLETE fingerprint owner result
+IDEM key ABORT fingerprint owner
 ```
 
 The key is always argument 1, so normal single-key hash-slot routing applies.
@@ -37,7 +38,15 @@ record with the exact owner and fingerprint. An identical repeat of a completed
 record (same owner, fingerprint and result bytes) also returns 1 without a write.
 It returns **0** for missing/expired records, owner/fingerprint mismatch, or an
 attempt to replace an already completed result. There is no automatic takeover,
-abort/delete, renewal, or overwrite action. Completion never extends retention.
+renewal, or overwrite action. Completion never extends retention.
+
+`ABORT` gives up a pending record so the next `BEGIN` acquires it at once
+instead of waiting for the retention to end. It returns **1** when it removed a
+live pending record with the exact owner and fingerprint, and **0** for a
+missing/expired record, an owner or fingerprint mismatch, or a completed record:
+a stored result is never removed. It is logged and replicated as an ordinary
+delete. Abort only when the operation did not take effect, or is safe to run
+again: a retry after `ABORT` runs it again.
 
 The result is binary-safe and limited to **4 MiB**, including any serialization
 the caller adds. The configured protocol value limit must also accommodate the

@@ -247,7 +247,18 @@ public sealed class IdempotencyMiddleware
 
             context.Features.Set<IHttpResponseFeature>(responseFeature);
             context.Features.Set<IHttpResponseBodyFeature>(responseBody);
-            await next(context);
+
+            try
+            {
+                await next(context);
+            }
+            catch (Exception) when (options.AbortOnException)
+            {
+                await IdempotencyStore.AbortAsync(client, storageKey, fingerprint, owner);
+
+                throw;
+            }
+
             // OnStarting callbacks run before the snapshot below, so the stored headers are the final ones.
             await responseFeature.RunStartingAsync();
             cancellation.ThrowIfCancellationRequested();

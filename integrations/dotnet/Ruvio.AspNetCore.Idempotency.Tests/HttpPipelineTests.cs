@@ -74,6 +74,89 @@ public class HttpPipelineTests
         finally { await app.StopAsync(); }
     }
 
+    [LiveFact]
+    public async Task A_throwing_handler_frees_the_key_only_when_abort_on_exception_is_on()
+    {
+        var endpoint = Environment.GetEnvironmentVariable("RUVIO_TEST_ADDR")!.Split(':');
+
+        await using var connection = await RuvioConnection.ConnectAsync(endpoint[0], int.Parse(endpoint[1]));
+        IRuvioClient client = await connection.GetDefaultDatabaseAsync();
+
+        foreach (bool abort in new[] { false, true })
+        {
+            var builder = WebApplication.CreateBuilder();
+
+            builder.WebHost.UseUrls("http://127.0.0.1:0");
+            builder.Logging.ClearProviders();
+            builder.Services.AddSingleton<IRuvioClient>(client);
+            builder.Services.AddRuvioIdempotency(o =>
+            {
+                o.Namespace = "abort-http-" + Guid.NewGuid().ToString("N");
+                o.ScopeSelector = _ => "tenant";
+                o.Retention = TimeSpan.FromSeconds(10);
+                o.AbortOnException = abort;
+            });
+
+            await using var app = builder.Build();
+            app.Use(async (context, next) =>
+            {
+                context.User = new ClaimsPrincipal(new ClaimsIdentity([new Claim("sub", "user")], "test"));
+
+                try
+                {
+                    await next();
+                }
+                catch (InvalidOperationException)
+                {
+                    context.Response.StatusCode = StatusCodes.Status500InternalServerError;
+                }
+            });
+
+            app.UseRouting();
+            app.UseRuvioIdempotency();
+            int calls = 0;
+
+            app.MapPost("/flaky", () =>
+            {
+                if (++calls == 1)
+                    throw new InvalidOperationException("transient");
+
+                return new { value = "saved" };
+            }).WithMetadata(new RuvioIdempotencyAttribute());
+
+            await app.StartAsync();
+            try
+            {
+                string address = app.Services.GetRequiredService<IServer>().Features
+                    .Get<IServerAddressesFeature>()!.Addresses.Single();
+                using var http = new HttpClient { BaseAddress = new Uri(address), Timeout = TimeSpan.FromSeconds(10) };
+
+                http.DefaultRequestHeaders.Add("Idempotency-Key", "flaky-request");
+                using var failed = await http.PostAsync("/flaky", new StringContent("{}"));
+                using var retry = await http.PostAsync("/flaky", new StringContent("{}"));
+                using var replay = await http.PostAsync("/flaky", new StringContent("{}"));
+
+                Assert.Equal(HttpStatusCode.InternalServerError, failed.StatusCode);
+
+                if (abort)
+                {
+                    Assert.Equal(HttpStatusCode.OK, retry.StatusCode);
+                    Assert.Equal(HttpStatusCode.OK, replay.StatusCode);
+                    Assert.Equal(await retry.Content.ReadAsStringAsync(), await replay.Content.ReadAsStringAsync());
+                    Assert.Equal(2, calls);
+                }
+                else
+                {
+                    Assert.Equal(HttpStatusCode.Conflict, retry.StatusCode);
+                    Assert.Equal(HttpStatusCode.Conflict, replay.StatusCode);
+                    Assert.Equal(1, calls);
+                }
+            }
+
+            finally { await app.StopAsync(); }
+        }
+    }
+
     [Fact]
     public async Task RealHttpReplaysJsonAndNeverSendsPartialHandlerFailure()
     {

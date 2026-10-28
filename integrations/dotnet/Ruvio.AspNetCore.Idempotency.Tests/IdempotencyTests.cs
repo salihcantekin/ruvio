@@ -176,6 +176,22 @@ public class IdempotencyTests
     }
 
     [Fact]
+    public async Task AFailedAbortLeavesTheHandlersExceptionAndThePendingRecord()
+    {
+        // The stub refuses every call but BEGIN and COMPLETE, so the abort itself fails here.
+        var (client, stub) = StubClient.Create();
+        var options = Options();
+
+        options.AbortOnException = true;
+        var middleware = Middleware(_ => throw new InvalidOperationException("handler"), options);
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() => middleware.InvokeAsync(Context(client)));
+
+        Assert.Equal("handler", error.Message);
+        Assert.Equal("pending", Assert.Single(stub.Records).Value.State);
+    }
+
+    [Fact]
     public async Task ConcurrentPendingRequestConflictsAndNeverRunsHandler()
     {
         var (client, _) = StubClient.Create();

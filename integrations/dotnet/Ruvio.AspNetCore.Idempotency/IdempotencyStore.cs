@@ -67,6 +67,26 @@ internal static class IdempotencyStore
             throw new InvalidOperationException("Idempotency ownership was lost or completion failed; outcome is uncertain.");
     }
 
+    /// <summary>
+    /// Gives up the pending record after the handler threw. A failure here is counted and swallowed so the handler's
+    /// own exception reaches the caller; the record then stays pending until its retention ends, as without the option.
+    /// </summary>
+    internal static async Task AbortAsync(IRuvioClient client, string key, string fingerprint, string owner)
+    {
+        long started = Stopwatch.GetTimestamp();
+
+        try
+        {
+            if (await MeasureStorageAsync("abort", started,
+                client.AbortIdempotencyAsync(key, fingerprint, owner, CancellationToken.None)).ConfigureAwait(false))
+                RecordState("aborted");
+        }
+        catch (Exception)
+        {
+            // Already counted with outcome "error" by MeasureStorageAsync.
+        }
+    }
+
     /// <summary>Records the outcome of a storage call that has already started; no delegate is allocated.</summary>
     private static async ValueTask<T> MeasureStorageAsync<T>(string operation, long started, ValueTask<T> pending)
     {

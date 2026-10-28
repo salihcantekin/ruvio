@@ -1050,7 +1050,9 @@ pub fn command_acl_name(command: &Command<'_>) -> &'static str {
         Command::Semaphore { .. } => "semaphore",
         Command::Limit { .. } => "limit",
         Command::Once { .. } => "once",
-        Command::IdempotencyBegin { .. } | Command::IdempotencyComplete { .. } => "idem",
+        Command::IdempotencyBegin { .. }
+        | Command::IdempotencyComplete { .. }
+        | Command::IdempotencyAbort { .. } => "idem",
         Command::Take { .. } => "take",
         Command::Transfer { .. } => "transfer",
         Command::HashTransfer { .. } => "htransfer",
