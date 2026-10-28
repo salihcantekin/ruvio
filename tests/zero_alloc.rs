@@ -291,7 +291,7 @@ fn lrange_replies_allocate_no_intermediate_vec() {
 
         execute(
             &mut shard,
-            Command::ListPushBack(Cow::Borrowed(b"list"), vec![Cow::Owned(member)]),
+            Command::ListPushBack(Cow::Borrowed(b"list"), vec![Cow::Owned(member)].into()),
         );
     }
 
@@ -371,4 +371,87 @@ fn collection_writes_allocate_only_the_vec_the_command_keeps() {
         assert_eq!(consumed, frame.len());
         assert_eq!(used, 1, "{:?}: {used} allocations", frame);
     }
+}
+
+/// A single-element LPUSH/RPUSH and a single-pair ZADD keep their one argument inline:
+/// parsing them touches no allocator.
+#[test]
+fn single_element_collection_writes_parse_without_allocating() {
+    use ruvio::protocol::parse_command;
+
+    let frames: [&[u8]; 4] = [
+        b"*3\r\n$5\r\nLPUSH\r\n$1\r\nl\r\n$1\r\na\r\n",
+        b"*3\r\n$5\r\nRPUSH\r\n$1\r\nl\r\n$1\r\na\r\n",
+        b"*4\r\n$4\r\nZADD\r\n$1\r\nz\r\n$1\r\n1\r\n$2\r\nm1\r\n",
+        b"*6\r\n$4\r\nZADD\r\n$1\r\nz\r\n$2\r\nXX\r\n$2\r\nCH\r\n$1\r\n1\r\n$2\r\nm1\r\n",
+    ];
+
+    for frame in frames {
+        parse_command(frame).unwrap().unwrap();
+    }
+
+    for frame in frames {
+        let before = allocations();
+        let (_, consumed) = parse_command(frame).unwrap().unwrap();
+        let used = allocations() - before;
+
+        assert_eq!(consumed, frame.len());
+        assert_eq!(used, 0, "{:?}: {used} allocations", frame);
+    }
+}
+
+/// On a warm key, a single-element push and a single-pair ZADD that updates an existing
+/// member build no temporary collection in the engine.
+#[test]
+fn single_element_collection_writes_execute_without_temporaries() {
+    use std::borrow::Cow;
+
+    use ruvio::{engine::execute, protocol::Command};
+
+    let mut shard = KvShard::new();
+    let zadd = |score: f64| Command::SortedSetAdd {
+        key: Cow::Borrowed(b"zset"),
+        pairs: ruvio::protocol::OneOrMany::One((score, Cow::Borrowed(b"member"))),
+        options: Default::default(),
+    };
+    let push = |back: bool| {
+        let value = ruvio::protocol::OneOrMany::One(Cow::Borrowed(VALUE));
+
+        if back {
+            Command::ListPushBack(Cow::Borrowed(b"list"), value)
+        } else {
+            Command::ListPush(Cow::Borrowed(b"list"), value)
+        }
+    };
+
+    for round in 0..ROUNDS {
+        execute(&mut shard, push(round % 2 == 0));
+        execute(&mut shard, zadd(round as f64));
+    }
+
+    let before = allocations();
+
+    for round in 0..ROUNDS {
+        execute(&mut shard, zadd((round % 7) as f64));
+    }
+
+    let zadd_used = allocations() - before;
+    let before = allocations();
+
+    for round in 0..ROUNDS {
+        execute(&mut shard, push(round % 2 == 0));
+    }
+
+    let push_used = allocations() - before;
+
+    assert_eq!(
+        zadd_used, 0,
+        "ZADD: {zadd_used} allocations in {ROUNDS} rounds"
+    );
+    // Only the list's own nodes grow, about one per a dozen elements; a per-push
+    // temporary would cost at least one allocation each.
+    assert!(
+        push_used < ROUNDS as u64 / 2,
+        "LPUSH/RPUSH: {push_used} allocations in {ROUNDS} rounds"
+    );
 }

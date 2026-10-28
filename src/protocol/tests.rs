@@ -534,13 +534,13 @@ fn parses_collection_commands() {
 
     assert_eq!(
         read_command(&mut reader).unwrap(),
-        Some(Command::ListPush(owned(b"list"), vec![owned(b"a")]))
+        Some(Command::ListPush(owned(b"list"), vec![owned(b"a")].into()))
     );
     assert_eq!(
         read_command(&mut reader).unwrap(),
         Some(Command::SortedSetAdd {
             key: owned(b"scores"),
-            pairs: vec![(1.5, owned(b"bob"))],
+            pairs: vec![(1.5, owned(b"bob"))].into(),
             options: SortedSetAddOptions::default(),
         })
     );
@@ -715,7 +715,7 @@ fn parses_sorted_set_family_commands() {
         read_command(&mut reader).unwrap(),
         Some(Command::SortedSetAdd {
             key: owned(b"z"),
-            pairs: vec![(1.0, owned(b"a")), (2.0, owned(b"b"))],
+            pairs: vec![(1.0, owned(b"a")), (2.0, owned(b"b"))].into(),
             options: SortedSetAddOptions::default(),
         })
     );
@@ -1319,7 +1319,7 @@ fn parses_list_family_commands() {
     assert_eq!(
         parse_command(rpush).unwrap(),
         Some((
-            Command::ListPushBack(owned(b"l"), vec![owned(b"a")]),
+            Command::ListPushBack(owned(b"l"), vec![owned(b"a")].into()),
             rpush.len()
         ))
     );

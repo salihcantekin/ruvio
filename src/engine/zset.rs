@@ -1,11 +1,12 @@
 use super::*;
+use crate::protocol::OneOrMany;
 
 pub(super) fn sorted_set_add<'a, C: Clock, I: StorageIndex, S: MutationSink, W: ListWaiterSink>(
     shard: &'a mut KvShard<C, I>,
     sink: &mut S,
     waiters: &mut W,
     key: crate::protocol::Bytes<'a>,
-    pairs: Vec<(f64, crate::protocol::Bytes<'a>)>,
+    pairs: OneOrMany<(f64, crate::protocol::Bytes<'a>)>,
     options: crate::protocol::SortedSetAddOptions,
 ) -> Result<Response<'a>, S::Error> {
     if pairs.iter().any(|(score, _)| score.is_nan()) {
@@ -30,37 +31,56 @@ pub(super) fn sorted_set_add<'a, C: Clock, I: StorageIndex, S: MutationSink, W: 
 
     let mut added = 0i64;
     let mut changed = 0i64;
-    // Scores this command already set, by member: one lookup per pair, so a ZADD of
-    // many members stays linear.
-    let mut overlay: ahash::AHashMap<&[u8], f64> = ahash::AHashMap::new();
-    let mut kept = vec![false; pairs.len()];
 
-    for (index, (score, member)) in pairs.iter().enumerate() {
-        let current = overlay.get(member.as_ref()).copied().or_else(|| {
-            shard
-                .sorted_set_score(&key, member)
-                .expect("sorted-set type was validated")
-        });
+    let selected = match pairs {
+        // One pair: no other pair can have set its member, and it is either kept or not.
+        OneOrMany::One((score, member)) => {
+            let current = shard
+                .sorted_set_score(&key, &member)
+                .expect("sorted-set type was validated");
 
-        if current == Some(*score) || !score_update_applies(current, *score, options) {
-            continue;
+            if current == Some(score) || !score_update_applies(current, score, options) {
+                return Ok(Response::Integer(0));
+            }
+
+            added = i64::from(current.is_none());
+            changed = 1;
+            OneOrMany::One((score, member))
         }
+        OneOrMany::Many(mut pairs) => {
+            // Scores this command already set, by member: one lookup per pair, so a ZADD of
+            // many members stays linear.
+            let mut overlay: ahash::AHashMap<&[u8], f64> = ahash::AHashMap::new();
+            let mut kept = vec![false; pairs.len()];
 
-        if current.is_none() {
-            added += 1;
+            for (index, (score, member)) in pairs.iter().enumerate() {
+                let current = overlay.get(member.as_ref()).copied().or_else(|| {
+                    shard
+                        .sorted_set_score(&key, member)
+                        .expect("sorted-set type was validated")
+                });
+
+                if current == Some(*score) || !score_update_applies(current, *score, options) {
+                    continue;
+                }
+
+                if current.is_none() {
+                    added += 1;
+                }
+
+                changed += 1;
+                overlay.insert(member.as_ref(), *score);
+                kept[index] = true;
+            }
+            drop(overlay);
+
+            // `retain` visits every pair once, in order.
+            let mut kept = kept.into_iter();
+
+            pairs.retain(|_| kept.next().unwrap_or(false));
+            OneOrMany::Many(pairs)
         }
-
-        changed += 1;
-        overlay.insert(member.as_ref(), *score);
-        kept[index] = true;
-    }
-    drop(overlay);
-
-    let selected: Vec<_> = pairs
-        .into_iter()
-        .zip(kept)
-        .filter_map(|(pair, kept)| kept.then_some(pair))
-        .collect();
+    };
 
     if selected.is_empty() {
         return Ok(Response::Integer(0));

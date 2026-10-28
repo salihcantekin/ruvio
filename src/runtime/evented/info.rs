@@ -32,7 +32,7 @@ pub(super) fn evented_info(state: &ShardState, section: Option<&[u8]>) -> io::Re
     let shard_id = state.route.as_ref().map_or(0, |route| route.shard_id);
     let shard_count = state.route.as_ref().map_or(1, |route| route.shard_count);
     let mut info = Vec::with_capacity(512);
-    let counters = *state.command_metrics.borrow();
+    let counters = state.command_totals();
     let (net_input, net_output) = super::net::totals();
     let admission = crate::admission::admission_totals();
 
@@ -280,7 +280,7 @@ fn command_latency(state: &ShardState) -> Vec<crate::metrics::CommandLatency> {
 
 pub(super) fn evented_snapshot(state: &ShardState) -> crate::metrics::MetricsSnapshot {
     let store = state.store.borrow();
-    let command_metrics = *state.command_metrics.borrow();
+    let command_metrics = state.command_totals();
     let persistence = state
         .persistence
         .lock()

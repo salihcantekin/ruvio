@@ -689,7 +689,7 @@ pub(super) async fn handle_client(
             } {
                 Ok(HotParse::Complete(command, frame_length)) => {
                     let command_timing =
-                        CommandTiming::new(state.clone(), hot_command_group(&command), || {
+                        CommandTiming::new(&state, hot_command_group(&command), || {
                             hot_command_name(&command)
                         });
                     command_timing.observe_key(
@@ -720,8 +720,10 @@ pub(super) async fn handle_client(
                         continue;
                     }
 
+                    let mutates = hot_command_mutates_store(&command);
+
                     if let Some(refusal) = state.write_gate.get().refusal()
-                        && hot_command_mutates_store(&command)
+                        && mutates
                     {
                         write_response(&mut output, Response::Error(refusal))?;
                         continue;
@@ -752,12 +754,12 @@ pub(super) async fn handle_client(
                             owner,
                             &input[consumed - frame_length..consumed],
                             output.len(),
-                            hot_command_mutates_store(&command),
+                            mutates,
                         );
                         continue;
                     }
 
-                    if hot_command_mutates_store(&command) {
+                    if mutates {
                         bump_mutations(&state);
                     }
 
@@ -1079,7 +1081,7 @@ pub(super) async fn handle_client(
                                 continue;
                             }
                             let command_timing =
-                                CommandTiming::new(state.clone(), command_group(&command), || {
+                                CommandTiming::new(&state, command_group(&command), || {
                                     crate::acl::command_acl_name(&command)
                                 });
                             command_timing.observe_key(
