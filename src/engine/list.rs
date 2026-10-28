@@ -5,7 +5,7 @@ pub(super) fn push_list<'a, C: Clock, I: StorageIndex, S: MutationSink, W: ListW
     sink: &mut S,
     waiters: &mut W,
     key: crate::protocol::Bytes<'a>,
-    values: Vec<crate::protocol::Bytes<'a>>,
+    values: crate::protocol::OneOrMany<crate::protocol::Bytes<'a>>,
     back: bool,
 ) -> Result<Response<'a>, S::Error> {
     Ok(
@@ -38,7 +38,7 @@ fn push_list_length<C: Clock, I: StorageIndex, S: MutationSink, W: ListWaiterSin
     sink: &mut S,
     waiters: &mut W,
     key: &crate::protocol::Bytes<'_>,
-    values: Vec<crate::protocol::Bytes<'_>>,
+    values: crate::protocol::OneOrMany<crate::protocol::Bytes<'_>>,
     back: bool,
 ) -> Result<Result<Pushed, Response<'static>>, S::Error> {
     if !accepts_type(shard, key, ValueKind::List) {
@@ -65,20 +65,21 @@ fn push_or_deliver<C: Clock, I: StorageIndex, S: MutationSink, W: ListWaiterSink
     sink: &mut S,
     waiters: &mut W,
     key: &crate::protocol::Bytes<'_>,
-    values: Vec<crate::protocol::Bytes<'_>>,
+    values: crate::protocol::OneOrMany<crate::protocol::Bytes<'_>>,
     back: bool,
 ) -> Result<Result<Pushed, Response<'static>>, S::Error> {
-    let mut remaining = Vec::with_capacity(values.len());
+    let mut remaining = values;
     let database = shard.active_database();
     let mut delivered = 0;
 
-    for value in values {
-        if waiters.deliver(database, key, &value) {
-            delivered += 1;
-            continue;
-        }
+    // Without blocked clients every element stays and nothing is copied.
+    if waiters.has_waiters() {
+        remaining.retain(|value| {
+            let taken = waiters.deliver(database, key, value);
 
-        remaining.push(value);
+            delivered += usize::from(taken);
+            !taken
+        });
     }
 
     if remaining.is_empty() {
@@ -138,7 +139,7 @@ pub(super) fn push_list_capped<
     back: bool,
 ) -> Result<Response<'a>, S::Error> {
     let pushed = values.len();
-    let (length, reply) = match push_list_length(shard, sink, waiters, &key, values, back)? {
+    let (length, reply) = match push_list_length(shard, sink, waiters, &key, values.into(), back)? {
         Ok(done) => (done.length, done.reply().min(cap)),
         Err(rejected) => return Ok(rejected),
     };

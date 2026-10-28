@@ -28,7 +28,7 @@ fn evented_wal_group_policy_checks_execution_path_and_session() {
     ));
     for command in [
         Command::Get(b"k".as_slice().into()),
-        Command::ListPush(b"k".as_slice().into(), vec![b"v".as_slice().into()]),
+        Command::ListPush(b"k".as_slice().into(), vec![b"v".as_slice().into()].into()),
         Command::MSet(vec![(b"k".as_slice().into(), b"v".as_slice().into())]),
         Command::SetAdd(b"k".as_slice().into(), vec![b"v".as_slice().into()]),
     ] {

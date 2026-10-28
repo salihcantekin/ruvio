@@ -4,6 +4,7 @@ mod command;
 mod direct;
 mod hot;
 mod inline;
+mod one_or_many;
 mod parse;
 mod resp;
 mod table;
@@ -22,6 +23,7 @@ mod validate;
 
 pub(crate) use command::*;
 pub use hot::*;
+pub use one_or_many::OneOrMany;
 pub(crate) use parse::*;
 pub use resp::*;
 use validate::*;
@@ -829,8 +831,8 @@ pub enum Command<'a> {
     },
     DbSize,
     Del(Keys<'a>),
-    ListPush(Bytes<'a>, Vec<Bytes<'a>>),
-    ListPushBack(Bytes<'a>, Vec<Bytes<'a>>),
+    ListPush(Bytes<'a>, OneOrMany<Bytes<'a>>),
+    ListPushBack(Bytes<'a>, OneOrMany<Bytes<'a>>),
     ListPop {
         key: Bytes<'a>,
         count: Option<usize>,
@@ -1014,7 +1016,7 @@ pub enum Command<'a> {
     },
     SortedSetAdd {
         key: Bytes<'a>,
-        pairs: Vec<(f64, Bytes<'a>)>,
+        pairs: OneOrMany<(f64, Bytes<'a>)>,
         options: SortedSetAddOptions,
     },
     SortedSetRange {

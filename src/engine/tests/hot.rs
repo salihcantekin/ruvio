@@ -115,7 +115,7 @@ fn validation_errors_do_not_cross_the_mutation_boundary() {
 
     let response = execute_with_sink(
         &mut shard,
-        Command::ListPush(owned(b"not-a-list"), vec![owned(b"item")]),
+        Command::ListPush(owned(b"not-a-list"), vec![owned(b"item")].into()),
         &mut sink,
     )
     .unwrap();
