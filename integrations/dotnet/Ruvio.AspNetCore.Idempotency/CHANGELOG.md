@@ -5,6 +5,7 @@ Notable changes to the NuGet package `Ruvio.AspNetCore.Idempotency`. New entries
 ## Unreleased
 
 - `ClientKey` option: names a connection registered with `AddKeyedRuvioClient`, so the middleware can use its own server or database. Null (the default) keeps the unkeyed `IRuvioClient`.
+- README: lists the existing `ruvio.idempotency.states` counter and its tags.
 - Less allocation per idempotent request: the request body is read into, and the response is buffered in, storage rented from the shared array pool (grown as needed, cleared when returned) instead of a new array each time, and the response buffer no longer reserves the full `MaxResponseBodyBytes` up front. Limits and behaviour are unchanged.
 - `options.Outage`: choose what happens when Ruvio is unreachable (`Throw`, the default and unchanged; `FailClosed`, 503; `FailOpen`, the handler runs without idempotency) and optionally stop calling Ruvio after repeated failures with a circuit breaker. See the README.
 

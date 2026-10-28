@@ -409,7 +409,9 @@ public class OfflineLockTests
             renewReturnsNull = true;
             IRuvioLock? lockInContext = context.GetRuvioLock();
 
-            Assert.Null(lockInContext);
+            // The attribute's lock is visible to the handler too (for its fencing token).
+            Assert.NotNull(lockInContext);
+            Assert.Equal("r", lockInContext.Resource);
             await Task.Delay(10);
         });
 

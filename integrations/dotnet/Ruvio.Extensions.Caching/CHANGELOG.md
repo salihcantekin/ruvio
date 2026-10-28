@@ -5,6 +5,7 @@ Notable changes to the NuGet package `Ruvio.Extensions.Caching`. New entries go 
 ## Unreleased
 
 - `ClientKey` option: names a connection registered with `AddKeyedRuvioClient`, so the cache can use its own server or database. Null (the default) keeps the unkeyed `IRuvioClient`.
+- Hit and miss metrics: `ruvio.cache.hit` and `ruvio.cache.miss` counters on the `Ruvio.Extensions.Caching` meter, tagged `operation` (`get` or `get_or_create`); an expired entry is a miss. No keys or values are recorded; with no listener a lookup pays one field read.
 - Fewer allocations per call: `GetJsonAsync`, `SetAsync`, `SetStringAsync` and `SetJsonAsync` no longer allocate a closure and delegate for each call. Behaviour is unchanged.
 - `options.Outage`: `FailOpen` makes reads misses and drops writes and removals when Ruvio is unreachable (`GetOrCreate*` runs its factory without caching), and an optional circuit breaker stops calls to a Ruvio that is down. Default (`Throw`) unchanged. See the README.
 

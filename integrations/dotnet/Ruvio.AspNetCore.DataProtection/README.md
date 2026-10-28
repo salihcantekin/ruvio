@@ -94,6 +94,20 @@ The provider cannot inspect or guarantee the deployment's durability, replicatio
 or failover policy. A separate durable connection is recommended when ordinary
 caches use different retention/eviction settings.
 
+The server's default durability profile is `memory`: a ring stored there is gone when the server restarts. On its
+first key-ring access the repository reads `INFO server` once. When the profile is `memory`, or the server does not say
+(an ACL without `INFO`), it logs a warning through the host's logging. Set `RequireDurableStorage = true` to refuse
+reads and writes instead, before the ring is touched:
+
+```csharp
+builder.Services.AddDataProtection()
+    .PersistKeysToRuvio(o => o.RequireDurableStorage = true)
+    .ProtectKeysWithCertificate(certificate);
+```
+
+The check costs one command per process; a transport error leaves it for the next access. It does not see replication
+or failover settings.
+
 There is no TTL, key pruning, automatic retry or fallback to an ephemeral local
 ring. An existing key with a TTL is rejected on reads and writes. Keep old keys
 and revocation records: removing them can make existing cookies/tokens permanently

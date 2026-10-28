@@ -28,6 +28,13 @@ public sealed class RuvioLockOptions
     public bool AutoRenew { get; set; } = true;
 
     /// <summary>
+    /// Take locks with the server's <c>LEASE</c> (renewed with <c>RENEW</c>, freed with <c>RELEASE</c>) so each lock carries a
+    /// <see cref="IRuvioLock.FencingToken"/>. Off by default. Turn it on for every instance that shares a key prefix: while a
+    /// plain lock (from an instance with it off) holds a resource, a fenced instance sees it as taken, and the other way round.
+    /// </summary>
+    public bool Fenced { get; set; }
+
+    /// <summary>
     /// How long an HTTP request may hold its lock before the lease expires, unless the endpoint sets its own.
     /// With <see cref="AutoRenew"/> on, the lease is renewed while the request runs, so this is only how long a
     /// crashed process keeps other requests out: keep it short (the default is 30 seconds).

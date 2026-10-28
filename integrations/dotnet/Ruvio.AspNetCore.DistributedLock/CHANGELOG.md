@@ -5,6 +5,10 @@ Notable changes to the NuGet package `Ruvio.AspNetCore.DistributedLock`. New ent
 ## Unreleased
 
 - `ClientKey` option: names a connection registered with `AddKeyedRuvioClient`, so the lock provider can use its own server or database. Null (the default) keeps the unkeyed `IRuvioClient`.
+- `RuvioLockOptions.Fenced` (off by default): locks use the server's `LEASE`, `RENEW` and `RELEASE`, and `IRuvioLock.FencingToken` carries a number that only grows per resource, for the guarded resource to refuse writes from an owner whose lease ran out. A resource held by a plain lock counts as taken (`WRONGTYPE`). The server keeps a lease's key, so use it for a bounded set of names; see the README. `FencingToken` is a default interface member (null), so other `IRuvioLock` implementations keep compiling.
+- `[RuvioLock]` endpoints can read their lock (and its fencing token) with `HttpContext.GetRuvioLock()`; it returned null for them before.
+- `AddRuvioSingleton<TWorker>(name)`: a hosted service that runs an `IRuvioSingletonWorker` on one instance at a time and hands it to another instance when it stops, fails or loses the lock.
+- `RuvioLockProvider.RunOncePerPeriodAsync(name, period, work)`: runs work at most once per period across instances, with the server's `ONCE`.
 - A missing `AddRuvioDistributedLock` registration now fails the request with the usual "no service registered" error instead of a `NullReferenceException`.
 - `options.Outage`: choose what happens when Ruvio is unreachable (`Throw`, the default and unchanged: the `[RuvioLock]` middleware answers 503, `WithDistributedLock` raises; `FailClosed`, 503 on both; `FailOpen`, the request runs with no lock) and optionally stop calling Ruvio after repeated failures with a circuit breaker. See the README.
 

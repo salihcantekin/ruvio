@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.DataProtection.KeyManagement;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Ruvio.Client;
 
@@ -43,7 +44,8 @@ public static class RuvioDataProtectionExtensions
             {
                 IRuvioConnection connection = connectionFactory(provider, options);
                 IRuvioClient client = connection.GetDefaultDatabaseAsync().GetAwaiter().GetResult();
-                keys.XmlRepository = new RuvioXmlRepository(client, Options.Create(options));
+                keys.XmlRepository = new RuvioXmlRepository(client, Options.Create(options),
+                    provider.GetService<ILogger<RuvioXmlRepository>>());
             })
             .PostConfigure(keys =>
             {

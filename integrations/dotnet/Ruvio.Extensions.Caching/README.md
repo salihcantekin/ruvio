@@ -149,7 +149,8 @@ The envelope costs **9–37 bytes** (ASCII decimal fields), not base64 expansion
 key/object/index overhead is additional and implementation-dependent. Persistent
 entries have no TTL; no extra metadata keys, hash fields, polling tasks, timers, or
 server changes are introduced. Sliding-only entries use only native expiry plus the
-in-value sliding duration. The provider adds no telemetry or key/value logging.
+in-value sliding duration. The provider logs no keys or values; its
+metrics are counters without key tags (see Metrics).
 
 Defaults: 1 MiB payload and 1024 UTF-8 bytes for the **full namespaced key**.
 `MaxValueBytes` (zero allows only empty values) and `MaxKeyBytes` are configurable.
@@ -168,6 +169,16 @@ own (another server, database or set of options), register one with
 ```csharp
 services.AddKeyedRuvioClient("cache", "cache-host", 6379);
 services.AddRuvioDistributedCache(o => { o.ClientKey = "cache"; o.InstanceName = "orders"; });
+```
+
+## Metrics
+
+Meter `Ruvio.Extensions.Caching` counts lookups: `ruvio.cache.hit` and `ruvio.cache.miss`, tagged `operation`
+(`get` for `Get*`/`Refresh*`, `get_or_create` for `GetOrCreate*`). An expired entry counts as a miss. The tags carry no keys
+or values. With no listener attached each lookup pays one field read.
+
+```csharp
+builder.Services.AddOpenTelemetry().WithMetrics(m => m.AddMeter("Ruvio.Extensions.Caching"));
 ```
 
 ## When Ruvio is unreachable
