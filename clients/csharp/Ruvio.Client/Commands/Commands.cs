@@ -22,7 +22,7 @@ public sealed partial class RuvioClient
             .ConfigureAwait(false);
 
         if (reply.Kind != RespKind.Integer || reply.Integer is < 0 or > 1)
-            throw new RuvioException("Invalid idempotency completion response.");
+            throw RuvioException.Client("Invalid idempotency completion response.");
 
         return reply.Integer == 1;
     }
@@ -110,7 +110,7 @@ public sealed partial class RuvioClient
             || items[0].Kind != RespKind.Integer
             || items[1].Kind != RespKind.Integer)
         {
-            throw new RuvioException("Invalid LIMIT WITHRETRY response.");
+            throw RuvioException.Client("Invalid LIMIT WITHRETRY response.");
         }
 
         long remaining = items[0].Integer;
@@ -234,7 +234,7 @@ public sealed partial class RuvioClient
 
         if (reply.Items is null)
         {
-            throw new RuvioException("CHANGES did not return an array");
+            throw RuvioException.Client("CHANGES did not return an array");
         }
 
         var notes = new List<ChangeNote>(reply.Items.Count);
@@ -243,7 +243,7 @@ public sealed partial class RuvioClient
         {
             if (row.Items is not { Count: >= 2 } parts)
             {
-                throw new RuvioException("CHANGES note is not a sequence and a text");
+                throw RuvioException.Client("CHANGES note is not a sequence and a text");
             }
 
             notes.Add(new ChangeNote(parts[0].Integer, parts[1].AsString() ?? ""));
@@ -426,7 +426,7 @@ public sealed partial class RuvioClient
     public async ValueTask<string> GetKeyTypeAsync(string key, CancellationToken cancellationToken = default)
     {
         return (await ExecuteCommandAsync(new RespCommand("TYPE", key), cancellationToken)).AsString()
-            ?? throw new RuvioException("TYPE returned a null reply");
+            ?? throw RuvioException.Client("TYPE returned a null reply");
     }
 
     /// <inheritdoc />
@@ -1116,7 +1116,7 @@ public sealed partial class RuvioClient
     {
         string? text = await BulkOrNull(new RespCommand("ZINCRBY", key, Number(delta), member), cancellationToken);
 
-        return ParseDouble(text ?? throw new RuvioException("ZINCRBY returned a null reply"));
+        return ParseDouble(text ?? throw RuvioException.Client("ZINCRBY returned a null reply"));
     }
 
     /// <inheritdoc />
@@ -1208,7 +1208,7 @@ public sealed partial class RuvioClient
 
         if (reply.Kind is not RespKind.Array || reply.Items is null)
         {
-            throw new RuvioException($"GEOPOS returned {reply.Kind}");
+            throw RuvioException.Client($"GEOPOS returned {reply.Kind}");
         }
 
         var points = new List<(double Longitude, double Latitude)?>(reply.Items.Count);
@@ -1223,12 +1223,12 @@ public sealed partial class RuvioClient
 
             if (item.Kind is not RespKind.Array || item.Items is null || item.Items.Count != 2)
             {
-                throw new RuvioException($"GEOPOS returned {item.Kind}");
+                throw RuvioException.Client($"GEOPOS returned {item.Kind}");
             }
 
             points.Add((
-                ParseDouble(item.Items[0].AsString() ?? throw new RuvioException("GEOPOS returned a null coordinate")),
-                ParseDouble(item.Items[1].AsString() ?? throw new RuvioException("GEOPOS returned a null coordinate"))));
+                ParseDouble(item.Items[0].AsString() ?? throw RuvioException.Client("GEOPOS returned a null coordinate")),
+                ParseDouble(item.Items[1].AsString() ?? throw RuvioException.Client("GEOPOS returned a null coordinate"))));
         }
 
         return points;
@@ -1357,7 +1357,7 @@ public sealed partial class RuvioClient
 
         if (reply.Kind is not RespKind.Integer)
         {
-            throw new RuvioException($"{command} returned {reply.Kind}");
+            throw RuvioException.Client($"{command} returned {reply.Kind}");
         }
 
         return reply.Integer;
@@ -1400,7 +1400,7 @@ public sealed partial class RuvioClient
     {
         string? result = await BulkOrNull(FlattenPairs("XADD", key, id, fields));
 
-        return result ?? throw new RuvioException("XADD returned a null reply");
+        return result ?? throw RuvioException.Client("XADD returned a null reply");
     }
 
     /// <inheritdoc />
@@ -1416,7 +1416,7 @@ public sealed partial class RuvioClient
         arguments.AddRange(FlattenPairs(id, fields));
         string? result = await BulkOrNull(arguments);
 
-        return result ?? throw new RuvioException("XADD returned a null reply");
+        return result ?? throw RuvioException.Client("XADD returned a null reply");
     }
 
     /// <inheritdoc />
@@ -1432,7 +1432,7 @@ public sealed partial class RuvioClient
         arguments.AddRange(FlattenPairs(id, fields));
         string? result = await BulkOrNull(arguments);
 
-        return result ?? throw new RuvioException("XADD returned a null reply");
+        return result ?? throw RuvioException.Client("XADD returned a null reply");
     }
 
     /// <inheritdoc />
@@ -1449,7 +1449,7 @@ public sealed partial class RuvioClient
         arguments.AddRange(FlattenPairs(id, fields));
         string? result = await BulkOrNull(arguments);
 
-        return result ?? throw new RuvioException("XADD returned a null reply");
+        return result ?? throw RuvioException.Client("XADD returned a null reply");
     }
 
     /// <inheritdoc />
@@ -1745,7 +1745,7 @@ public sealed partial class RuvioClient
         {
             if (row.Items is not { Count: 4 } fields)
             {
-                throw new RuvioException("XPENDING returned an unexpected row");
+                throw RuvioException.Client("XPENDING returned an unexpected row");
             }
 
             rows.Add(new StreamPendingEntry(
@@ -1864,7 +1864,7 @@ public sealed partial class RuvioClient
     public async ValueTask<string> GetInfoAsync(CancellationToken cancellationToken = default)
     {
         return await BulkOrNull(new RespCommand("INFO"), cancellationToken)
-            ?? throw new RuvioException("INFO returned a null reply");
+            ?? throw RuvioException.Client("INFO returned a null reply");
     }
 
     /// <inheritdoc />
@@ -1872,7 +1872,7 @@ public sealed partial class RuvioClient
     public async ValueTask<string> GetInfoAsync(string section, CancellationToken cancellationToken = default)
     {
         return await BulkOrNull(new RespCommand("INFO", section), cancellationToken)
-            ?? throw new RuvioException("INFO returned a null reply");
+            ?? throw RuvioException.Client("INFO returned a null reply");
     }
 
     /// <inheritdoc />
@@ -1880,7 +1880,7 @@ public sealed partial class RuvioClient
     public async ValueTask<string> GetInfoAsync(InfoSection section, CancellationToken cancellationToken = default)
     {
         return await BulkOrNull(new RespCommand("INFO", Keywords.Arg(section)), cancellationToken)
-            ?? throw new RuvioException("INFO returned a null reply");
+            ?? throw RuvioException.Client("INFO returned a null reply");
     }
 
     /// <inheritdoc />
@@ -1951,7 +1951,7 @@ public sealed partial class RuvioClient
     public async ValueTask<string> GetAclUserNameAsync(CancellationToken cancellationToken = default)
     {
         return await BulkOrNull(new RespCommand("ACL", "WHOAMI"), cancellationToken)
-            ?? throw new RuvioException("ACL WHOAMI returned a null reply");
+            ?? throw RuvioException.Client("ACL WHOAMI returned a null reply");
     }
 
     /// <inheritdoc />
@@ -1965,7 +1965,7 @@ public sealed partial class RuvioClient
     public async ValueTask<string> GetClusterNodesAsync(CancellationToken cancellationToken = default)
     {
         return await BulkOrNull(new RespCommand("CLUSTER", "NODES"), cancellationToken)
-            ?? throw new RuvioException("CLUSTER NODES returned a null reply");
+            ?? throw RuvioException.Client("CLUSTER NODES returned a null reply");
     }
 
     /// <inheritdoc />
@@ -1979,7 +1979,7 @@ public sealed partial class RuvioClient
     public async ValueTask<string> GetClusterInfoAsync(CancellationToken cancellationToken = default)
     {
         return await BulkOrNull(new RespCommand("CLUSTER", "INFO"), cancellationToken)
-            ?? throw new RuvioException("CLUSTER INFO returned a null reply");
+            ?? throw RuvioException.Client("CLUSTER INFO returned a null reply");
     }
 
     /// <inheritdoc />
@@ -1987,7 +1987,7 @@ public sealed partial class RuvioClient
     public async ValueTask<string> GetClusterMyIdAsync(CancellationToken cancellationToken = default)
     {
         return await BulkOrNull(new RespCommand("CLUSTER", "MYID"), cancellationToken)
-            ?? throw new RuvioException("CLUSTER MYID returned a null reply");
+            ?? throw RuvioException.Client("CLUSTER MYID returned a null reply");
     }
 
     /// <inheritdoc />
@@ -2013,7 +2013,7 @@ public sealed partial class RuvioClient
     public async ValueTask<string> LoadScriptAsync(string script, CancellationToken cancellationToken = default)
     {
         return await BulkOrNull(new RespCommand("SCRIPT", "LOAD", script), cancellationToken)
-            ?? throw new RuvioException("SCRIPT LOAD returned a null reply");
+            ?? throw RuvioException.Client("SCRIPT LOAD returned a null reply");
     }
 
     /// <inheritdoc />
@@ -2451,7 +2451,7 @@ public sealed partial class RuvioClient
 
         if (reply.Kind is not RespKind.Integer)
         {
-            throw new RuvioException($"{arguments.Name} returned {reply.Kind}");
+            throw RuvioException.Client($"{arguments.Name} returned {reply.Kind}");
         }
 
         return reply.Integer;
@@ -2491,7 +2491,7 @@ public sealed partial class RuvioClient
         {
             if (value is null)
             {
-                throw new RuvioException($"{arguments.Name} returned a null bulk");
+                throw RuvioException.Client($"{arguments.Name} returned a null bulk");
             }
         }
 
@@ -2513,7 +2513,7 @@ public sealed partial class RuvioClient
 
         if (reply.Kind is not RespKind.Array || reply.Items is not { } items)
         {
-            throw new RuvioException($"{name} returned {reply.Kind}");
+            throw RuvioException.Client($"{name} returned {reply.Kind}");
         }
 
         var values = new string?[items.Count];
@@ -2547,7 +2547,7 @@ public sealed partial class RuvioClient
 
         if (reply.Items is not { Count: 2 })
         {
-            throw new RuvioException($"{command} returned {reply.Kind}");
+            throw RuvioException.Client($"{command} returned {reply.Kind}");
         }
 
         return new KeyValuePair<string, string>(
@@ -2559,7 +2559,7 @@ public sealed partial class RuvioClient
     {
         if (reply.Items is not { Count: 2 })
         {
-            throw new RuvioException("SCAN returned an unexpected shape");
+            throw RuvioException.Client("SCAN returned an unexpected shape");
         }
 
         long cursor = long.Parse(reply.Items[0].AsString() ?? "0", CultureInfo.InvariantCulture);
@@ -2594,7 +2594,7 @@ public sealed partial class RuvioClient
 
         if (reply.Items is not { Count: 3 } items)
         {
-            throw new RuvioException($"{command} returned {reply.Kind}");
+            throw RuvioException.Client($"{command} returned {reply.Kind}");
         }
 
         return (
@@ -2612,7 +2612,7 @@ public sealed partial class RuvioClient
 
         if (reply.Items is not { Count: 2 } items || items[0].Kind is not RespKind.Integer || items[1].Kind is not RespKind.Integer)
         {
-            throw new RuvioException($"{name} returned {reply.Kind}");
+            throw RuvioException.Client($"{name} returned {reply.Kind}");
         }
 
         return (items[0].Integer, items[1].Integer);
@@ -2625,7 +2625,7 @@ public sealed partial class RuvioClient
 
         if (reply.Items is not { } items)
         {
-            throw new RuvioException($"{arguments.Name} returned {reply.Kind}");
+            throw RuvioException.Client($"{arguments.Name} returned {reply.Kind}");
         }
 
         var values = new long[items.Count];
@@ -2634,7 +2634,7 @@ public sealed partial class RuvioClient
         {
             if (items[index].Kind is not RespKind.Integer)
             {
-                throw new RuvioException($"{arguments.Name} returned {reply.Kind}");
+                throw RuvioException.Client($"{arguments.Name} returned {reply.Kind}");
             }
 
             values[index] = items[index].Integer;
@@ -2694,7 +2694,7 @@ public sealed partial class RuvioClient
 
         if (items.Count % 2 != 0)
         {
-            throw new RuvioException("sorted set reply is not member/score pairs");
+            throw RuvioException.Client("sorted set reply is not member/score pairs");
         }
 
         var entries = new List<SortedSetEntry>(items.Count / 2);

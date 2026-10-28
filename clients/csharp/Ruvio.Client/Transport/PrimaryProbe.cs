@@ -221,6 +221,6 @@ internal static class PrimaryProbe
     }
 
     private static bool NoAnswer(Exception error, CancellationToken cancellationToken) =>
-        error is SocketException or IOException or TimeoutException or RuvioException { IsServerReply: false }
+        error is SocketException or IOException or TimeoutException or RuvioException { IsServerReply: false, IsClientError: false }
         || (error is OperationCanceledException && !cancellationToken.IsCancellationRequested);
 }

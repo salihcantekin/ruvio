@@ -30,7 +30,7 @@ internal static class RespConvert
 
         catch (DecoderFallbackException)
         {
-            throw new RuvioException("bulk string is not UTF-8");
+            throw RuvioException.Client("bulk string is not UTF-8");
         }
 
         if (target == typeof(string))
@@ -49,20 +49,20 @@ internal static class RespConvert
 
             if (value is < int.MinValue or > int.MaxValue)
             {
-                throw new RuvioException($"GET value {value} does not fit in Int32");
+                throw RuvioException.Client($"GET value {value} does not fit in Int32");
             }
 
             return (T)(object)(int)value;
         }
 
-        throw new RuvioException($"GET cannot convert a bulk string to {typeof(T).Name}");
+        throw RuvioException.Client($"GET cannot convert a bulk string to {typeof(T).Name}");
     }
 
     private static long ParseInt64(string text)
     {
         if (!long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out long value))
         {
-            throw new RuvioException($"GET value is not an integer: {text}");
+            throw RuvioException.Client($"GET value is not an integer: {text}");
         }
 
         return value;

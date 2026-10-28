@@ -150,7 +150,7 @@ public sealed partial class RuvioClient : IRuvioClient
             (string Host, int Port)? primary =
                 await PrimaryProbe.FindAsync(coordinators, 0, null, options, cancellationToken).ConfigureAwait(false);
 
-            seeds = [primary ?? throw new RuvioException($"no coordinator names a primary for '{master}'")];
+            seeds = [primary ?? throw RuvioException.Client($"no coordinator names a primary for '{master}'")];
         }
 
         RuvioSocket seed = seeds.Length == 0
@@ -181,7 +181,7 @@ public sealed partial class RuvioClient : IRuvioClient
 
             if (cluster is not null && options.Database != 0)
             {
-                throw new RuvioException("SELECT is not supported in cluster mode");
+                throw RuvioException.Client("SELECT is not supported in cluster mode");
             }
 
             if (cluster is null)
@@ -281,7 +281,7 @@ public sealed partial class RuvioClient : IRuvioClient
                 : "PONG";
         }
 
-        return reply.AsString() ?? throw new RuvioException("PING returned a null reply");
+        return reply.AsString() ?? throw RuvioException.Client("PING returned a null reply");
     }
 
     /// <inheritdoc />
@@ -314,7 +314,7 @@ public sealed partial class RuvioClient : IRuvioClient
 
         if (bytes is null && requiredValue)
         {
-            throw new RuvioException($"GET {key} is missing");
+            throw RuvioException.Client($"GET {key} is missing");
         }
 
         return RespConvert.FromBulk<T>(bytes);
@@ -346,7 +346,7 @@ public sealed partial class RuvioClient : IRuvioClient
 
         if (reply.Kind is not RespKind.Bulk)
         {
-            throw new RuvioException($"GET returned {reply.Kind}");
+            throw RuvioException.Client($"GET returned {reply.Kind}");
         }
 
         return reply.Bytes;
@@ -462,7 +462,7 @@ public sealed partial class RuvioClient : IRuvioClient
 
         if (reply.Kind is not RespKind.Integer)
         {
-            throw new RuvioException($"INCR returned {reply.Kind}");
+            throw RuvioException.Client($"INCR returned {reply.Kind}");
         }
 
         return reply.Integer;
@@ -489,7 +489,7 @@ public sealed partial class RuvioClient : IRuvioClient
 
         if (reply.Kind is not RespKind.Integer)
         {
-            throw new RuvioException($"EXPIRE returned {reply.Kind}");
+            throw RuvioException.Client($"EXPIRE returned {reply.Kind}");
         }
 
         return reply.Integer > 0;
@@ -525,7 +525,7 @@ public sealed partial class RuvioClient : IRuvioClient
 
         if (reply.Kind is not RespKind.Integer)
         {
-            throw new RuvioException($"DEL returned {reply.Kind}");
+            throw RuvioException.Client($"DEL returned {reply.Kind}");
         }
 
         return reply.Integer;
@@ -681,7 +681,7 @@ public sealed partial class RuvioClient : IRuvioClient
 
         if (IsSelect(arguments[0].Span))
         {
-            throw new RuvioException("SELECT is not allowed on a database-scoped client; request the database from its connection.");
+            throw RuvioException.Client("SELECT is not allowed on a database-scoped client; request the database from its connection.");
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -1509,7 +1509,7 @@ public sealed partial class RuvioClient : IRuvioClient
     {
         if (IsSelect(name))
         {
-            throw new RuvioException("SELECT is not allowed on a database-scoped client; request the database from its connection.");
+            throw RuvioException.Client("SELECT is not allowed on a database-scoped client; request the database from its connection.");
         }
     }
 
