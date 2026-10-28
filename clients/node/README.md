@@ -57,7 +57,7 @@ await c.quit();
 
 Typed methods for every command in `docs/compatibility-matrix.json` (299/299, enforced by `test/coverage.test.ts`),
 including the Ruvio options: `set(k, v, { ifEq })`, `set(k, n, { ifGt })` / `{ ifLt }`, `incrbyMax`, `fillget`/`fillset` (`WAIT`, `SWR`), `getex(k, ms)`,
-`delex(k, ifEq)`, `lpushcap`/`rpushcap`, `bf*`, `json*` (incl. `jsonIndexCreate`, `jsonFind`), `idemBegin`/`idemComplete`,
+`delex(k, ifEq)`, `lpushcap`/`rpushcap`, `bf*`, `json*` (incl. `jsonIndexCreate`, `jsonFind`), `idemBegin`/`idemComplete`/`idemAbort`,
 `lease`/`semaphore`/`release`, `once`, `take`, `transfer`, `htransfer`, `setv`, `changes*`, `limit`. Anything else: `c.call('CMD', ...args)`.
 
 - **Pipeline:** `await c.pipeline().set('a', 1).get('a').exec()` (one write; per-command errors stay in their slot, `execStrict()` rejects).
@@ -83,7 +83,8 @@ including the Ruvio options: `set(k, v, { ifEq })`, `set(k, n, { ifGt })` / `{ i
 | `c.limitSliding(key, max, windowMs)`, `c.limitTokens(key, capacity, refillMs, cost?)` -> remaining or `null` | `LIMIT ... SLIDING`, `LIMIT ... TOKENS` |
 | `c.limitSlidingWithRetry(...)`, `c.limitTokensWithRetry(...)` -> `{ allowed, remaining, retryAfterMs }` | `LIMIT ... WITHRETRY` |
 | `c.getOrCreate(key, ttlMs, factory, { staleMs })` | `FILLGET`/`FILLSET`; waiters poll plain `FILLGET` with backoff (never `WAIT`) |
-| `c.idempotent(key, fingerprint, ttlMs, fn)` | `IDEM BEGIN/COMPLETE` |
+| `c.idempotent(key, fingerprint, ttlMs, fn, opts)` | `IDEM BEGIN/COMPLETE`. If `fn` throws the record stays pending until `ttlMs`; with `opts.abortOnError` (default `false`) it sends `IDEM ABORT` first, so a retry runs `fn` again at once, and the original error is still thrown (a failed abort is ignored). Use it only when a failed `fn` did not take effect or is safe to run again |
+| `c.idemAbort(key, fingerprint, owner)` | `IDEM ABORT`: `true` when the pending record of that owner and fingerprint was removed; `false` for a missing key, a completed record (its result is never removed) or another owner. Abort only when the work did not take effect or is safe to run again; a retry after an abort runs it again |
 | `c.scanIterator()`, `hscanIterator`, `sscanIterator`, `zscanIterator` | cursor-driven async generators |
 | `GeoUnit`, `GeoOrder`, `ListSide`, `InsertPosition`, `BitOp`, `BitUnit`, `Aggregate`, `ScanType`, `BitfieldOp` | named keyword constants and `BITFIELD` builders, e.g. `c.geodist('g', 'a', 'b', GeoUnit.Km)`, `c.scan(0, { type: ScanType.Hash })`, `c.bitfield(k, ...BitfieldOp.get('u8', 0))`; plain string literals still work, and the keywords are sent pre-encoded |
 | `StreamTrim`, `TrimMode`, `InfoSection`, `ClientType`, `StreamId`, `ScoreBound`, `LexBound` | one typed trim rule for `XADD` and `XTRIM`, `INFO` and `CLIENT LIST TYPE` names, stream id markers and range bound builders, e.g. `c.xtrim('s', StreamTrim.maxLen(1000, TrimMode.Approximate))`, `c.xadd('s', StreamId.New, f, { trim: StreamTrim.minId(id) })`, `c.info(InfoSection.Memory)`, `c.zrangebyscore(k, ScoreBound.NegativeInfinity, ScoreBound.exclusive(100))`, `c.zrangebylex(k, LexBound.inclusive('a'), LexBound.Max)` |

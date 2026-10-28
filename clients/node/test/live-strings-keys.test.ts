@@ -227,6 +227,24 @@ test('LIMIT, ONCE, LEASE, SEMAPHORE, RELEASE, IDEM, CHANGES and their helpers', 
     assert.equal(calls, 1);
     await assert.rejects(c.idempotent('idem2', 'fp-other', 10000, () => 'x'), { name: 'IdempotencyConflictError' });
 
+    // ABORT frees a pending record, never a completed one, and only for its owner
+    assert.equal((await c.idemBegin('idem-abort', 'fp', 'o1', 10000)).state, 'acquired');
+    assert.equal(await c.idemAbort('idem-abort', 'fp', 'o2'), false);
+    assert.equal(await c.idemAbort('idem-abort', 'other', 'o1'), false);
+    assert.equal(await c.idemAbort('idem-abort', 'fp', 'o1'), true);
+    assert.equal((await c.idemBegin('idem-abort', 'fp', 'o2', 10000)).state, 'acquired');
+    assert.equal(await c.idemComplete('idem-abort', 'fp', 'o2', 'kept'), 1);
+    assert.equal(await c.idemAbort('idem-abort', 'fp', 'o2'), false);
+    assert.deepEqual(await c.idemBegin('idem-abort', 'fp', 'o3', 10000), { state: 'completed', result: 'kept' });
+    // the helper flag frees the key after a failing fn; without it the key stays pending
+    const boom = async (): Promise<string> => {
+      throw new Error('boom');
+    };
+    await assert.rejects(c.idempotent('idem-flag', 'fp', 10000, boom, { abortOnError: true }), { message: 'boom' });
+    assert.deepEqual(await c.idempotent('idem-flag', 'fp', 10000, () => 'again'), { result: 'again', replayed: false });
+    await assert.rejects(c.idempotent('idem-keep', 'fp', 10000, boom), { message: 'boom' });
+    await assert.rejects(c.idempotent('idem-keep', 'fp', 10000, () => 'x'), { name: 'IdempotencyPendingError' });
+
     // CHANGES
     const cur = await c.changesStart();
     await c.set('watched', '1');

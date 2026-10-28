@@ -258,6 +258,8 @@ let mut db = Client::connect("127.0.0.1", 6379)?;
 let first = db.idem_begin("order:42", "request-digest", "attempt-1", Duration::from_secs(60))?;
 // IdemState::Acquired -> run the handler once
 db.idem_complete("order:42", "request-digest", "attempt-1", b"saved-result")?; // true
+// If the handler failed and is safe to run again, free the key instead of completing it:
+// db.idem_abort("order:42", "request-digest", "attempt-1")?; // true
 let retry = db.idem_begin("order:42", "request-digest", "attempt-2", Duration::from_secs(60))?;
 // IdemState::Completed(b"saved-result".to_vec())`,
     csharp: `await using var connection = await RuvioConnection.ConnectAsync("127.0.0.1", 6379);
@@ -266,6 +268,8 @@ var db = await connection.GetDefaultDatabaseAsync();
 var first = await db.TryBeginIdempotencyAsync("order:42", "request-digest", "attempt-1", TimeSpan.FromSeconds(60));
 // first.State == IdempotencyState.Acquired -> run the handler once
 await db.CompleteIdempotencyAsync("order:42", "request-digest", "attempt-1", "saved-result"); // true
+// If the handler failed and is safe to run again, free the key instead of completing it:
+// await db.AbortIdempotencyAsync("order:42", "request-digest", "attempt-1"); // true
 var retry = await db.TryBeginIdempotencyAsync("order:42", "request-digest", "attempt-2", TimeSpan.FromSeconds(60));
 // retry.State == IdempotencyState.Completed, retry.Result holds "saved-result" as bytes`,
     go: `c, err := ruvio.Connect(ctx, ruvio.Options{Addr: "127.0.0.1:6379"})
@@ -277,6 +281,8 @@ fmt.Println(first.State) // acquired -> run the handler once
 n, err := c.IdemComplete(ctx, "order:42", "request-digest", "attempt-1", []byte("saved-result"))
 if err != nil { return err }
 fmt.Println(n) // 1
+// If the handler failed and is safe to run again, free the key instead of completing it:
+// freed, err := c.IdemAbort(ctx, "order:42", "request-digest", "attempt-1") // true
 retry, err := c.IdemBegin(ctx, "order:42", "request-digest", "attempt-2", time.Minute)
 if err != nil { return err }
 fmt.Println(retry.State, string(retry.Result)) // completed saved-result`,
@@ -285,6 +291,8 @@ fmt.Println(retry.State, string(retry.Result)) // completed saved-result`,
 var first = c.idemBegin("order:42", "request-digest", "attempt-1", 60_000);
 // first.state() == IdemResult.State.ACQUIRED -> run the handler once
 c.idemComplete("order:42", "request-digest", "attempt-1", "saved-result"); // 1
+// If the handler failed and is safe to run again, free the key instead of completing it:
+// c.idemAbort("order:42", "request-digest", "attempt-1"); // true
 var retry = c.idemBegin("order:42", "request-digest", "attempt-2", 60_000);
 // retry.state() == COMPLETED, retry.resultString() == "saved-result"`,
     python: `import ruvio
@@ -293,6 +301,8 @@ r = ruvio.Ruvio("127.0.0.1", 6379)
 first = r.idem_begin("order:42", "request-digest", "attempt-1", 60_000)
 # IdemResult(state='acquired', result=None) -> run the handler once
 r.idem_complete("order:42", "request-digest", "attempt-1", "saved-result")  # 1
+# If the handler failed and is safe to run again, free the key instead of completing it:
+# r.idem_abort("order:42", "request-digest", "attempt-1")  # True
 retry = r.idem_begin("order:42", "request-digest", "attempt-2", 60_000)
 # IdemResult(state='completed', result='saved-result')`,
     node: `import { createClient } from 'ruvio-client';
@@ -301,6 +311,8 @@ const c = createClient({ host: '127.0.0.1', port: 6379 });
 const first = await c.idemBegin('order:42', 'request-digest', 'attempt-1', 60_000);
 // { state: 'acquired', result: null } -> run the handler once
 await c.idemComplete('order:42', 'request-digest', 'attempt-1', 'saved-result'); // 1
+// If the handler failed and is safe to run again, free the key instead of completing it:
+// await c.idemAbort('order:42', 'request-digest', 'attempt-1'); // true
 const retry = await c.idemBegin('order:42', 'request-digest', 'attempt-2', 60_000);
 // { state: 'completed', result: 'saved-result' }`,
   },

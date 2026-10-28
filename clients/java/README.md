@@ -100,7 +100,7 @@ Anything without a typed method: `c.async().execute("COMMAND", arg, ...)`.
 All 299 commands of `docs/compatibility-matrix.json` have a typed method (`CoverageTest` maps every
 matrix name to a method and fails otherwise), including the Ruvio options: `SET ... IFEQ`, `SET ... IFGT/IFLT` (`setIfGreater`, `setIfLess`),
 `INCRBY ... MAX`, `FILLGET ... WAIT`, `FILLSET ... SWR`, `GETEX`, `DELEX key IFEQ v`, `LPUSHCAP/RPUSHCAP`,
-`BF.*`, `JSON.*` incl. `JSON.INDEX/FIND`, `IDEM BEGIN/COMPLETE`, `LEASE/RELEASE`, `SEMAPHORE`, `ONCE`,
+`BF.*`, `JSON.*` incl. `JSON.INDEX/FIND`, `IDEM BEGIN/COMPLETE/ABORT`, `LEASE/RELEASE`, `SEMAPHORE`, `ONCE`,
 `TAKE`, `TRANSFER/HTRANSFER`, `SETV`, `CHANGES`, `LIMIT`. Not typed (use `execute`): `FLUSHDB ASYNC`, `HELLO ... SETNAME`.
 
 ## Typed keywords
@@ -146,6 +146,8 @@ Also: `incr`, `decr`, `incrby`, `decrby`, `incrbyfloat` take a trailing `Duratio
 | `limitSlidingWithRetry(...)`, `limitTokensWithRetry(...)` -> `LimitOutcome(allowed, remaining, retryAfterMillis)` | `LIMIT ... WITHRETRY` |
 | `getOrCreate(key, ttl, factory)` (+ stale-while-revalidate form) | `FILLGET`/`FILLSET`; losers poll plain `FILLGET` with backoff (WAIT would park the shared socket) |
 | `idempotent(key, fingerprint, ttl, wait, action)` | `IDEM BEGIN/COMPLETE` |
+| `idempotent(key, fingerprint, ttl, wait, action, abortOnError)` | `IDEM BEGIN/COMPLETE/ABORT`: with `abortOnError` set (the overload above is `false`), an exception from `action` sends `ABORT` and is rethrown, so a retry runs the action again at once instead of finding the key pending until `ttl`; a failed abort is ignored. Use it only when a failed action did not take effect or is safe to run again |
+| `idemAbort(key, fingerprint, owner)` -> `boolean` | `IDEM ABORT`: `true` when the pending record of that owner and fingerprint was removed; `false` for a missing key, a completed record (its result is never removed) or another owner. Abort only when the work did not take effect or is safe to run again; a retry after an abort runs it again |
 | `scanIterable/scanStream`, `hscan*`, `sscan*`, `zscan*` | lazy cursor-driven pages |
 | `jsonSetObject/jsonGetObject/jsonMgetObjects` + `setJsonCodec(JsonCodec)` | `JSON.*`; the JDK has no JSON, so plug in Jackson/Gson/... through the 2-method `JsonCodec` (default: String passthrough) |
 | `pushRecent` / `recent` | `LPUSHCAP` |

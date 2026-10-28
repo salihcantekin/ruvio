@@ -146,9 +146,19 @@ allows execution; a pending response must not be treated as permission to retry.
 Neither completion nor replay renews retention. This is not exactly-once for
 external effects; see [the native contract](../../docs/IDEM.md).
 
+`idem_abort(key, fingerprint, owner)` (raw: `idempotency_abort`) sends `ABORT`
+and returns `true` when it removed the pending record of that owner and
+fingerprint, so the next `BEGIN` acquires the key at once. It returns `false`
+for a missing key, a completed record (its result is never removed) or another
+owner. Abort only when the work did not take effect or is safe to run again; a
+retry after an abort runs it again. `idempotent_abort_on_error` is the opt-in
+twin of `idempotent` (which keeps the record pending when the work fails): on
+a failed `work` it sends `ABORT` and returns the work's error, and a failed
+abort is ignored.
+
 | Family | Methods |
 | --- | --- |
-| Ruvio jobs | `lease`, `release`, `semaphore`, `setv`, `limit`, `once`, `take`, `transfer`, `htransfer`, `getex`, `incr_by_max`, `changes_start`, `changes`, `idem_begin`, `idem_complete`, `idempotency_begin`, `idempotency_complete`, `fill_get`, `fill_get_wait` (`WAIT`), `fill_set` (`SWR`) |
+| Ruvio jobs | `lease`, `release`, `semaphore`, `setv`, `limit`, `once`, `take`, `transfer`, `htransfer`, `getex`, `incr_by_max`, `changes_start`, `changes`, `idem_begin`, `idem_complete`, `idem_abort`, `idempotency_begin`, `idempotency_complete`, `idempotency_abort`, `fill_get`, `fill_get_wait` (`WAIT`), `fill_set` (`SWR`) |
 | Ruvio extensions | `delex` (`DELEX key IFEQ v`), `set_if_eq`, `set_if_eq_keep_ttl` (`SET ... IFEQ`), `set_if_greater`, `set_if_less` (`SET ... IFGT` / `IFLT`), `lpushcap`, `rpushcap`, `json_index_create`, `json_index_drop`, `json_index_list`, `json_find`, `ruvio` |
 | Strings | `get`, `get_string`, `set`, `set_with`, `set_ex`, `set_exat`, `set_expires_at`, `set_keep_ttl`, `set_and_get`, `set_bytes`, `setex`, `psetex`, `setnx`, `getdel`, `mget`, `mset`, `msetnx`, `getset`, `append`, `strlen`, `incr`, `incr_by`, `incr_by_float`, `decr`, `decr_by`, `getrange`, `substr`, `setrange` |
 | Bitmaps / HyperLogLog | `setbit`, `getbit`, `bitcount`, `bitcount_range` (`BYTE`/`BIT`), `bitpos`, `bitpos_range`, `bitop`, `bitfield`, `bitfield_ro` (typed `BitFieldOp`, `BitFieldType`, `BitFieldOverflow`), `pfadd`, `pfcount`, `pfmerge` |
@@ -229,6 +239,7 @@ match db.idempotent("pay:42", "fingerprint", "worker-1", Duration::from_secs(360
     IdemOutcome::Executed(result) | IdemOutcome::Replayed(result) => { /* reply */ }
     IdemOutcome::Pending | IdemOutcome::Conflict => { /* retry later / reject */ }
 }
+// idempotent_abort_on_error(..) takes the same arguments and frees the key if the work fails.
 
 // Lazy scan iterators (SCAN / HSCAN / SSCAN / ZSCAN), one page in memory at a time.
 for key in db.scan_iter(Some("session:*"), Some(500)) { let key = key?; }

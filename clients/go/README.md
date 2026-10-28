@@ -32,7 +32,7 @@ Import path `github.com/salihcantekin/ruvio/clients/go` (package `ruvio`).
 - A typed method for **every command in `docs/compatibility-matrix.json` (299/299)** plus the
   options that change what Ruvio does (`SET ... IFEQ`, `INCRBY ... MAX`, `FILLGET ... WAIT`,
   `FILLSET ... SWR`, `GETEX` ms, `DELEX key IFEQ`, `LPUSHCAP/RPUSHCAP`, `BF.*`, `JSON.*` incl.
-  `JSON.INDEX`/`JSON.FIND`, `IDEM BEGIN/COMPLETE`, `LEASE/RELEASE`, `SEMAPHORE`, `ONCE`, `TAKE`, `TRANSFER/HTRANSFER`,
+  `JSON.INDEX`/`JSON.FIND`, `IDEM BEGIN/COMPLETE/ABORT`, `LEASE/RELEASE`, `SEMAPHORE`, `ONCE`, `TAKE`, `TRANSFER/HTRANSFER`,
   `SETV`, `CHANGES`, `LIMIT`, `XADD ... DELAY`).
 - `context.Context` on every call; pipelines; `MULTI/EXEC` transactions with `WATCH`;
   Pub/Sub; RESP3 (`Options.Protocol = 3`) with push frames for `CLIENT TRACKING`.
@@ -157,7 +157,8 @@ n, _ = c.ZCount(ctx, "board", ruvio.ScoreExclusive(5), ruvio.ScorePosInf)
 | `LimitSliding(key, max, window)`, `LimitTokens(key, capacity, refill, cost)` | `LIMIT ... SLIDING`, `LIMIT ... TOKENS` | Return `(remaining, allowed)`. |
 | `LimitSlidingWithRetry(...)`, `LimitTokensWithRetry(...)` | `LIMIT ... WITHRETRY` | Return a `LimitOutcome` with `Allowed`, `Remaining` and `RetryAfter`. |
 | `GetOrCreate`, `GetOrCreateJSON[T]` | `FILLGET`/`FILLSET` | One factory run across callers. On `BUSY` it polls plain `FILLGET` with 2..50 ms backoff, because `FILLGET ... WAIT` would park the shared connection. `Stale` enables SWR: stale readers return the old value and one refreshes in the background. |
-| `Idempotent(key, fingerprint, ttl, fn)` | `IDEM BEGIN/COMPLETE` | Returns the stored result to repeats; `ErrIdemPending` / `ErrIdemConflict`. Not exactly-once for external effects. |
+| `Idempotent(key, fingerprint, ttl, fn, opts...)` | `IDEM BEGIN/COMPLETE` | Returns the stored result to repeats; `ErrIdemPending` / `ErrIdemConflict`. A failed `fn` leaves the record pending until `ttl`; pass `WithAbortOnError()` to send `IDEM ABORT` instead (off by default), so a retry runs `fn` again at once and `fn`'s error is still returned. Use it only when a failed `fn` did not take effect or is safe to run again. Not exactly-once for external effects. |
+| `IdemAbort(key, fingerprint, owner)` | `IDEM ABORT` | `true` when it removed the pending record of that owner and fingerprint; `false` for a missing key, a completed record (its result is never removed) or another owner. Abort only when the work did not take effect or is safe to run again; a retry after an abort runs it again. |
 | `ScanIter`, `HScanIter`, `SScanIter`, `ZScanIter` (+ `Scanner.All` → `iter.Seq2` on Go 1.23+) | `SCAN`, `HSCAN`, `SSCAN`, `ZSCAN` | Lazy, one page per round trip. |
 | `JSONSetValue`, `JSONGetValue`, `JSONGetAs[T]` | `JSON.SET`/`JSON.GET` + `encoding/json` | |
 | `PushRecent`, `Recent` | `LPUSHCAP`, `LRANGE` | Capped "recent items" list. |

@@ -95,6 +95,17 @@ def test_sync_idempotent_and_rate_limit(sync_client):
     assert r.idempotent(key, "fp", 10000, lambda: runs.append(1) or "again") == ("completed", "done")
     assert r.idempotent(key, "other", 10000, lambda: "x")[0] == "conflict"
     assert runs == [1]
+
+    def boom():
+        raise RuntimeError("boom")
+
+    # abort_on_error frees the key after a failing fn; without it the key stays pending
+    with pytest.raises(RuntimeError):
+        r.idempotent(key + ":a", "fp", 10000, boom, abort_on_error=True)
+    assert r.idempotent(key + ":a", "fp", 10000, lambda: "again") == ("executed", "again")
+    with pytest.raises(RuntimeError):
+        r.idempotent(key + ":k", "fp", 10000, boom)
+    assert r.idempotent(key + ":k", "fp", 10000, lambda: "x") == ("pending", None)
     assert [r.rate_limit("rl:" + key, 3, 10000) for _ in range(4)] == [(True, 2), (True, 1), (True, 0), (False, 0)]
 
 
@@ -313,6 +324,16 @@ async def test_async_idempotent(async_client):
 
     assert await r.idempotent(key, "fp", 10000, work) == ("executed", "ok")
     assert await r.idempotent(key, "fp", 10000, work) == ("completed", "ok")
+
+    async def boom():
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        await r.idempotent(key + ":a", "fp", 10000, boom, abort_on_error=True)
+    assert await r.idempotent(key + ":a", "fp", 10000, work) == ("executed", "ok")
+    with pytest.raises(RuntimeError):
+        await r.idempotent(key + ":k", "fp", 10000, boom)
+    assert await r.idempotent(key + ":k", "fp", 10000, work) == ("pending", None)
 
 
 async def test_async_pubsub(async_client):

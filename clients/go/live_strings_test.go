@@ -208,6 +208,36 @@ func TestLiveRuvioExtensions(t *testing.T) {
 	r, _ = c.IdemBegin(ctx, "idem", "other", "o2", time.Minute)
 	eq(t, r.State, IdemConflict)
 
+	// Abort frees a pending record, never a completed one, and only for its owner.
+	r, _ = c.IdemBegin(ctx, "idem-abort", "fp", "o1", time.Minute)
+	eq(t, r.State, IdemAcquired)
+	eq(t, mb(c.IdemAbort(ctx, "idem-abort", "fp", "o2")), false)
+	eq(t, mb(c.IdemAbort(ctx, "idem-abort", "other", "o1")), false)
+	eq(t, mb(c.IdemAbort(ctx, "idem-abort", "fp", "o1")), true)
+	r, _ = c.IdemBegin(ctx, "idem-abort", "fp", "o2", time.Minute)
+	eq(t, r.State, IdemAcquired)
+	eq(t, mi(c.IdemComplete(ctx, "idem-abort", "fp", "o2", []byte("kept"))), int64(1))
+	eq(t, mb(c.IdemAbort(ctx, "idem-abort", "fp", "o2")), false)
+	r, _ = c.IdemBegin(ctx, "idem-abort", "fp", "o3", time.Minute)
+	eq(t, r.State, IdemCompleted)
+	eq(t, string(r.Result), "kept")
+
+	// The helper flag frees the key after a failing work function; without it the key
+	// stays pending.
+	boom := errors.New("boom")
+	failing := func(context.Context) ([]byte, error) { return nil, boom }
+	_, err = c.Idempotent(ctx, "idem-flag", "fp", time.Minute, failing, WithAbortOnError())
+	eq(t, errors.Is(err, boom), true)
+	out, err := c.Idempotent(ctx, "idem-flag", "fp", time.Minute,
+		func(context.Context) ([]byte, error) { return []byte("again"), nil })
+	noErr(t, err)
+	eq(t, string(out), "again")
+	_, err = c.Idempotent(ctx, "idem-noflag", "fp", time.Minute, failing)
+	eq(t, errors.Is(err, boom), true)
+	_, err = c.Idempotent(ctx, "idem-noflag", "fp", time.Minute,
+		func(context.Context) ([]byte, error) { return nil, nil })
+	eq(t, errors.Is(err, ErrIdemPending), true)
+
 	cur := mi(c.ChangesStart(ctx))
 	noErr(t, c.Set(ctx, "changed", "1"))
 	ch := must[[]Change](t)(c.Changes(ctx, cur))

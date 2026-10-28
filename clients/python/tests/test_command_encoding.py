@@ -319,3 +319,81 @@ def test_transfer_commands_encode_the_optional_cap_and_return_a_pair():
     r.reply = None
     assert r.transfer("a", "b", 4) is None
     assert r.htransfer("h", "f", "g", 1) is None
+
+
+# --------------------------------------------------------------------------- IDEM ABORT
+
+
+@pytest.mark.parametrize("reply,expected", [(1, True), (0, False)])
+def test_idem_abort_encoding_and_reply(reply, expected):
+    r = Rec(reply)
+    assert r.idem_abort("k", "fp", "me") is expected
+    assert r.args == ["IDEM", "k", "ABORT", "fp", "me"]
+
+
+class _IdemStub:
+    """Just the three methods ``idempotent`` calls, recording whether ABORT was sent."""
+
+    def __init__(self, abort_fails=False):
+        self.aborts = []
+        self.abort_fails = abort_fails
+
+    def idem_begin(self, key, fingerprint, owner, ttl_ms):
+        from ruvio import IdemResult
+
+        return IdemResult("acquired", None)
+
+    def idem_complete(self, key, fingerprint, owner, result):
+        return 1
+
+    def idem_abort(self, key, fingerprint, owner):
+        self.aborts.append((key, fingerprint, owner))
+        if self.abort_fails:
+            raise ConnectionError("down")
+        return True
+
+
+@pytest.mark.parametrize("flag", [False, True])
+@pytest.mark.parametrize("abort_fails", [False, True])
+def test_idempotent_aborts_only_when_asked_and_keeps_the_error(flag, abort_fails):
+    import ruvio
+
+    stub = _IdemStub(abort_fails)
+
+    def boom():
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        ruvio.Ruvio.idempotent(stub, "k", "fp", 1000, boom, owner="me", abort_on_error=flag)
+    assert stub.aborts == ([("k", "fp", "me")] if flag else [])
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_async_idempotent_aborts_only_when_asked(flag):
+    import asyncio
+
+    import ruvio.asyncio
+
+    stub = _IdemStub()
+
+    async def begin(*a):
+        return stub.idem_begin(*a)
+
+    async def abort(*a):
+        return stub.idem_abort(*a)
+
+    stub.idem_begin_async, stub.idem_abort_async = begin, abort
+
+    class AStub:
+        idem_begin = staticmethod(begin)
+        idem_abort = staticmethod(abort)
+
+    async def boom():
+        raise RuntimeError("boom")
+
+    async def run():
+        await ruvio.asyncio.Ruvio.idempotent(AStub(), "k", "fp", 1000, boom, owner="me", abort_on_error=flag)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        asyncio.run(run())
+    assert stub.aborts == ([("k", "fp", "me")] if flag else [])

@@ -4,6 +4,7 @@ Notable changes to the Node.js client `ruvio-client` on npm. New entries go unde
 
 ## Unreleased
 
+- `idemAbort(key, fingerprint, owner)` sends `IDEM key ABORT fingerprint owner`: it removes a pending record of that owner and fingerprint so the next `idemBegin` acquires the key at once, and resolves `true`/`false` (`false` for a missing key, a completed record or another owner). `idempotent` takes `opts.abortOnError` (default `false`); when set, a throwing `fn` sends `ABORT` and the original error is rethrown (a failed abort is ignored). The default behavior is unchanged. Needs a server that has `IDEM ... ABORT`.
 - The reply parser refuses a bulk string over 64 MiB and an array, set, push or map over 1,048,576 elements as a protocol error before it allocates, the same limits as the Rust and C# clients. Before, Node.js had no limit.
 - `evalCached(script, keys, args)` runs a script by its SHA1 and sends the whole script only when the shard answers `NOSCRIPT` (`EVALSHA`, then `EVAL` once). The SHA1 is computed in the client; nothing changes for `eval` and `evalsha`.
 - A cluster client now retries `-TRYAGAIN` up to 7 times, after waits doubling from 5 ms to 320 ms (635 ms in all), instead of 3 times after 5, 10 and 20 ms. A slot range moving between the nodes of a cluster is frozen for a few hundred milliseconds (about 170-240 ms in a local test), so the caller saw `TRYAGAIN` on every such move before. Only `TRYAGAIN` replies wait; other replies are unchanged.

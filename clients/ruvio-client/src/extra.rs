@@ -1434,6 +1434,23 @@ impl Client {
         }
     }
 
+    /// Sends `IDEM key ABORT fingerprint owner`.
+    ///
+    /// Returns `true` when the pending record of this owner and fingerprint was removed, so the
+    /// next `BEGIN` acquires the key at once. Returns `false` when the key is missing, already
+    /// completed (its result is never removed), or held by another owner or fingerprint.
+    ///
+    /// Abort only when the work did not take effect or is safe to run again; a retry after an
+    /// abort runs it again.
+    pub fn idem_abort(&mut self, key: &str, fingerprint: &str, owner: &str) -> Result<bool, Error> {
+        let reply = self.execute(&["IDEM", key, "ABORT", fingerprint, owner])?;
+
+        match reply {
+            RespValue::Integer(value) => Ok(value > 0),
+            other => Err(unexpected("IDEM", &other)),
+        }
+    }
+
     // ---- shared plumbing -------------------------------------------------------------------
 
     pub(crate) fn scan_page(

@@ -232,6 +232,15 @@ async def test_idem_and_changes(c):
     assert await c.idem_complete("idem", "fp", "owner1", "result") == 1
     assert await c.idem_begin("idem", "fp", "owner2", 10000) == IdemResult("completed", "result")
     assert (await c.idem_begin("idem", "fp2", "owner2", 10000)).state == "conflict"
+    # abort frees a pending record, never a completed one, and only for its owner
+    assert (await c.idem_begin("idem-abort", "fp", "o1", 10000)).state == "acquired"
+    assert await c.idem_abort("idem-abort", "fp", "o2") is False
+    assert await c.idem_abort("idem-abort", "other", "o1") is False
+    assert await c.idem_abort("idem-abort", "fp", "o1") is True
+    assert (await c.idem_begin("idem-abort", "fp", "o2", 10000)).state == "acquired"
+    assert await c.idem_complete("idem-abort", "fp", "o2", "kept") == 1
+    assert await c.idem_abort("idem-abort", "fp", "o2") is False
+    assert await c.idem_begin("idem-abort", "fp", "o3", 10000) == IdemResult("completed", "kept")
     cursor = await c.changes_start()
     await c.set("chg", "1")
     notes = await c.changes(cursor)

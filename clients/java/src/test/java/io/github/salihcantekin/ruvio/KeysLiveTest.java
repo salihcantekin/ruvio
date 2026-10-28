@@ -185,6 +185,15 @@ class KeysLiveTest {
         assertEquals(IdemResult.State.COMPLETED, done.state());
         assertEquals("done", done.resultString());
         assertEquals(1L, c.idemComplete("k:idem", "fp", "o1", "done".getBytes()));
+        // ABORT frees a pending record, never a completed one, and only for its owner
+        assertEquals(IdemResult.State.ACQUIRED, c.idemBegin("k:idem-abort", "fp", "o1", 10_000).state());
+        assertFalse(c.idemAbort("k:idem-abort", "fp", "o2"));
+        assertFalse(c.idemAbort("k:idem-abort", "other", "o1"));
+        assertTrue(c.idemAbort("k:idem-abort", "fp", "o1"));
+        assertEquals(IdemResult.State.ACQUIRED, c.idemBegin("k:idem-abort", "fp", "o2", 10_000).state());
+        assertEquals(1L, c.idemComplete("k:idem-abort", "fp", "o2", "kept"));
+        assertFalse(c.idemAbort("k:idem-abort", "fp", "o2"));
+        assertEquals("kept", c.idemBegin("k:idem-abort", "fp", "o3", 10_000).resultString());
         // CHANGES
         long cursor = c.changesStart();
         c.set("k:chg", "1");

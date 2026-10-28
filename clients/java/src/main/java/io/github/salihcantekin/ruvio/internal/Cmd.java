@@ -12,6 +12,8 @@ public final class Cmd {
 
     /** The word {@code ACL}, pre-encoded as a RESP bulk string. */
     public static final byte[] ACL = RespOut.fragment("ACL");
+    /** The word {@code ABORT}, pre-encoded as a RESP bulk string. */
+    public static final byte[] ABORT = RespOut.fragment("ABORT");
     /** The word {@code APPEND}, pre-encoded as a RESP bulk string. */
     public static final byte[] APPEND = RespOut.fragment("APPEND");
     /** The word {@code AUTH}, pre-encoded as a RESP bulk string. */

@@ -697,9 +697,56 @@ impl Client {
         F: FnOnce() -> Result<Vec<u8>, E>,
         E: From<Error>,
     {
+        self.idempotent_run(key, fingerprint, owner, ttl, false, work)
+    }
+
+    /// Like [`Client::idempotent`], but when `work` fails the reservation is released with
+    /// `IDEM ... ABORT` and the original error is returned, so a retry runs the work again at
+    /// once instead of getting `Pending` until `ttl` passes.
+    ///
+    /// Use it only when a failed `work` did not take effect or is safe to run again. A failed
+    /// abort (for example Ruvio unreachable) is ignored: the record then stays pending until
+    /// `ttl`, and the error of `work` is still the one returned.
+    pub fn idempotent_abort_on_error<F, E>(
+        &mut self,
+        key: &str,
+        fingerprint: &str,
+        owner: &str,
+        ttl: Duration,
+        work: F,
+    ) -> Result<IdemOutcome, E>
+    where
+        F: FnOnce() -> Result<Vec<u8>, E>,
+        E: From<Error>,
+    {
+        self.idempotent_run(key, fingerprint, owner, ttl, true, work)
+    }
+
+    fn idempotent_run<F, E>(
+        &mut self,
+        key: &str,
+        fingerprint: &str,
+        owner: &str,
+        ttl: Duration,
+        abort_on_error: bool,
+        work: F,
+    ) -> Result<IdemOutcome, E>
+    where
+        F: FnOnce() -> Result<Vec<u8>, E>,
+        E: From<Error>,
+    {
         match self.idem_begin(key, fingerprint, owner, ttl)? {
             IdemState::Acquired => {
-                let result = work()?;
+                let result = match work() {
+                    Ok(result) => result,
+                    Err(error) => {
+                        if abort_on_error {
+                            let _ = self.idem_abort(key, fingerprint, owner);
+                        }
+
+                        return Err(error);
+                    }
+                };
 
                 self.idem_complete(key, fingerprint, owner, &result)?;
 

@@ -258,7 +258,9 @@ fn methods_exist() {
     let _ = Client::httl;
     let _ = Client::hvals;
     let _ = Client::idem_begin;
+    let _ = Client::idem_abort;
     let _ = Client::idem_complete;
+    let _ = Client::idempotency_abort;
     let _ = Client::idempotency_begin;
     let _ = Client::idempotency_complete;
     let _ = Client::incr;

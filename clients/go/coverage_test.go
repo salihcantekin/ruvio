@@ -25,6 +25,7 @@ var optionMethods = map[string]string{
 	"FILLGET WAIT":             "FillGetWait",
 	"FILLSET SWR":              "FillSet",
 	"IDEM COMPLETE":            "IdemComplete",
+	"IDEM ABORT":               "IdemAbort",
 	"CHANGES START":            "ChangesStart",
 	"RUVIO OWNER":              "RuvioOwner",
 	"JSON.INDEX DROP":          "JSONIndexDrop",

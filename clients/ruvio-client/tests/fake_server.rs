@@ -1412,6 +1412,17 @@ fn idem_begin_decodes_every_state() {
     assert!(!done.unwrap());
     let (done, _) = probe("+OK\r\n", |c| c.idem_complete("k", "fp", "me", b"x"));
     assert!(protocol(done).starts_with("IDEM returned"));
+
+    let (done, request) = probe(":1\r\n", |c| c.idem_abort("k", "fp", "me"));
+    assert!(done.unwrap());
+    assert_eq!(request, words(&["IDEM", "k", "ABORT", "fp", "me"]));
+    let (done, _) = probe(":0\r\n", |c| c.idem_abort("k", "fp", "me"));
+    assert!(!done.unwrap());
+    let (done, _) = probe("+OK\r\n", |c| c.idem_abort("k", "fp", "me"));
+    assert!(protocol(done).starts_with("IDEM returned"));
+    let (raw, request) = probe(":1\r\n", |c| c.idempotency_abort("k", "fp", "me"));
+    assert_eq!(raw.unwrap(), 1);
+    assert_eq!(request, words(&["IDEM", "k", "ABORT", "fp", "me"]));
 }
 
 #[test]

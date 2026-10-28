@@ -114,7 +114,7 @@
     "HTRANSFER": {"rust": "htransfer", "csharp": "TransferHashFieldAsync", "go": ["HTransfer", "HTransferMax"], "java": "htransfer", "node": "htransfer", "python": "htransfer"},
     "HTTL": {"rust": "httl", "csharp": "GetHashFieldTimeToLiveAsync", "go": "HTTL", "java": "httl", "node": "httl", "python": "httl"},
     "HVALS": {"rust": "hvals", "csharp": "GetHashFieldValuesAsync", "go": "HVals", "java": "hvals", "node": "hvals", "python": "hvals"},
-    "IDEM": {"rust": ["idempotency_begin", "idempotency_complete", "idem_begin", "idem_complete"], "csharp": "BeginIdempotencyAsync", "go": "IdemBegin", "java": "idemBegin", "node": "idemBegin", "python": "idem_begin"},
+    "IDEM": {"rust": ["idempotency_begin", "idempotency_complete", "idempotency_abort", "idem_begin", "idem_complete", "idem_abort"], "csharp": "BeginIdempotencyAsync", "go": ["IdemBegin", "IdemComplete", "IdemAbort"], "java": ["idemBegin", "idemComplete", "idemAbort"], "node": ["idemBegin", "idemComplete", "idemAbort"], "python": ["idem_begin", "idem_complete", "idem_abort"]},
     "INCR": {"rust": "incr", "csharp": "IncrementAsync", "go": "Incr", "java": "incr", "node": "incr", "python": "incr"},
     "INCRBY": {"rust": ["incr_by", "incr_by_max"], "csharp": "IncrementWithLimitAsync", "go": "IncrBy", "java": "incrby", "node": "incrby", "python": "incrby"},
     "INCRBYFLOAT": {"rust": "incr_by_float", "csharp": "IncrementByFloatAsync", "go": "IncrByFloat", "java": "incrbyfloat", "node": "incrbyfloat", "python": "incrbyfloat"},

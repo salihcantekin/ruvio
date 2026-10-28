@@ -1139,12 +1139,21 @@ Acquire is ``SET NX PX``, renew is ``SET IFEQ PX`` and release is ``DELEX IFEQ``
             delay = min(delay * 2, 0.1)
 
     def idempotent(
-        self, key: KeyT, fingerprint: str, ttl_ms: int, fn: Callable[[], Union[str, bytes]], owner: Optional[str] = None
+        self,
+        key: KeyT,
+        fingerprint: str,
+        ttl_ms: int,
+        fn: Callable[[], Union[str, bytes]],
+        owner: Optional[str] = None,
+        abort_on_error: bool = False,
     ) -> Tuple[str, Any]:
         """Runs ``fn`` at most once per key, using ``IDEM BEGIN``/``COMPLETE``.
 
         If ``fn`` raises, the record stays pending until ``ttl_ms`` and retries report ``"pending"``; use a
         retention that matches your retry horizon. This is not exactly-once for external side effects.
+        With ``abort_on_error=True`` a raising ``fn`` first sends ``IDEM ABORT`` so a retry runs it again at
+        once, then the original exception propagates; a failed abort is ignored. Use it only when a failed
+        ``fn`` did not take effect or is safe to run again.
 
         Args:
             key: Operation key, scoped to the tenant and operation (for example ``"order:42"``).
@@ -1152,6 +1161,7 @@ Acquire is ``SET NX PX``, renew is ``SET IFEQ PX`` and release is ``DELEX IFEQ``
             ttl_ms: Retention in milliseconds, 1 to 604800000 (7 days).
             fn: Zero-argument callable returning the result (``str`` or ``bytes``) to store.
             owner: Attempt token; a random one is generated when omitted.
+            abort_on_error: Release the reservation with ``IDEM ABORT`` when ``fn`` raises. Default ``False``.
 
         Returns:
             ``("executed", result)`` when ``fn`` ran now, ``("completed", stored_result)`` when an earlier run
@@ -1164,7 +1174,15 @@ Acquire is ``SET NX PX``, renew is ``SET IFEQ PX`` and release is ``DELEX IFEQ``
         owner = owner or uuid.uuid4().hex
         r = self.idem_begin(key, fingerprint, owner, ttl_ms)
         if r.state == "acquired":
-            result = fn()
+            try:
+                result = fn()
+            except BaseException:
+                if abort_on_error:
+                    try:
+                        self.idem_abort(key, fingerprint, owner)
+                    except Exception:
+                        pass  # the record stays pending until ttl_ms; fn's error is the one raised
+                raise
             self.idem_complete(key, fingerprint, owner, result)
             return "executed", result
         return r.state, r.result

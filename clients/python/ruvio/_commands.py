@@ -1515,6 +1515,27 @@ class Commands:
         """
         return self._c(None, "IDEM", key, "COMPLETE", fingerprint, owner, result)
 
+    def idem_abort(self, key: KeyT, fingerprint: Arg, owner: Arg) -> Any:
+        """``IDEM key ABORT fingerprint owner`` - gives up a pending operation. Ruvio extension.
+
+        The next :meth:`idem_begin` for the key then acquires it at once. Abort only when the work did not
+        take effect or is safe to run again; a retry after an abort runs it again.
+
+        Args:
+            key: The operation key used in :meth:`idem_begin`.
+            fingerprint: Same fingerprint as in ``idem_begin``.
+            owner: Same owner token as in ``idem_begin``.
+
+        Returns:
+            ``True`` when the pending record of this owner and fingerprint was removed. ``False`` when
+            nothing changed: the key is missing or expired, the record is completed (its result is never
+            removed), or another owner or fingerprint holds it.
+
+        Raises:
+            ResponseError: Tokens out of range, or the key holds no idempotency record.
+        """
+        return self._c(_bool, "IDEM", key, "ABORT", fingerprint, owner)
+
     def once(self, key: KeyT, ttl_ms: int) -> Any:
         """``ONCE key ttl_ms`` - true only for the first call within the TTL. Ruvio extension.
 
