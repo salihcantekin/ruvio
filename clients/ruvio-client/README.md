@@ -78,6 +78,34 @@ let mut client = Client::connect_with(ClientOptions {
 })?;
 ```
 
+### Retry policies of your own
+
+`Error::is_transient` and `Error::may_have_run` sort what a call returns, for a retry loop or policy of
+your own. The client already follows `MOVED`/`ASK`, waits out `TRYAGAIN` during a slot move and finds a new
+primary after a failover; these judge what still reaches you.
+
+- `is_transient()`: trying again later can succeed. True for `Error::Io` (a failed or timed-out socket) and for
+  `LOADING`, `MASTERDOWN`, `CLUSTERDOWN`, `TRYAGAIN`, `READONLY` and `NOREPLICAS`; false for `WRONGTYPE`, `OOM`,
+  syntax errors and `Error::Protocol`.
+- `may_have_run()`: the failed call may have changed data. False only for a server error reply (the server
+  refused the command), except `NOREPLICAS`: the write was applied and only the replica confirmation timed out.
+  A failed socket or a timeout may have run.
+
+Repeat a write only when it is safe to repeat or did not run:
+
+```rust
+let mut attempt = 0;
+let visits = loop {
+    match client.incr("visits") {
+        // INCR is not safe to repeat: retry it only when it surely did not run.
+        Err(error) if attempt < 3 && error.is_transient() && !error.may_have_run() => attempt += 1,
+        result => break result?,
+    }
+};
+```
+
+For a read, `is_transient()` alone is enough.
+
 ### Following a failover
 
 With two or more seeds a standalone client finds the primary again after a failover. On a reconnect it asks the seeds `ROLE` and connects to the one that answers `master` (a replica's reported primary is tried too); if none does it falls back to the first seed that answers. When a command is answered `READONLY` (the node was demoted) it does the same and sends that command once more to the new primary (the node that answered is skipped only while it still says `master`; once it says it is a replica, a later round takes it when it is promoted): `READONLY` is sent before the command runs, so the retry cannot apply it twice. It is not sent again inside a transaction the client opened, or in a pipeline, and a second `READONLY` is returned. The rounds wait with the reconnect backoff (`max_reconnect_attempts`, `reconnect_base_delay`, `reconnect_max_delay`); with `reconnect: false` there is one round. Nothing is sent while the connection is healthy, and a single address behaves as before. `ClientOptions::follow_primary = false` turns it off.

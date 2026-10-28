@@ -185,6 +185,33 @@ reachable seed; when a node cannot be opened again, the slot map is reloaded fro
 that still have a connection and then from the other known nodes and the seeds, and the
 command goes to the owner the new map names. No cost is added to the per-command path.
 
+### Retry policies of your own
+
+`ruvio.IsTransient` and `ruvio.MayHaveRun` sort what a call returns, for a retry policy of your own
+(failsafe-go, a loop). The client already follows `MOVED`/`ASK`, waits out `TRYAGAIN` during a slot move and
+finds a new primary after a failover; these judge what still reaches you.
+
+- `IsTransient(err)`: trying again later can succeed. True for a failed or closed connection, a network error,
+  `context.DeadlineExceeded` and `LOADING`, `MASTERDOWN`, `CLUSTERDOWN`, `TRYAGAIN`, `READONLY` and `NOREPLICAS`;
+  false for `WRONGTYPE`, `OOM`, syntax errors, `ErrProtocol` and `context.Canceled` (your own cancellation).
+- `MayHaveRun(err)`: the failed call may have changed data. False only for a server error reply (the server
+  refused the command), except `NOREPLICAS`: the write was applied and only the replica confirmation timed out.
+  A failed connection or a timeout may have run.
+
+Repeat a write only when it is safe to repeat or did not run:
+
+```go
+for attempt := 0; ; attempt++ {
+	visits, err := client.Incr(ctx, "visits")
+	// INCR is not safe to repeat: retry it only when it surely did not run.
+	if err == nil || attempt == 3 || !ruvio.IsTransient(err) || ruvio.MayHaveRun(err) {
+		return visits, err
+	}
+}
+```
+
+For a read, `IsTransient` alone is enough.
+
 ### Following a failover
 
 With two or more `Seeds` a standalone client finds the primary again after a failover. After

@@ -6,6 +6,7 @@ import io.github.salihcantekin.ruvio.RuvioConnectionException;
 import io.github.salihcantekin.ruvio.RuvioException;
 import io.github.salihcantekin.ruvio.RuvioOptions;
 import io.github.salihcantekin.ruvio.RuvioServerException;
+import io.github.salihcantekin.ruvio.RuvioTimeoutException;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -779,7 +780,7 @@ public final class Link implements AutoCloseable {
         } catch (ExecutionException e) {
             throw rethrow(e.getCause());
         } catch (TimeoutException e) {
-            throw new RuvioException("no reply within " + timeoutMillis + " ms");
+            throw new RuvioTimeoutException("no reply within " + timeoutMillis + " ms");
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new RuvioException("interrupted", e);

@@ -86,6 +86,8 @@ from .errors import (
     TimeoutError,
     WatchError,
     WrongTypeError,
+    is_transient,
+    may_have_run,
 )
 
 __version__ = "0.1.2"
@@ -136,6 +138,8 @@ __all__ = [
     "PendingEntry",
     "PendingSummary",
     "StreamEntry",
+    "is_transient",
+    "may_have_run",
     "BusyError",
     "ConnectionError",
     "CrossSlotError",

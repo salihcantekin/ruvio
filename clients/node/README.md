@@ -190,6 +190,32 @@ const cluster = createClusterClient({ seeds: ['10.0.0.1:7000', '10.0.0.2:7000', 
 - `ClusterClient` reads the slot table from the first reachable seed. A reload asks the open node connections first; when none answers it opens the other known nodes and then the seeds, and a command whose node cannot be opened goes to the owner the new table names. Seeds that cannot be opened do not stay in `c.nodes`.
 - `seeds` cannot be combined with `path`; an empty host or an invalid port throws a `TypeError` when the client is created.
 
+## Retry policies of your own
+
+`isTransient` and `mayHaveRun` sort what a call throws, for a retry policy of your own (cockatiel, a loop).
+The client already follows `MOVED`/`ASK`, waits out `TRYAGAIN` during a slot move and finds a new primary after
+a failover; these judge what still reaches you.
+
+- `isTransient(err)`: trying again later can succeed. True for `ConnectionError` (including a command timeout)
+  and for `LOADING`, `MASTERDOWN`, `CLUSTERDOWN`, `TRYAGAIN`, `READONLY` and `NOREPLICAS`; false for `WRONGTYPE`,
+  `OOM`, syntax errors, `ReplyError` and an aborted signal.
+- `mayHaveRun(err)`: the failed call may have changed data. False only for a server error reply (the server
+  refused the command), except `NOREPLICAS`: the write was applied and only the replica confirmation timed out.
+  A failed connection or a timeout may have run.
+
+Repeat a write only when it is safe to repeat or did not run:
+
+```ts
+import { handleWhen, retry, ExponentialBackoff } from 'cockatiel';
+import { isTransient, mayHaveRun } from 'ruvio-client';
+
+// INCR is not safe to repeat: retry it only when it surely did not run.
+const policy = retry(handleWhen((e) => isTransient(e) && !mayHaveRun(e)), { maxAttempts: 3, backoff: new ExponentialBackoff() });
+const visits = await policy.execute(() => client.incr('visits'));
+```
+
+For a read, `isTransient` alone is enough.
+
 ## Following a failover
 
 A standalone client with two or more `seeds`, or with `sentinelMaster`, finds the primary again after a failover instead of staying on a node that is now a replica. `followPrimary` (default `true`) turns it off; with one address and no coordinator name nothing changes. A `ClusterClient` does not follow.
