@@ -276,7 +276,7 @@
       "family": "keys",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Acquires a shard-owned lease. Returns a new fencing token, or a null bulk when the lease is still held. Tokens only grow: after expiry, RELEASE, DEL, a restart, a failover or a slot move, the next grant is larger (generation in the top bits, then a counter with a clock floor). The grant is a WAL record. GET of a lease is WRONGTYPE. Unused keys do not store a lease.",
+      "limitations": "Acquires a shard-owned lease. Returns a new fencing token, or a null bulk when the lease is still held. Tokens only grow: after expiry, RELEASE, DEL, a restart, a failover or a slot move, the next grant is larger (generation in the top bits, then a counter with a clock floor). The grant is a WAL record. The key has the lease deadline as its TTL (PTTL shows the time left) and goes away when the lease expires or is released. GET of a lease is WRONGTYPE. Unused keys do not store a lease.",
       "coverage": [
         "src/protocol/",
         "src/engine/"
@@ -298,7 +298,7 @@
       "family": "keys",
       "status": "supported",
       "same_slot": false,
-      "limitations": "Releases a lease when the token matches the current holder. Returns 1 or 0. A mismatch leaves the holder in place. The next LEASE gets a larger token. The release is a WAL record.",
+      "limitations": "Releases a lease when the token matches the current holder. Returns 1 or 0. A mismatch leaves the holder in place. A released lease removes its key. The next LEASE gets a larger token. The release is a WAL delete record.",
       "coverage": [
         "src/protocol/",
         "src/engine/"

@@ -345,26 +345,21 @@ pub fn execute_in_database<'a, C: Clock, I: StorageIndex, S: MutationSink, W: Li
         }
 
         Command::Release { key, token } => {
-            let expires_at = match shard.lease_release_plan(&key, token) {
-                Ok(Some(expires_at)) => expires_at,
+            match shard.lease_release_plan(&key, token) {
+                Ok(Some(_)) => {}
                 Ok(None) => return Ok(Response::Integer(0)),
                 Err(_) => return Ok(wrong_type()),
-            };
+            }
 
-            // Releasing rewrites the lease in place: a running snapshot keeps the held one.
+            // A released lease takes its key with it, recorded as a plain delete so a replica and
+            // a replayed log drop it too. A running snapshot still keeps the held lease.
             before_mutation_allow_oom(shard, sink, [key.as_ref()], 0)?;
 
-            sink.record(Mutation::LeasePut {
-                key: &key,
-                token,
-                expires_at,
+            sink.record(Mutation::Delete {
+                keys: std::slice::from_ref(&key),
             })?;
 
-            if shard.lease_put(&key, token, expires_at, "RELEASE").is_err() {
-                debug_assert!(false, "lease release failed after validation");
-
-                return Ok(wrong_type());
-            }
+            shard.delete(&key);
 
             Ok(Response::Integer(1))
         }

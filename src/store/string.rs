@@ -658,11 +658,13 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
 
         self.note_fence_token(token);
 
+        // The key lives exactly as long as the lease, so it expires like any key with a TTL.
         if kind.is_none() {
             self.insert_entry(
                 key,
                 Entry::fresh(Value::Lease(Box::new(LeaseValue { token, expires_at }))),
             );
+            self.set_deadline(self.active, key, UnixMillis::new(expires_at));
         } else {
             let Some(Value::Lease(lease)) =
                 self.entries.object_mut(key).map(|entry| &mut entry.value)
@@ -672,6 +674,7 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
 
             lease.token = token;
             lease.expires_at = expires_at;
+            self.set_deadline(self.active, key, UnixMillis::new(expires_at));
         }
 
         self.reconcile_entry_charge(before, key);
@@ -799,20 +802,6 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         }
 
         Ok(())
-    }
-
-    pub(crate) fn lease_ttl_ms(&self, key: &[u8]) -> Option<i64> {
-        let Value::Lease(lease) = self.object_value(key).ok().flatten()? else {
-            return None;
-        };
-
-        let now = self.now_unix_millis().get();
-
-        if now >= lease.expires_at {
-            return Some(-1);
-        }
-
-        Some(i64::try_from(lease.expires_at - now).unwrap_or(i64::MAX))
     }
 
     pub(crate) fn plan_limit(

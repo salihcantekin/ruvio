@@ -1034,6 +1034,9 @@ async fn serve_async(
                 && snapshot == snapshot_sequence
                 && sink.last_sequence() >= through);
     let mut store = KvShard::with_clock(SystemClock::with_floor(created_at));
+
+    // Leases released or expired before the checkpoint left no key with their token.
+    store.raise_fence_floor(created_at);
     let replay_clock = store.pause_expiration_for_replay();
 
     // A replica removes a key only when the primary's delete arrives; restarted with

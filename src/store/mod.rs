@@ -387,6 +387,9 @@ pub struct KvShard<C = SystemClock, I = AHashIndex> {
     /// Highest token of a later generation applied before this shard learned it (a log
     /// replayed before the epoch was read); taken over when that generation is set.
     fence_ahead: u64,
+    /// Lowest clock reading, in milliseconds, new tokens are taken from: one past the checkpoint
+    /// a restart loaded, whatever the generation.
+    fence_clock_floor: u64,
     /// Log drain round in progress; `None` while every log is dense enough.
     reclaim: Option<Box<ReclaimWalk>>,
 }
@@ -451,6 +454,7 @@ impl Default for KvShard<SystemClock, AHashIndex> {
             fence_generation: 0,
             fence_last: 0,
             fence_ahead: 0,
+            fence_clock_floor: 0,
             reclaim: None,
         }
     }
@@ -514,6 +518,7 @@ impl KvShard<SystemClock, AHashIndex> {
             fence_generation: 0,
             fence_last: 0,
             fence_ahead: 0,
+            fence_clock_floor: 0,
             reclaim: None,
         };
 
@@ -578,6 +583,7 @@ impl<C: Clock> KvShard<C, AHashIndex> {
             fence_generation: 0,
             fence_last: 0,
             fence_ahead: 0,
+            fence_clock_floor: 0,
             reclaim: None,
         };
 
@@ -652,6 +658,7 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
             fence_generation: 0,
             fence_last: 0,
             fence_ahead: 0,
+            fence_clock_floor: 0,
             reclaim: None,
         };
 
