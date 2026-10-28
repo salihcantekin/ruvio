@@ -1249,15 +1249,44 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         // so a string hit pays nothing for it.
         match self.live_unchecked(key) {
             None => Ok(None),
-            Some(IndexRef::Log { offset, len }) => Ok(Some(ByteView::Borrowed(
+            Some(hit) => self.string_view(hit),
+        }
+    }
+
+    /// [`Self::value_view`] for a recency-tracking read: also names the record that
+    /// [`Self::mark_read`] stamps afterwards, any live key whatever its type, as
+    /// [`Self::touch`] would, so the read costs one lookup.
+    pub(crate) fn value_view_read(
+        &self,
+        key: &[u8],
+    ) -> (Result<Option<ByteView<'_>>, WrongType>, ReadMark) {
+        let Some((hit, may_expire, address)) = self.entries.lookup_ttl_at(key) else {
+            return (Ok(None), ReadMark::Missing);
+        };
+
+        if may_expire && self.deadline_passed(self.active, key) {
+            return (Ok(None), ReadMark::Missing);
+        }
+
+        match self.string_view(hit) {
+            Ok(None) => (Ok(None), ReadMark::Missing),
+            view => (view, address.map_or(ReadMark::Key, ReadMark::At)),
+        }
+    }
+
+    /// A live record as a string; `Ok(None)` only for a hash whose fields are all due.
+    #[inline(always)]
+    fn string_view<'a>(&'a self, hit: IndexRef<'a>) -> Result<Option<ByteView<'a>>, WrongType> {
+        match hit {
+            IndexRef::Log { offset, len } => Ok(Some(ByteView::Borrowed(
                 self.value_log.slice(offset, plain_len(len)),
             ))),
-            Some(IndexRef::Integer(value)) => Ok(Some(ByteView::Integer(value))),
-            Some(IndexRef::Heap(bytes)) => Ok(Some(ByteView::Borrowed(bytes))),
-            Some(IndexRef::SetSlab(_) | IndexRef::SortedSlab(_) | IndexRef::CollSlab(_)) => {
+            IndexRef::Integer(value) => Ok(Some(ByteView::Integer(value))),
+            IndexRef::Heap(bytes) => Ok(Some(ByteView::Borrowed(bytes))),
+            IndexRef::SetSlab(_) | IndexRef::SortedSlab(_) | IndexRef::CollSlab(_) => {
                 Err(WrongType)
             }
-            Some(IndexRef::Object(entry)) => match &entry.value {
+            IndexRef::Object(entry) => match &entry.value {
                 Value::Bytes(value) => Ok(Some(value.view(&self.value_log))),
                 Value::Versioned(value) => Ok(Some(value.body.view(&self.value_log))),
                 value @ Value::TimedHash(_) if self.timed_hash_is_dead(value) => Ok(None),
@@ -1535,4 +1564,15 @@ fn transfer_result(from: i64, to: i64, amount: i64, max: Option<i64>) -> Option<
     }
 
     Some((from, to))
+}
+
+/// What [`KvShard::value_view_read`] found for [`KvShard::mark_read`] to stamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadMark {
+    /// No live key: nothing to stamp.
+    Missing,
+    /// The record at this index address.
+    At(u32),
+    /// A live key in an index without addresses: stamped by key.
+    Key,
 }
