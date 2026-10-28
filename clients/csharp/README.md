@@ -43,6 +43,20 @@ await db.SetAsync("session:ada", "hello");
 string? value = await db.GetStringAsync("session:ada");
 ```
 
+## Tracing and metrics
+
+Every command gets an OpenTelemetry client span named after it and a duration on the
+`ruvio_client_command_duration_milliseconds` histogram. Nothing is recorded until you listen:
+
+```csharp
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracing => tracing.AddSource("Ruvio.Client"))
+    .WithMetrics(metrics => metrics.AddMeter("Ruvio.Client"));
+```
+
+Keys and values are never recorded. Without a listener a command costs one check and no allocation. The full list
+of spans, tags and instruments is in [Observability](../../docs/OBSERVABILITY.md#net-client).
+
 ## JSON and text values
 
 Values are `string` or a model serialized with a source-generated `JsonTypeInfo<T>`, so callers do not handle `byte[]`. The `byte[]` members (`GetAsync`, `DumpAsync`, `FillResult.Value`) stay for binary data.

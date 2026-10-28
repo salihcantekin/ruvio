@@ -14,6 +14,8 @@ internal sealed class RuvioSocket : IDisposable
     private static readonly Meter Meter = new("Ruvio.Client");
     private static readonly Histogram<double> SocketPhaseDuration = Meter.CreateHistogram<double>(
         "ruvio_client_socket_phase_duration_milliseconds", "ms");
+    private static readonly Histogram<double> CommandDuration = Meter.CreateHistogram<double>(
+        "ruvio_client_command_duration_milliseconds", "ms");
     private static readonly Counter<long> SocketWrites = Meter.CreateCounter<long>(
         "ruvio_client_socket_write_calls");
     private static readonly Counter<long> SocketWrittenBytes = Meter.CreateCounter<long>(
@@ -521,6 +523,45 @@ internal sealed class RuvioSocket : IDisposable
 
     internal static bool TracingEnabled => Activities.HasListeners();
     internal static bool PhaseMetricsEnabled => SocketPhaseDuration.Enabled;
+
+    /// <summary>True when a listener wants command spans or the command duration; otherwise commands skip both.</summary>
+    internal static bool CommandTelemetryEnabled => Activities.HasListeners() || CommandDuration.Enabled;
+
+    /// <summary>A client span for one command, named after it. Keys and values are never recorded.</summary>
+    internal static Activity? StartCommand(string? name, int database)
+    {
+        Activity? activity = Activities.StartActivity(name ?? "ruvio", ActivityKind.Client);
+
+        if (activity is { IsAllDataRequested: true })
+        {
+            activity.SetTag("db.system", "ruvio");
+            activity.SetTag("db.operation.name", name);
+            activity.SetTag("db.namespace", database.ToString(CultureInfo.InvariantCulture));
+        }
+
+        return activity;
+    }
+
+    internal static void EndCommand(Activity? activity, string? name, long started, Exception? failure)
+    {
+        if (failure is not null && activity is not null)
+        {
+            activity.SetStatus(ActivityStatusCode.Error, failure.Message);
+            activity.SetTag("error.type", failure.GetType().FullName);
+        }
+
+        if (!CommandDuration.Enabled)
+            return;
+
+        var tags = new TagList
+        {
+            { "db.system", "ruvio" },
+            { "db.operation.name", name },
+            { "outcome", failure is null ? "ok" : "error" },
+        };
+
+        CommandDuration.Record(Stopwatch.GetElapsedTime(started).TotalMilliseconds, tags);
+    }
 
     internal static void RecordSocketWrite(int bytes)
     {
