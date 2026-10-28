@@ -2566,3 +2566,182 @@ fn only_host_names_and_addresses_are_announced() {
         assert_eq!(read_endpoint(7000, host.as_bytes()), Ok(None));
     }
 }
+
+/// Accepts at most `limit` bytes per write and counts the writes.
+struct CountingWire {
+    written: Vec<u8>,
+    writes: usize,
+    limit: usize,
+}
+
+impl Read for CountingWire {
+    fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+        Ok(0)
+    }
+}
+
+impl Write for CountingWire {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let accepted = bytes.len().min(self.limit);
+
+        self.written.extend_from_slice(&bytes[..accepted]);
+        self.writes += 1;
+        Ok(accepted)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Wire for CountingWire {
+    fn set_read_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn set_write_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn set_nodelay(&self, _: bool) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn set_nonblocking(&self, _: bool) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
+        Err(io::ErrorKind::NotConnected.into())
+    }
+}
+
+#[test]
+fn shipped_records_are_gathered_into_few_writes_in_order() {
+    use crate::{
+        mutation::{Mutation, MutationSink},
+        persistence::DurabilityProfile,
+    };
+
+    let limits = ProtocolLimits::default();
+    let dir = tempfile::tempdir().unwrap();
+    let config = PersistenceConfig {
+        profile: DurabilityProfile::Everysec,
+        data_dir: dir.path().to_path_buf(),
+        ..PersistenceConfig::default()
+    };
+    let (mut wal, _, _) = WalSink::open(config, 0, limits).unwrap();
+    let value = vec![b'v'; 1000];
+
+    for index in 0..600u32 {
+        wal.record(Mutation::SetBytes {
+            key: &index.to_le_bytes(),
+            value: &value,
+        })
+        .unwrap();
+    }
+
+    let FrameRead::Frames(frames) = read_frames(dir.path(), 0, 0, 600, limits).unwrap() else {
+        panic!("WAL frames unavailable");
+    };
+    let expected = frames.concat();
+    let floor = Arc::new(AtomicU64::new(u64::MAX));
+    let progress = Arc::new(ReplicaProgress::new(
+        Arc::clone(&floor),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(DurableAcks::new()),
+    ));
+    let hold = progress.hold(0);
+    let stop = AtomicBool::new(false);
+    let mut batch = Vec::new();
+
+    for limit in [usize::MAX, 4096] {
+        let mut wire = CountingWire {
+            written: Vec::new(),
+            writes: 0,
+            limit,
+        };
+        let last = write_frames(&mut wire, &frames, &mut batch, &hold, &stop).unwrap();
+
+        assert_eq!(frames.len(), 600);
+        assert_eq!(last, Some(Some(600)));
+        assert_eq!(floor.load(Ordering::Acquire), 600);
+        assert!(wire.written == expected, "records out of order or lost");
+
+        let batches = expected.len().div_ceil(SHIPPER_WRITE_BYTES);
+
+        if limit == usize::MAX {
+            assert!(wire.writes <= batches + 1, "{} writes", wire.writes);
+        } else {
+            assert!(wire.writes <= expected.len().div_ceil(limit) + batches + 1);
+        }
+    }
+
+    stop.store(true, Ordering::Release);
+
+    let mut wire = CountingWire {
+        written: Vec::new(),
+        writes: 0,
+        limit: usize::MAX,
+    };
+
+    assert_eq!(
+        write_frames(&mut wire, &frames, &mut batch, &hold, &stop).unwrap(),
+        None
+    );
+    assert!(wire.written.is_empty());
+}
+
+#[test]
+fn a_record_larger_than_a_shipper_write_is_written_on_its_own() {
+    use crate::{
+        mutation::{Mutation, MutationSink},
+        persistence::DurabilityProfile,
+    };
+
+    let limits = ProtocolLimits::default();
+    let dir = tempfile::tempdir().unwrap();
+    let config = PersistenceConfig {
+        profile: DurabilityProfile::Everysec,
+        data_dir: dir.path().to_path_buf(),
+        ..PersistenceConfig::default()
+    };
+    let (mut wal, _, _) = WalSink::open(config, 0, limits).unwrap();
+    let small = vec![b's'; 100];
+    let large = vec![b'l'; SHIPPER_WRITE_BYTES];
+
+    for (key, value) in [(b"a", &small), (b"b", &large), (b"c", &small)] {
+        wal.record(Mutation::SetBytes { key, value }).unwrap();
+    }
+
+    let FrameRead::Frames(frames) = read_frames(dir.path(), 0, 0, 3, limits).unwrap() else {
+        panic!("WAL frames unavailable");
+    };
+    let progress = Arc::new(ReplicaProgress::new(
+        Arc::new(AtomicU64::new(u64::MAX)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(DurableAcks::new()),
+    ));
+    let hold = progress.hold(0);
+    let mut wire = CountingWire {
+        written: Vec::new(),
+        writes: 0,
+        limit: usize::MAX,
+    };
+    let mut batch = Vec::new();
+    let last = write_frames(
+        &mut wire,
+        &frames,
+        &mut batch,
+        &hold,
+        &AtomicBool::new(false),
+    );
+
+    assert_eq!(last.unwrap(), Some(Some(3)));
+    assert!(
+        wire.written == frames.concat(),
+        "records out of order or lost"
+    );
+    assert_eq!(wire.writes, 3);
+    assert!(batch.capacity() < SHIPPER_WRITE_BYTES);
+}
