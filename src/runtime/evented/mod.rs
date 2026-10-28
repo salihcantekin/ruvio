@@ -97,7 +97,9 @@ use wal_group::*;
 // Only the WAL sink (`persistence`) is locked, because it is shared. Never share a ShardState across threads.
 struct ShardState {
     store: RefCell<KvShard>,
+    /// Durations and WAL sync totals; the per-command counts live in `command_counts`.
     command_metrics: RefCell<CommandMetrics>,
+    command_counts: CommandCounts,
     latency: RefCell<crate::latency::LatencyTable>,
     key_stats: RefCell<crate::keystats::KeyStats>,
     persistence: Arc<Mutex<WalSink>>,
@@ -240,7 +242,30 @@ struct CommandMetrics {
     other_duration_nanos: u128,
     wal_sync_count: u64,
     wal_sync_duration_nanos: u128,
-    timing_tick: u32,
+}
+
+/// The counts every command bumps, in cells so the count costs no `RefCell` borrow.
+#[derive(Default)]
+struct CommandCounts {
+    tick: Cell<u32>,
+    commands: Cell<u64>,
+    /// Indexed by `CommandGroup`.
+    groups: [Cell<u64>; 4],
+}
+
+impl ShardState {
+    /// `command_metrics` with the counts filled in.
+    fn command_totals(&self) -> CommandMetrics {
+        let mut metrics = *self.command_metrics.borrow();
+        let counts = &self.command_counts;
+
+        metrics.commands = counts.commands.get();
+        metrics.gets = counts.groups[CommandGroup::Get as usize].get();
+        metrics.sets = counts.groups[CommandGroup::Set as usize].get();
+        metrics.increments = counts.groups[CommandGroup::Increment as usize].get();
+        metrics.other_commands = counts.groups[CommandGroup::Other as usize].get();
+        metrics
+    }
 }
 
 /// Command durations are measured on one command in this many and scaled up, so the
@@ -249,14 +274,14 @@ const COMMAND_TIMING_SAMPLE: u32 = 16;
 
 #[derive(Clone, Copy)]
 enum CommandGroup {
-    Get,
-    Set,
-    Increment,
-    Other,
+    Get = 0,
+    Set = 1,
+    Increment = 2,
+    Other = 3,
 }
 
-struct CommandTiming {
-    state: Rc<ShardState>,
+struct CommandTiming<'a> {
+    state: &'a ShardState,
     group: CommandGroup,
     started: Option<Instant>,
     /// Command-table index for the latency histogram; set only on sampled commands.
@@ -267,22 +292,16 @@ struct CommandTiming {
     discarded: bool,
 }
 
-impl CommandTiming {
+impl<'a> CommandTiming<'a> {
     fn new(
-        state: Rc<ShardState>,
+        state: &'a ShardState,
         group: CommandGroup,
         name: impl FnOnce() -> &'static str,
     ) -> Self {
-        let sampled = {
-            let mut metrics = state.command_metrics.borrow_mut();
-            let tick = metrics.timing_tick;
-            metrics.timing_tick = tick.wrapping_add(1);
-            (
-                tick.is_multiple_of(COMMAND_TIMING_SAMPLE),
-                tick.is_multiple_of(crate::keystats::HOT_KEY_SAMPLE),
-            )
-        };
-        let (sampled, hot_tick) = sampled;
+        let tick = state.command_counts.tick.get();
+        state.command_counts.tick.set(tick.wrapping_add(1));
+        let sampled = tick.is_multiple_of(COMMAND_TIMING_SAMPLE);
+        let hot_tick = tick.is_multiple_of(crate::keystats::HOT_KEY_SAMPLE);
         let hot_sample = hot_tick && state.live.key_stats.get();
 
         let histogram = (sampled && state.live.latency_histograms.get())
@@ -304,13 +323,13 @@ impl CommandTiming {
 
 /// Counts a command this connection hands to other shards (or runs on all of them): the
 /// owner shards do not count what they are sent.
-fn forwarded_timing(state: &Rc<ShardState>, command: &Command<'_>) -> CommandTiming {
-    CommandTiming::new(state.clone(), command_group(command), || {
+fn forwarded_timing<'a>(state: &'a ShardState, command: &Command<'_>) -> CommandTiming<'a> {
+    CommandTiming::new(state, command_group(command), || {
         crate::acl::command_acl_name(command)
     })
 }
 
-impl CommandTiming {
+impl CommandTiming<'_> {
     /// Leaves the count to a later timing of the same command.
     fn discard(mut self) {
         self.discarded = true;
@@ -337,42 +356,46 @@ impl CommandTiming {
     }
 }
 
-impl Drop for CommandTiming {
+impl Drop for CommandTiming<'_> {
     fn drop(&mut self) {
         if self.discarded {
             return;
         }
-        let measured = self.started.map(|started| started.elapsed().as_nanos());
+        let counts = &self.state.command_counts;
+        let group = &counts.groups[self.group as usize];
 
-        if let (Some(index), Some(nanos)) = (self.histogram, measured) {
+        counts.commands.set(counts.commands.get().saturating_add(1));
+        group.set(group.get().saturating_add(1));
+
+        if let Some(started) = self.started {
+            self.record_duration(started);
+        }
+    }
+}
+
+impl CommandTiming<'_> {
+    /// The sampled command's time, for the latency histogram and the scaled-up totals.
+    #[inline(never)]
+    fn record_duration(&self, started: Instant) {
+        let nanos = started.elapsed().as_nanos();
+
+        if let Some(index) = self.histogram {
             self.state
                 .latency
                 .borrow_mut()
                 .record(index, u64::try_from(nanos).unwrap_or(u64::MAX));
         }
 
-        let elapsed = measured.map_or(0, |nanos| nanos * u128::from(COMMAND_TIMING_SAMPLE));
+        let elapsed = nanos * u128::from(COMMAND_TIMING_SAMPLE);
         let mut metrics = self.state.command_metrics.borrow_mut();
-        metrics.commands = metrics.commands.saturating_add(1);
-        match self.group {
-            CommandGroup::Get => {
-                metrics.gets = metrics.gets.saturating_add(1);
-                metrics.get_duration_nanos = metrics.get_duration_nanos.saturating_add(elapsed);
-            }
-            CommandGroup::Set => {
-                metrics.sets = metrics.sets.saturating_add(1);
-                metrics.set_duration_nanos = metrics.set_duration_nanos.saturating_add(elapsed);
-            }
-            CommandGroup::Increment => {
-                metrics.increments = metrics.increments.saturating_add(1);
-                metrics.increment_duration_nanos =
-                    metrics.increment_duration_nanos.saturating_add(elapsed);
-            }
-            CommandGroup::Other => {
-                metrics.other_commands = metrics.other_commands.saturating_add(1);
-                metrics.other_duration_nanos = metrics.other_duration_nanos.saturating_add(elapsed);
-            }
-        }
+        let total = match self.group {
+            CommandGroup::Get => &mut metrics.get_duration_nanos,
+            CommandGroup::Set => &mut metrics.set_duration_nanos,
+            CommandGroup::Increment => &mut metrics.increment_duration_nanos,
+            CommandGroup::Other => &mut metrics.other_duration_nanos,
+        };
+
+        *total = total.saturating_add(elapsed);
     }
 }
 
@@ -1217,6 +1240,7 @@ async fn serve_async(
     let state = Rc::new(ShardState {
         store: RefCell::new(store),
         command_metrics: RefCell::new(CommandMetrics::default()),
+        command_counts: CommandCounts::default(),
         latency: RefCell::new(crate::latency::LatencyTable::default()),
         key_stats: RefCell::new(crate::keystats::KeyStats::default()),
         persistence: Arc::new(Mutex::new(sink)),

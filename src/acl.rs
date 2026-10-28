@@ -122,6 +122,10 @@ impl AclRules {
     }
 
     pub fn authorize_hot(&self, command: &HotCommand<'_>) -> Result<(), AclDeny> {
+        if self.all_commands && self.all_keys {
+            return Ok(());
+        }
+
         let (name, key) = match command {
             HotCommand::Ping(_) => ("ping", None),
             HotCommand::Get(key) => ("get", Some(*key)),

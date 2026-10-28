@@ -79,6 +79,7 @@ impl NotifyState {
         self.refresh();
     }
 
+    #[inline]
     pub fn is_idle(&self) -> bool {
         self.pending.is_empty() && self.dropped.is_empty()
     }
