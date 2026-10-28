@@ -4,6 +4,7 @@ Notable changes to the NuGet package `Ruvio.AspNetCore.Idempotency`. New entries
 
 ## Unreleased
 
+- Fixed: with `AbortOnException` on, a response over `MaxResponseBodyBytes` no longer aborts the record (the handler's work took effect, so a retry would have run it again); the record stays pending for the retention. A `sizeHint` larger than the space left no longer fails a write that fits.
 - When the server rejects `IDEM ABORT` (a server from before it), `AbortOnException` logs one warning per process instead of failing silently.
 - Needs Ruvio.Client 0.4.0; `AbortOnException` needs a server with `IDEM ABORT`.
 - Docs: the README lists what this package checks while the host starts, and shows how to watch the circuit breaker (logs, `ruvio_client_circuit_transitions`, a `StateChanged` handler).

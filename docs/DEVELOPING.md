@@ -17,6 +17,7 @@ Where the code lives, how to check a change quickly, and every place a new comma
 | `docs/` | Reference docs and `compatibility-matrix.json`, the list of supported commands |
 | `scripts/` | Local gates, release helpers, fault and benchmark harnesses ([scripts/README.md](../scripts/README.md)) |
 | `site-next/` | The website ([ruviodb.com](https://ruviodb.com)): Astro, docs generated from `docs/`, `clients/` and `integrations/` by `scripts/sync-docs.mjs`; the `/changelog/` page shows the newest sections of the server's `CHANGELOG.md` and is built from the first-parent history of `main` and `dev` and the release tags by `scripts/changelog.mjs`, 100 entries per page, with a search that fetches `/changelog/entries.json` on first use (a shallow clone gets a page that links to GitHub instead); published by the manual `site-azure` workflow. Measurement records it charts are in `benchmark/records/` |
+| `CLAUDE.md`, `.claude/` | The working agreement and skills for Claude Code sessions (see [Working with Claude Code](#working-with-claude-code)) |
 | `.github/workflows/` | `pr-gate` runs on pull requests and pushes to `main`; every other workflow is started by hand |
 
 ## Server module map
@@ -106,6 +107,18 @@ Every client has a coverage test that loads `docs/compatibility-matrix.json` and
 | Python | `ruvio/_commands.py` | `tests/test_coverage.py` | `tests/test_live.py` |
 
 `python3 scripts/client_stubs.py <COMMAND> --reply integer|bulk|ok|array` prints a starting skeleton for each client. Cluster key routing needs no hand edit: every client reads the key table `scripts/gen_client_keys.py` writes from `clients/testdata/commands.json`, and tests it against `clients/testdata/key_vectors.json`. The Java blocking facade and command words are generated; the PR gate runs `generate.py --check`. Cluster routing, redirects and retries are compared across clients in [CLIENT_BEHAVIOR.md](CLIENT_BEHAVIOR.md); every client's slot function is tested against `clients/testdata/slots.json`.
+
+## Working with Claude Code
+
+The repository carries the project files for [Claude Code](https://docs.claude.com/en/docs/claude-code/overview), so every contributor's session starts with the same rules.
+
+| File | What it is |
+| --- | --- |
+| `CLAUDE.md` | The working agreement every session reads first: the time budget, how to verify, the test, performance and safety rules, git flow, and which doc to read for what |
+| `.claude/settings.json` | Shared permissions: build, test and read-only commands are allowed; destructive and publishing commands (force-push, tags, `cargo publish`, release workflows, `--release` test builds) are denied, and a deny wins over an allow |
+| `.claude/skills/<name>/SKILL.md` | Procedures for recurring tasks (adding a command, measuring, a risky-change review, test reliability, hygiene, release preparation), loaded when a task matches their description |
+
+Personal overrides go in `.claude/settings.local.json`, which git ignores; do not widen the shared file for one machine. To add a skill, create `.claude/skills/ruvio-<name>/SKILL.md` with YAML front matter (`name:` equal to the folder name, and a one-sentence `description:` that says when to use it), keep the body in English, point to existing docs and scripts rather than copying them, check that every path it names exists, list it in the skills table in `CLAUDE.md`, and run `scripts/check_hygiene.sh`.
 
 ## Releases
 

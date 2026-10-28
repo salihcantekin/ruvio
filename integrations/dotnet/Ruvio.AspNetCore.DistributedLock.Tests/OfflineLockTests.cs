@@ -79,7 +79,7 @@ public class OfflineLockTests
         Assert.Throws<ArgumentNullException>(() => ((HttpContext)null!).GetRuvioLock());
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task AcquireValidatesInputAndSurfacesServerErrors()
     {
         var (client, script) = Fake();
@@ -104,7 +104,7 @@ public class OfflineLockTests
         Assert.Contains("busy", timeout.Message);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task AcquireRetriesWithGrowingPausesUntilTheWaitRunsOutOrTheKeyFrees()
     {
         int attempts = 0;
@@ -130,7 +130,7 @@ public class OfflineLockTests
             await provider.TryAcquireAsync("r", TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(30), cancel.Token));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task ExtendAndReleaseFollowTheOwnerToken()
     {
         RespValue extendReply = Ok;
@@ -177,7 +177,7 @@ public class OfflineLockTests
         await second.DisposeAsync();
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task DisposeSwallowsAFailedReleaseAndReleasesAHeldLock()
     {
         bool failRelease = true;
@@ -192,7 +192,7 @@ public class OfflineLockTests
         Assert.Equal(2, script.Sent.Count(c => c[0] == "DELEX"));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task AutoRenewKeepsTheLeaseAndReportsLossAfterAWholeLeaseOfFailures()
     {
         int renewals = 0;
@@ -237,7 +237,7 @@ public class OfflineLockTests
         Assert.True(tiny.IsHeld);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task AutoRenewStopsWhenTheLockIsReleased()
     {
         int renewals = 0;
@@ -328,7 +328,7 @@ public class OfflineLockTests
         return (context, script);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task MiddlewareAnswers503WhenTheLockServiceFailsAndStaysSilentWhenTheClientLeaves()
     {
         bool ran = false;
@@ -352,7 +352,7 @@ public class OfflineLockTests
         Assert.False(ran);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task MiddlewareRejectsWithTheConfiguredStatusAndRetryAfter()
     {
         var middleware = new RuvioLockMiddleware(_ => throw new InvalidOperationException("must not run"));
@@ -364,7 +364,7 @@ public class OfflineLockTests
         Assert.Equal("7", context.Response.Headers.RetryAfter.ToString());
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task MiddlewareResolvesTemplatesFromRouteQueryAndUserOrAnswers400()
     {
         var seen = new List<string>();
@@ -400,7 +400,7 @@ public class OfflineLockTests
         Assert.Equal(["lock:fixed", "lock:a:42:b", "lock:q:zed", "lock:u:ann", "lock:xy"], seen);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task MiddlewareFlagsALostLockAndSurvivesAFailingRelease()
     {
         bool renewReturnsNull = false;
@@ -445,7 +445,7 @@ public class OfflineLockTests
         Assert.Equal("tail:7:x", new RuvioLockHttp.Template("tail:{id}:x").Resolve(context));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task EndpointHelpersTakeTheLockExposeItAndBuildTheConflictResponse()
     {
         (DefaultHttpContext context, ScriptClient script) = Locked(new RuvioLockAttribute("r"));
