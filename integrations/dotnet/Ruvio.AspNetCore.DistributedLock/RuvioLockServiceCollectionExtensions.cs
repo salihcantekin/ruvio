@@ -22,4 +22,33 @@ public static class RuvioLockServiceCollectionExtensions
 
         return services;
     }
+
+    /// <summary>
+    /// Runs <typeparamref name="TWorker"/> as a hosted service on one instance at a time: every instance asks for the lock
+    /// <paramref name="name"/> (with the registered <see cref="RuvioLockProvider"/>'s options), the one that gets it runs the
+    /// work, and when it stops, crashes or loses the lock another instance takes over. Call <see cref="AddRuvioDistributedLock"/> too.
+    /// </summary>
+    /// <param name="services">The service collection.</param>
+    /// <param name="name">The lock resource, unique per kind of work (the provider's key prefix is added).</param>
+    /// <param name="configure">Lease and retry interval.</param>
+    /// <returns>The same service collection.</returns>
+    public static IServiceCollection AddRuvioSingleton<[System.Diagnostics.CodeAnalysis.DynamicallyAccessedMembers(System.Diagnostics.CodeAnalysis.DynamicallyAccessedMemberTypes.PublicConstructors)] TWorker>(
+        this IServiceCollection services,
+        string name,
+        Action<RuvioSingletonOptions>? configure = null)
+        where TWorker : class, IRuvioSingletonWorker
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentException.ThrowIfNullOrEmpty(name);
+        var options = new RuvioSingletonOptions();
+
+        configure?.Invoke(options);
+        options.Validate();
+        services.TryAddScoped<TWorker>();
+        // Not AddHostedService: it de-duplicates by type, which would drop a second name for the same worker.
+        services.AddSingleton<Microsoft.Extensions.Hosting.IHostedService>(provider =>
+            new RuvioSingletonService<TWorker>(name, options, provider));
+
+        return services;
+    }
 }

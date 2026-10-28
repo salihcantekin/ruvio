@@ -252,6 +252,12 @@ See [When Ruvio is unreachable](../README.md#when-ruvio-is-unreachable) for the 
 - Instrumentation is off by default. `EnableInstrumentation` enables the
   `Ruvio.AspNetCore.Idempotency` ActivitySource with an `idempotency` activity and
   only the bounded `idempotency.state` tag. No request/identity/key/body data.
+- Metrics are always published on the `Ruvio.AspNetCore.Idempotency` Meter (an exporter
+  only sees them when the host adds that Meter): `ruvio.idempotency.states`, tagged
+  `state` = `acquired` (the handler runs), `completed` (a stored result is replayed),
+  `pending` (the first request still runs: 409) or `conflict` (the key was used for a
+  different request: 409); `ruvio.idempotency.storage_calls`, `storage_commands`,
+  `storage_duration` (tagged `operation` and `outcome`); and `ruvio.idempotency.outage`.
 
 ## Tests
 

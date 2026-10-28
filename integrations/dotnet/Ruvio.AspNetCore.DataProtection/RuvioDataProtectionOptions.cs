@@ -20,6 +20,13 @@ public sealed class RuvioDataProtectionOptions
     /// <summary>Refuses to store keys unless a key encryptor is configured.</summary>
     public bool RequireEncryption { get; set; } = true;
 
+    /// <summary>
+    /// Refuses to read or write the key ring when the server keeps data in memory only (durability profile
+    /// <c>memory</c>, lost on restart) or does not say which profile it runs. Off by default: the first key-ring
+    /// access logs a warning instead.
+    /// </summary>
+    public bool RequireDurableStorage { get; set; }
+
     internal static readonly Encoding Utf8 = new UTF8Encoding(false, true);
 
     internal void Validate()

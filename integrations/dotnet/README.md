@@ -28,6 +28,7 @@ keep their current paths.
 | `Ruvio.Extensions.Caching` | `IDistributedCache` for web, worker and console applications |
 | `Ruvio.AspNetCore.RateLimiting` | Endpoint-opt-in distributed budgets (fixed, sliding window, token bucket, concurrency), inline or as named policies with their own partition, chained limits and a default policy |
 | `Ruvio.AspNetCore.Idempotency` | Endpoint-opt-in bounded HTTP request deduplication and response replay |
+| `Ruvio.Extensions.Idempotency` | Run work once per key outside HTTP (message consumers, jobs, gRPC) and replay its stored result |
 | `Ruvio.AspNetCore.OutputCaching` | Native ASP.NET Core output-cache store with distributed tag invalidation |
 | `Ruvio.AspNetCore.DataProtection` | Encrypted key-ring persistence for shared cookies and protected payloads |
 | `Ruvio.AspNetCore.DistributedLock` | Distributed locks with owner-checked release and automatic renewal, plus a `[RuvioLock]` endpoint attribute (409 when taken, request cancelled on lock loss, metrics) |
@@ -146,7 +147,10 @@ exactly-once guarantee. Idempotency retention is bounded; external side effects
 require their own idempotency/transaction mechanism. A timeout after a write is an
 unknown outcome, not permission to retry it automatically.
 
-Each package documents its ActivitySource/Meter names where provided. Configure
+Each package documents its ActivitySource/Meter names. The cache packages count hits and misses
+(`ruvio.cache.hit|miss`, `ruvio.output_cache.hit|miss|tag_evict`), idempotency counts each outcome
+(`ruvio.idempotency.states` by `state`), the lock and rate-limit packages count acquisitions and
+rejections. With no listener attached a counter costs one field read. Configure
 OpenTelemetry/exporters in the host; metrics must not contain keys, payloads,
 tenant identifiers or HTTP idempotency keys.
 
