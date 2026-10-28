@@ -27,6 +27,9 @@ public sealed class RuvioCacheOptions
     /// <summary>How long other callers of <c>GetOrCreateAsync</c> wait for the builder before building the value themselves. Defaults to 10 seconds.</summary>
     public TimeSpan FillWait { get; set; } = TimeSpan.FromSeconds(10);
 
+    /// <summary>Most tags one entry may carry (<see cref="RuvioCacheEntryOptions.Tags"/>), from 1 to 64. Defaults to 8.</summary>
+    public int MaxTagsPerEntry { get; set; } = 8;
+
     /// <summary>
     /// What happens when Ruvio cannot be reached. The default, <see cref="RuvioOutageMode.Throw"/>, lets the storage
     /// exception reach the caller (<see cref="RuvioOutageMode.FailClosed"/> does the same, a cache has no response to
@@ -38,6 +41,7 @@ public sealed class RuvioCacheOptions
     public RuvioOutageOptions Outage { get; } = new();
 
     internal const string VersionPrefix = ":ruvio:cache:v1:";
+    internal const string TagPrefix = ":ruvio:cache-tag:v1:";
     internal static readonly Encoding Utf8 = new UTF8Encoding(false, true);
 
     internal void Validate()
@@ -55,6 +59,9 @@ public sealed class RuvioCacheOptions
 
         if (FillWait < TimeSpan.FromMilliseconds(1) || FillWait > TimeSpan.FromHours(1))
             throw new ArgumentOutOfRangeException(nameof(FillWait), "FillWait must be between 1 ms and one hour.");
+
+        if (MaxTagsPerEntry is < 1 or > 64)
+            throw new ArgumentOutOfRangeException(nameof(MaxTagsPerEntry), "MaxTagsPerEntry must be between 1 and 64.");
 
         if (MaxKeyBytes < 1 || Utf8.GetByteCount(InstanceName + VersionPrefix) > MaxKeyBytes)
             throw new ArgumentOutOfRangeException(nameof(MaxKeyBytes), "The key limit must accommodate the namespace.");
