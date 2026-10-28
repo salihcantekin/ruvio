@@ -1909,8 +1909,10 @@ fn a_stalled_member_does_not_hold_up_the_primary_lease() {
     // A look at the stalled member takes a full second (the coordinators' call timeout), so
     // pings of the group go out about once a second. Renewals come every 200 ms on their own:
     // with a 1100 ms lease the gate closes 800 ms after a renewal, so a renewal that waited for
-    // the pings would close it for about 200 ms each round, while renewals on time leave 600 ms
-    // to spare for a loaded machine.
+    // the pings would close it for about 200 ms in every round of about a second. The test
+    // counts the separate windows in which writes were refused over five seconds: that fault
+    // makes one in every round (about four), while a scheduler or fsync stall on a loaded host
+    // makes at most one.
     let _coordinators: Vec<Process> = (0..3)
         .map(|index| {
             group.coordinator_with(
@@ -1927,17 +1929,31 @@ fn a_stalled_member_does_not_hold_up_the_primary_lease() {
     wait_until("the primary to take writes", || {
         call(&primary, &["SET", "before", "1"]).as_deref() == Some("OK")
     });
-    let until = Instant::now() + Duration::from_secs(4);
-    let mut writes = 0u64;
+    let until = Instant::now() + Duration::from_secs(5);
+    let (mut writes, mut accepted, mut windows) = (0u64, 0u64, 0u32);
+    let mut refusing = false;
 
     while Instant::now() < until {
         if let Some(reply) = call(&primary, &["SET", "during", &writes.to_string()]) {
-            assert_eq!(reply, "OK", "write {writes} refused");
+            let refused = reply != "OK";
+
+            if refused && !refusing {
+                windows += 1;
+            }
+            refusing = refused;
+            accepted += u64::from(!refused);
         }
         writes += 1;
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(writes > 20, "only {writes} writes in four seconds");
+    assert!(
+        accepted > 100,
+        "only {accepted} of {writes} writes taken in five seconds"
+    );
+    assert!(
+        windows <= 1,
+        "writes were refused in {windows} separate windows: the renewals wait for the pings"
+    );
 }
 
 /// A node whose `primary_lease_coordinators` lists other coordinators refuses every grant; the
