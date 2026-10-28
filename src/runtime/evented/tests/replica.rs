@@ -811,6 +811,99 @@ fn an_idle_replica_applies_a_burst_without_waiting_for_its_timers() {
 }
 
 #[test]
+fn a_replica_keeps_applying_writes_after_a_copied_publish() {
+    let primary_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let ports = crate::test_ports::reserve();
+    let replication = ports.address_at(0);
+    let persistence = |directory: &std::path::Path| PersistenceConfig {
+        profile: crate::DurabilityProfile::Everysec,
+        data_dir: directory.to_path_buf(),
+        ..PersistenceConfig::default()
+    };
+    let (primary_address, primary_stop, primary) = serve_with(|config| {
+        config.persistence = persistence(primary_dir.path());
+        config.replication = crate::config::ReplicationConfig {
+            role: crate::config::ReplicationRole::Primary,
+            listen: Some(replication),
+            primary: None,
+            primary_name: None,
+            ..Default::default()
+        };
+    });
+    let (replica_address, replica_stop, replica) = serve_with(|config| {
+        config.persistence = persistence(replica_dir.path());
+        config.replication = crate::config::ReplicationConfig {
+            role: crate::config::ReplicationRole::Replica,
+            listen: None,
+            primary: Some(replication),
+            primary_name: None,
+            ..Default::default()
+        };
+    });
+    let limits = ProtocolLimits::default();
+    let replica_holds = |sequence: u64| {
+        matches!(
+            crate::persistence::read_frames(replica_dir.path(), 0, sequence - 1, sequence, limits),
+            Ok(crate::persistence::FrameRead::Frames(frames)) if frames.len() == 1
+        )
+    };
+
+    // The replica must be connected before the publish, or the primary copies it to no one.
+    let first = request_within(
+        primary_address,
+        &resp(&[&[b"SET", b"first", b"v"]]),
+        PATIENCE,
+    );
+    assert_eq!(first, b"+OK\r\n");
+    wait_until("the replica to apply the first write", || replica_holds(1));
+
+    // A subscriber on the replica gets the message the primary copies.
+    let mut subscriber = StdTcpStream::connect(replica_address).unwrap();
+    subscriber.set_read_timeout(Some(PATIENCE)).unwrap();
+    subscriber
+        .write_all(&resp(&[&[b"SUBSCRIBE", b"news"]]))
+        .unwrap();
+    let mut seen = Vec::new();
+    let mut read_until = |subscriber: &mut StdTcpStream, needle: &[u8]| {
+        let mut chunk = [0; 512];
+        while !seen.windows(needle.len()).any(|window| window == needle) {
+            let read = subscriber.read(&mut chunk).unwrap();
+            assert_ne!(read, 0, "the replica closed the subscriber");
+            seen.extend_from_slice(&chunk[..read]);
+        }
+    };
+    read_until(&mut subscriber, b"$4\r\nnews\r\n:1\r\n");
+
+    let published = request_within(
+        primary_address,
+        &resp(&[&[b"PUBLISH", b"news", b"hello"]]),
+        PATIENCE,
+    );
+    assert_eq!(published, b":0\r\n");
+    read_until(&mut subscriber, b"$5\r\nhello\r\n");
+
+    // More writes than the replica's queue holds: a publish frame left in the queue's
+    // accounting would fill it and stop the replica here.
+    let records = 2 * crate::replication::QUEUE_FRAMES as u64;
+    let mut burst = Vec::new();
+    for index in 0..records {
+        burst.extend_from_slice(&resp(&[&[b"SET", format!("k{index}").as_bytes(), b"v"]]));
+    }
+    let replies = request_within(primary_address, &burst, Duration::from_secs(20));
+    assert_eq!(replies.len(), records as usize * b"+OK\r\n".len());
+
+    wait_until("the replica to apply every write after the publish", || {
+        replica_holds(records + 1)
+    });
+
+    primary_stop.request();
+    replica_stop.request();
+    join_within(primary, PATIENCE).unwrap();
+    join_within(replica, PATIENCE).unwrap();
+}
+
+#[test]
 fn replica_with_a_pending_full_resync_starts_over_a_log_that_does_not_replay() {
     let directory = tempfile::tempdir().unwrap();
     let persistence = PersistenceConfig {
