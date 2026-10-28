@@ -2946,7 +2946,7 @@ fn read_primary(
         } else {
             Some(frame_sequence(&frame))
         };
-        if !enqueue_frame(link, outstanding, frame, stop) {
+        if !enqueue_frame(link, outstanding, frame, sequence, stop) {
             return (!stop.load(Ordering::Acquire), true);
         }
         unwoken = true;
@@ -3133,13 +3133,15 @@ fn reclaim_applied(link: &ReplicaLink, outstanding: &mut Outstanding) {
     outstanding.reclaim_through(applied);
 }
 
+/// `sequence` is `None` for a copied publish: it is never logged, so the log's last
+/// sequence never passes it and it must not wait in `outstanding` to be reclaimed.
 fn enqueue_frame(
     link: &ReplicaLink,
     outstanding: &mut Outstanding,
     mut frame: Vec<u8>,
+    sequence: Option<u64>,
     stop: &AtomicBool,
 ) -> bool {
-    let sequence = frame_sequence(&frame);
     let len = frame.len();
 
     loop {
@@ -3149,7 +3151,9 @@ fn enqueue_frame(
 
         match link.inbound.try_send(ReplicaDelivery::Frame(frame)) {
             Ok(()) => {
-                outstanding.push(sequence, len);
+                if let Some(sequence) = sequence {
+                    outstanding.push(sequence, len);
+                }
 
                 return true;
             }
