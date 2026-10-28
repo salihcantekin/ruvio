@@ -2566,3 +2566,35 @@ fn only_host_names_and_addresses_are_announced() {
         assert_eq!(read_endpoint(7000, host.as_bytes()), Ok(None));
     }
 }
+
+#[test]
+fn a_publish_with_no_replica_builds_no_frame() {
+    let fanout = PublishFanout::new();
+    let mut built = 0;
+
+    fanout.send_with(|| {
+        built += 1;
+        vec![1]
+    });
+    assert_eq!(built, 0);
+
+    let receiver = fanout.register();
+
+    fanout.send_with(|| {
+        built += 1;
+        vec![2]
+    });
+    assert_eq!(built, 1);
+    assert_eq!(receiver.try_recv().unwrap(), vec![2]);
+
+    drop(receiver);
+    fanout.send_with(|| vec![3]);
+    fanout.send_with(|| {
+        built += 1;
+        vec![4]
+    });
+    assert_eq!(
+        built, 1,
+        "a dropped replica is forgotten after the next send"
+    );
+}

@@ -1399,23 +1399,36 @@ pub fn decode_copied_publish(frame: &[u8]) -> Option<(bool, Vec<u8>, Vec<u8>)> {
 
 pub struct PublishFanout {
     senders: Mutex<Vec<SyncSender<Vec<u8>>>>,
+    /// Registered senders, readable without the lock so a publish with no replica builds nothing.
+    registered: std::sync::atomic::AtomicUsize,
 }
 
 impl PublishFanout {
     pub fn new() -> Self {
         Self {
             senders: Mutex::new(Vec::new()),
+            registered: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     pub fn register(&self) -> std::sync::mpsc::Receiver<Vec<u8>> {
         let (sender, receiver) = std::sync::mpsc::sync_channel(64);
-
-        self.senders
+        let mut senders = self
+            .senders
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .push(sender);
+            .unwrap_or_else(|error| error.into_inner());
+
+        senders.push(sender);
+        self.registered
+            .store(senders.len(), std::sync::atomic::Ordering::Release);
         receiver
+    }
+
+    /// Sends the frame `build` makes; with no replica registered nothing is built or locked.
+    pub fn send_with(&self, build: impl FnOnce() -> Vec<u8>) {
+        if self.registered.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            self.send(build());
+        }
     }
 
     pub fn send(&self, frame: Vec<u8>) {
@@ -1429,6 +1442,8 @@ impl PublishFanout {
             Err(TrySendError::Full(_)) => true,
             Err(TrySendError::Disconnected(_)) => false,
         });
+        self.registered
+            .store(senders.len(), std::sync::atomic::Ordering::Release);
     }
 }
 
