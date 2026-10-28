@@ -82,7 +82,7 @@ public class EdgeTests
             RuvioRateLimitingMiddleware.StorageKey("p:", "a", "bc"));
     }
 
-    [Theory]
+    [Theory(Timeout = 30000)]
     [InlineData(" ")]
     [InlineData("")]
     public async Task BlankPartitionsAndOversizedPartitionsAreConfigurationErrors(string partition)
@@ -122,7 +122,7 @@ public class EdgeTests
             () => MiddlewareTests.Create(_ => throw new Exception("must not run"), provider).InvokeAsync(context));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task TheRetryDelayIsTheWholeWindowAndTheAllowanceIsCheckedAtItsEdges()
     {
         var client = DispatchProxy.Create<IRuvioClient, MiddlewareTests.Stub>();

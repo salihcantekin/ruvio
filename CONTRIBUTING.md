@@ -22,6 +22,8 @@ An assistant may help you write the patch. You still own it. Before opening the 
 
 A patch you cannot explain, or a batch of unrelated edits produced by a prompt, is closed without a line-by-line review. "An assistant suggested it" is not a reason to merge.
 
+If you work with Claude Code, it reads [CLAUDE.md](CLAUDE.md), the project's working agreement, and the skills in `.claude/skills/`; follow them.
+
 ## The hot path
 
 The shard that owns a key parses, records, applies, and replies. A feature costs memory or CPU only on keys that use it.

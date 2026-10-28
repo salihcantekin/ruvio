@@ -116,6 +116,8 @@ def wait_ready(
     context = None
     if tls_ca is not None:
         context = ssl.create_default_context(cafile=tls_ca)
+        # The default already refuses TLS 1.0 and 1.1 on current Pythons; said explicitly.
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         if tls_client is not None:
             context.load_cert_chain(*tls_client)
     deadline = time.monotonic() + timeout

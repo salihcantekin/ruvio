@@ -26,14 +26,16 @@ public class StoreTests
         Assert.Throws<ArgumentOutOfRangeException>(() => new ServiceCollection().AddRuvioOutputCache(o => o.MaxTagsPerEntry = 33));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task InvalidInputsAndCancellationDoNotResolveTheClient()
     {
         var cache = new RuvioOutputCacheStore(() => throw new InvalidOperationException("Unexpected IO."),
             Options.Create(new RuvioOutputCacheOptions { MaxValueBytes = 1, MaxKeyBytes = 3, MaxTagsPerEntry = 1 }));
 
         await Assert.ThrowsAsync<ArgumentNullException>(() => cache.GetAsync(null!, default).AsTask());
-        await Assert.ThrowsAsync<ArgumentException>(() => cache.GetAsync("long", default).AsTask());
+        // A key over MaxKeyBytes is a miss and is not stored; neither touches the client.
+        Assert.Null(await cache.GetAsync("long", default));
+        await cache.SetAsync("long", [], null, TimeSpan.FromSeconds(1), default);
         await Assert.ThrowsAsync<System.Text.EncoderFallbackException>(() => cache.GetAsync("\ud800", default).AsTask());
         await Assert.ThrowsAsync<ArgumentNullException>(() => cache.SetAsync("", null!, null, TimeSpan.FromSeconds(1), default).AsTask());
         await Assert.ThrowsAsync<ArgumentException>(() => cache.SetAsync("", [1, 2], [], TimeSpan.FromSeconds(1), default).AsTask());
@@ -49,7 +51,18 @@ public class StoreTests
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => cache.EvictByTagAsync("", source.Token).AsTask());
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
+    public async Task AFiveKilobyteQueryStringIsAMissAndIsNotStored()
+    {
+        var cache = new RuvioOutputCacheStore(() => throw new InvalidOperationException("Unexpected IO."),
+            Options.Create(new RuvioOutputCacheOptions { Outage = { Mode = RuvioOutageMode.FailOpen } }));
+        string key = "GET\u001Fhost\u001F/items?q=" + new string('x', 5 * 1024);
+
+        Assert.Null(await cache.GetAsync(key, default));
+        await cache.SetAsync(key, [1], null, TimeSpan.FromSeconds(1), default);
+    }
+
+    [Fact(Timeout = 30000)]
     public async Task TransportErrorsAreNotRetriedAndTokensAreForwarded()
     {
         var client = DispatchProxy.Create<IRuvioClient, RejectingClient>();

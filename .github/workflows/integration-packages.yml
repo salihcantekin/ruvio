@@ -142,7 +142,7 @@ jobs:
             packages=("$PACKAGE")
           fi
           for name in "${packages[@]}"; do
-            dotnet test "integrations/dotnet/$name.Tests/$name.Tests.csproj" -c Release
+            dotnet test "integrations/dotnet/$name.Tests/$name.Tests.csproj" -c Release --blame-hang-timeout 5m
             dotnet pack "integrations/dotnet/$name/$name.csproj" -c Release -o dist -p:ContinuousIntegrationBuild=true
           done
       - name: Ruvio log

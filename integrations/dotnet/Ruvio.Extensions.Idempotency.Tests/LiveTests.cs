@@ -6,7 +6,7 @@ namespace Ruvio.Extensions.Idempotency.Tests;
 /// <summary>Run against a real server: set RUVIO_TEST_ADDR to host:port, otherwise each test returns at once.</summary>
 public class LiveTests
 {
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task EveryStateAgainstARealServer()
     {
         string? address = Environment.GetEnvironmentVariable("RUVIO_TEST_ADDR");
@@ -60,7 +60,7 @@ public class LiveTests
         Assert.Equal(new Receipt("r-1", 5), stored.Value);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task AbortOnExceptionFreesTheKeyOnARealServer()
     {
         string? address = Environment.GetEnvironmentVariable("RUVIO_TEST_ADDR");
