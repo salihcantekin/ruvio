@@ -1,5 +1,7 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.DependencyInjection;
+using Ruvio.Client;
+using Ruvio.Integrations;
 
 namespace Ruvio.AspNetCore.RateLimiting;
 
@@ -31,13 +33,24 @@ public static class RuvioRateLimitingExtensions
                 "KeyPrefix must have 1-128 characters and no cluster hash tags.")
             .Validate(options => options.Outage.IsValid(), "Outage options are out of range.")
             .ValidateOnStart();
+        RuvioStartupChecks.RequireAtStart<IRuvioClient>(services, "Ruvio.AspNetCore.RateLimiting", static _ => null);
+        RuvioEndpointCheck.Add(services, "Ruvio.AspNetCore.RateLimiting", RuvioRateLimitingMiddleware.EndpointError);
 
         return services;
     }
 
     /// <summary>Place after routing, authentication and authorization, before endpoint execution.</summary>
     public static IApplicationBuilder UseRuvioRateLimiting(this IApplicationBuilder app)
-        => app.UseMiddleware<RuvioRateLimitingMiddleware>();
+    {
+        ArgumentNullException.ThrowIfNull(app);
+
+        // Runs while the pipeline is set up, so a missing AddRuvioRateLimiting fails before the server takes a request.
+        if (app.ApplicationServices.GetService<IServiceProviderIsService>() is { } services
+            && !services.IsService(typeof(RuvioEndpointCheckMarker)))
+            throw new InvalidOperationException("UseRuvioRateLimiting needs services.AddRuvioRateLimiting(...) first.");
+
+        return app.UseMiddleware<RuvioRateLimitingMiddleware>();
+    }
 }
 
 /// <summary>Applies a Ruvio rate limit to minimal API endpoints and groups without writing the attribute by hand.</summary>

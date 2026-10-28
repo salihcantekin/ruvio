@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.OutputCaching;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
+using Ruvio.Integrations;
 
 namespace Ruvio.AspNetCore.OutputCaching;
 
@@ -21,6 +22,7 @@ public static class RuvioOutputCacheExtensions
 
         configure?.Invoke(options);
         options.Validate();
+        RuvioStartupChecks.RequireAtStart<Client.IRuvioClient>(services, "Ruvio.AspNetCore.OutputCaching", _ => options.ClientKey);
         services.AddOutputCache();
         services.Replace(ServiceDescriptor.Singleton<IOptions<RuvioOutputCacheOptions>>(Options.Create(options)));
         services.RemoveAll<IOutputCacheStore>();

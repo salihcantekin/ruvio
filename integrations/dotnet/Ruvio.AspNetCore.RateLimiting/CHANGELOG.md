@@ -4,6 +4,7 @@ Notable changes to the NuGet package `Ruvio.AspNetCore.RateLimiting`. New entrie
 
 ## Unreleased
 
+- Startup checks: host start fails when `IRuvioClient` is not registered, when an endpoint names a policy never added with `AddPolicy`, or when an inline limit has no partition key (every bad endpoint is listed), and `UseRuvioRateLimiting` throws without `AddRuvioRateLimiting`. Before, these failed on the first matching request. No connection is opened for the checks; requests are unchanged.
 - Per-policy partition: `AddPolicy(name, permits, window, partitionKey)` gives a policy its own key (for example the client IP on a login endpoint) that replaces `options.PartitionKey` for it. `options.PartitionKey` is now only required when some limit has no key of its own.
 - Chained limits and concurrency: `AddPolicy(name, policy => policy.Limit(...).Limit(...).Concurrency(...))`. A request must pass every limit, in the order added; `Concurrency` caps requests in flight with `SEMAPHORE` and releases the slot after the endpoint runs. Single-limit policies are unchanged (one command, same key).
 - `options.DefaultPolicy` applies a named policy to every routed endpoint without its own limit; `[DisableRuvioRateLimit]` and `.DisableRuvioRateLimit()` opt an endpoint or group out. Without a default policy nothing changes and the bypass path does no extra work.

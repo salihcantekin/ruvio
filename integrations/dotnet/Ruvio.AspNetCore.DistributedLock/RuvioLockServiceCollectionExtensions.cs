@@ -1,6 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Ruvio.Client;
+using Ruvio.Integrations;
 
 namespace Ruvio.AspNetCore.DistributedLock;
 
@@ -17,6 +18,12 @@ public static class RuvioLockServiceCollectionExtensions
 
         configure?.Invoke(options);
         options.Validate();
+
+        // An existing provider registration stays, and so does the client it was built for.
+        if (!services.Any(static descriptor => descriptor.ServiceType == typeof(RuvioLockProvider)))
+            RuvioStartupChecks.RequireAtStart<IRuvioClient>(services, "Ruvio.AspNetCore.DistributedLock", _ => options.ClientKey);
+
+        RuvioEndpointCheck.Add(services, "Ruvio.AspNetCore.DistributedLock", RuvioLockMiddleware.EndpointError);
         services.TryAddSingleton(provider =>
             new RuvioLockProvider(options.ClientKey is { } key
                 ? provider.GetRequiredKeyedService<IRuvioClient>(key)

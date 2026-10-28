@@ -19,7 +19,8 @@ public sealed class RuvioRateLimitAttribute : Attribute
 {
     /// <summary>
     /// Refers to a policy defined with <see cref="RuvioRateLimitingOptions.AddPolicy(string, long, TimeSpan, RuvioRateLimitAlgorithm)"/>; its permits, window and algorithm
-    /// come from there. An unknown name fails the request with <see cref="InvalidOperationException"/>.
+    /// come from there. An unknown name stops host start (and fails a request on an endpoint added after start)
+    /// with <see cref="InvalidOperationException"/>.
     /// </summary>
     /// <param name="policy">The name of a registered policy.</param>
     public RuvioRateLimitAttribute(string policy)

@@ -106,7 +106,7 @@ public class SingletonTests
         });
         ServiceProvider provider = services.BuildServiceProvider();
 
-        return (provider, provider.GetServices<IHostedService>().Single());
+        return (provider, provider.GetServices<IHostedService>().OfType<RuvioSingletonService<LeaderWorker>>().Single());
     }
 
     [Fact(Timeout = 30000)]

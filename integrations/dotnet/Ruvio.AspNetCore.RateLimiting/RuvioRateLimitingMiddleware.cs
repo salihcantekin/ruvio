@@ -64,6 +64,25 @@ public sealed class RuvioRateLimitingMiddleware
         return InvokeLimitedAsync(context, policy);
     }
 
+    // Checked once before the server takes a request: the per-request failures an endpoint's rate-limit metadata can cause.
+    internal static string? EndpointError(IServiceProvider provider, Endpoint endpoint)
+    {
+        var metadata = endpoint.Metadata;
+
+        if (metadata.GetMetadata<RuvioRateLimitAttribute>() is not { } policy
+            || (metadata.GetMetadata<DisableRuvioRateLimitAttribute>() is not null && DisableIsClosest(metadata)))
+            return null;
+
+        var options = provider.GetRequiredService<IOptions<RuvioRateLimitingOptions>>().Value;
+
+        if (policy.IsNamed)
+            return options.TryGetPolicy(policy.Policy, out _) ? null : $"no rate-limit policy named '{policy.Policy}' was added with AddPolicy.";
+
+        return options.PartitionKey is null
+            ? $"the inline rate limit '{policy.Policy}' has no partition key; set options.PartitionKey."
+            : null;
+    }
+
     // The metadata closest to the endpoint (added last) decides when both a limit and an exemption are present.
     private static bool DisableIsClosest(EndpointMetadataCollection metadata)
     {

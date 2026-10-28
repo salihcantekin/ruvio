@@ -14,6 +14,16 @@ public sealed class RuvioLockMiddleware(RequestDelegate next)
 {
     private readonly RequestDelegate next = next ?? throw new ArgumentNullException(nameof(next));
 
+    // Checked once before the server takes a request, with the rules RuvioLockOptions applies to its defaults.
+    internal static string? EndpointError(IServiceProvider provider, Endpoint endpoint)
+        => endpoint.Metadata.GetMetadata<RuvioLockAttribute>() switch
+        {
+            { RejectStatusCode: < 400 or > 599 } metadata =>
+                $"RuvioLock RejectStatusCode {metadata.RejectStatusCode} must be a 4xx or 5xx status.",
+            { WaitMilliseconds: < 0 } metadata => $"RuvioLock WaitMilliseconds {metadata.WaitMilliseconds} must not be negative.",
+            _ => null,
+        };
+
     /// <summary>Handles one request.</summary>
     public Task InvokeAsync(HttpContext context)
     {

@@ -86,6 +86,31 @@ atomically without widening ordinary entries. Upgrade servers, replicas and
 recovery tools together. Earlier unpublished Lua hash records fail closed; see
 the idempotency package README for the drain-before-upgrade requirement.
 
+## Startup checks
+
+The packages do not register a client themselves: call `AddRuvioClient` (or
+`AddKeyedRuvioClient` for a `ClientKey`) once and every package borrows that
+connection. What a package needs is checked while the host starts, before the
+server takes a request, and a mistake stops start with the fix named:
+
+- the client the package will use is registered (keyed by `ClientKey` when set;
+  `IRuvioConnection` for Data Protection). Only the registration is checked:
+  no connection is opened, so a Ruvio that is down at startup still follows the
+  package's `Outage` settings;
+- `UseRuvioRateLimiting`, `UseRuvioIdempotency` and `UseRuvioLock` throw when
+  the matching `Add...` call is missing;
+- endpoint settings: a rate-limit policy name never added with `AddPolicy`, an
+  inline limit without a partition key, `[RuvioIdempotency]` values out of range,
+  and a `[RuvioLock]` reject status outside 4xx/5xx or a negative wait. Every bad
+  endpoint is listed in one error. `WithDistributedLock` checks its lease, wait and
+  status when the endpoint is mapped.
+
+The checks run where the generic host validates options on start (any
+`Host`/`WebApplication`); a bare `ServiceProvider` skips them, and the per-request
+checks stay in place. A package registered over an existing implementation
+(another `IDistributedCache`, lock provider or executor) keeps that one and needs
+no client.
+
 ## When Ruvio is unreachable
 
 Every integration except Data Protection lets you choose what happens when Ruvio cannot be reached, with

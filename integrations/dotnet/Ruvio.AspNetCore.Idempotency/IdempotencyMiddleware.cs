@@ -80,7 +80,7 @@ public sealed class IdempotencyMiddleware
             return;
         }
 
-        var (keyHeader, retention, pendingWait) = EndpointSettings(endpoint);
+        var (keyHeader, retention, pendingWait) = EndpointSettings(endpoint, options);
         var suppliedKey = request.Headers[keyHeader];
 
         // An endpoint that makes the key optional runs a request without one unchecked, before any body is read.
@@ -367,8 +367,27 @@ public sealed class IdempotencyMiddleware
         }
     }
 
-    // The attribute's own values win; checked per request because endpoint metadata is not seen at startup.
-    private (string KeyHeader, TimeSpan Retention, TimeSpan PendingWait) EndpointSettings(RuvioIdempotencyAttribute endpoint)
+    // Checked once before the server takes a request, with the same rules the request path applies.
+    internal static string? EndpointError(IServiceProvider provider, Endpoint endpoint)
+    {
+        if (endpoint.Metadata.GetMetadata<RuvioIdempotencyAttribute>() is not { } attribute)
+            return null;
+
+        try
+        {
+            EndpointSettings(attribute, provider.GetRequiredService<IOptions<IdempotencyOptions>>().Value);
+
+            return null;
+        }
+        catch (InvalidOperationException error)
+        {
+            return error.Message;
+        }
+    }
+
+    // The attribute's own values win. Checked again per request: endpoints added after startup are not seen there.
+    private static (string KeyHeader, TimeSpan Retention, TimeSpan PendingWait) EndpointSettings(
+        RuvioIdempotencyAttribute endpoint, IdempotencyOptions options)
     {
         string keyHeader = endpoint.KeyHeader ?? options.KeyHeader;
 
