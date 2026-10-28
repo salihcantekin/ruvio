@@ -1698,7 +1698,7 @@ pub(super) fn parse_lpush<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, Protoc
         ));
     }
 
-    Ok(Command::ListPush(args.arg(0), args.rest(1)))
+    Ok(Command::ListPush(args.arg(0), args.rest_one_or_many(1)))
 }
 
 pub(super) fn parse_rpush<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, ProtocolError> {
@@ -1708,7 +1708,7 @@ pub(super) fn parse_rpush<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, Protoc
         ));
     }
 
-    Ok(Command::ListPushBack(args.arg(0), args.rest(1)))
+    Ok(Command::ListPushBack(args.arg(0), args.rest_one_or_many(1)))
 }
 
 pub(super) fn parse_zadd<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, ProtocolError> {
@@ -1776,11 +1776,17 @@ pub(super) fn parse_zadd<'a>(args: &Args<'a, '_>) -> Result<Command<'a>, Protoco
         ));
     }
 
-    let mut pairs = Vec::with_capacity(remaining / 2);
+    let pairs = if remaining == 2 {
+        OneOrMany::One((parse_f64(args.bytes(index))?, args.arg(index + 1)))
+    } else {
+        let mut pairs = Vec::with_capacity(remaining / 2);
 
-    for position in (index..args.len()).step_by(2) {
-        pairs.push((parse_f64(args.bytes(position))?, args.arg(position + 1)));
-    }
+        for position in (index..args.len()).step_by(2) {
+            pairs.push((parse_f64(args.bytes(position))?, args.arg(position + 1)));
+        }
+
+        OneOrMany::Many(pairs)
+    };
 
     if options.increment && pairs.len() != 1 {
         return Err(ProtocolError::Invalid(

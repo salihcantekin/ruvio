@@ -170,7 +170,7 @@ fn a_sorted_set_write_serves_a_parked_bzpopmin() {
         &mut shard,
         Command::SortedSetAdd {
             key: owned(b"z"),
-            pairs: vec![(2.0, owned(b"b")), (1.0, owned(b"a"))],
+            pairs: vec![(2.0, owned(b"b")), (1.0, owned(b"a"))].into(),
             options: crate::protocol::SortedSetAddOptions::default(),
         },
         &mut sink,
@@ -237,7 +237,8 @@ fn sorted_pops_write_member_score_pairs_and_record_members_in_pop_order() {
                 (f64::INFINITY, owned(b"top")),
                 (-2.0, owned(b"neg")),
                 (3.0, owned(b"mid")),
-            ],
+            ]
+            .into(),
             options: crate::protocol::SortedSetAddOptions::default(),
         },
         &mut sink,

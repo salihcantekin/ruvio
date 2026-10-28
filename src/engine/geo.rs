@@ -20,7 +20,7 @@ pub(super) fn geo_add<'a, C: Clock, I: StorageIndex, S: MutationSink, W: ListWai
         pairs.push((score, member));
     }
 
-    sorted_set_add(shard, sink, waiters, key, pairs, options)
+    sorted_set_add(shard, sink, waiters, key, pairs.into(), options)
 }
 
 pub(super) fn geo_dist<'a, C: Clock, I: StorageIndex>(

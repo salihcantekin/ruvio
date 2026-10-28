@@ -548,7 +548,10 @@ mod tests {
         assert_eq!(
             dispatch(
                 &lock,
-                &Command::ListPush(Bytes::from(&b"lock:foo"[..]), vec![Bytes::from(&b"x"[..])])
+                &Command::ListPush(
+                    Bytes::from(&b"lock:foo"[..]),
+                    vec![Bytes::from(&b"x"[..])].into()
+                )
             ),
             HotDispatch::RejectUnsupported
         );
@@ -896,18 +899,21 @@ mod tests {
             execute(
                 &store,
                 now,
-                &Command::ListPush(Bytes::from(&b"lock:foo"[..]), vec![Bytes::from(&b"x"[..])])
+                &Command::ListPush(
+                    Bytes::from(&b"lock:foo"[..]),
+                    vec![Bytes::from(&b"x"[..])].into()
+                )
             )
             .unwrap(),
             unsupported(&Command::ListPush(
                 Bytes::from(&b"lock:foo"[..]),
-                vec![Bytes::from(&b"x"[..])]
+                vec![Bytes::from(&b"x"[..])].into()
             ))
         );
         assert_eq!(
             unsupported(&Command::ListPush(
                 Bytes::from(&b"lock:foo"[..]),
-                vec![Bytes::from(&b"x"[..])]
+                vec![Bytes::from(&b"x"[..])].into()
             )),
             Response::OwnedError(b"ERR hot key does not support lpush".to_vec())
         );

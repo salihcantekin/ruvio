@@ -188,7 +188,7 @@ pub(super) fn list_push_existing<
         return Ok(Response::Integer(0));
     }
 
-    push_list(shard, sink, waiters, key, values, back)
+    push_list(shard, sink, waiters, key, values.into(), back)
 }
 
 /// Moves one element; `None` when the source is empty. Errors surface as a response.
