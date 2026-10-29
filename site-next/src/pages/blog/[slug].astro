@@ -5,6 +5,8 @@ import Page from "../../layouts/Page.astro";
 import UseCaseScene from "../../components/animations/UseCaseScene.astro";
 import PostThumb from "../../components/blog/PostThumb.astro";
 import TagChips from "../../components/blog/TagChips.astro";
+import CodeTabs from "../../components/content/CodeTabs.astro";
+import { clients } from "../../config/site";
 import { site } from "../../config/site";
 import { posts, readingMinutes, longDate, renderBody, type Post } from "../../lib/blog";
 
@@ -64,6 +66,22 @@ const source = `${site.github}/blob/dev/site-next/src/content/blog/${post.id}.md
               <Fragment set:html={p.html} />
             ) : "scene" in p ? (
               <UseCaseScene id={p.scene} />
+            ) : "tabs" in p ? (
+              <div class="tabbed">
+                <CodeTabs id={p.tabs.id} label="Code example" tabs={p.tabs.tabs} />
+                <p class="pkgs">
+                  <span class="pk-h">Clients</span>
+                  {clients.map((c) => <a href={`/docs/clients/${c.slug}/`}>{c.language}</a>)}
+                </p>
+                {p.tabs.packages.length > 0 && (
+                  <p class="pkgs">
+                    <span class="pk-h">Packages</span>
+                    {p.tabs.packages.map((k) => (
+                      <span class="pk"><a href={k.docs}><code>{k.name}</code></a> <a class="reg" href={k.registry}>{k.registryName}</a></span>
+                    ))}
+                  </p>
+                )}
+              </div>
             ) : (
               facts.length > 0 && (
                 <dl class="facts">
@@ -141,6 +159,13 @@ const source = `${site.github}/blob/dev/site-next/src/content/blog/${post.id}.md
   }
   .post-body :global(.copy:hover) { color: var(--code-ink); border-color: rgba(255, 255, 255, 0.22); }
   .post-body :global(.table-wrap) { margin-block: 24px; }
+  .tabbed { margin-block: 24px; }
+  .pkgs { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 14px; margin: 10px 0 0; font-size: 14.5px; max-width: none; }
+  .pk-h { font-size: 12.5px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--mute); }
+  .pkgs a { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--line-soft); }
+  .pkgs a:hover { text-decoration-color: var(--ink); }
+  .pkgs code { font-family: var(--f-mono); font-size: 13.5px; }
+  .pkgs .reg { font-size: 13px; color: var(--mute); }
   .post-body :global(.table-wrap table) { font-size: 15.5px; }
   .post-body :global(.case-scene) { margin-block: 30px; }
   .post-body :global(hr) { border: 0; border-top: 1px solid var(--line); margin-block: 36px; }

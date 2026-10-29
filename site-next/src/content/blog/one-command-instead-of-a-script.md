@@ -30,6 +30,7 @@ TRANSFER {user:42}:wallet {user:42}:escrow 30
 TRANSFER {user:42}:wallet {user:42}:escrow 30
 # (nil)  -> only 20 left, nothing changed
 ```
+<!-- clients: balances -->
 
 Both balances change in one WAL record, so a crash cannot leave you with only half of the move on disk.
 
@@ -49,6 +50,7 @@ TAKE stock:ticket-42 2
 TAKE stock:ticket-42 1000
 # (nil) -> not enough, the key is unchanged
 ```
+<!-- clients: inventory -->
 
 The mirror image is a counter with a ceiling, for seats in a room or members in a team:
 
@@ -84,6 +86,7 @@ SET watermark:orders 1700000100 IFGT
 SET price:best 499 IFLT PX 3600000
 # OK    -> new lowest price, expires in an hour
 ```
+<!-- clients: watermarks -->
 
 > [!WARNING] Integers only
 > A stored value that is not a number is an error and stays as it was. I prefer that to a silent string comparison.
@@ -102,6 +105,7 @@ LIMIT api:key-7:burst 10 1000 TOKENS COST 2 WITHRETRY
 # 1) 8  -> 8 tokens left
 # 2) 0  -> no need to wait
 ```
+<!-- clients: rate-limits -->
 
 `WITHRETRY` puts the wait in the reply, so the number for a `Retry-After` header comes from the server rather than from a guess in the client.
 
@@ -133,6 +137,7 @@ SETV profile:ada "v2" 1
 SETV profile:ada "v3" 1
 # ERR version mismatch
 ```
+<!-- clients: versions -->
 
 No `WATCH`, no retry loop around `MULTI`.
 
@@ -147,4 +152,4 @@ Not every script deserves to become a command. Anything with real business rules
 
 There is also a speed side. Every one of these is measured against the script it replaces on the [benchmarks page](/benchmarks/#scripted), together with the memory each key takes. I will let the table speak there rather than paste numbers here.
 
-All six first-party clients have a typed method for each command, so in C# the first example is `await db.TransferAsync(...)` and not a string you send and parse. The [use cases page](/use-cases/) has every one of them in all six languages.
+All six first-party clients have a typed method for each command, so in C# the first example is `await db.TransferAsync(...)` and not a string you send and parse. The tabs under each example show the same steps in all six languages.
