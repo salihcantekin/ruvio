@@ -9,6 +9,11 @@ import ScaleBars from "../components/charts/ScaleBars.astro";
 import { platforms, scripted, commands, families, fmtOps, fmtX, pct, serverVersion, scale, scaleDeep, scaleEverysec } from "../data/bench";
 import { clients, site } from "../config/site";
 import CodeBlock from "../components/content/CodeBlock.astro";
+import Failover from "../components/animations/Failover.astro";
+import SlotMigration from "../components/animations/SlotMigration.astro";
+import RateLimit from "../components/animations/RateLimit.astro";
+import Lease from "../components/animations/Lease.astro";
+import Cache from "../components/animations/Cache.astro";
 
 const jobs = [
   { title: "Caches without stampedes", cmds: ["FILLGET", "FILLSET"], text: "When a hot key expires, one caller refills it while the others wait or get the stale copy.", href: "/use-cases/#cache" },
@@ -93,6 +98,26 @@ $ redis-cli -a change-me
             <p>{j.text}</p>
           </a>
         ))}
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="in-motion">
+    <div class="wrap">
+      <div class="head-row">
+        <div>
+          <p class="kicker">In motion</p>
+          <h2 class="title">A node drops off and the cluster keeps going</h2>
+          <p class="lede">The coordinator promotes a replica by majority vote and clients follow the new primary on their own. The same loop of small scenes covers slot moves and the coordination commands.</p>
+        </div>
+        <a class="btn ghost" href="/docs/cluster/">Cluster and failover</a>
+      </div>
+      <div class="motion-main"><Failover /></div>
+      <div class="grid grid-2 motion-grid">
+        <SlotMigration />
+        <Lease />
+        <Cache />
+        <RateLimit />
       </div>
     </div>
   </section>
@@ -289,6 +314,8 @@ $ redis-cli -a change-me
 </script>
 
 <style>
+  .motion-main { max-width: 760px; margin: 36px auto 18px; }
+  .motion-grid { max-width: 1000px; margin-inline: auto; }
   .scroll-x { overflow-x: auto; }
   .res { width: 100%; border-collapse: collapse; font-size: 15px; }
   .res th { text-align: left; font-family: var(--f-mono); font-size: 12.5px; font-weight: 500; color: var(--faint); padding: 10px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
