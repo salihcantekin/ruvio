@@ -43,6 +43,10 @@
   <a href="#license">License</a>
 </p>
 
+<p align="center">
+  <img src="docs/images/ruvio-demo.gif" width="100%" alt="Terminal demo: redis-cli against Ruvio running LEASE, LIMIT, INCRBY with MAX and ZMOVEDUE, each in one command">
+</p>
+
 ---
 
 ## Why Ruvio
