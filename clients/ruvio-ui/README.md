@@ -116,7 +116,11 @@ keyboard-accessible controls. Every color and font lives in
   arrow keys, to read every series at one moment. The charts send nothing extra
   to the server: one `INFO` per node per refresh, only while Overview, Cluster or
   Dashboard is open, and the readings stay in the tab for up to 30 minutes.
-- **Cluster** shows the topology and changes nothing. Shards are grouped by each
+- **Cluster** shows the topology and changes nothing. It is in the menu only when
+  there is a cluster: more than one server process, a replica, a `cluster-group`, or
+  coordinators configured; one process with several shards shows them on Overview.
+  Without a cluster, the replica column and the replication chart are hidden too.
+  Shards are grouped by each
   node's `cluster-group` (or by server process), with their slot ranges, the
   primary, each replica with its link state and how many records it is behind,
   and the cluster map version every node serves. After a failover or a slot

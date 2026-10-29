@@ -120,6 +120,19 @@ export function groupsOf(shards, readings) {
   }));
 }
 
+// A cluster is more than one server process, a replica, or coordinators in front. One process
+// with several shards is not: its shards and slots already show on Overview.
+export function isCluster(shards, readings, coordinatorsConfigured) {
+  if (coordinatorsConfigured) return true;
+  if (shards.some((shard) => shard.replicas?.length)) return true;
+  const processes = new Set();
+  for (const reading of readings) {
+    if (reading.group) return true;
+    if (reading.info?.run_id) processes.add(reading.info.run_id);
+  }
+  return processes.size > 1;
+}
+
 export function slotsCovered(shards) {
   return shards.reduce((total, shard) => total + (shard.slots ?? 0), 0);
 }

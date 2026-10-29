@@ -16,7 +16,7 @@
   import Overview from "./Overview.svelte";
   import Cluster from "./Cluster.svelte";
   import Dashboard from "./Dashboard.svelte";
-  import { probeTargets, readingsFrom, snapshot, keepRecent, coordinatorModel, failoverEvents, nodeKey, rangeText } from "./monitor.js";
+  import { probeTargets, readingsFrom, snapshot, keepRecent, coordinatorModel, failoverEvents, nodeKey, rangeText, isCluster } from "./monitor.js";
   import Tasks from "./Tasks.svelte";
   import Browser from "./Browser.svelte";
   import PubSub from "./PubSub.svelte";
@@ -80,6 +80,9 @@
   let interval = $state([2, 5, 10, 30, 60].includes(savedInterval) ? savedInterval : 5);
   let refreshNow = $state(() => {});
   let live = $derived(connected && ["overview", "cluster", "dashboard"].includes(section));
+  // The Cluster screen is offered only when there is a cluster to show.
+  let clustered = $derived(isCluster(shards, readings, coordinatorsConfigured));
+  let menu = $derived(navigation.filter((item) => item.id !== "cluster" || clustered || section === "cluster"));
 
   $effect(() => {
     savePreference("overview.paused", paused);
@@ -350,7 +353,7 @@
           </button>
         {/snippet}
         <nav aria-label="Main navigation">
-          {#each navigation as item}{@render navButton(item)}{/each}
+          {#each menu as item}{@render navButton(item)}{/each}
         </nav>
         <nav class="nav-dock" aria-label="Tools">{#each dock as item}{@render navButton(item)}{/each}</nav>
         <div class="sidebar-foot"><span class="status-dot"></span><span class="sidebar-foot-label"> HTTP to RESP</span><p>Connected as {username || "default"}</p></div>
@@ -359,9 +362,9 @@
         {#if sessionError}<div class="error-box" role="alert">{sessionError}</div>{/if}
         <div class="screen">
           {#if section === "overview"}
-            <Overview {shards} selected={selectedNodes} {readings} {openTask} {lines} onData={() => navigate("data")} onCluster={() => navigate("cluster")} onDashboard={() => navigate("dashboard")} bind:interval bind:paused {refreshing} {updated} {probeError} refresh={refreshNow} />
+            <Overview {shards} selected={selectedNodes} {readings} {openTask} {lines} onData={() => navigate("data")} onCluster={clustered ? () => navigate("cluster") : null} onDashboard={() => navigate("dashboard")} bind:interval bind:paused {refreshing} {updated} {probeError} refresh={refreshNow} />
           {:else if section === "dashboard"}
-            <Dashboard {readings} {history} selected={selectedNodes} bind:interval bind:paused {refreshing} {updated} {probeError} refresh={refreshNow} ready={shards.length > 0} />
+            <Dashboard {readings} {history} {clustered} selected={selectedNodes} bind:interval bind:paused {refreshing} {updated} {probeError} refresh={refreshNow} ready={shards.length > 0} />
           {:else if section === "cluster"}
             <Cluster {shards} {readings} {coordinator} {coordinatorsConfigured} {failovers} {topologyNotice} bind:interval bind:paused {refreshing} {updated} {probeError} refresh={refreshNow} reload={loadShards} />
           {:else if section === "data"}

@@ -11,6 +11,8 @@ Notable changes to `ruvio-ui`, the web console (Docker image and host binaries).
 - Fixed: a shard that owns several slot ranges (after `COORDINATOR MOVE`, `COORDINATOR REBALANCE` or `RUVIO MOVESLOTS`) was listed once per range, so Overview counted its keys and memory more than once and a scan of the selected shards read it twice. Shards now come from `CLUSTER SHARDS`, numbered by their first slot, and keys and memory are summed over primaries only.
 - Fixed: one slow or unreachable node no longer holds up every other request. Each connection has its own lock, node readings are taken in parallel with a 1 s connect and 2 s read limit, and a node whose connect failed is not dialled again for 3 s.
 - After a failover or slot move raises the cluster map version, the UI reads the topology again by itself.
+- The Cluster menu entry, the Overview replica column and the replication chart show only when there is a cluster: more than one server process, a replica, a `cluster-group`, or coordinators configured.
+- Website Get started page: the Operator UI section shows the Dashboard and Cluster screens, with new screenshots from a two-group cluster with coordinators.
 
 ## 0.2.0 - 2026-10-29
 

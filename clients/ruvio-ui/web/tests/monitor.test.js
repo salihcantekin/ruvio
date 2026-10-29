@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   probeTargets, readingsFrom, primaries, sum, replicationRows, groupsOf, notices, coordinatorModel,
-  failoverEvents, snapshot, keepRecent, chartData, formatValue, CHARTS, DEFAULT_CHARTS, rangeText, slotsCovered,
+  failoverEvents, snapshot, keepRecent, chartData, formatValue, CHARTS, DEFAULT_CHARTS, rangeText, slotsCovered, isCluster,
 } from "../src/monitor.js";
 
 const bulk = (text) => ({ kind: "bulk", text });
@@ -140,4 +140,18 @@ test("ranges read as a short line", () => {
   assert.equal(rangeText(shards[0]), "0–99, 200–8191");
   assert.equal(rangeText({ ranges: [[1, 1], [3, 4], [6, 9]] }), "1, 3–4 +1 more");
   assert.equal(rangeText({ ranges: [] }), "No slots");
+});
+
+test("one process with several shards is not a cluster; replicas, groups, processes or coordinators are", () => {
+  const alone = shards.map((shard) => ({ ...shard, replicas: [] }));
+  const targets = probeTargets(alone);
+  const sameProcess = readingsFrom(targets, [{ reachable: true, info: info({ run_id: "r1" }) }, { reachable: true, info: info({ run_id: "r1" }) }]);
+  assert.equal(isCluster(alone, sameProcess, false), false);
+  assert.equal(isCluster(alone, [], false), false);
+  assert.equal(isCluster(alone, sameProcess, true), true);
+  assert.equal(isCluster(shards, sameProcess, false), true);
+  const twoProcesses = readingsFrom(targets, [{ reachable: true, info: info({ run_id: "r1" }) }, { reachable: true, info: info({ run_id: "r2" }) }]);
+  assert.equal(isCluster(alone, twoProcesses, false), true);
+  sameProcess[0].group = "east";
+  assert.equal(isCluster(alone, sameProcess, false), true);
 });

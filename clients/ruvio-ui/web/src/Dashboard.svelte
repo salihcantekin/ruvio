@@ -5,18 +5,20 @@
   import { preference, savePreference } from "./preferences.js";
   import LiveControls from "./LiveControls.svelte";
   import TimeChart from "./TimeChart.svelte";
-  let { readings, history, selected, interval = $bindable(), paused = $bindable(), refreshing, updated, probeError, refresh, ready } = $props();
+  let { readings, history, clustered = true, selected, interval = $bindable(), paused = $bindable(), refreshing, updated, probeError, refresh, ready } = $props();
   const known = new Set(CHARTS.map((chart) => chart.id));
+  // Replication charts are offered only when there is a cluster; the choice is kept for later.
+  let offered = $derived(CHARTS.filter((chart) => clustered || chart.group !== "Replication"));
   const saved = preference("dashboard.charts", DEFAULT_CHARTS);
   let chosen = $state(Array.isArray(saved) ? saved.filter((id) => known.has(id)) : DEFAULT_CHARTS);
   const windows = [{ minutes: 5, label: "5 min" }, { minutes: 15, label: "15 min" }, { minutes: 30, label: "30 min" }];
   const savedWindow = Number(preference("dashboard.window", 15));
   let minutes = $state(windows.some((item) => item.minutes === savedWindow) ? savedWindow : 15);
   let view = $state(preference("dashboard.view", "total") === "nodes" ? "nodes" : "total");
-  let groups = [...new Set(CHARTS.map((chart) => chart.group))];
+  let groups = $derived([...new Set(offered.map((chart) => chart.group))]);
   let selectedIds = $derived(new Set(selected.map((item) => item.id)));
   let keys = $derived(selected.length ? readings.filter((item) => selectedIds.has(item.node.shard)).map((item) => nodeKey(item.node)) : []);
-  let shown = $derived(CHARTS.filter((chart) => chosen.includes(chart.id)));
+  let shown = $derived(offered.filter((chart) => chosen.includes(chart.id)));
   let span = $derived(history.length > 1 ? (history[history.length - 1].at - history[0].at) / 60000 : 0);
 
   $effect(() => {
@@ -38,11 +40,11 @@
 
 <div class="dashboard-bar">
   <details class="scope-dropdown chart-picker">
-    <summary>Charts <span class="count">{chosen.length} / {CHARTS.length}</span></summary>
+    <summary>Charts <span class="count">{shown.length} / {offered.length}</span></summary>
     <div class="scope-menu" role="group" aria-label="Charts to show">
       {#each groups as group}
         <p class="eyebrow">{group.toUpperCase()}</p>
-        {#each CHARTS.filter((chart) => chart.group === group) as chart}
+        {#each offered.filter((chart) => chart.group === group) as chart}
           <label><input type="checkbox" checked={chosen.includes(chart.id)} onchange={(event) => toggle(chart.id, event.currentTarget.checked)} /><span>{chart.title}</span></label>
         {/each}
       {/each}

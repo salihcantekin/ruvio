@@ -54,17 +54,17 @@
 <button class="panel dashboard-link" onclick={onDashboard}><span class="quick-icon"><Icon name="chart" /></span><span><strong>Dashboard</strong><span class="hint">Time charts of throughput, memory breakdown, network bytes, persistence and replication. Pick the charts you want.</span></span><span aria-hidden="true">&rarr;</span></button>
 
 <section class="panel">
-  <div class="section-heading"><div><h2>Slots and data</h2><p class="hint">Who owns each hash slot, and how keys and memory are spread</p></div><button class="text-button" onclick={onCluster}>Cluster view &rarr;</button></div>
+  <div class="section-heading"><div><h2>Slots and data</h2><p class="hint">Who owns each hash slot, and how keys and memory are spread</p></div>{#if onCluster}<button class="text-button" onclick={onCluster}>Cluster view &rarr;</button>{/if}</div>
   <SlotMap {shards} {groups} />
-  <div class="distribution" role="table" aria-label="Keys and memory by shard">
-    <div class="distribution-row head" role="row"><span role="columnheader">Shard</span><span role="columnheader">Slots</span><span role="columnheader">Keys</span><span role="columnheader">Memory</span><span role="columnheader">Replicas</span></div>
+  <div class="distribution" class:single={!onCluster} role="table" aria-label="Keys and memory by shard">
+    <div class="distribution-row head" role="row"><span role="columnheader">Shard</span><span role="columnheader">Slots</span><span role="columnheader">Keys</span><span role="columnheader">Memory</span>{#if onCluster}<span role="columnheader">Replicas</span>{/if}</div>
     {#each distribution as row}
       <div class="distribution-row" role="row">
         <span role="cell" data-label="Shard"><strong>Shard {row.shard.id}</strong><small class="mono">{nodeId(row.shard)}</small></span>
         <span role="cell" data-label="Slots">{(row.shard.slots ?? 0).toLocaleString()}<small>{rangeText(row.shard)}</small></span>
         <span role="cell" data-label="Keys" class="bar-cell"><span class="bar" style="width: {share(row.keys, maxKeys)}"></span>{number(row.keys)}</span>
         <span role="cell" data-label="Memory" class="bar-cell"><span class="bar" style="width: {share(row.memory, maxMemory)}"></span>{bytes(row.memory)}</span>
-        <span role="cell" data-label="Replicas">{row.replicas.length ? `${row.replicas.filter((item) => item.reading?.reachable).length} / ${row.replicas.length}` : "None"}{#if row.replicas.some((item) => item.behind)}<small class="warning">{Math.max(...row.replicas.map((item) => item.behind ?? 0)).toLocaleString()} behind</small>{/if}</span>
+        {#if onCluster}<span role="cell" data-label="Replicas">{row.replicas.length ? `${row.replicas.filter((item) => item.reading?.reachable).length} / ${row.replicas.length}` : "None"}{#if row.replicas.some((item) => item.behind)}<small class="warning">{Math.max(...row.replicas.map((item) => item.behind ?? 0)).toLocaleString()} behind</small>{/if}</span>{/if}
       </div>
     {/each}
   </div>

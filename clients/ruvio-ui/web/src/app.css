@@ -503,6 +503,7 @@ span.jtoggle { display: inline-block; }
 .group-panel h2 .swatch { margin-right: .55rem; }
 .distribution { display: grid; font-size: .85rem; }
 .distribution-row { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 1.3fr) minmax(0, 1.3fr) minmax(0, .8fr); gap: .9rem; align-items: center; padding: .65rem 0; border-bottom: 1px solid var(--line); }
+.distribution.single .distribution-row { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 1.3fr) minmax(0, 1.3fr); }
 .distribution-row.coord { grid-template-columns: minmax(0, .7fr) minmax(0, 1.3fr) minmax(0, .5fr) minmax(0, .9fr) minmax(0, 1.6fr); }
 .distribution-row.head { color: var(--muted); font-size: .75rem; padding-top: 0; }
 .distribution-row > span { display: grid; gap: .15rem; min-width: 0; overflow-wrap: anywhere; }
