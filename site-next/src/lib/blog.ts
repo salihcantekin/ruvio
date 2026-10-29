@@ -5,6 +5,9 @@ import { getCollection, type CollectionEntry } from "astro:content";
 import { createMarkdownProcessor } from "@astrojs/markdown-remark";
 import { highlight, languages, type Lang } from "./highlight";
 import { ICONS } from "../config/docs-icons.mjs";
+import { clients } from "../config/site";
+import { clientExamples } from "../data/client-examples";
+import { integrationsFor } from "../data/integrations";
 
 export type IconName = keyof typeof ICONS;
 export const iconNames = Object.keys(ICONS) as [IconName, ...IconName[]];
@@ -64,8 +67,36 @@ const cards = (html: string) =>
     return `<ul class="bcards" role="list">${lis.join("")}</ul>`;
   });
 
+/** A tab of a code example: the post's own block first, then the clients, then a framework package. */
+export type Tab = { key: string; label: string; lang: Lang; code: string };
+/** A framework package that does the job of a use case, for the links under its code tabs. */
+export type PackageLink = { name: string; docs: string; registry: string; registryName: string };
+export type Tabs = { id: string; tabs: Tab[]; packages: PackageLink[] };
+
 /** One piece of a post body: HTML, or a placeholder the page fills with a component. */
-export type Piece = { html: string } | { scene: string } | { facts: true };
+export type Piece = { html: string } | { scene: string } | { facts: true } | { tabs: Tabs };
+
+/**
+ * `<!-- clients: id -->` right after a code block turns that block into the first tab and adds the
+ * same steps in every client from src/data/client-examples.ts (keyed by the use-case id), then the
+ * framework packages that serve that use case (src/data/integrations.ts).
+ */
+function tabsFor(id: string, lang: Lang, code: string, n: number): Tabs {
+  const examples = clientExamples[id];
+  if (!examples) throw new Error(`<!-- clients: ${id} -->: src/data/client-examples.ts has no "${id}"`);
+  const integrations = integrationsFor(id);
+  return {
+    id: `${id}-${n}`,
+    tabs: [
+      { key: "cli", label: languages[lang], lang, code },
+      ...clients.flatMap((c) => (examples[c.slug] ? [{ key: c.slug, label: c.language, lang: c.lang as Lang, code: examples[c.slug] }] : [])),
+      ...integrations.map((i) => ({ key: `pkg-${i.ecosystem.id}`, label: `${i.ecosystem.label} package`, ...i.example })),
+    ],
+    packages: integrations.flatMap((i) =>
+      i.packages.map((p) => ({ name: p.package, docs: p.docs, registry: i.ecosystem.packageUrl(p.package), registryName: i.ecosystem.registry })),
+    ),
+  };
+}
 
 let processor: ReturnType<typeof createMarkdownProcessor> | undefined;
 
@@ -104,13 +135,22 @@ async function frameCode(html: string): Promise<string> {
 export async function renderBody(body: string): Promise<{ pieces: Piece[]; headings: { slug: string; text: string }[] }> {
   processor ??= createMarkdownProcessor({ syntaxHighlight: false });
   const { code, metadata } = await (await processor).render(body);
-  const html = cards(notes(await frameCode(code)));
+  const tabs: Tabs[] = [];
+  const withTabs = code.replace(
+    /<pre><code class="language-([\w-]+)">([\s\S]*?)<\/code><\/pre>\s*<!--\s*clients:\s*([a-z-]+)\s*-->/g,
+    (_, lang: string, block: string, id: string) => {
+      if (!(lang in languages)) throw new Error(`Blog code block uses unknown language "${lang}"`);
+      tabs.push(tabsFor(id, lang as Lang, unescape(block).replace(/\n$/, ""), tabs.length));
+      return `<!-- tabs: ${tabs.length - 1} -->`;
+    },
+  );
+  const html = cards(notes(await frameCode(withTabs)));
   const pieces: Piece[] = [];
-  const marker = /<!--\s*(scene:\s*([a-z-]+)|facts)\s*-->/g;
+  const marker = /<!--\s*(scene:\s*([a-z-]+)|facts|tabs:\s*(\d+))\s*-->/g;
   let last = 0;
   for (const m of html.matchAll(marker)) {
     pieces.push({ html: html.slice(last, m.index) });
-    pieces.push(m[2] ? { scene: m[2] } : { facts: true });
+    pieces.push(m[2] ? { scene: m[2] } : m[3] !== undefined ? { tabs: tabs[Number(m[3])] } : { facts: true });
     last = m.index! + m[0].length;
   }
   pieces.push({ html: html.slice(last) });

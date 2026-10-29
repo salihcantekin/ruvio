@@ -32,6 +32,7 @@ FILLSET product:42 "{...}" 60000 1 SWR 30000
 FILLGET product:42 5000
 # 1) HIT   2) "{...}"
 ```
+<!-- clients: cache -->
 
 The `5000` is how long a filler may take. If it crashes halfway, its claim lapses after five seconds and the next caller becomes the filler. The token makes sure that only the caller who was asked to fill can write the value; a late `FILLSET` with an old token answers `0` and changes nothing.
 
@@ -62,16 +63,7 @@ FILLGET product:42 5000 WAIT 200
 
 ## From application code
 
-The clients wrap the whole dance in one call. In C#, `GetOrCreateAsync` runs your factory in exactly one caller and polls with short `FILLGET` calls in the others:
-
-```csharp
-await using var connection = await RuvioConnection.ConnectAsync("127.0.0.1", 6379);
-var db = await connection.GetDefaultDatabaseAsync();
-
-// One caller builds the value; the others poll with short FILLGET calls, so the connection is never held.
-string html = await db.GetOrCreateAsync("product:42", TimeSpan.FromSeconds(60),
-    async ct => await LoadProductHtmlAsync(42, ct));
-```
+The clients wrap the whole dance in one call: the tabs under the first example show it in every language. In C#, `GetOrCreateAsync` runs your factory in exactly one caller and polls with short `FILLGET` calls in the others, so a shared connection is never held.
 
 If you are in ASP.NET Core, the `Ruvio.Extensions.Caching` package gives you an `IDistributedCache` with the same `GetOrCreate` across every instance of your app, plus the stale period and tags you can remove in one call. The details are on the [integrations page](/integrations/).
 

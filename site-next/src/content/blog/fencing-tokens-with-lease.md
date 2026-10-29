@@ -30,6 +30,7 @@ RENEW job:nightly-report 114770882368960 30000
 RELEASE job:nightly-report 114770882368960
 # 1               -> released
 ```
+<!-- clients: locks -->
 
 `LEASE` gives you the lock and a token, or a null when someone else has it. `RENEW` moves the deadline for a long job, but only for the token that holds the lock right now. `RELEASE` frees it, again only for the right token. A stale worker calling `RENEW` or `RELEASE` gets `0` back and changes nothing, so it cannot free a lock that by now belongs to someone else.
 
@@ -51,26 +52,6 @@ Now follow the animation at the top again. Worker 1 gets token 41 and stalls. Th
 
 The same trick works with anything that can compare a number: a column in Postgres, an `IFGT` write in Ruvio itself, a version header on an object store, a check in your own service. The important part is that the comparison happens where the data lives, not in the worker that might be asleep.
 
-## In application code
-
-Every client has typed methods for the three commands. In C#:
-
-```csharp
-await using var connection = await RuvioConnection.ConnectAsync("127.0.0.1", 6379);
-var db = await connection.GetDefaultDatabaseAsync();
-
-long? token = await db.LeaseAsync("job:nightly-report", 30_000);
-// token -> you hold it
-// null -> someone else holds it
-if (token is long held)
-{
-    long released = await db.ReleaseAsync("job:nightly-report", held);
-    // 1 -> released (0 if the token no longer matches)
-}
-```
-
-Rust, Go, Java, Python and Node.js look the same; the [use cases page](/use-cases/#locks) has all six.
-
 ## When you need N holders, not one
 
 Sometimes the rule is "at most eight exports at a time" rather than "one". `SEMAPHORE` gives each holder its own slot, its own TTL and its own token:
@@ -81,6 +62,7 @@ SEMAPHORE upstream:billing 8 15000
 # (nil)           -> all 8 slots are taken
 RELEASE upstream:billing 114770882371136
 ```
+<!-- clients: workers -->
 
 A crashed worker frees its slot when its own TTL ends. The others are not affected, and the key goes away when the last holder leaves.
 

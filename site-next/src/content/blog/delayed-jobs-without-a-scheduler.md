@@ -30,22 +30,11 @@ XREADGROUP GROUP workers w1 COUNT 10 BLOCK 5000 STREAMS jobs >
 # (nil) until the 30 s have passed
 XACK jobs workers 1793295045919-0
 ```
+<!-- clients: delayed -->
 
 The entry is written right away, so it is in the log and survives a restart. `XREADGROUP` simply skips it until the delay has passed; after that it is delivered like any other entry. Pending lists, `XCLAIM` and `XAUTOCLAIM` work as usual, so your retry and dead-letter logic does not change. A plain `XREAD` still sees the entry, which is handy when you want to look at what is scheduled.
 
-The worker side has nothing special in it. In Python:
-
-```python
-import ruvio
-
-r = ruvio.Ruvio("127.0.0.1", 6379)
-r.xgroup_create("jobs", "workers", "$", mkstream=True)
-r.xadd("jobs", {"kind": "send-reminder", "user": 42}, delay_ms=30_000)
-read = r.xreadgroup("workers", "w1", {"jobs": ">"}, count=10, block=5000)
-for _stream, entries in read or []:
-    for entry in entries:  # the entry appears here after 30 s
-        r.xack("jobs", "workers", entry.id)
-```
+The worker side has nothing special in it: pick your language in the tabs above.
 
 > [!NOTE] Free when unused
 > The hold is a WAL record, and it is only written when a delay is set. Streams that never use `DELAY` pay nothing for it.
