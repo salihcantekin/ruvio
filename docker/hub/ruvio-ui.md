@@ -1,6 +1,6 @@
 # Ruvio UI
 
-A browser console for a running Ruvio server or cluster: a live dashboard, a read-only cluster view (groups, shards, slots, replicas, coordinators), keys, commands, ACL users and Pub/Sub.
+A browser console for a running Ruvio server or cluster: a dashboard of time charts you choose (memory breakdown, network bytes, command rates and more), a read-only cluster view (groups, shards, slots, replicas, coordinators), keys, commands, ACL users and Pub/Sub.
 
 - Source: https://github.com/salihcantekin/ruvio (`clients/ruvio-ui`)
 - Documentation: https://ruviodb.com/get-started/#ui

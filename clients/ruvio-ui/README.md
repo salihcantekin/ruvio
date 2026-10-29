@@ -76,7 +76,10 @@ keyboard-accessible controls. Every color and font lives in
 `web/src/tokens.css`; change the look there.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/salihcantekin/ruvio/main/docs/images/ui-overview.png" width="90%" alt="Overview: shards and replicas responding, keys, memory, trend lines for commands per second, memory and clients, and the slot map">
+  <img src="https://raw.githubusercontent.com/salihcantekin/ruvio/main/docs/images/ui-overview.png" width="90%" alt="Overview: shards and replicas responding, keys, memory, commands and the slot map">
+</p>
+<p align="center">
+  <img src="https://raw.githubusercontent.com/salihcantekin/ruvio/main/docs/images/ui-dashboard.png" width="90%" alt="Dashboard: time charts of commands per second, command mix, network bytes, clients and memory, with a chart picker">
 </p>
 <p align="center">
   <img src="https://raw.githubusercontent.com/salihcantekin/ruvio/main/docs/images/ui-cluster.png" width="90%" alt="Cluster: groups, shards, the hash slot map and the coordinators with their leader">
@@ -91,9 +94,7 @@ keyboard-accessible controls. Every color and font lives in
   five seconds by default. Choose 2, 5, 10, 30, or 60 seconds, pause, or refresh
   manually. The interval and pause setting survive navigation and reloads. Keys
   and charged store memory are summed over primaries, since replicas hold copies.
-  Commands per second, charged memory and connected clients are drawn as trend
-  lines for as long as the tab stays open; point at a line to read a value. A
-  slot map and a per-shard table show how slots, keys and memory are spread and
+  A slot map and a per-shard table show how slots, keys and memory are spread and
   how far replicas are behind. **Needs attention** lists a node that does not
   answer, a persistence error, a primary a newer one replaced, a replica whose
   link is down or that takes a full copy, nodes on different cluster map
@@ -103,6 +104,18 @@ keyboard-accessible controls. Every color and font lives in
   response. Memory breakdowns distinguish live data, index capacity, and reusable
   buffers from process RSS. Deleting the last key releases empty index capacity;
   retained reusable buffers can still account for a nonzero memory charge.
+- **Dashboard** (below Console) draws time charts of the `INFO` fields the
+  refresh already reads: commands per second and the command mix, network bytes
+  per second, connections and clients, charged memory and its breakdown (keys,
+  values, collections, index, reusable and persistence buffers, memory waiting
+  to be freed), keys and expiry, WAL records and bytes not yet on disk, the
+  largest buffers and the replication send lag. **Charts** picks which ones to
+  show; the window is 5, 15 or 30 minutes; **Total** adds the nodes up and **Per
+  node** draws one line per node (seven at most, the rest as "Other"). The
+  choices are kept in the browser. Point at a chart, or focus it and use the
+  arrow keys, to read every series at one moment. The charts send nothing extra
+  to the server: one `INFO` per node per refresh, only while Overview, Cluster or
+  Dashboard is open, and the readings stay in the tab for up to 30 minutes.
 - **Cluster** shows the topology and changes nothing. Shards are grouped by each
   node's `cluster-group` (or by server process), with their slot ranges, the
   primary, each replica with its link state and how many records it is behind,

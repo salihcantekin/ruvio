@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   probeTargets, readingsFrom, primaries, sum, replicationRows, groupsOf, notices, coordinatorModel,
-  failoverEvents, snapshot, trendSeries, pushHistory, rangeText, slotsCovered,
+  failoverEvents, snapshot, keepRecent, chartData, formatValue, CHARTS, DEFAULT_CHARTS, rangeText, slotsCovered,
 } from "../src/monitor.js";
 
 const bulk = (text) => ({ kind: "bulk", text });
@@ -68,16 +68,48 @@ test("notices name unreachable nodes, fenced primaries, broken links and map ver
   assert.ok(notices(shards.slice(0, 1), []).some((item) => item.text.includes("8,092 of 16,384")));
 });
 
-test("commands per second come from counter deltas and skip a restarted node", () => {
-  const targets = probeTargets(shards.slice(1));
-  const at = (time, commands) => snapshot(readingsFrom(targets, [{ reachable: true, info: info({ total_commands_processed: commands, charged_memory_bytes: 8, connected_clients: 2 }) }], time), time);
+const chart = (id) => CHARTS.find((item) => item.id === id);
+
+test("rates come from counter deltas, gauges add up, and a restarted node is left out", () => {
+  const targets = probeTargets(shards);
+  const point = (at, a, replica, b) => snapshot(readingsFrom(targets, [
+    { reachable: true, info: info({ run_id: "p1", total_commands_processed: a, charged_memory_bytes: 100, total_connections_received: a }) },
+    { reachable: true, info: info({ run_id: "p2", total_commands_processed: replica, charged_memory_bytes: 100 }) },
+    { reachable: true, info: info({ run_id: "p1", total_commands_processed: b, charged_memory_bytes: 50, total_connections_received: a }) },
+  ], at), at);
+  const history = [point(0, 100, 10, 0), point(2000, 300, 30, 40), point(4000, 500, 50, 10)];
+  const commands = chartData(chart("commands"), history).series[0].points.map((item) => item.value);
+  assert.deepEqual(commands, [100 + 10 + 20, 100 + 10]);
+  // Memory is a gauge over primaries only: the replica's copy is not counted.
+  assert.deepEqual(chartData(chart("memory"), history).series[0].points.map((item) => item.value), [150, 150, 150]);
+  // A process-wide counter is taken once per process, not once per shard.
+  assert.deepEqual(chartData(chart("connections"), history).series[0].points.map((item) => item.value), [100, 100]);
+  // Narrowed to one shard's nodes.
+  assert.deepEqual(chartData(chart("commands"), history, { keys: ["a:7001"] }).series[0].points.map((item) => item.value), [20, null]);
+  const perNode = chartData(chart("commands"), history, { view: "nodes" });
+  assert.deepEqual(perNode.series.map((series) => series.label), ["Shard 0 \u00b7 a:7000", "Replica of 0 \u00b7 a2:7000", "Shard 1 \u00b7 a:7001"]);
+  assert.equal(chartData(chart("memory-breakdown"), history).stacked, true);
+  assert.deepEqual(chartData(chart("memory"), history, { windowMs: 2000 }).series[0].points.map((item) => item.at), [2000, 4000]);
+});
+
+test("per-node lines stop at seven plus Other, so colors never repeat", () => {
+  const many = Array.from({ length: 10 }, (_, index) => ({ id: index, host: "h", port: 7000 + index, ranges: [], slots: 0, replicas: [] }));
+  const targets = probeTargets(many);
+  const history = [snapshot(readingsFrom(targets, targets.map((_, index) => ({ reachable: true, info: info({ connected_clients: index }) })), 0), 0)];
+  const series = chartData(chart("clients"), history, { view: "nodes" }).series;
+  assert.equal(series.length, 8);
+  assert.equal(series[7].label, "Other 3 nodes");
+  assert.equal(series[7].points[0].value, 0 + 1 + 2);
+});
+
+test("history keeps the last 30 minutes and the default charts exist", () => {
   let history = [];
-  for (const point of [at(0, 100), at(2000, 300), at(4000, 50)]) history = pushHistory(history, point, 2);
-  assert.equal(history.length, 2);
-  const series = trendSeries([at(0, 100), at(2000, 300), at(4000, 50)]);
-  assert.deepEqual(series.ops.map((point) => point.value), [100, null]);
-  assert.deepEqual(series.memory.map((point) => point.value), [8, 8, 8]);
-  assert.deepEqual(trendSeries([at(0, 1), at(1000, 2)], ["other:1"]).clients.map((point) => point.value), [null, null]);
+  for (const at of [0, 60_000, 31 * 60_000]) history = keepRecent(history, { at, nodes: {} });
+  assert.deepEqual(history.map((item) => item.at), [60_000, 31 * 60_000]);
+  assert.ok(DEFAULT_CHARTS.length >= 5 && DEFAULT_CHARTS.every((id) => chart(id)));
+  assert.equal(formatValue("bytes", 1536, true), "1.5 KiB/s");
+  assert.equal(formatValue("count", 12500), "12.5k");
+  assert.equal(formatValue("count", null), "Not reported");
 });
 
 test("coordinator reports become groups, a leader and seen failovers", () => {

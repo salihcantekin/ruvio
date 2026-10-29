@@ -1,14 +1,13 @@
 <script>
   import { nodeId, metric, number, bytes } from "./operator.js";
-  import { primaries, replicas, sum, notices, groupsOf, replicationRows, trendSeries, rate, rangeText, nodeKey } from "./monitor.js";
+  import { primaries, replicas, sum, notices, groupsOf, replicationRows, rangeText } from "./monitor.js";
   import { taskFamilies } from "./catalog.js";
   import Icon from "./Icon.svelte";
   import LiveControls from "./LiveControls.svelte";
-  import Sparkline from "./Sparkline.svelte";
   import SlotMap from "./SlotMap.svelte";
   import { preference, savePreference } from "./preferences.js";
   const taskIcons = { locking: "lock", conditional: "layers", limiting: "clock", idempotency: "key", inventory: "cart", sessions: "users", jobs: "tasks", changes: "list", json: "doc", strings: "doc", keys: "key", lists: "list" };
-  let { shards, selected, readings, history, openTask, onData, onCluster, lines, interval = $bindable(), paused = $bindable(), refreshing, updated, probeError, refresh } = $props();
+  let { shards, selected, readings, openTask, onData, onCluster, onDashboard, lines, interval = $bindable(), paused = $bindable(), refreshing, updated, probeError, refresh } = $props();
   let shardsOpen = $state(preference("overview.shardsOpen", false) === true);
   let selectedIds = $derived(new Set(selected.map((item) => item.id)));
   let visible = $derived(selected.length ? readings.filter((item) => selectedIds.has(item.node.shard)) : readings);
@@ -17,7 +16,6 @@
   let copies = $derived(replicas(visible));
   let up = $derived(owners.filter((item) => item.reachable).length);
   let commands = $derived(sum(visible, "total_commands_processed"));
-  let trends = $derived(trendSeries(history, selected.length ? visible.map((item) => nodeKey(item.node)) : []));
   let alerts = $derived(notices(visibleShards, visible));
   let groups = $derived(groupsOf(shards, readings));
   let rows = $derived(replicationRows(visibleShards, readings));
@@ -53,12 +51,7 @@
   </section>
 {/if}
 
-<section class="trends" aria-label="Trends">
-  <Sparkline label="Commands per second" points={trends.ops} format={rate} hint="Includes this panel's own reads" />
-  <Sparkline label="Charged memory" points={trends.memory} format={bytes} hint="Primaries" />
-  <Sparkline label="Connected clients" points={trends.clients} format={number} hint="Primaries and replicas" />
-</section>
-<p class="metrics-caption">Trends cover the last {Math.max(0, history.length - 1)} refreshes while this tab is open; they start again after a reload.</p>
+<button class="panel dashboard-link" onclick={onDashboard}><span class="quick-icon"><Icon name="chart" /></span><span><strong>Dashboard</strong><span class="hint">Time charts of throughput, memory breakdown, network bytes, persistence and replication. Pick the charts you want.</span></span><span aria-hidden="true">&rarr;</span></button>
 
 <section class="panel">
   <div class="section-heading"><div><h2>Slots and data</h2><p class="hint">Who owns each hash slot, and how keys and memory are spread</p></div><button class="text-button" onclick={onCluster}>Cluster view &rarr;</button></div>

@@ -15,7 +15,8 @@
   import { summarize } from "./value.js";
   import Overview from "./Overview.svelte";
   import Cluster from "./Cluster.svelte";
-  import { probeTargets, readingsFrom, snapshot, pushHistory, coordinatorModel, failoverEvents, nodeKey, rangeText } from "./monitor.js";
+  import Dashboard from "./Dashboard.svelte";
+  import { probeTargets, readingsFrom, snapshot, keepRecent, coordinatorModel, failoverEvents, nodeKey, rangeText } from "./monitor.js";
   import Tasks from "./Tasks.svelte";
   import Browser from "./Browser.svelte";
   import PubSub from "./PubSub.svelte";
@@ -31,7 +32,10 @@
     { id: "pubsub", label: "Pub/Sub", icon: "pubsub" },
     { id: "users", label: "ACL", icon: "users" },
   ];
-  const dock = { id: "console", label: "Console", icon: "terminal" };
+  const dock = [
+    { id: "console", label: "Console", icon: "terminal" },
+    { id: "dashboard", label: "Dashboard", icon: "chart" },
+  ];
   const logLimit = 100;
   let host = $state("127.0.0.1");
   let port = $state(6379);
@@ -75,7 +79,7 @@
   const savedInterval = Number(preference("overview.interval", 5));
   let interval = $state([2, 5, 10, 30, 60].includes(savedInterval) ? savedInterval : 5);
   let refreshNow = $state(() => {});
-  let live = $derived(connected && (section === "overview" || section === "cluster"));
+  let live = $derived(connected && ["overview", "cluster", "dashboard"].includes(section));
 
   $effect(() => {
     savePreference("overview.paused", paused);
@@ -109,7 +113,7 @@
           for (const reading of next) reading.group = known.get(nodeKey(reading.node)) ?? null;
         }
         readings = next;
-        history = pushHistory(history, snapshot(next, at));
+        history = keepRecent(history, snapshot(next, at));
         if (report) {
           const model = coordinatorModel(report);
           model.error = report.error ?? "";
@@ -348,14 +352,16 @@
         <nav aria-label="Main navigation">
           {#each navigation as item}{@render navButton(item)}{/each}
         </nav>
-        <nav class="nav-dock" aria-label="Tools">{@render navButton(dock)}</nav>
+        <nav class="nav-dock" aria-label="Tools">{#each dock as item}{@render navButton(item)}{/each}</nav>
         <div class="sidebar-foot"><span class="status-dot"></span><span class="sidebar-foot-label"> HTTP to RESP</span><p>Connected as {username || "default"}</p></div>
       </aside>
       <main class="workspace">
         {#if sessionError}<div class="error-box" role="alert">{sessionError}</div>{/if}
         <div class="screen">
           {#if section === "overview"}
-            <Overview {shards} selected={selectedNodes} {readings} {history} {openTask} {lines} onData={() => navigate("data")} onCluster={() => navigate("cluster")} bind:interval bind:paused {refreshing} {updated} {probeError} refresh={refreshNow} />
+            <Overview {shards} selected={selectedNodes} {readings} {openTask} {lines} onData={() => navigate("data")} onCluster={() => navigate("cluster")} onDashboard={() => navigate("dashboard")} bind:interval bind:paused {refreshing} {updated} {probeError} refresh={refreshNow} />
+          {:else if section === "dashboard"}
+            <Dashboard {readings} {history} selected={selectedNodes} bind:interval bind:paused {refreshing} {updated} {probeError} refresh={refreshNow} ready={shards.length > 0} />
           {:else if section === "cluster"}
             <Cluster {shards} {readings} {coordinator} {coordinatorsConfigured} {failovers} {topologyNotice} bind:interval bind:paused {refreshing} {updated} {probeError} refresh={refreshNow} reload={loadShards} />
           {:else if section === "data"}

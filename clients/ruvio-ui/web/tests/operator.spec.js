@@ -510,7 +510,7 @@ test("JSON values are edited, incremented and deleted by path; bad JSON is rejec
   await draft.fill('"Grace"');
   await page.getByRole("button", { name: "Save value" }).click();
   await expect(page.locator(".jdoc").getByRole("status")).toContainText("Saved $.name");
-  expect(lastWrite(sent)).toEqual(["JSON.SET", "app:hello", "$.name", '"Grace"']);
+  await expect.poll(() => lastWrite(sent)).toEqual(["JSON.SET", "app:hello", "$.name", '"Grace"']);
   await draft.fill("{broken");
   await page.getByRole("button", { name: "Save value" }).click();
   await expect(page.getByRole("alert")).toContainText("Not valid JSON");
@@ -518,19 +518,19 @@ test("JSON values are edited, incremented and deleted by path; bad JSON is rejec
   await tree.getByRole("button", { name: /"age"/ }).click();
   await page.getByLabel("Amount").fill("2");
   await page.getByRole("button", { name: "Add", exact: true }).click();
-  expect(lastWrite(sent)).toEqual(["JSON.NUMINCRBY", "app:hello", "$.age", "2"]);
+  await expect.poll(() => lastWrite(sent)).toEqual(["JSON.NUMINCRBY", "app:hello", "$.age", "2"]);
   await tree.getByRole("button", { name: /"ok"/ }).click();
   await page.getByRole("button", { name: "Toggle" }).click();
-  expect(lastWrite(sent)).toEqual(["JSON.TOGGLE", "app:hello", "$.ok"]);
+  await expect.poll(() => lastWrite(sent)).toEqual(["JSON.TOGGLE", "app:hello", "$.ok"]);
   await tree.getByRole("button", { name: /"tags"/ }).click();
   await page.getByLabel("Value to append").fill('"c"');
   await page.getByRole("button", { name: "Append" }).click();
-  expect(lastWrite(sent)).toEqual(["JSON.ARRAPPEND", "app:hello", "$.tags", '"c"']);
+  await expect.poll(() => lastWrite(sent)).toEqual(["JSON.ARRAPPEND", "app:hello", "$.tags", '"c"']);
   await expect(page.locator(".jdoc").getByRole("status")).toContainText("Appended to $.tags");
   await expect(tree.getByRole("button", { name: /"odd key"/ })).toBeDisabled();
   await tree.getByRole("button", { name: /"addr"/ }).click();
   await page.getByRole("button", { name: "Delete path" }).click();
-  expect(lastWrite(sent)).toEqual(["JSON.DEL", "app:hello", "$.addr"]);
+  await expect.poll(() => lastWrite(sent)).toEqual(["JSON.DEL", "app:hello", "$.addr"]);
 });
 
 test("a large JSON document is read by path instead of loaded whole", async ({ page }) => {
@@ -610,6 +610,39 @@ test("the cluster view reads groups and coordinators without sending commands", 
   await expect(page.locator(".group-panel")).toHaveCount(1);
   await noOverflow(page);
   await page.screenshot({ path: testInfo.outputPath("cluster.png"), fullPage: true });
+  expect(requests.filter((item) => item.path === "/api/command")).toEqual([]);
+  expect(errors).toEqual([]);
+});
+
+test("the dashboard draws the chosen charts from the probe readings and remembers the choice", async ({ page }, testInfo) => {
+  let commands = 0;
+  const { requests, errors } = await setup(page, { command: (args) => {
+    if (args[0] !== "INFO") return null;
+    commands += 500;
+    return { ok: true, value: bulk(`run_id:r1\r\ntotal_commands_processed:${commands}\r\nget_commands:${commands / 2}\r\nset_commands:${commands / 2}\r\nincrement_commands:0\r\nother_commands:0\r\ntotal_net_input_bytes:${commands * 40}\r\ntotal_net_output_bytes:${commands * 10}\r\nconnected_clients:4\r\ncharged_memory_bytes:2048\r\nkey_memory_bytes:512\r\nvalue_memory_bytes:1536\r\nkeys:12\r\nexpires:2\r\n`) };
+  } });
+  await signIn(page);
+  await page.getByRole("navigation", { name: "Tools" }).getByRole("button", { name: "Dashboard", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Dashboard", exact: true })).toBeVisible();
+  await page.getByLabel("Refresh interval").selectOption("2");
+  await expect(page.locator(".chart-card")).toHaveCount(7);
+  await expect(page.locator(".chart-card").filter({ hasText: "Commands per second" }).locator("svg")).toBeVisible({ timeout: 8000 });
+  await expect(page.locator(".chart-card").filter({ hasText: "Charged memory" }).locator(".chart-now")).toContainText("4.0 KiB");
+  await page.locator(".chart-picker summary").click();
+  await page.getByRole("group", { name: "Charts to show" }).getByLabel("Memory breakdown").uncheck();
+  await page.getByRole("group", { name: "Charts to show" }).getByLabel("Largest buffers seen").check();
+  await page.locator(".chart-picker summary").click();
+  await expect(page.locator(".chart-card")).toHaveCount(7);
+  await expect(page.locator(".chart-card").filter({ hasText: "Memory breakdown" })).toHaveCount(0);
+  await page.getByRole("button", { name: "Per node", exact: true }).click();
+  await expect(page.locator(".chart-card").filter({ hasText: "Connected clients" }).locator(".chart-legend li")).toHaveCount(2);
+  await noOverflow(page);
+  await page.screenshot({ path: testInfo.outputPath("dashboard.png"), fullPage: true });
+  await page.reload();
+  await page.getByRole("navigation", { name: "Tools" }).getByRole("button", { name: "Dashboard", exact: true }).click();
+  await expect(page.locator(".chart-card").filter({ hasText: "Largest buffers seen" })).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "Per node", exact: true })).toHaveAttribute("aria-pressed", "true");
+  // Every chart comes from the probe: the dashboard sends no command of its own.
   expect(requests.filter((item) => item.path === "/api/command")).toEqual([]);
   expect(errors).toEqual([]);
 });
