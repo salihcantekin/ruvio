@@ -12,6 +12,8 @@ const isValid = /^G-[A-Z0-9]+$/.test(measurementId);
   isValid && (
     <>
       <script is:inline define:vars={{ measurementId }}>
+        // define:vars wraps the script in its own function, so gtag and the config call
+        // must live in this one script to share a scope.
         window.dataLayer = window.dataLayer || [];
         function gtag() {
           dataLayer.push(arguments);
@@ -23,11 +25,9 @@ const isValid = /^G-[A-Z0-9]+$/.test(measurementId);
           ad_personalization: "denied",
         });
         gtag("js", new Date());
-      </script>
-      <script async src={`https://www.googletagmanager.com/gtag/js?id=${measurementId}`}></script>
-      <script is:inline define:vars={{ measurementId }}>
         gtag("config", measurementId);
       </script>
+      <script async src={`https://www.googletagmanager.com/gtag/js?id=${measurementId}`}></script>
     </>
   )
 }
