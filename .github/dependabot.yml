@@ -3,11 +3,13 @@ updates:
   # Keeps the base image digests in the Dockerfiles current, so security patches arrive as PRs.
   - package-ecosystem: docker
     directory: /
+    target-branch: dev
     schedule:
       interval: weekly
   # Workflow actions are pinned to commit SHAs; this opens PRs that move the pins (and the version comments) forward.
   - package-ecosystem: github-actions
     directory: /
+    target-branch: dev
     schedule:
       interval: weekly
     groups:
@@ -16,12 +18,14 @@ updates:
   # The UI image bases are pinned by digest like the server's.
   - package-ecosystem: docker
     directory: /clients/ruvio-ui
+    target-branch: dev
     schedule:
       interval: weekly
   # Rust crates: the server, the Rust client and the UI. Updates arrive as pull requests that
   # run the PR gate; advisories are checked nightly (cargo deny).
   - package-ecosystem: cargo
     directory: /
+    target-branch: dev
     schedule:
       interval: weekly
     groups:
@@ -29,6 +33,7 @@ updates:
         patterns: ["*"]
   - package-ecosystem: cargo
     directory: /clients/ruvio-client
+    target-branch: dev
     schedule:
       interval: weekly
     groups:
@@ -36,6 +41,7 @@ updates:
         patterns: ["*"]
   - package-ecosystem: cargo
     directory: /clients/ruvio-ui
+    target-branch: dev
     schedule:
       interval: weekly
     groups:
@@ -43,6 +49,7 @@ updates:
         patterns: ["*"]
   - package-ecosystem: npm
     directory: /clients/ruvio-ui/web
+    target-branch: dev
     schedule:
       interval: weekly
     groups:
