@@ -1623,7 +1623,7 @@ dependencies = [
 
 [[package]]
 name = "ruvio"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "ahash",
  "blake3",

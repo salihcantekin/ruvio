@@ -4,6 +4,8 @@ Notable changes to the Java client `io.github.salihcantekin:ruvio-client`. New e
 
 ## Unreleased
 
+## 0.2.0 - 2026-10-29
+
 - Fixed: a storm of `MOVED` or `TRYAGAIN` replies over many commands in flight no longer starts a platform thread per retry; the cluster follow-ups run on 8 daemon threads with a queue of 65,536, and a follow-up beyond that fails with the redirect error. No API change (issue #322).
 - Fixed: a burst of commands refused with `READONLY` (for example 16384 in flight at a demotion) no longer starts one platform thread per command; one background task per connection finds the primary once and sends every refused command again.
 - `renew(key, token, ttlMillis)` sends the server's `RENEW`: it extends a `LEASE` or `SEMAPHORE` holder by its token without releasing it (true when the token is a live holder). `RuvioLock.renew` and `RuvioToken.renew` use it. Needs a server that has `RENEW`.

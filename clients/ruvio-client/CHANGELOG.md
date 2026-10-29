@@ -4,6 +4,8 @@ Notable changes to the Rust client crate `ruvio-client`. New entries go under "U
 
 ## Unreleased
 
+## 0.5.0 - 2026-10-29
+
 - A pipeline now waits for one `-TRYAGAIN` budget (the 635 ms schedule), shared by all its commands, instead of up to 635 ms for each refused command in turn; a command not yet retried when the budget has run out still gets one more try. A shorter `command_timeout` shortens the budget. Before, a pipeline of 100 commands on a frozen slot range could wait over a minute. A single command waits as before (issue #312).
 - `renew(key, token, ttl_ms)` sends the server's `RENEW`: it extends a `LEASE` or `SEMAPHORE` holder by its token without releasing it (1 when the token is a live holder, 0 otherwise). Lease and permit handles gain `renew`. Needs a server that has `RENEW`.
 - `Error::is_transient()` and `Error::may_have_run()` sort an error for a retry loop or policy of your own: transient means trying again later can succeed (`Error::Io`, or the replies `LOADING`, `MASTERDOWN`, `CLUSTERDOWN`, `TRYAGAIN`, `READONLY`, `NOREPLICAS`); may have run is false only for a server error reply other than `NOREPLICAS`. The same rules as the other clients. Nothing changes on the command path.
