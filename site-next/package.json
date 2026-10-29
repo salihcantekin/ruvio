@@ -5,7 +5,7 @@
   "scripts": {
     "sync-docs": "node scripts/sync-docs.mjs && node scripts/changelog.mjs",
     "dev": "npm run sync-docs && astro dev",
-    "build": "npm run sync-docs && astro build",
+    "build": "npm run sync-docs && astro build && node scripts/check-dist.mjs",
     "preview": "astro preview",
     "check": "npm run sync-docs && astro check"
   },
