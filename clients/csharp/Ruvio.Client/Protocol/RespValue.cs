@@ -149,7 +149,7 @@ public sealed class RespValue
 
             catch (DecoderFallbackException)
             {
-                throw new RuvioException("bulk string is not UTF-8");
+                throw RuvioException.Client("bulk string is not UTF-8");
             }
         }
 

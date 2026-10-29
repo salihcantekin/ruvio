@@ -63,6 +63,10 @@ A cluster client can send read-only commands to replicas. The server lists each 
 
 The live tests start a 2-shard primary and its 2-shard replica (`RUVIO_REPLICATED_ADDR`, `RUVIO_REPLICA_ADDR` from `scripts/run_with_servers.sh`) and check through the replica's `INFO get_commands` that a read went to the replica.
 
+## `TRYAGAIN` while a slot range moves
+
+A cluster client sends a command again after `-TRYAGAIN`, at most 7 times, after waits of 5, 10, 20, 40, 80, 160 and 320 ms (635 ms in all); the last `TRYAGAIN` is returned. The budget belongs to the call, not to each command: a pipeline of N refused commands waits for one budget, and a command not yet retried when the budget has run out still gets one more try, so a freeze that ended meanwhile does not fail the later ones. Rust cuts the budget to `command_timeout` when that is shorter; Go ends the wait with its context, C# with its cancellation token. Each client has a scripted test with 100 refused commands in one pipeline.
+
 ## Following a failover
 
 After a failover the primary is another node. A standalone client with several seeds, or with a coordinator name, finds it again instead of staying on a node that is now a replica. All six clients do the same; this section is the contract. It applies to standalone connections only: a cluster client (a multi-node slot map) keeps its `MOVED`/`ASK` rules and does not run any of this.
@@ -128,6 +132,30 @@ While the connection is healthy nothing is sent and nothing is checked on the su
 Every client has a scripted test (nodes that answer `ROLE`, refuse writes with `READONLY`, and name a primary for `SENTINEL`) for: the retry once, the second refusal, the refusing replica taken once it is promoted (with seeds and with a coordinator name), a refusing node that keeps saying `master` never taken, the transaction, the reconnect order, the reported primary, the coordinator name, the option off, no extra commands while healthy, and a hung seed bounded. Every client also has a live test on the pair `scripts/run_with_servers.sh` starts (`RUVIO_FAILOVER_ADDRS`, the two client addresses, primary first; `RUVIO_FAILOVER_REPLICATION`, their replication addresses): connect with both as seeds, write, wait until the replica holds the key, `REPLICAOF NO ONE` on the replica, `REPLICAOF host port` (the new primary's replication address) on the old primary, and check that the next write through the client succeeds within 5 s and lands on the new primary; that the same situation with the option off is `READONLY`; and that after `CLIENT KILL ID` on the client's socket the reconnect is on the node whose `ROLE` is `master` before any write. Without the variables the live test returns early. Poll with deadlines, never fixed sleeps. No coordinator process is needed.
 
 Every client also has a live test under real coordinators: `scripts/run_with_servers.sh` starts a group of two data nodes (`RUVIO_COORDINATOR_GROUP_ADDRS`, primary first, and their pids in `RUVIO_COORDINATOR_GROUP_PIDS`) watched by three `ruvio coordinator` processes (`RUVIO_COORDINATOR_ADDRS`, the group named in `RUVIO_COORDINATOR_MASTER`; ping 200 ms, down after 1 s, no secret). The test writes through a client with the coordinator option and through one with the two data nodes as seeds, waits until the replica holds both writes, kills the primary with SIGKILL, and has both clients write at once until each succeeds; each first write must come within 5 s of the kill (the writes keep trying for 15 s, so a slow one fails on the bound, not on a timeout). Then it checks that the surviving node answers `master` and holds both writes. The kill is not undone, so the group serves one test per run of the script. Measured on a Mac with a debug server: the coordinator client wrote again about 0.9-1.6 s after the kill. The seeds client took about 5 s (Java) to 7.2 s (the others) while the rounds avoided the refusing replica even once it was the primary; since it is taken once it is promoted (step 4 of the round), it writes about as soon as the coordinator client (1.56 s for both in one Linux run of the Rust test).
+
+## TLS
+
+TLS is off in every client; plain TCP is the default and nothing changes without the option. With it on, the contract is the same everywhere:
+
+- **Verified by default.** The server certificate chain and the host name are checked against the system roots, or against the private CA the caller gives. A refused certificate fails the connect.
+- **Every socket.** The first connect, reconnects, pooled and dedicated sockets, per-shard and cluster node sockets, replica sockets, Pub/Sub sockets and the probes of the follow-primary rounds (`ROLE`, `SENTINEL`, coordinator lookups) all use the same TLS settings. A probe never falls back to plain TCP.
+- **The handshake is part of the connect.** It is bounded by the connect timeout where the client has one.
+- **Disabling verification is explicit.** One option named for it (`InsecureSkipVerify` and its equivalents below) accepts any certificate and removes the protection against someone in the middle. Use it for throwaway tests only; it is never the default and is not implied by any other option.
+- **Private CA and mutual TLS.** A CA file or certificate list trusts a private CA; a client certificate and key answer a server that sets `tls_client_auth`.
+- **Server name.** The name checked is the host being dialed. When the host is an IP address and the certificate carries a name, set the server name option. Node does not send an IP address as the TLS server name (it would print a deprecation warning).
+
+| Client | Turn on | Private CA | Client certificate | Server name | Skip verification |
+| --- | --- | --- | --- | --- | --- |
+| Rust (cargo feature `tls`) | `ClientOptions::tls: Some(TlsOptions)` | `ca_pem` | `client_cert_pem`, `client_key_pem` | `server_name` | `insecure_skip_verify` |
+| C# | `RuvioClientOptions.Tls = new RuvioTlsOptions()` | `TrustedCertificates` | `ClientCertificates` | `ServerName` | `InsecureSkipVerify` |
+| Go | `Options.TLS` (`*tls.Config`) | `RootCAs` | `Certificates` | `ServerName` | `InsecureSkipVerify` |
+| Java | `tls()`, `tls(SSLContext)` | `RuvioTls.context(caPem, ...)` | `RuvioTls.context(..., certPem, keyPem)` | `tlsServerName(name)` | `tlsInsecure()` |
+| Node | `tls: true` or `tls.ConnectionOptions` | `ca` | `cert`, `key` | `servername` | `rejectUnauthorized: false` |
+| Python | `tls=True` (or an `ssl.SSLContext`), `ruvios://`, `rediss://` | `tls_ca_file` | `tls_cert_file`, `tls_key_file` | `tls_server_name` | `tls_insecure_skip_verify` |
+
+Differences: Go ignores `Options.TLS` when `Options.Dial` is set (return your own `*tls.Conn` from `Dial`); Rust without the `tls` feature fails the connect with `Error::Protocol` when `tls` is set; Python raises `ValueError` for a TLS option without `tls=True` or with a unix socket; C# ignores `DedicatedReaderThread` with TLS on.
+
+Tests: Go, Java, Python, Rust and C# have live TLS tests against a server started with TLS. The Node TLS path has not been verified against a live server; Node's own `tls` module does the work, and the connect code is the only part Ruvio owns. The latency TLS adds is measured for Go and Rust only (a handshake of about 1 ms and 3-6 µs per command); for the others it is not measured.
 
 ## Differences
 

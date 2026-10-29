@@ -10,7 +10,7 @@ namespace Ruvio.AspNetCore.DataProtection.Tests;
 /// <summary>What the package checks before the server takes a request.</summary>
 public sealed class StartupCheckTests
 {
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task MissingConnectionFailsStartAndNamesTheFix()
     {
         await using WebApplication app = App(static builder => builder.PersistKeysToRuvio(static o => o.RequireEncryption = false));
@@ -21,7 +21,7 @@ public sealed class StartupCheckTests
         Assert.Contains("services.AddRuvioClient", error.Message);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task MissingKeyedConnectionFailsStartAndNamesTheKey()
     {
         await using WebApplication app = App(static builder => builder.PersistKeysToRuvio(static o =>

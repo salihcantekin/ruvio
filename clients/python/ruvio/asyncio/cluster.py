@@ -579,7 +579,9 @@ class ClusterRuvio(Ruvio):
             return proto
         raise error
 
-    async def _redirect(self, err: ResponseError, data: bytes, conv: Conv, dec: bool, blocking: bool) -> Any:
+    async def _redirect(
+        self, err: ResponseError, data: bytes, conv: Conv, dec: bool, blocking: bool, clock: Optional[cl.TryAgainClock] = None
+    ) -> Any:
         """Follows ``-MOVED`` and ``-ASK`` (one budget of ``MAX_REDIRECTS`` per command) and re-sends after
         ``-TRYAGAIN`` (``TRYAGAIN_DELAYS``, one ``asyncio.sleep`` before each re-send); the last error is raised
         when a budget runs out. ``ASK`` sends ``ASKING`` and the command to the named node and leaves the table alone."""
@@ -590,7 +592,12 @@ class ClusterRuvio(Ruvio):
                 node = self._route_node(data)
                 if node is None or tries == len(cl.TRYAGAIN_DELAYS):
                     raise err
-                await asyncio.sleep(cl.TRYAGAIN_DELAYS[tries])
+                # One command keeps the fixed schedule; a pipeline's commands share a clock.
+                pause = cl.TRYAGAIN_DELAYS[tries] if clock is None else clock.pause(tries)
+                if pause is None:
+                    raise err
+                if pause > 0:
+                    await asyncio.sleep(pause)
                 tries += 1
             else:
                 if hops == cl.MAX_REDIRECTS:
@@ -844,10 +851,11 @@ class ClusterRuvio(Ruvio):
                 nxt[i] = iter(r).__next__
             replies = [nxt[i]() for i in idx]
         if MovedError in set(map(type, replies)):
+            clock = cl.TryAgainClock()
             for i, v in enumerate(replies):
                 if v.__class__ is MovedError:
                     try:
-                        replies[i] = await self._redirect(v, payload[i], None, dec, False)
+                        replies[i] = await self._redirect(v, payload[i], None, dec, False, clock)
                     except ResponseError as e:
                         replies[i] = e
         return replies
@@ -869,11 +877,12 @@ class ClusterRuvio(Ruvio):
                 replies[i] = v
         if failure is not None:
             raise failure
+        clock = cl.TryAgainClock()
         for i, v in enumerate(replies):
             if v.__class__ is MovedError:
                 frame = payload[i] if i < n else subs[i - n][4]  # type: ignore[index]
                 try:
-                    replies[i] = await self._redirect(v, frame, None, dec, False)
+                    replies[i] = await self._redirect(v, frame, None, dec, False, clock)
                 except ResponseError as e:
                     replies[i] = e
         return replies if subs is None else cl.merge_pipeline(replies, n, subs)

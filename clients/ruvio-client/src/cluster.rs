@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use std::net::{TcpStream, ToSocketAddrs};
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::blocking::{Wait, blocking_wait, pipeline_wait};
 use crate::client::{ClientOptions, NoticeHook, ReadPolicy};
@@ -31,6 +31,46 @@ const TRYAGAIN_BACKOFF: [Duration; 7] = [
     Duration::from_millis(160),
     Duration::from_millis(320),
 ];
+
+/// The one `TRYAGAIN` wait of a call. The retry schedule runs from the first `TRYAGAIN` the call
+/// sees and is shared by every command of a pipeline, so a pipeline of N refused commands waits
+/// for one budget, not N.
+#[derive(Default)]
+struct TryAgainClock {
+    started: Option<Instant>,
+}
+
+impl TryAgainClock {
+    /// How long to sleep before retry number `retries` (counted from 0), or `None` when the call
+    /// has used its budget: the schedule's end (or the command timeout, when it is shorter) has
+    /// passed. A command that has not been retried yet always gets one more try, so a freeze that
+    /// ended while earlier commands were waiting does not fail the later ones.
+    fn pause(&mut self, retries: usize, timeout: Option<Duration>) -> Option<Duration> {
+        let started = *self.started.get_or_insert_with(Instant::now);
+        let elapsed = started.elapsed();
+        let mut budget: Duration = TRYAGAIN_BACKOFF.iter().sum();
+
+        if let Some(timeout) = timeout {
+            budget = budget.min(timeout);
+        }
+
+        let mut at = Duration::ZERO;
+
+        for step in TRYAGAIN_BACKOFF {
+            at += step;
+
+            if at > budget {
+                break;
+            }
+
+            if at > elapsed {
+                return Some(at - elapsed);
+            }
+        }
+
+        (retries == 0).then_some(Duration::ZERO)
+    }
+}
 
 /// What the server answers for a command whose keys span slots; the client answers it the same
 /// way without sending the command.
@@ -1389,13 +1429,18 @@ impl ClusterRouter {
             self.send_spread(commands, targets, used)?
         };
 
+        let mut clock = TryAgainClock::default();
+
         for (index, reply) in replies.iter_mut().enumerate() {
             if matches!(reply, RespValue::Error(_)) {
                 let first = std::mem::replace(reply, RespValue::Null);
 
-                *reply = self.follow_moved(targets[index], first, |connection, asking| {
-                    connection.send_with(commands[index], asking)
-                })?;
+                *reply = self.follow_moved_within(
+                    Some(&mut clock),
+                    targets[index],
+                    first,
+                    |connection, asking| connection.send_with(commands[index], asking),
+                )?;
             }
         }
 
@@ -1525,14 +1570,19 @@ impl ClusterRouter {
                 .push(command.iter().map(|item| (*item).to_owned()).collect());
         }
 
+        let mut clock = TryAgainClock::default();
+
         for (target, (destinations, batch)) in groups {
             let values = self.connection(target)?.send_many_owned(&batch)?;
 
             for ((destination, command), value) in destinations.into_iter().zip(&batch).zip(values)
             {
-                let value = self.follow_moved(target, value, |connection, asking| {
-                    connection.send_owned_with(command, asking)
-                })?;
+                let value = self.follow_moved_within(
+                    Some(&mut clock),
+                    target,
+                    value,
+                    |connection, asking| connection.send_owned_with(command, asking),
+                )?;
 
                 match destination {
                     Destination::Whole(index) => replies[index] = value,
@@ -1817,9 +1867,22 @@ impl ClusterRouter {
     /// so a slot map that keeps changing cannot loop forever: the next redirect is returned. An
     /// `ASK` is answered by the named node and leaves the slot map alone. `TRYAGAIN` sends the
     /// command to the slot's current owner again after a short sleep, at most
-    /// `TRYAGAIN_BACKOFF.len()` times; the last `TRYAGAIN` is returned.
+    /// `TRYAGAIN_BACKOFF.len()` times and only while the call's `TryAgainClock` has budget left;
+    /// the last `TRYAGAIN` is returned.
     fn follow_moved(
         &mut self,
+        owner: usize,
+        reply: RespValue,
+        send: impl FnMut(&mut Connection, bool) -> Result<RespValue, Error>,
+    ) -> Result<RespValue, Error> {
+        self.follow_moved_within(None, owner, reply, send)
+    }
+
+    /// `follow_moved` for one command of a pipeline: `clock`, when given, is shared by the
+    /// pipeline's commands, so all of them wait out one `TRYAGAIN` budget together.
+    fn follow_moved_within(
+        &mut self,
+        mut clock: Option<&mut TryAgainClock>,
         mut owner: usize,
         mut reply: RespValue,
         mut send: impl FnMut(&mut Connection, bool) -> Result<RespValue, Error>,
@@ -1834,12 +1897,21 @@ impl ClusterRouter {
             };
 
             if text.starts_with("TRYAGAIN") {
-                let Some(pause) = TRYAGAIN_BACKOFF.get(retries) else {
+                if retries == TRYAGAIN_BACKOFF.len() {
+                    return Ok(reply);
+                }
+
+                // One command keeps the fixed schedule; a pipeline's commands share a clock.
+                let pause = match clock.as_deref_mut() {
+                    Some(clock) => clock.pause(retries, self.options.command_timeout),
+                    None => Some(TRYAGAIN_BACKOFF[retries]),
+                };
+                let Some(pause) = pause else {
                     return Ok(reply);
                 };
 
                 retries += 1;
-                std::thread::sleep(*pause);
+                std::thread::sleep(pause);
                 reply = send(self.connection(owner)?, false)?;
 
                 continue;

@@ -46,13 +46,13 @@ public class HttpOptionsTests
 
     private static string Body(HttpContext c) => Encoding.UTF8.GetString(((MemoryStream)c.Response.Body).ToArray());
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task ARunningRequestAnswers409WithRetryAfterAndAMismatchUsesTheConfiguredStatus()
     {
         var (client, _) = StubClient.Create();
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var middleware = Middleware(async _ => { entered.SetResult(); await release.Task; },
+        var middleware = Middleware(async _ => { entered.SetResult(); await release.Task.WaitAsync(TimeSpan.FromSeconds(20)); },
             Defaults(o => o.MismatchStatusCode = 422));
 
         Task first = middleware.InvokeAsync(Context(client));
@@ -72,7 +72,7 @@ public class HttpOptionsTests
         Assert.False(different.Response.Headers.ContainsKey("Retry-After"));
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task TheMismatchStatusStays409ByDefault()
     {
         var (client, _) = StubClient.Create();
@@ -85,7 +85,7 @@ public class HttpOptionsTests
         Assert.Equal(409, different.Response.StatusCode);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task AReplayIsMarkedAndCarriesLocationOnlyWhenConfigured()
     {
         foreach (bool withLocation in new[] { false, true })
@@ -142,7 +142,18 @@ public class HttpOptionsTests
         Middleware(_ => Task.CompletedTask, Defaults(o => { o.MismatchStatusCode = 422; o.PendingWait = TimeSpan.FromSeconds(30); }));
     }
 
-    [Fact]
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+
+        while (!condition())
+        {
+            Assert.True(DateTime.UtcNow < deadline, "The condition was not reached in time.");
+            await Task.Yield();
+        }
+    }
+
+    [Fact(Timeout = 30000)]
     public async Task AWaitingRequestReplaysTheFirstResultAndTheHandlerRunsOnce()
     {
         var (client, stub) = StubClient.Create();
@@ -153,7 +164,7 @@ public class HttpOptionsTests
         {
             Interlocked.Increment(ref calls);
             entered.SetResult();
-            await release.Task;
+            await release.Task.WaitAsync(TimeSpan.FromSeconds(20));
             await c.Response.WriteAsync("done");
         }, Defaults(o => o.PendingWait = TimeSpan.FromSeconds(10)));
 
@@ -163,7 +174,8 @@ public class HttpOptionsTests
         var waiting = Context(client);
         Task second = middleware.InvokeAsync(waiting);
 
-        await Task.Delay(50);
+        // The waiter's own BEGIN has been answered once the stub counts a second acquisition.
+        await WaitUntilAsync(() => stub.Acquisitions >= 2);
         Assert.False(second.IsCompleted);
         int pollsWhileRunning = stub.Acquisitions;
         release.SetResult();
@@ -177,13 +189,13 @@ public class HttpOptionsTests
         Assert.InRange(pollsWhileRunning, 2, 60); // the first BEGIN, the waiter's own and its polls (growing delay, capped at 25 ms)
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task AWaitThatRunsOutAnswers409()
     {
         var (client, _) = StubClient.Create();
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var middleware = Middleware(async _ => { entered.SetResult(); await release.Task; });
+        var middleware = Middleware(async _ => { entered.SetResult(); await release.Task.WaitAsync(TimeSpan.FromSeconds(20)); });
 
         Task first = middleware.InvokeAsync(Context(client));
 
@@ -198,13 +210,13 @@ public class HttpOptionsTests
         Assert.Equal("1", waiting.Response.Headers.RetryAfter.ToString());
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task AWaitingRequestStopsWhenTheCallerGoesAway()
     {
         var (client, _) = StubClient.Create();
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var middleware = Middleware(async _ => { entered.SetResult(); await release.Task; },
+        var middleware = Middleware(async _ => { entered.SetResult(); await release.Task.WaitAsync(TimeSpan.FromSeconds(20)); },
             Defaults(o => o.PendingWait = TimeSpan.FromSeconds(30)));
 
         Task first = middleware.InvokeAsync(Context(client));
@@ -219,7 +231,7 @@ public class HttpOptionsTests
         await first;
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task EndpointSettingsOverrideTheGlobalOnes()
     {
         var (client, stub) = StubClient.Create();
@@ -241,7 +253,7 @@ public class HttpOptionsTests
         Assert.Equal(1, calls);
     }
 
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task AnOptionalKeyLetsARequestWithoutOneRunUnchecked()
     {
         var (client, stub) = StubClient.Create();
@@ -266,7 +278,7 @@ public class HttpOptionsTests
         Assert.Equal(400, required.Response.StatusCode);
     }
 
-    [Theory]
+    [Theory(Timeout = 30000)]
     [InlineData(-1, null, -1)]
     [InlineData(604_801, null, -1)]
     [InlineData(0, "bad header", -1)]

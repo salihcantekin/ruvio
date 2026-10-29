@@ -415,6 +415,70 @@ public class ClusterTests
         Assert.True(clock.ElapsedMilliseconds >= 4, $"retried after {clock.ElapsedMilliseconds} ms");
     }
 
+    [Fact(Timeout = 30000)]
+    public async Task PipelineOfRefusedCommandsWaitsForOneTryAgainBudget()
+    {
+        using var first = Listen();
+        using var second = Listen();
+        (RuvioConnection opened, NetworkStream seedStream, TcpClient seed) = await ConnectTwoShards(first, second);
+
+        await using RuvioConnection connection = opened;
+        using TcpClient seedClient = seed;
+        RuvioClient client = await connection.GetDefaultDatabaseAsync();
+        const int count = 100;
+        var commands = new IReadOnlyList<string>[count];
+
+        for (int index = 0; index < count; index++)
+        {
+            commands[index] = ["GET", "somekey"];
+        }
+
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        ValueTask<IReadOnlyList<RespValue>> pending = client.ExecuteManyAsync(commands);
+        using TcpClient owner = await second.AcceptTcpClientAsync();
+        NetworkStream ownerStream = owner.GetStream();
+
+        for (int index = 0; index < count; index++)
+        {
+            await ExpectAsync(ownerStream, "GET", "somekey");
+        }
+
+        await ReplyAsync(ownerStream, string.Concat(Enumerable.Repeat("-TRYAGAIN slot is being moved\r\n", count)));
+
+        // The slot stays frozen: refuse every retry until the pipeline returns. How many retries a slow
+        // machine fits into the budget varies, so the server answers whatever arrives.
+        int retries = 0;
+        Task refuse = Task.Run(async () =>
+        {
+            try
+            {
+                while (true)
+                {
+                    await ExpectAsync(ownerStream, "GET", "somekey");
+                    Interlocked.Increment(ref retries);
+                    await ReplyAsync(ownerStream, "-TRYAGAIN slot is being moved\r\n");
+                }
+            }
+            catch (Exception)
+            {
+                // The client closed the socket when the test ended.
+            }
+        });
+
+        IReadOnlyList<RespValue> replies = await pending;
+
+        Assert.Equal(count, replies.Count);
+        Assert.All(replies, reply => Assert.StartsWith("TRYAGAIN", reply.Text));
+
+        // One budget (635 ms), not 100 of them; the bound leaves room for a slow machine.
+        Assert.InRange(clock.ElapsedMilliseconds, 630, 5000);
+
+        // 100 commands at 7 retries each would be 700 sends; one shared budget sends far fewer.
+        Assert.True(Volatile.Read(ref retries) < 300, $"{retries} retries");
+        owner.Dispose();
+        await refuse;
+    }
+
     [Fact(Timeout = 15000)]
     public async Task TryAgainIsReturnedAfterSevenRetries()
     {

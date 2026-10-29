@@ -18,6 +18,45 @@ internal sealed class ClusterRouter : IDisposable
     private const int MaxTryAgains = 7;
     private const int FirstTryAgainDelayMs = 5;
 
+    /// <summary>
+    /// The one <c>TRYAGAIN</c> wait of a call. The 5, 10, ... 320 ms schedule runs from the first <c>TRYAGAIN</c> the call
+    /// sees and is shared by every command of a pipeline, so N refused commands wait for one budget (635 ms), not N.
+    /// </summary>
+    private sealed class TryAgainClock
+    {
+        private long _started;
+
+        /// <summary>
+        /// How long to wait before retry number <paramref name="retries"/> (from 0), or null when the budget is spent. A command
+        /// that has not been retried yet always gets one more try, so a freeze that ended while earlier commands waited does not
+        /// fail the later ones.
+        /// </summary>
+        public TimeSpan? Pause(int retries)
+        {
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+
+            if (_started == 0)
+            {
+                _started = now;
+            }
+
+            TimeSpan elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(_started, now);
+            int at = 0;
+
+            for (int step = 0; step < MaxTryAgains; step++)
+            {
+                at += FirstTryAgainDelayMs << step;
+
+                if (TimeSpan.FromMilliseconds(at) > elapsed)
+                {
+                    return TimeSpan.FromMilliseconds(at) - elapsed;
+                }
+            }
+
+            return retries == 0 ? TimeSpan.Zero : null;
+        }
+    }
+
     private static readonly string[] AskingCommand = ["ASKING"];
     private static readonly byte[] AskingFrame = Encoding.ASCII.GetBytes("*1\r\n$6\r\nASKING\r\n");
 
@@ -332,7 +371,7 @@ internal sealed class ClusterRouter : IDisposable
 
         if (_options.ReadPolicy == ReadPolicy.Replica)
         {
-            throw new RuvioException($"no replica is known for slot {slot} (read policy Replica)");
+            throw RuvioException.Client($"no replica is known for slot {slot} (read policy Replica)");
         }
 
         return PrimaryReadAsync(slot, cancellationToken);
@@ -757,12 +796,13 @@ internal sealed class ClusterRouter : IDisposable
         CancellationToken cancellationToken)
     {
         RespValue[] replies = values as RespValue[] ?? [.. values];
+        var clock = new TryAgainClock();
 
         for (int index = 0; index < replies.Length; index++)
         {
             if (NeedsFollowUp(replies[index]))
             {
-                replies[index] = await FollowUpAsync(commands[index], -1, 0, replies[index], cancellationToken);
+                replies[index] = await FollowUpAsync(commands[index], -1, 0, replies[index], cancellationToken, clock);
             }
         }
 
@@ -883,6 +923,8 @@ internal sealed class ClusterRouter : IDisposable
             await ReadAgainFromPrimariesAsync(groups, replicas, commands, extra, replies, cancellationToken);
         }
 
+        var clock = new TryAgainClock();
+
         for (int index = 0; index < replies.Length; index++)
         {
             // A split command's own index stays empty until its parts are merged below.
@@ -890,7 +932,7 @@ internal sealed class ClusterRouter : IDisposable
             {
                 IReadOnlyList<string> command = index < commands.Count ? commands[index] : extra![index - commands.Count];
 
-                replies[index] = await FollowUpAsync(command, -1, 0, reply, cancellationToken);
+                replies[index] = await FollowUpAsync(command, -1, 0, reply, cancellationToken, clock);
             }
         }
 
@@ -1235,6 +1277,8 @@ internal sealed class ClusterRouter : IDisposable
 
         await Task.WhenAll(sends);
 
+        var clock = new TryAgainClock();
+
         for (int part = 0; part < parts.Count; part++)
         {
             if (targets is not null && targets[part].Replica && IsLoading(replies[part]))
@@ -1250,7 +1294,7 @@ internal sealed class ClusterRouter : IDisposable
 
             if (NeedsFollowUp(replies[part]))
             {
-                replies[part] = await FollowUpAsync((IReadOnlyList<string>)parts[part].Command, parts[part].Slot, 0, replies[part], cancellationToken);
+                replies[part] = await FollowUpAsync((IReadOnlyList<string>)parts[part].Command, parts[part].Slot, 0, replies[part], cancellationToken, clock);
             }
         }
 
@@ -1450,7 +1494,8 @@ internal sealed class ClusterRouter : IDisposable
     /// command's keys when the slot is -1.
     /// </summary>
     private Task<RespValue> FollowUpAsync(
-        IReadOnlyList<string> arguments, int slot, int redirects, RespValue reply, CancellationToken cancellationToken)
+        IReadOnlyList<string> arguments, int slot, int redirects, RespValue reply, CancellationToken cancellationToken,
+        TryAgainClock? clock = null)
     {
         return ResolveAsync(
             reply,
@@ -1459,7 +1504,8 @@ internal sealed class ClusterRouter : IDisposable
                 ? ForSlotAsync(slot, token)
                 : TargetAsync(ClusterKeys.Of(ClusterKeys.Name(arguments), arguments), token),
             (node, asking, token) => asking ? AskAsync(node, arguments, token) : node.SendAsync(arguments, token).AsTask(),
-            cancellationToken);
+            cancellationToken,
+            clock);
     }
 
     /// <summary>
@@ -1468,12 +1514,17 @@ internal sealed class ClusterRouter : IDisposable
     /// <paramref name="redirects"/> counts the <c>MOVED</c> replies already followed. <paramref name="route"/> picks the
     /// node for a retry from the current slot map; <paramref name="send"/> sends the command to a node, after <c>ASKING</c> when asked.
     /// </summary>
+    /// <summary>The wait before a <c>TRYAGAIN</c> retry: the fixed schedule for one command, the shared clock for a pipeline.</summary>
+    private static TimeSpan? NextTryAgainPause(TryAgainClock? clock, int retries) =>
+        clock is null ? TimeSpan.FromMilliseconds(FirstTryAgainDelayMs << retries) : clock.Pause(retries);
+
     private async Task<RespValue> ResolveAsync(
         RespValue reply,
         int redirects,
         Func<CancellationToken, ValueTask<RuvioSocket>> route,
         Func<RuvioSocket, bool, CancellationToken, Task<RespValue>> send,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TryAgainClock? clock = null)
     {
         int moves = redirects;
         int retries = 0;
@@ -1506,9 +1557,14 @@ internal sealed class ClusterRouter : IDisposable
 
                 reply = await send(node, true, cancellationToken).ConfigureAwait(false);
             }
-            else if (IsTryAgain(reply) && retries < MaxTryAgains)
+            else if (IsTryAgain(reply) && retries < MaxTryAgains && NextTryAgainPause(clock, retries) is { } pause)
             {
-                await Task.Delay(FirstTryAgainDelayMs << retries++, cancellationToken).ConfigureAwait(false);
+                retries++;
+
+                if (pause > TimeSpan.Zero)
+                {
+                    await Task.Delay(pause, cancellationToken).ConfigureAwait(false);
+                }
 
                 RuvioSocket owner = await route(cancellationToken).ConfigureAwait(false);
 

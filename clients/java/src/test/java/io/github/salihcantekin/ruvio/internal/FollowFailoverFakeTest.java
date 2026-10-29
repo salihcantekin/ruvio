@@ -249,6 +249,8 @@ class FollowFailoverFakeTest {
             next.mode = MASTER;
             int n = 500;
             List<CompletableFuture<Void>> all = new ArrayList<>();
+            // Idle follow threads of earlier tests in this JVM stay for 30 s; count only the ones this burst adds.
+            int before = followThreads();
             int peak = 0;
             for (int i = 0; i < n; i++) {
                 all.add(c.async().set("k" + i, "v"));
@@ -259,7 +261,7 @@ class FollowFailoverFakeTest {
                 peak = Math.max(peak, followThreads());
             }
             assertEquals(n, next.seen("SET"));
-            assertTrue(peak < 8, "follow threads: " + peak);
+            assertTrue(peak - before < 8, "follow threads: " + peak + " (" + before + " before the burst)");
         }
     }
 

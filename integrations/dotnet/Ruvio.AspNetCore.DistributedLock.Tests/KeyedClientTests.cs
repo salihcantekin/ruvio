@@ -7,7 +7,7 @@ namespace Ruvio.AspNetCore.DistributedLock.Tests;
 
 public class KeyedClientTests
 {
-    [Fact]
+    [Fact(Timeout = 30000)]
     public async Task ClientKeySelectsTheKeyedClient()
     {
         var keyed = DispatchProxy.Create<IRuvioClient, OfflineLockTests.ScriptClient>();

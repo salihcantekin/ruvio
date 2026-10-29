@@ -39,6 +39,8 @@
   --c2: #8da2c0;
   --c3: #66739a;
   --redis: #5f6b8a;
+  --ok: #6fae8a;
+  --bad: #d4604a;
 
   /* Code */
   --code-bg: #080a12;
@@ -111,6 +113,8 @@
   --c2: #3b5780;
   --c3: #56648a;
   --redis: #5a6684;
+  --ok: #2f7a55;
+  --bad: #b8402b;
 
   --code-bg: #1b1e2e;
   --code-ink: #e3e7f0;

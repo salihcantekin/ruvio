@@ -33,7 +33,7 @@ internal static class RespRead
         {
             RespKind.Null => null,
             RespKind.Integer => reply.Integer,
-            _ => throw new RuvioException($"{name} returned {reply.Kind}"),
+            _ => throw RuvioException.Client($"{name} returned {reply.Kind}"),
         };
     }
 
@@ -47,7 +47,7 @@ internal static class RespRead
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     internal static async ValueTask<string> RequiredText(ValueTask<RespValue> pending, string name) =>
-        (await pending.ConfigureAwait(false)).AsString() ?? throw new RuvioException($"{name} returned a null reply");
+        (await pending.ConfigureAwait(false)).AsString() ?? throw RuvioException.Client($"{name} returned a null reply");
 
     internal static async ValueTask<double?> OptionalDouble(ValueTask<RespValue> pending, string name)
     {
@@ -55,7 +55,7 @@ internal static class RespRead
 
         return reply.Kind is RespKind.Null
             ? null
-            : ParseDouble(reply.AsString() ?? throw new RuvioException($"{name} returned a null reply"));
+            : ParseDouble(reply.AsString() ?? throw RuvioException.Client($"{name} returned a null reply"));
     }
 
     internal static async ValueTask<IReadOnlyList<long?>> BitFieldResults(ValueTask<RespValue> pending, string name)
@@ -64,7 +64,7 @@ internal static class RespRead
 
         if (reply.Items is not { } items)
         {
-            throw new RuvioException($"{name} returned {reply.Kind}");
+            throw RuvioException.Client($"{name} returned {reply.Kind}");
         }
 
         var results = new long?[items.Count];
@@ -75,7 +75,7 @@ internal static class RespRead
             {
                 RespKind.Null => null,
                 RespKind.Integer => items[i].Integer,
-                _ => throw new RuvioException($"{name} returned {items[i].Kind} in an array"),
+                _ => throw RuvioException.Client($"{name} returned {items[i].Kind} in an array"),
             };
         }
 
@@ -84,7 +84,7 @@ internal static class RespRead
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     internal static async ValueTask<double> Double(ValueTask<RespValue> pending, string name) =>
-        ParseDouble((await pending.ConfigureAwait(false)).AsString() ?? throw new RuvioException($"{name} returned a null reply"));
+        ParseDouble((await pending.ConfigureAwait(false)).AsString() ?? throw RuvioException.Client($"{name} returned a null reply"));
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     internal static async ValueTask<IReadOnlyList<string>> Strings(ValueTask<RespValue> pending, string name) =>
@@ -147,7 +147,7 @@ internal static class RespRead
 
         if (reply.Items is not { } items || items.Count % 2 != 0)
         {
-            throw new RuvioException($"BF.INFO returned {reply.Kind}");
+            throw RuvioException.Client($"BF.INFO returned {reply.Kind}");
         }
 
         long capacity = 0, size = 0, filters = 0, inserted = 0;
@@ -182,7 +182,7 @@ internal static class RespRead
 
         if (reply.Items is not { Count: 2 } items || items[1].Items is null)
         {
-            throw new RuvioException($"{name} returned {reply.Kind}");
+            throw RuvioException.Client($"{name} returned {reply.Kind}");
         }
 
         return new KeyValuePair<string, IReadOnlyList<string>>(items[0].AsString() ?? "", Strings(items[1], name));
@@ -195,7 +195,7 @@ internal static class RespRead
 
         if (reply.Items is not { Count: >= 1 } items)
         {
-            throw new RuvioException($"IDEM returned {reply.Kind}");
+            throw RuvioException.Client($"IDEM returned {reply.Kind}");
         }
 
         return items[0].AsString() switch
@@ -204,12 +204,12 @@ internal static class RespRead
             "pending" => new IdempotencyBegin(IdempotencyState.Pending, null),
             "conflict" => new IdempotencyBegin(IdempotencyState.Conflict, null),
             "completed" when items.Count >= 2 => new IdempotencyBegin(IdempotencyState.Completed, items[1].Bytes ?? []),
-            _ => throw new RuvioException("IDEM returned an unexpected state"),
+            _ => throw RuvioException.Client("IDEM returned an unexpected state"),
         };
     }
 
     internal static long Integer(RespValue reply, string name) =>
-        reply.Kind is RespKind.Integer ? reply.Integer : throw new RuvioException($"{name} returned {reply.Kind}");
+        reply.Kind is RespKind.Integer ? reply.Integer : throw RuvioException.Client($"{name} returned {reply.Kind}");
 
     internal static IReadOnlyList<string> Strings(RespValue reply, string name)
     {
@@ -218,7 +218,7 @@ internal static class RespRead
             return [];
         }
 
-        IReadOnlyList<RespValue> items = reply.Items ?? throw new RuvioException($"{name} returned {reply.Kind}");
+        IReadOnlyList<RespValue> items = reply.Items ?? throw RuvioException.Client($"{name} returned {reply.Kind}");
         var values = new string[items.Count];
 
         for (int index = 0; index < values.Length; index++)
@@ -232,7 +232,7 @@ internal static class RespRead
     /// <summary>An array of 0/1 integers. An error element (for example a full non-scaling filter) throws.</summary>
     internal static IReadOnlyList<bool> Flags(RespValue reply, string name)
     {
-        IReadOnlyList<RespValue> items = reply.Items ?? throw new RuvioException($"{name} returned {reply.Kind}");
+        IReadOnlyList<RespValue> items = reply.Items ?? throw RuvioException.Client($"{name} returned {reply.Kind}");
         var values = new bool[items.Count];
 
         for (int index = 0; index < values.Length; index++)
@@ -252,7 +252,7 @@ internal static class RespRead
 
     internal static IReadOnlyList<double?> Scores(RespValue reply, string name)
     {
-        IReadOnlyList<RespValue> items = reply.Items ?? throw new RuvioException($"{name} returned {reply.Kind}");
+        IReadOnlyList<RespValue> items = reply.Items ?? throw RuvioException.Client($"{name} returned {reply.Kind}");
         var values = new double?[items.Count];
 
         for (int index = 0; index < values.Length; index++)
@@ -264,7 +264,7 @@ internal static class RespRead
     }
 
     internal static IReadOnlyList<SortedSetEntry> Entries(RespValue reply, string name) =>
-        (reply.Kind is RespKind.Null) ? Array.Empty<SortedSetEntry>() : EntriesOf(reply.Items ?? throw new RuvioException($"{name} returned {reply.Kind}"), name);
+        (reply.Kind is RespKind.Null) ? Array.Empty<SortedSetEntry>() : EntriesOf(reply.Items ?? throw RuvioException.Client($"{name} returned {reply.Kind}"), name);
 
     internal static IReadOnlyList<KeyValuePair<string, string>> Pairs(RespValue reply, string name)
     {
@@ -273,11 +273,11 @@ internal static class RespRead
             return [];
         }
 
-        IReadOnlyList<RespValue> items = reply.Items ?? throw new RuvioException($"{name} returned {reply.Kind}");
+        IReadOnlyList<RespValue> items = reply.Items ?? throw RuvioException.Client($"{name} returned {reply.Kind}");
 
         if (items.Count % 2 != 0)
         {
-            throw new RuvioException($"{name} reply is not pairs");
+            throw RuvioException.Client($"{name} reply is not pairs");
         }
 
         var pairs = new KeyValuePair<string, string>[items.Count / 2];
@@ -294,7 +294,7 @@ internal static class RespRead
     {
         if (items.Count % 2 != 0)
         {
-            throw new RuvioException($"{name} reply is not member/score pairs");
+            throw RuvioException.Client($"{name} reply is not member/score pairs");
         }
 
         var entries = new SortedSetEntry[items.Count / 2];
@@ -313,7 +313,7 @@ internal static class RespRead
     {
         if (reply.Items is not { Count: 2 } parts)
         {
-            throw new RuvioException($"{name} returned an unexpected shape");
+            throw RuvioException.Client($"{name} returned an unexpected shape");
         }
 
         long cursor = long.Parse(parts[0].AsString() ?? "0", NumberStyles.Integer, CultureInfo.InvariantCulture);

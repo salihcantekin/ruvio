@@ -25,6 +25,35 @@ public class RuvioErrorsTests
     }
 
     [Fact]
+    public void ClientErrorsAreNotTransientAndNotOutages()
+    {
+        // A conversion failure from the real reply path, and one built by hand.
+        var conversion = Assert.Throws<RuvioException>(() => RespConvert.FromBulk<int>(System.Text.Encoding.ASCII.GetBytes("abc")));
+        var shape = new RuvioException("GET returned Array", isClientError: true);
+
+        foreach (RuvioException error in new[] { conversion, shape })
+        {
+            Assert.True(error.IsClientError);
+            Assert.False(error.IsServerReply);
+            Assert.False(RuvioOutageOptions.IsOutage(error, CancellationToken.None));
+            Assert.False(RuvioErrors.IsTransient(error));
+
+            // The server ran the command before the reply could not be used, so a write may have been applied.
+            Assert.True(RuvioErrors.MayHaveRun(error));
+        }
+    }
+
+    [Fact]
+    public void BrokenFramingStaysAnOutage()
+    {
+        var framing = new RuvioException("bad RESP integer");
+
+        Assert.False(framing.IsClientError);
+        Assert.True(RuvioOutageOptions.IsOutage(framing, CancellationToken.None));
+        Assert.True(RuvioErrors.IsTransient(framing));
+    }
+
+    [Fact]
     public void ConnectionFailuresAreTransientAndMayHaveRun()
     {
         Exception[] failures =

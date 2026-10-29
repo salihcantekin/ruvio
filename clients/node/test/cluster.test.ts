@@ -496,6 +496,30 @@ test('TRYAGAIN is retried seven times; the eighth answer is returned to the call
   }
 });
 
+test('a pipeline of refused commands waits for one TRYAGAIN budget, not one per command', async () => {
+  const a = await fakeServer((args) => {
+    if (args[0] === 'CLUSTER') return slotsReply([[0, 16383, a.port]]);
+    if (args[0] === 'GET') return err('TRYAGAIN slot is being handed over');
+    return ok;
+  });
+  const c = new ClusterClient({ host: '127.0.0.1', port: a.port, commandTimeoutMs: 5000 });
+  try {
+    await c.connect();
+    const p = c.pipeline();
+    for (let i = 0; i < 100; i++) p.get('k');
+    const t0 = process.hrtime.bigint();
+    const res = await p.exec();
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+    assert.equal(res.length, 100);
+    for (const r of res) assert.ok(r instanceof Error && /^TRYAGAIN/.test(r.message), String(r));
+    // The commands wait at the same time, so the pipeline takes one budget (635 ms), not 100 of them.
+    assert.ok(ms >= 630 && ms < 5000, `pipeline took ${ms} ms`);
+  } finally {
+    c.disconnect();
+    await a.close();
+  }
+});
+
 test('ASK and MOVED share one budget of three redirects; the fourth comes back as the error', async () => {
   const seq = (ports: number[]) => [`ASK # 127.0.0.1:${ports[1]}`, `MOVED # 127.0.0.1:${ports[2]}`, `ASK # 127.0.0.1:${ports[1]}`, `ASK # 127.0.0.1:${ports[2]}`];
   let n = 0;

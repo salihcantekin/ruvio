@@ -322,6 +322,32 @@ class ClusterUnitTest {
     }
 
     @Test
+    @Timeout(60)
+    void aStormOfMovedRepliesStaysOnABoundedPool() throws Exception {
+        Pair p = new Pair();
+        RuvioClient<String, String> c = p.client();
+        int n = 500;
+        List<String> keys = new ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            String k = p.key(true, i);
+            keys.add(k);
+            p.b.store.put(k, "v" + i);
+        }
+        // Every slot moved from A to B: each command gets its own MOVED.
+        p.a.end = -1;
+        p.b.start = 0;
+        List<CompletableFuture<String>> futures = new ArrayList<>();
+        for (String k : keys) {
+            futures.add(c.async().get(k));
+        }
+        for (int i = 0; i < n; i++) {
+            assertEquals("v" + i, futures.get(i).get(30, java.util.concurrent.TimeUnit.SECONDS));
+        }
+        long threads = Thread.getAllStackTraces().keySet().stream().filter(t -> "ruvio-cluster".equals(t.getName())).count();
+        assertTrue(threads <= 8, "follow-up threads: " + threads);
+    }
+
+    @Test
     void movedOnDifferentCommandsPatchesSlotsWithoutReloading() throws Exception {
         Pair p = new Pair();
         RuvioClient<String, String> c = p.client();
@@ -503,6 +529,31 @@ class ClusterUnitTest {
         assertEquals("TRYAGAIN", e.code());
         assertEquals(8, p.a.commands("GET").size(), "sent once plus seven retries");
         assertTrue(waitedMs >= 630, "waited " + waitedMs + " ms, want 5 + 10 + 20 + 40 + 80 + 160 + 320");
+    }
+
+    @Test
+    @Timeout(30)
+    void aPipelineOfRefusedCommandsWaitsForOneTryAgainBudget() throws Exception {
+        Pair p = new Pair();
+        RuvioClient<String, String> c = p.client();
+        String k = p.key(true, 0);
+        p.a.node.handler = a -> a.get(0).equalsIgnoreCase("GET")
+                ? FakeNode.error("TRYAGAIN slot is being moved") : p.a.handle(a);
+        Pipeline<String, String> pipe = c.async().pipeline();
+        List<CompletableFuture<String>> gets = new ArrayList<>();
+        for (int i = 0; i < 100; i++) {
+            gets.add(pipe.get(k));
+        }
+        long started = System.nanoTime();
+        pipe.sync();
+        for (CompletableFuture<String> f : gets) {
+            RuvioServerException e = assertThrows(java.util.concurrent.CompletionException.class, f::join).getCause() instanceof RuvioServerException x
+                    ? x : null;
+            assertEquals("TRYAGAIN", e.code());
+        }
+        long waitedMs = (System.nanoTime() - started) / 1_000_000;
+        // The retries wait at the same time: one budget (635 ms), not 100 of them.
+        assertTrue(waitedMs >= 630 && waitedMs < 5_000, "waited " + waitedMs + " ms");
     }
 
     @Test

@@ -1,0 +1,35 @@
+---
+import Failover from "./Failover.astro";
+import SlotMigration from "./SlotMigration.astro";
+import RateLimit from "./RateLimit.astro";
+import Lease from "./Lease.astro";
+import Cache from "./Cache.astro";
+import Transfer from "./Transfer.astro";
+import Delayed from "./Delayed.astro";
+import Idem from "./Idem.astro";
+import Changes from "./Changes.astro";
+import Inventory from "./Inventory.astro";
+import ReplicaReads from "./ReplicaReads.astro";
+
+// Use-case id -> scene. A case without an entry simply has no animation.
+const scenes = {
+  "rate-limits": RateLimit, locks: Lease, cache: Cache, rebalance: SlotMigration, "multi-node": Failover,
+  balances: Transfer, delayed: Delayed, idempotency: Idem, changes: Changes, inventory: Inventory, "replica-reads": ReplicaReads,
+} as const;
+const { id } = Astro.props as { id: string };
+const Scene = scenes[id as keyof typeof scenes];
+---
+
+{Scene && <div class="case-scene" data-scene><Scene /></div>}
+
+<style>
+  .case-scene { max-width: 560px; margin: 4px auto 22px; }
+</style>
+
+<script>
+  // Scenes that are off screen stop animating, so a page with eleven of them stays light.
+  const io = new IntersectionObserver((entries) => {
+    for (const e of entries) e.target.classList.toggle("an-off", !e.isIntersecting);
+  });
+  document.querySelectorAll("[data-scene]").forEach((el) => io.observe(el));
+</script>
