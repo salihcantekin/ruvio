@@ -4,6 +4,10 @@ Notable changes to the Go client `github.com/salihcantekin/ruvio/clients/go`. A 
 
 ## Unreleased
 
+No recorded changes.
+
+## v0.3.0 - 2026-10-29
+
 - A cluster pipeline now waits for one `-TRYAGAIN` budget (the 635 ms schedule), shared by all its commands and nodes, instead of up to 635 ms for each refused command in turn; a command not yet retried when the budget has run out still gets one more try. The wait still ends with the context. A single command waits as before (issue #312).
 - `Renew(ctx, key, token, ttl)` sends the server's `RENEW`: it extends a `LEASE` or `SEMAPHORE` holder by its token without releasing it (true when the token is a live holder). `LeaseHandle.Renew` and `Permit.Renew` use it. Needs a server that has `RENEW`.
 - `IsTransient(err)` and `MayHaveRun(err)` sort an error for a retry policy of your own (failsafe-go, a loop): transient means trying again later can succeed (a failed or closed connection, a network error, `context.DeadlineExceeded`, or the replies `LOADING`, `MASTERDOWN`, `CLUSTERDOWN`, `TRYAGAIN`, `READONLY`, `NOREPLICAS`; never `context.Canceled`); may have run is false only for a server error reply other than `NOREPLICAS`. The same rules as the other clients. Nothing changes on the command path.
