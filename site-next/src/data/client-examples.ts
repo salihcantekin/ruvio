@@ -250,6 +250,109 @@ const seats = await c.incrbyMax('seats:room-9', 1, 120);
 // 57   -> joined
 // null -> room is full, nothing was written`,
   },
+  balances: {
+    rust: `use ruvio_client::Client;
+
+let mut db = Client::connect("127.0.0.1", 6379)?;
+db.set("{user:42}:wallet", "50")?;
+match db.transfer("{user:42}:wallet", "{user:42}:escrow", 30, None)? {
+    Some((wallet, escrow)) => println!("{wallet} left, {escrow} held"), // 20 left, 30 held
+    None => println!("not enough, nothing changed"),
+}
+let held = db.htransfer("account:7", "available", "held", 30, Some(1000))?;
+// Some((available_after, held_after)), or None when it was refused`,
+    csharp: `await using var connection = await RuvioConnection.ConnectAsync("127.0.0.1", 6379);
+var db = await connection.GetDefaultDatabaseAsync();
+
+await db.SetAsync("{user:42}:wallet", "50");
+var moved = await db.TransferAsync("{user:42}:wallet", "{user:42}:escrow", 30);
+// (Source: 20, Destination: 30)
+// null -> not enough, nothing changed
+
+var held = await db.TransferHashFieldAsync("account:7", "available", "held", 30, max: 1000);
+// (From: 20, To: 30), or null when it was refused`,
+    go: `c, err := ruvio.Connect(ctx, ruvio.Options{Addr: "127.0.0.1:6379"})
+if err != nil { return err }
+
+if err := c.Set(ctx, "{user:42}:wallet", "50"); err != nil { return err }
+wallet, escrow, ok, err := c.Transfer(ctx, "{user:42}:wallet", "{user:42}:escrow", 30)
+if err != nil { return err }
+fmt.Println(wallet, escrow, ok) // 20 30 true; 0 0 false -> not enough, nothing changed
+
+available, held, ok, err := c.HTransferMax(ctx, "account:7", "available", "held", 30, 1000)`,
+    java: `var c = RuvioClient.connect("127.0.0.1", 6379);
+
+c.set("{user:42}:wallet", "50");
+List<Long> after = c.transfer("{user:42}:wallet", "{user:42}:escrow", 30);
+// [20, 30]
+// null -> not enough, nothing changed
+
+List<Long> held = c.htransfer("account:7", "available", "held", 30, 1000);
+// [available after, held after], or null when it was refused`,
+    python: `import ruvio
+
+r = ruvio.Ruvio("127.0.0.1", 6379)
+r.set("{user:42}:wallet", 50)
+after = r.transfer("{user:42}:wallet", "{user:42}:escrow", 30)
+# (20, 30)
+# None -> not enough, nothing changed
+
+held = r.htransfer("account:7", "available", "held", 30, max=1000)
+# (available after, held after), or None when it was refused`,
+    node: `import { createClient } from 'ruvio-client';
+
+const c = createClient({ host: '127.0.0.1', port: 6379 });
+await c.set('{user:42}:wallet', 50);
+const after = await c.transfer('{user:42}:wallet', '{user:42}:escrow', 30);
+// [20, 30]
+// null -> not enough, nothing changed
+
+const held = await c.htransfer('account:7', 'available', 'held', 30, 1000);
+// [available after, held after], or null when it was refused`,
+  },
+  watermarks: {
+    rust: `use std::time::Duration;
+use ruvio_client::Client;
+
+let mut db = Client::connect("127.0.0.1", 6379)?;
+let advanced = db.set_if_greater("watermark:orders", 1_700_000_200, None)?;
+// true  -> written (key was missing or smaller)
+// false -> stored number is greater, nothing written
+let lowered = db.set_if_less("price:best", 499, Some(Duration::from_secs(3600)))?;`,
+    csharp: `await using var connection = await RuvioConnection.ConnectAsync("127.0.0.1", 6379);
+var db = await connection.GetDefaultDatabaseAsync();
+
+bool advanced = await db.SetIfGreaterAsync("watermark:orders", 1_700_000_200);
+// true  -> written (key was missing or smaller)
+// false -> stored number is greater, nothing written
+bool lowered = await db.SetIfLessAsync("price:best", 499, TimeSpan.FromHours(1));`,
+    go: `c, err := ruvio.Connect(ctx, ruvio.Options{Addr: "127.0.0.1:6379"})
+if err != nil { return err }
+
+advanced, err := c.SetIfGreater(ctx, "watermark:orders", 1700000200, ruvio.SetOptions{})
+// true -> written; false -> stored number is greater, nothing written
+lowered, err := c.SetIfLess(ctx, "price:best", 499, ruvio.SetOptions{TTL: time.Hour})`,
+    java: `var c = RuvioClient.connect("127.0.0.1", 6379);
+
+boolean advanced = c.setIfGreater("watermark:orders", 1_700_000_200L);
+// true  -> written (key was missing or smaller)
+// false -> stored number is greater, nothing written
+boolean lowered = c.setIfLess("price:best", 499L, SetOptions.px(3_600_000));`,
+    python: `import ruvio
+
+r = ruvio.Ruvio("127.0.0.1", 6379)
+advanced = r.set("watermark:orders", 1700000200, ifgt=True)
+# True  -> written (key was missing or smaller)
+# False -> stored number is greater, nothing written
+lowered = r.set("price:best", 499, iflt=True, px=3_600_000)`,
+    node: `import { createClient } from 'ruvio-client';
+
+const c = createClient({ host: '127.0.0.1', port: 6379 });
+const advanced = await c.set('watermark:orders', 1700000200, { ifGt: true });
+// 'OK' -> written (key was missing or smaller)
+// null -> stored number is greater, nothing written
+const lowered = await c.set('price:best', 499, { ifLt: true, px: 3_600_000 });`,
+  },
   idempotency: {
     rust: `use std::time::Duration;
 use ruvio_client::Client;

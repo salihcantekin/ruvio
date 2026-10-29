@@ -7,6 +7,14 @@ groups (a primary and its replicas) and fails a group over when its primary stop
 no data and serves no data commands. Run three (or five) of them; they agree through Raft on which
 member of each group is the primary, and only a majority can change it.
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/salihcantekin/ruvio/main/docs/images/ruvio-failover.gif" width="100%" alt="Terminal demo: three data nodes and three coordinators; the primary is killed while a Python client keeps writing, and the client continues on the promoted replica about a second later">
+</p>
+
+The recording above runs three data nodes and three coordinators on one machine with `ping_interval_ms` 200 and
+`down_after_ms` 1000 (the defaults are 500 and 3000); the Python client finds the new primary through the
+coordinators with `sentinel_master`.
+
 Without coordinators nothing changes: a primary and its replicas run as described in
 [RECOVERY.md](RECOVERY.md), and promotion is a person running `REPLICAOF NO ONE`.
 

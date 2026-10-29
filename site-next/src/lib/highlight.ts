@@ -19,13 +19,14 @@ export const languages = {
   typescript: "Node.js",
   toml: "TOML",
   json: "JSON",
+  sql: "SQL",
 } as const;
 
 export type Lang = keyof typeof languages;
 
 // Night Owl's comment grey is too faint on our code background (under 4.5:1); lift it.
 const COMMENT = "#8d9bb3";
-const theme: ThemeRegistration = {
+export const theme: ThemeRegistration = {
   ...nightOwl,
   name: "ruvio-night-owl",
   tokenColors: nightOwl.tokenColors?.map((rule) => {
@@ -38,7 +39,7 @@ let highlighter: Promise<Highlighter> | undefined;
 const getHighlighter = () =>
   (highlighter ??= createHighlighter({
     themes: [theme],
-    langs: ["shellscript", "rust", "csharp", "go", "java", "kotlin", "python", "typescript", "toml", "json", redis, redisSession],
+    langs: ["shellscript", "rust", "csharp", "go", "java", "kotlin", "python", "typescript", "toml", "json", "sql", redis, redisSession],
   }));
 
 const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");

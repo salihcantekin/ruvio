@@ -17,7 +17,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Blog posts are Markdown under site-next/src/content/blog/ and touch no code, so a change that
+  # only edits them skips every job below. A skipped job counts as passed for the required checks.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: diff
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          # A manual run, a new branch or a base that cannot be fetched runs everything.
+          if [ -z "${BASE:-}" ] || [ "$BASE" = 0000000000000000000000000000000000000000 ] \
+            || ! git fetch --no-tags --depth=1 origin "$BASE" 2>/dev/null; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only "$BASE" HEAD | grep -qv '^site-next/src/content/blog/'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Only blog posts changed; skipping the checks."
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
   core:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -42,6 +71,8 @@ jobs:
       - run: python3 scripts/check_package_metadata.py
 
   instruction-count:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -66,6 +97,8 @@ jobs:
   # dependencies alone, so this check is repeatable. Advisories change every day and run in the
   # nightly workflow instead; a new RustSec entry must not fail an unrelated pull request.
   supply-chain:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -76,6 +109,8 @@ jobs:
       - run: python3 scripts/test_supply_chain.py
 
   rust-client-and-cluster:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -119,7 +154,8 @@ jobs:
   # Live tests are skipped without RUVIO_TEST_ADDR, so the C# client and the .NET
   # integrations run against the shared server binary.
   dotnet-client:
-    needs: server-binary
+    needs: [changes, server-binary]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -148,7 +184,8 @@ jobs:
           '
 
   go-client:
-    needs: server-binary
+    needs: [changes, server-binary]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -171,6 +208,8 @@ jobs:
   # The C#, Go, Node, Python and Java client suites need a live server (standalone
   # and a 3-shard cluster), so the server is built once and shared as an artifact.
   server-binary:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     # Built on 24.04 so the binary also runs on the 24.04 python-client job (a binary built on a newer glibc would not).
     runs-on: ubuntu-24.04
     timeout-minutes: 25
@@ -188,7 +227,8 @@ jobs:
           retention-days: 1
 
   node-client:
-    needs: server-binary
+    needs: [changes, server-binary]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -212,7 +252,8 @@ jobs:
         working-directory: clients/node
 
   python-client:
-    needs: server-binary
+    needs: [changes, server-binary]
+    if: needs.changes.outputs.code == 'true'
     # setup-python has no Python 3.9 for ubuntu-latest (26.04); the package still supports 3.9.
     runs-on: ubuntu-24.04
     timeout-minutes: 25
@@ -239,7 +280,8 @@ jobs:
           python -m twine check dist-py/*
 
   java-client:
-    needs: server-binary
+    needs: [changes, server-binary]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:

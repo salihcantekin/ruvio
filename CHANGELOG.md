@@ -4,6 +4,9 @@ Notable changes to the Ruvio server (`ruvio`, `ruvio-ctl`, the Docker image and 
 
 ## Unreleased
 
+- Site: a new link preview image (`og:image`) in the site's dark theme, with current facts; the old one still showed the light theme and an outdated command count.
+- Docs: the README opens with a short terminal recording of `LEASE`, `LIMIT`, `INCRBY ... MAX` and `ZMOVEDUE`, and `docs/COORDINATOR.md` shows a recorded failover with a client that keeps writing.
+
 ## 0.4.0 - 2026-10-29
 
 - Docs: `docs/CLIENT_BEHAVIOR.md` has a TLS section: what the six clients verify by default, which sockets use TLS (including follow-primary probes), how to disable verification, and the option names per client (issue #323).
