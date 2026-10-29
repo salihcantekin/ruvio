@@ -2,8 +2,9 @@
 // Google Analytics 4, rendered in the <head> of every page (marketing, docs and 404).
 // The measurement ID comes from the build environment (PUBLIC_GA_ID, a G-XXXXXXXXXX value).
 // Without a valid ID this renders nothing, so the site ships no analytics code.
-// Consent Mode starts denied: GA sets no cookies until a visitor consents, and no consent
-// banner exists yet, so only cookieless measurement is sent.
+// Consent Mode starts denied: GA sets no cookies until a visitor accepts the banner below.
+// The choice is kept in localStorage ("ruvio-consent") and can be changed from the footer
+// ("Cookie settings"). Ad storage and personalization are never granted.
 const measurementId = (import.meta.env.PUBLIC_GA_ID ?? "").trim();
 const isValid = /^G-[A-Z0-9]+$/.test(measurementId);
 ---
@@ -12,22 +13,80 @@ const isValid = /^G-[A-Z0-9]+$/.test(measurementId);
   isValid && (
     <>
       <script is:inline define:vars={{ measurementId }}>
+        // define:vars wraps the script in its own function, so gtag, the consent handling and
+        // the config call must live in this one script to share a scope.
         window.dataLayer = window.dataLayer || [];
         function gtag() {
           dataLayer.push(arguments);
         }
+        var KEY = "ruvio-consent";
+        function stored() {
+          try { return localStorage.getItem(KEY); } catch (e) { return null; }
+        }
+        function save(v) {
+          try { localStorage.setItem(KEY, v); } catch (e) {}
+        }
+        var choice = stored();
         gtag("consent", "default", {
-          analytics_storage: "denied",
+          analytics_storage: choice === "granted" ? "granted" : "denied",
           ad_storage: "denied",
           ad_user_data: "denied",
           ad_personalization: "denied",
         });
         gtag("js", new Date());
+        gtag("config", measurementId);
+
+        function apply(v) {
+          save(v);
+          gtag("consent", "update", { analytics_storage: v });
+        }
+        function closeBanner() {
+          var b = document.getElementById("consent-banner");
+          if (b) b.remove();
+        }
+        function openBanner() {
+          if (document.getElementById("consent-banner")) return;
+          var b = document.createElement("div");
+          b.id = "consent-banner";
+          b.setAttribute("role", "dialog");
+          b.setAttribute("aria-label", "Cookie consent");
+          b.innerHTML =
+            "<p>We use Google Analytics cookies to see which pages are useful. Nothing is set unless you accept.</p>" +
+            '<div><button type="button" data-consent="denied">Decline</button>' +
+            '<button type="button" data-consent="granted" class="primary">Accept</button></div>';
+          b.addEventListener("click", function (e) {
+            var v = e.target && e.target.getAttribute && e.target.getAttribute("data-consent");
+            if (!v) return;
+            apply(v);
+            closeBanner();
+          });
+          document.body.appendChild(b);
+        }
+        function init() {
+          var style = document.createElement("style");
+          style.textContent =
+            "#consent-banner{position:fixed;left:16px;right:16px;bottom:16px;max-width:560px;z-index:2147483000;" +
+            "display:flex;flex-wrap:wrap;gap:12px 16px;align-items:center;justify-content:space-between;" +
+            "padding:14px 16px;border:1px solid var(--line-soft,#3a4258);border-radius:var(--radius,8px);" +
+            "background:var(--surface,#10131f);color:var(--ink,#e9ecf3);font:14px/1.5 var(--font-sans,system-ui,sans-serif);" +
+            "box-shadow:0 8px 32px rgba(0,0,0,.45)}" +
+            "#consent-banner p{margin:0;flex:1 1 260px}#consent-banner a{color:inherit;text-decoration:underline}" +
+            "#consent-banner div{display:flex;gap:8px}" +
+            "#consent-banner button{font:inherit;cursor:pointer;padding:7px 14px;border-radius:var(--radius,6px);" +
+            "border:1px solid var(--line-soft,#3a4258);background:transparent;color:inherit}" +
+            "#consent-banner button.primary{background:var(--accent,#b4512a);border-color:var(--accent,#b4512a);color:var(--accent-ink,#fff)}";
+          document.head.appendChild(style);
+          var links = document.querySelectorAll("[data-cookie-settings]");
+          for (var i = 0; i < links.length; i++) {
+            links[i].hidden = false;
+            links[i].addEventListener("click", openBanner);
+          }
+          if (choice !== "granted" && choice !== "denied") openBanner();
+        }
+        if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
+        else init();
       </script>
       <script async src={`https://www.googletagmanager.com/gtag/js?id=${measurementId}`}></script>
-      <script is:inline define:vars={{ measurementId }}>
-        gtag("config", measurementId);
-      </script>
     </>
   )
 }
