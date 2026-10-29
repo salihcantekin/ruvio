@@ -55,7 +55,7 @@ connect. `ClientDurability(ctx, replicas, timeout)` sets it on one connection (t
 ## Install
 
 ```sh
-go get github.com/salihcantekin/ruvio/clients/go@v0.2.0
+go get github.com/salihcantekin/ruvio/clients/go@v0.3.0
 ```
 
 Releases are git tags named `clients/go/vX.Y.Z`.
