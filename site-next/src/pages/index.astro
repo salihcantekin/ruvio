@@ -2,30 +2,13 @@
 import Page from "../layouts/Page.astro";
 import PlatformSwitch from "../components/PlatformSwitch.astro";
 import RadialSpeed from "../components/charts/RadialSpeed.astro";
-import MemoryDumbbell from "../components/charts/MemoryDumbbell.astro";
-import CommandMosaic from "../components/charts/CommandMosaic.astro";
 import RecoveryScale from "../components/charts/RecoveryScale.astro";
-import ScaleBars from "../components/charts/ScaleBars.astro";
-import { platforms, scripted, commands, families, fmtOps, fmtX, pct, serverVersion, scale, scaleDeep, scaleEverysec } from "../data/bench";
+import { platforms, scripted, commands, families, fmtX, pct, serverVersion, scale, scaleDeep } from "../data/bench";
 import { clients, site } from "../config/site";
 import CodeBlock from "../components/content/CodeBlock.astro";
 import MotionCarousel from "../components/animations/MotionCarousel.astro";
 
-const jobs = [
-  { title: "Caches without stampedes", cmds: ["FILLGET", "FILLSET"], text: "When a hot key expires, one caller refills it while the others wait or get the stale copy.", href: "/use-cases/#cache" },
-  { title: "Locks and leases", cmds: ["LEASE", "RENEW", "SEMAPHORE"], text: "A named lease returns a fencing token, RENEW keeps a long job's slot, and a semaphore caps holders, each with its own expiry.", href: "/use-cases/#locks" },
-  { title: "Conditional writes", cmds: ["SETV", "TAKE", "IDEM"], text: "Versioned writes, stock that cannot go negative, and request replays that return the stored answer.", href: "/use-cases/#versions" },
-  { title: "Rate limits", cmds: ["LIMIT", "SLIDING", "TOKENS"], text: "Fixed window, sliding window or token bucket per key in one call, returning what is left of the allowance.", href: "/use-cases/#rate-limits" },
-  { title: "Balances and counters", cmds: ["TRANSFER", "HTRANSFER", "INCR … EX"], text: "Move an amount between two keys only when the source holds enough, and give a new counter its deadline in the same call.", href: "/use-cases/#balances" },
-  { title: "Due jobs", cmds: ["ZPOPBYSCORE", "ZMOVEDUE"], text: "Take the members of a sorted set whose time has come, or move them to a work list, in one command.", href: "/use-cases/#delayed" },
-  { title: "Change feeds", cmds: ["CHANGES"], text: "Read the writes on a shard from a cursor instead of polling keys.", href: "/use-cases/#changes" },
-  { title: "Delayed jobs", cmds: ["XADD … DELAY"], text: "A stream entry stays hidden from consumer groups until its delay passes.", href: "/use-cases/#delayed" },
-];
-
-// The whole-machine section: the commands most applications run, three servers each.
-const popular = ["GET", "SET", "DEL (missing key)", "SETEX", "HSET (existing field)", "HGET", "LPUSH", "ZADD (existing member, same score)", "EXPIRE (key with TTL)", "PUBLISH (no subscribers)"];
-const scriptedPick = ["TRANSFER (enough)", "SET IFGT (random keys, half hit)", "ZPOPBYSCORE COUNT 1", "LIMIT SLIDING (allowed)", "INCR EX 60 (new keys)", "RENEW lease"].map((n) => scripted.rows.find((r) => r.label === n)!);
-const deepGet = scaleDeep.row("GET"), deepSet = scaleDeep.row("SET");
+const deepGet = scaleDeep.row("GET");
 // The largest gains of one command over the same job as a Lua script, one row per command.
 const topScripted = Object.values(
   scripted.rows.reduce<Record<string, (typeof scripted.rows)[number]>>((acc, r) => {
@@ -34,13 +17,6 @@ const topScripted = Object.values(
     return acc;
   }, {}),
 ).sort((a, b) => b.ratio - a.ratio).slice(0, 4);
-
-const steps = [
-  { name: "Parse", text: "The connection's shard reads the request." },
-  { name: "Record", text: "The write is checked and appended to the shard's log." },
-  { name: "Apply", text: "The shard changes its own keys. No lock is taken." },
-  { name: "Reply", text: "The answer goes back on the same thread." },
-];
 
 // The hero terminal: a container start, then two coordination commands and their replies.
 const hero = `$ docker run -d -p 6379:6379 \\
@@ -66,35 +42,13 @@ $ redis-cli -a change-me
         </div>
         <ul class="facts">
           <li><a class="fact-link" href="/benchmarks/#peak"><b>{Math.round(deepGet.ruvio / 1e6)}M</b> GET/SET per second on {scale.shards} shards</a></li>
-          <li><a class="fact-link" href="#scripts">Up to <b>{fmtX(topScripted[0].ratio)}</b> a Lua script, as one command</a></li>
+          <li><a class="fact-link" href="/benchmarks/#scripted">Up to <b>{fmtX(topScripted[0].ratio)}</b> a Lua script, as one command</a></li>
           <li>{commands.length} commands</li>
           <li>{clients.length} first-party clients</li>
           <li>Linux, macOS and Windows builds</li>
         </ul>
       </div>
       <CodeBlock lang="redis-session" copy={false} code={hero} />
-    </div>
-  </section>
-
-  <section class="section" id="product">
-    <div class="wrap">
-      <div class="head-row">
-        <div>
-          <p class="kicker">Product</p>
-          <h2 class="title">Coordination work, finished on the shard that owns the key</h2>
-          <p class="lede">The jobs teams usually spread over several services are single commands in Ruvio, next to the strings, hashes, lists, sets, sorted sets, streams and JSON you already use.</p>
-        </div>
-        <div class="ctas"><a class="btn ghost" href="/examples/">Try them in the browser</a><a class="btn ghost" href="/use-cases/">All use cases</a></div>
-      </div>
-      <div class="grid grid-3">
-        {jobs.map((j) => (
-          <a class="card job" href={j.href}>
-            <div class="chips">{j.cmds.map((c) => <span>{c}</span>)}</div>
-            <h3>{j.title}</h3>
-            <p>{j.text}</p>
-          </a>
-        ))}
-      </div>
     </div>
   </section>
 
@@ -112,41 +66,6 @@ $ redis-cli -a change-me
     </div>
   </section>
 
-  <section class="section band" id="scripts">
-    <div class="wrap">
-      <div class="head-row">
-        <div>
-          <p class="kicker">One command instead of a script</p>
-          <h2 class="title">The jobs you would script on Redis are single commands</h2>
-          <p class="lede">Each row is a Ruvio command next to the Lua script that does the same job on Redis {scripted.redisVersion}. Same machine, same load, one request at a time per connection for the latency.</p>
-        </div>
-        <a class="btn ghost" href="/benchmarks/#scripted">All commands and memory</a>
-      </div>
-      <div class="kpis script-kpis">
-        {topScripted.map((r) => (
-          <div><b>{fmtX(r.ratio)}</b><span><code>{r.label.replace(/ \(.*\)$/, "")}</code> against the same job as a Lua script</span></div>
-        ))}
-      </div>
-      <div class="scroll-x">
-        <table class="res">
-          <thead><tr><th>Ruvio command</th><th class="num">Ruvio ops/s</th><th class="num">Redis Lua ops/s</th><th class="num">Ratio</th><th class="num">p99 ms</th></tr></thead>
-          <tbody>
-            {scriptedPick.map((r) => (
-              <tr>
-                <td>{r.label.replace(/ \(.*\)$/, "")}</td>
-                <td class="num">{fmtOps(r.ruvio)}</td>
-                <td class="num dim">{fmtOps(r.redis)}</td>
-                <td class="num">{fmtX(r.ratio)}</td>
-                <td class="num dim">{r.ruvioP99.toFixed(2)} / {r.redisP99.toFixed(2)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-      <p class="source">Source: <a href={`${site.github}/blob/main/${scripted.file}`}>{scripted.file}</a> · {scripted.machine}, in-memory, 1 shard · macOS only, not yet measured on x86 · <a href="/benchmarks/#scripted">how it is measured</a></p>
-    </div>
-  </section>
-
   <div data-platform-scope>
     <section class="section band" id="performance">
       <div class="wrap">
@@ -159,8 +78,6 @@ $ redis-cli -a change-me
           <PlatformSwitch />
         </div>
         {platforms.map((p, i) => {
-          const sorted = [...p.rows].sort((a, b) => b.ratio - a.ratio);
-          const behind = sorted.filter((r) => r.ratio < 0.97);
           return (
             <div data-platform={p.id} hidden={i !== 0}>
               <div class="kpis">
@@ -171,17 +88,7 @@ $ redis-cli -a change-me
               </div>
               <div class="speed">
                 <div class="chart" data-chart><RadialSpeed platform={p} /></div>
-                <div class="lists">
-                  <div>
-                    <h3>Largest gains</h3>
-                    <ol>{sorted.slice(0, 5).map((r) => <li><span class="n">{r.label}</span><span class="x">{fmtX(r.ratio)}</span><span class="ops">{fmtOps(r.ruvio)} vs {fmtOps(r.redis)} ops/s</span></li>)}</ol>
-                  </div>
-                  <div>
-                    <h3>Still behind Redis ({behind.length})</h3>
-                    <ol>{behind.map((r) => <li><span class="n">{r.label}</span><span class="x lo">{fmtX(r.ratio)}</span><span class="ops">{fmtOps(r.ruvio)} vs {fmtOps(r.redis)} ops/s</span></li>)}</ol>
-                  </div>
-                  <div class="legend"><span><i style="background:var(--c1)"></i>faster</span><span><i style="background:var(--c2)"></i>within 3%</span><span><i style="background:var(--redis)"></i>slower</span></div>
-                </div>
+                <div class="lists"><p class="speed-note">Each bar is one command against Redis. <a href="/benchmarks/">See every command, memory and the whole-machine results</a>.</p></div>
               </div>
               <p class="source">Source: <a href={`${site.github}/blob/main/${p.file}`}>{p.file}</a> · {p.machine} · {p.clients} clients, pipeline {p.pipeline} · in-memory profile, 1 shard · <a href="/benchmarks/">all results</a></p>
             </div>
@@ -190,66 +97,10 @@ $ redis-cli -a change-me
       </div>
     </section>
 
-    <section class="section" id="memory">
-      <div class="wrap">
-        <div class="head-row">
-          <div>
-            <p class="kicker">Memory</p>
-            <h2 class="title">Less memory for the same data</h2>
-            <p class="lede">Memory added by loading each data shape, Ruvio next to Redis on the same machine. Left is less; the axis is logarithmic, so the same saving has the same length at any size.</p>
-          </div>
-          <div class="legend"><span><i style="background:var(--c1)"></i>Ruvio</span><span><i style="background:var(--redis)"></i>Redis</span></div>
-        </div>
-        {platforms.map((p, i) => (
-          <div data-platform={p.id} hidden={i !== 0}>
-            <div data-chart class="chart"><MemoryDumbbell platform={p} /></div>
-            <p class="source">Source: <a href={`${site.github}/blob/main/${p.file}`}>{p.file}</a> · {p.machine}</p>
-          </div>
-        ))}
-      </div>
-    </section>
   </div>
 
-  <section class="section band" id="scale">
-    <div class="wrap">
-      <div class="head-row">
-        <div>
-          <p class="kicker">Whole machine</p>
-          <h2 class="title">{scale.shards} shards in one process against Redis on {scale.shards} cores</h2>
-          <p class="lede">Redis uses one core per process, so a whole machine means a Redis Cluster. Here Ruvio runs {scale.shards} shards in one process on {scale.shards} cores, against a Redis Cluster of {scale.shards} nodes on the same cores and against a single Redis process on one core. Each shard gets the same load as each Redis node.</p>
-        </div>
-        <a class="btn ghost" href="/benchmarks/#scale">Every command</a>
-      </div>
-      <div class="kpis">
-        <div><b>{fmtX(scale.geomeanCluster)}</b><span>geometric mean throughput against the {scale.shards}-node Redis Cluster, {scale.rows.length - 1} commands, pipeline {scale.pipeline}</span></div>
-        <div><b>{Math.round(deepGet.ruvio / 1e6)}M<em> GET/SET</em></b><span>requests per second on {scale.shards} shards once the client keeps up (pipeline {scaleDeep.pipeline}): GET {fmtOps(deepGet.ruvio)}, SET {fmtOps(deepSet.ruvio)}; {fmtX(deepGet.vsCluster)} and {fmtX(deepSet.vsCluster)} the {scale.shards}-node Redis Cluster. <a href="/benchmarks/#peak">What the number means</a></span></div>
-        <div><b>{Math.round(deepGet.ruvio / deepGet.redis1)}<em>×</em></b><span>the GETs of one Redis process: one core serves {fmtOps(deepGet.redis1)} req/s, the {scale.shards} shards {fmtOps(deepGet.ruvio)}</span></div>
-        <div><b>{fmtX(scale.memGeomeanPerShard)}</b><span>memory per shard against one Redis across {scale.memory.length} data shapes; {fmtX(scaleEverysec.geomeanCluster)} throughput with every write logged (everysec, same as Redis AOF)</span></div>
-      </div>
-      <div class="scale-chart"><ScaleBars scale={scale} names={popular} /></div>
-      <p class="source">Source: <a href={`${site.github}/blob/main/${scale.file}`}>{scale.file}</a>, <a href={`${site.github}/blob/main/${scaleDeep.file}`}>pipeline {scaleDeep.pipeline}</a> and <a href={`${site.github}/blob/main/${scaleEverysec.file}`}>everysec</a> · Azure VM F16as_v6 (AMD EPYC 9V74, virtualized), 16 cores · {scale.clients} clients per shard, {scale.rounds} alternating rounds · <a href="/benchmarks/#scale">how it is measured</a></p>
-    </div>
-  </section>
 
 
-  <section class="section band" id="architecture">
-    <div class="wrap arch">
-      <div>
-        <p class="kicker">Architecture</p>
-        <h2 class="title">One owner per shard</h2>
-        <p class="lede">The shard that owns a key parses, records, applies and replies. The hot path takes no lock and does not hop to another thread, and a feature allocates only when a key uses it.</p>
-        <p class="more-link"><a href="/docs/architecture/">How it works</a></p>
-      </div>
-      <div class="shards" aria-label="Request path inside one shard">
-        {[0, 1, 2].map((n) => (
-          <div class={`shard ${n === 1 ? "focus" : ""}`}>
-            <div class="shard-head"><span>Shard {n}</span><small>owns its keys</small></div>
-            <ol>{steps.map((s) => <li><b>{s.name}</b><span>{s.text}</span></li>)}</ol>
-          </div>
-        ))}
-      </div>
-    </div>
-  </section>
 
   <section class="section band" id="durability">
     <div class="wrap">
@@ -266,17 +117,16 @@ $ redis-cli -a change-me
     </div>
   </section>
 
-  <section class="section" id="compatibility">
+  <section class="section" id="clients">
     <div class="wrap">
       <div class="head-row">
         <div>
           <p class="kicker">Compatibility</p>
-          <h2 class="title">{commands.length} commands in {families.length} families, one square each</h2>
-          <p class="lede">The command list is checked in CI. Every command has a typed method in all {clients.length} first-party clients, with cluster routing from one seed address.</p>
+          <h2 class="title">Your Redis client already works. Six have typed methods.</h2>
+          <p class="lede">{commands.length} commands in {families.length} families, with cluster routing from one seed address in every first-party client.</p>
         </div>
         <a class="btn ghost" href="/docs/commands/">Command reference</a>
       </div>
-      <div data-chart class="chart"><CommandMosaic /></div>
       <div class="client-row">
         {clients.map((c) => (
           <a class="client" href={`/docs/clients/${c.slug}/`}><b>{c.language}</b><code>{c.package}</code><small>{c.registry}</small></a>
@@ -304,12 +154,6 @@ $ redis-cli -a change-me
 </script>
 
 <style>
-  .scroll-x { overflow-x: auto; }
-  .res { width: 100%; border-collapse: collapse; font-size: 15px; }
-  .res th { text-align: left; font-family: var(--f-mono); font-size: 12.5px; font-weight: 500; color: var(--faint); padding: 10px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
-  .res td { padding: 8px 12px; border-bottom: 1px solid var(--line); }
-  .res .num { text-align: right; font-family: var(--f-mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
-  .res .dim { color: var(--mute); }
 
   .hero { position: relative; isolation: isolate; overflow: hidden; border-bottom: 1px solid var(--line); }
   .hero::before {
@@ -326,17 +170,15 @@ $ redis-cli -a change-me
   .hero-lede { font-size: 19.5px; color: var(--mute); max-width: 46ch; margin: 0 0 30px; }
   .hero-lede code { font-size: 0.9em; }
   .ctas { display: flex; flex-wrap: wrap; gap: 12px; }
-  .script-kpis { margin-bottom: 24px; }
   .facts { display: flex; flex-wrap: wrap; gap: 8px 24px; margin: 30px 0 0; padding: 0; list-style: none; font-size: 15px; color: var(--mute); }
   .fact-link b { color: var(--ink); font-weight: 600; }
   .fact-link:hover { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
   .facts li::before { content: ""; display: inline-block; width: 4px; height: 4px; background: var(--mute); margin-right: 9px; vertical-align: 3px; }
 
-  .job .chips { margin-bottom: 4px; }
-  .scale-chart { margin-top: 36px; }
 
   .speed { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr); gap: 40px; align-items: center; margin-top: 44px; }
   .speed > * { min-width: 0; }
+  .speed-note { color: var(--mute); margin: 0; font-size: 16px; }
   .chart { position: relative; }
   .lists { display: grid; gap: 26px; }
   .lists h3 { margin: 0 0 8px; font-size: 14px; font-weight: 600; color: var(--mute); letter-spacing: 0; }
@@ -348,22 +190,6 @@ $ redis-cli -a change-me
   .lists .x.lo { color: var(--mute); }
   .lists .ops { grid-column: 1 / -1; font-family: var(--f-mono); font-size: 13px; color: var(--faint); }
 
-  .arch { display: grid; grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr); gap: 48px; align-items: center; }
-  .more-link { margin: 18px 0 0; font-weight: 600; }
-  .more-link a::after { content: " →"; color: var(--mute); }
-  .shards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
-  .shard { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); padding: 16px; opacity: 0.6; }
-  .shard.focus { opacity: 1; border-color: color-mix(in srgb, var(--c1) 60%, var(--line)); }
-  .shard-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 12px; }
-  .shard-head span { font-weight: 600; }
-  .shard-head small { font-size: 13px; color: var(--faint); }
-  .shard ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 0; counter-reset: s; }
-  .shard li { position: relative; padding: 0 0 14px 22px; display: grid; gap: 2px; }
-  .shard li::before { content: ""; position: absolute; left: 3px; top: 7px; width: 8px; height: 8px; border-radius: 50%; background: var(--c3); }
-  .shard.focus li::before { background: var(--c1); }
-  .shard li:not(:last-child)::after { content: ""; position: absolute; left: 6.5px; top: 18px; bottom: 2px; width: 1px; background: var(--line); }
-  .shard li b { font-size: 15px; }
-  .shard li span { font-size: 13.5px; color: var(--mute); line-height: 1.45; }
 
   .client-row { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; margin-top: 40px; }
   .client { display: grid; gap: 4px; padding: 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); min-width: 0; }
@@ -380,10 +206,8 @@ $ redis-cli -a change-me
     .client-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   }
   @media (max-width: 900px) {
-    .hero-in, .speed, .arch { grid-template-columns: minmax(0, 1fr); }
+    .hero-in, .speed { grid-template-columns: minmax(0, 1fr); }
     .hero-in { padding-block: 48px 72px; gap: 36px; }
-    .shards { grid-template-columns: minmax(0, 1fr); }
-    .shard:not(.focus) { display: none; }
   }
   @media (max-width: 520px) {
     .client-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
