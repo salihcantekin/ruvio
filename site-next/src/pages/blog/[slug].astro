@@ -1,0 +1,150 @@
+---
+// One blog post: title band, the post's scene, the Markdown body, then the licence note and the
+// neighbouring posts. Source: src/content/blog/<slug>.md (see src/lib/blog.ts).
+import Page from "../../layouts/Page.astro";
+import UseCaseScene from "../../components/animations/UseCaseScene.astro";
+import { site } from "../../config/site";
+import { posts, readingMinutes, longDate, renderBody, type Post } from "../../lib/blog";
+
+export async function getStaticPaths() {
+  const all = await posts();
+  return all.map((post, i) => ({ params: { slug: post.id }, props: { post, newer: all[i - 1], older: all[i + 1] } }));
+}
+
+const { post, newer, older } = Astro.props as { post: Post; newer?: Post; older?: Post };
+const { title, description, date, author, tags, scene, facts } = post.data;
+const pieces = await renderBody(post.body ?? "");
+const minutes = readingMinutes(post.body);
+const source = `${site.github}/blob/dev/site-next/src/content/blog/${post.id}.md`;
+---
+
+<Page title={title} description={description}>
+  <article class="post">
+    <header class="page-intro post-head">
+      <div class="wrap narrow">
+        <p class="kicker"><a href="/blog/">Blog</a> <span aria-hidden="true">/</span> {tags.join(" · ")}</p>
+        <h1>{title}</h1>
+        <p class="lede">{description}</p>
+        <p class="meta">
+          <b>{author}</b> · <time datetime={date.toISOString().slice(0, 10)}>{longDate(date)}</time> · {minutes} min read
+        </p>
+      </div>
+    </header>
+
+    <div class="reading">
+      <div class="wrap narrow">
+        <UseCaseScene id={scene} />
+        <div class="prose post-body">
+          {pieces.map((p) =>
+            "html" in p ? (
+              <Fragment set:html={p.html} />
+            ) : "scene" in p ? (
+              <UseCaseScene id={p.scene} />
+            ) : (
+              facts.length > 0 && (
+                <dl class="facts">
+                  {facts.map((f) => (
+                    <div><dt>{f.value}</dt><dd>{f.label}</dd></div>
+                  ))}
+                </dl>
+              )
+            ),
+          )}
+        </div>
+
+        <footer class="post-foot">
+          <p class="licence">
+            Text and diagrams on this page are licensed under{" "}
+            <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>; code samples are MIT. ·{" "}
+            <a href={source}>Source of this post</a> · Questions go to{" "}
+            <a href={site.discussions}>GitHub Discussions</a>.
+          </p>
+          {(newer || older) && (
+            <nav class="neighbours" aria-label="More posts">
+              {older ? (
+                <a class="card" href={`/blog/${older.id}/`}><span>Older</span><b>{older.data.title}</b></a>
+              ) : <span />}
+              {newer ? (
+                <a class="card next" href={`/blog/${newer.id}/`}><span>Newer</span><b>{newer.data.title}</b></a>
+              ) : <span />}
+            </nav>
+          )}
+        </footer>
+      </div>
+    </div>
+  </article>
+</Page>
+
+<style>
+  .narrow { max-width: 820px; }
+  .post-head .kicker a { color: var(--mute); }
+  .post-head .kicker a:hover { color: var(--ink); }
+  .post-head h1 { max-width: 24ch; }
+  .meta { margin: 22px 0 0; font-size: 15px; color: var(--mute); }
+  .meta b { color: var(--ink); font-weight: 500; }
+
+  .post-body { font-size: 18px; }
+  .post-body :global(> * + *) { margin-top: 18px; }
+  .post-body :global(h2) { margin-top: 44px; font-size: clamp(24px, 2.6vw, 30px); line-height: 1.2; color: var(--ink); }
+  .post-body :global(h3) { margin-top: 30px; font-size: 21px; color: var(--ink); }
+  .post-body :global(ul), .post-body :global(ol) { padding-left: 1.3em; }
+  .post-body :global(li + li) { margin-top: 6px; }
+  .post-body :global(blockquote) {
+    margin-inline: 0; padding: 4px 0 4px 18px; border-left: 3px solid var(--accent); color: var(--ink);
+    font-size: 19px;
+  }
+  .post-body :global(blockquote p) { margin: 0; }
+  .post-body :global(.code-block) { margin-block: 24px; }
+  .post-body :global(.code-block pre) { font-size: 14.5px; line-height: 1.7; }
+  .post-body :global(.code-block .term-bar) { align-items: center; min-height: 40px; padding-block: 6px; }
+  .post-body :global(.code-block .label b) { font-weight: 500; color: var(--code-ink); }
+  .post-body :global(.copy) {
+    font: inherit; font-size: 13px; color: var(--code-dim); background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 4px; padding: 3px 9px; cursor: pointer;
+  }
+  .post-body :global(.copy:hover) { color: var(--code-ink); border-color: rgba(255, 255, 255, 0.22); }
+  .post-body :global(.table-wrap) { margin-block: 24px; }
+  .post-body :global(.table-wrap table) { font-size: 15.5px; }
+  .post-body :global(.case-scene) { margin-block: 30px; }
+  .post-body :global(hr) { border: 0; border-top: 1px solid var(--line); margin-block: 36px; }
+
+  .facts {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1px; margin-block: 30px;
+    background: var(--line); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden;
+  }
+  .facts div { background: var(--surface); padding: 16px 18px; }
+  .facts dt { font-family: var(--f-mono); font-size: 26px; font-weight: 500; color: var(--c1); line-height: 1.2; }
+  .facts dd { margin: 6px 0 0; font-size: 14.5px; line-height: 1.45; color: var(--mute); }
+
+  .post-foot { margin-top: 56px; padding-top: 24px; border-top: 1px solid var(--line); }
+  .licence { margin: 0; font-size: 14.5px; color: var(--mute); }
+  .licence a { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--line-soft); }
+  .neighbours { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 28px; }
+  .neighbours .card { display: grid; gap: 6px; padding: 16px 18px; }
+  .neighbours .card span { font-size: 13.5px; color: var(--mute); }
+  .neighbours .card b { color: var(--ink); font-weight: 600; line-height: 1.35; }
+  .neighbours .next { text-align: right; }
+  @media (max-width: 600px) {
+    .post-body { font-size: 17px; }
+    .post-body :global(.code-block pre) { font-size: 13.5px; padding: 14px 16px 16px; }
+    .neighbours { grid-template-columns: 1fr; }
+    .neighbours .next { text-align: left; }
+  }
+</style>
+
+<script>
+  for (const btn of document.querySelectorAll<HTMLButtonElement>(".post-body [data-copy]")) {
+    if (!navigator.clipboard) continue;
+    btn.hidden = false;
+    btn.addEventListener("click", async () => {
+      const code = btn.closest(".code-block")?.querySelector("code")?.textContent ?? "";
+      try {
+        await navigator.clipboard.writeText(code);
+        btn.textContent = "Copied";
+      } catch {
+        btn.textContent = "Copy failed";
+      }
+      setTimeout(() => (btn.textContent = "Copy"), 1600);
+    });
+  }
+</script>

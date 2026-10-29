@@ -21,6 +21,7 @@ export const mainNav: NavItem[] = [
   { label: "Benchmarks", href: "/benchmarks/" },
   { label: "Clients", href: "/docs/clients/" },
   { label: "Integrations", href: "/integrations/" },
+  { label: "Blog", href: "/blog/" },
   { label: "Docs", href: "/docs/" },
 ];
 
@@ -35,6 +36,7 @@ export const footerNav: { title: string; items: NavItem[] }[] = [
       { label: "Long-run tests", href: "/testing/" },
       { label: "Get started", href: "/get-started/" },
       { label: "Changelog", href: "/changelog/" },
+      { label: "Blog", href: "/blog/" },
     ],
   },
   {

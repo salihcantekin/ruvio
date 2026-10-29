@@ -1,0 +1,119 @@
+---
+// /blog/: the newest post large with its scene, the rest as cards, and a topic filter.
+import Page from "../../layouts/Page.astro";
+import PageIntro from "../../components/PageIntro.astro";
+import UseCaseScene from "../../components/animations/UseCaseScene.astro";
+import { posts, readingMinutes, longDate } from "../../lib/blog";
+
+const all = await posts();
+const [lead, ...rest] = all;
+const topics = [...new Set(all.flatMap((p) => p.data.tags))].sort();
+const day = (d: Date) => d.toISOString().slice(0, 10);
+---
+
+<Page title="Blog" description="Notes from building Ruvio: one feature or one problem per post, with the commands, the trade-offs and the numbers behind them.">
+  <PageIntro title="Blog" kicker="Notes from building Ruvio">
+    One feature or one problem per post: what it is for, the commands that do it, what it costs and where it stops.
+    <a slot="after" class="rss" href="/blog/rss.xml">RSS feed</a>
+  </PageIntro>
+
+  <div class="reading">
+    <div class="wrap">
+      {all.length === 0 ? (
+        <p class="panel">No posts yet.</p>
+      ) : (
+        <>
+          {topics.length > 1 && (
+            <div class="seg topics" role="group" aria-label="Filter by topic" data-topics>
+              <button type="button" aria-pressed="true" data-topic="">All</button>
+              {topics.map((t) => <button type="button" aria-pressed="false" data-topic={t}>{t}</button>)}
+            </div>
+          )}
+
+          <a class="lead panel" href={`/blog/${lead.id}/`} data-tags={lead.data.tags.join("|")}>
+            <div class="lead-text">
+              <p class="tags">{lead.data.tags.join(" · ")}</p>
+              <h2>{lead.data.title}</h2>
+              <p class="desc">{lead.data.description}</p>
+              <p class="meta"><time datetime={day(lead.data.date)}>{longDate(lead.data.date)}</time> · {readingMinutes(lead.body)} min read</p>
+              <span class="btn small">Read the post</span>
+            </div>
+            <div class="lead-scene"><UseCaseScene id={lead.data.scene} /></div>
+          </a>
+
+          {rest.length > 0 && (
+            <ul class="cards" role="list">
+              {rest.map((p) => (
+                <li data-tags={p.data.tags.join("|")}>
+                  <a class="post-card" href={`/blog/${p.id}/`}>
+                    <div class="thumb"><UseCaseScene id={p.data.scene} /></div>
+                    <div class="body">
+                      <p class="tags">{p.data.tags.join(" · ")}</p>
+                      <h3>{p.data.title}</h3>
+                      <p class="desc">{p.data.description}</p>
+                      <p class="meta"><time datetime={day(p.data.date)}>{longDate(p.data.date)}</time> · {readingMinutes(p.body)} min read</p>
+                    </div>
+                  </a>
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
+    </div>
+  </div>
+</Page>
+
+<style>
+  .rss { display: inline-block; margin-top: 20px; font-size: 15px; color: var(--mute); text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--line-soft); }
+  .rss:hover { color: var(--ink); }
+  .topics { flex-wrap: wrap; margin-bottom: 22px; }
+  .topics button { font: inherit; font-size: 14.5px; padding: 6px 12px; border: 0; border-radius: var(--radius-s); background: transparent; color: var(--mute); cursor: pointer; }
+  .topics button[aria-pressed="true"] { background: var(--surface); color: var(--ink); box-shadow: inset 0 0 0 1px var(--line); }
+
+  .tags { margin: 0 0 10px; font-size: 13.5px; font-weight: 600; letter-spacing: 0.02em; color: var(--c1); }
+  .desc { margin: 0; color: var(--ink-body); line-height: 1.6; }
+  .meta { margin: 14px 0 0; font-size: 14px; color: var(--mute); }
+
+  .lead { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr); gap: clamp(20px, 4vw, 48px); align-items: center; color: inherit; transition: border-color .15s ease; }
+  .lead:hover { border-color: color-mix(in srgb, var(--accent) 55%, var(--paper-line)); }
+  .lead h2 { margin: 0 0 14px; font-size: clamp(26px, 3.2vw, 38px); line-height: 1.12; color: var(--ink); }
+  .lead .desc { font-size: 18px; }
+  .lead .btn { margin-top: 22px; }
+  .lead-scene :global(.case-scene) { margin: 0; max-width: none; }
+
+  .cards { list-style: none; padding: 0; margin: 22px 0 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: 18px; }
+  .cards li { display: flex; }
+  .post-card {
+    display: flex; flex-direction: column; width: 100%; color: inherit;
+    background: var(--paper); border: 1px solid var(--paper-line); border-radius: var(--radius); overflow: hidden;
+    transition: border-color .15s ease, transform .15s ease;
+  }
+  .post-card:hover { border-color: color-mix(in srgb, var(--accent) 55%, var(--paper-line)); transform: translateY(-2px); }
+  .thumb { padding: 14px 14px 0; background: color-mix(in srgb, var(--surface-2) 50%, transparent); border-bottom: 1px solid var(--paper-line); }
+  .thumb :global(.case-scene) { margin: 0 auto; }
+  .thumb :global(figcaption) { display: none; }
+  .body { padding: 18px 20px 22px; }
+  .body h3 { margin: 0 0 10px; font-size: 21px; line-height: 1.25; color: var(--ink); }
+  .body .desc { font-size: 16px; }
+
+  [data-hidden] { display: none !important; }
+  @media (max-width: 860px) {
+    .lead { grid-template-columns: minmax(0, 1fr); }
+    .lead-scene { order: -1; }
+    .lead-scene :global(figcaption) { display: none; }
+  }
+</style>
+
+<script>
+  // Topic filter: shows the posts that carry the chosen tag. Without JavaScript every post shows.
+  const group = document.querySelector<HTMLElement>("[data-topics]");
+  const items = [...document.querySelectorAll<HTMLElement>("[data-tags]")];
+  group?.addEventListener("click", (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>("button[data-topic]");
+    if (!btn) return;
+    const topic = btn.dataset.topic ?? "";
+    group.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b === btn)));
+    for (const el of items) el.toggleAttribute("data-hidden", topic !== "" && !el.dataset.tags!.split("|").includes(topic));
+  });
+</script>

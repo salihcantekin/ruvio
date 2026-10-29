@@ -1,0 +1,8 @@
+The text of the blog posts in this folder is licensed under
+the Creative Commons Attribution 4.0 International licence (CC BY 4.0):
+https://creativecommons.org/licenses/by/4.0/
+
+Code samples inside the posts are licensed under the MIT licence, like the Ruvio clients.
+
+The rest of the repository keeps its own licences (see the LICENSE files at the root and in
+each package).
