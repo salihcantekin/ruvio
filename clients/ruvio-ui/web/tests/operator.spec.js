@@ -4,9 +4,10 @@ const bulk = (text) => ({ kind: "bulk", text });
 const integer = (value) => ({ kind: "integer", value });
 const array = (...items) => ({ kind: "array", items });
 const shards = [
-  { id: 0, host: "127.0.0.1", port: 6380, start: 0, end: 8191 },
-  { id: 1, host: "127.0.0.1", port: 6381, start: 8192, end: 16383 },
+  { id: 0, host: "127.0.0.1", port: 6380, ranges: [[0, 8191]], slots: 8192, replicas: [] },
+  { id: 1, host: "127.0.0.1", port: 6381, ranges: [[8192, 16383]], slots: 8192, replicas: [] },
 ];
+const infoText = (port) => `run_id:r1\r\nruvio_backend:evented\r\nruvio_health:ok\r\nruvio_readiness:ready\r\nruvio_persistence_state:ok\r\nruvio_durability:memory\r\nconnected_clients:3\r\nget_commands:4\r\nset_commands:5\r\nincrement_commands:6\r\nother_commands:7\r\ntotal_commands_processed:22\r\nkeys:${port === 6381 ? 8 : 12}\r\ncharged_memory_bytes:1024\r\n`;
 
 async function setup(page, options = {}) {
   const requests = [];
@@ -20,16 +21,25 @@ async function setup(page, options = {}) {
     requests.push({ path, body, sessionId: route.request().headers()["x-ruvio-session"] });
     let result = { ok: true };
     if (path === "/api/defaults") result = { ok: true, host: "127.0.0.1", port: 6380, password: "" };
-    else if (path === "/api/session") result = { ok: true, connected: !!session, ...session };
+    else if (path === "/api/session") result = { ok: true, connected: !!session, coordinators: !!options.coordinators, ...session };
+    else if (path === "/api/coordinators") result = options.coordinators?.() ?? { ok: true, configured: false };
+    else if (path === "/api/probe") {
+      // The same INFO a pinned INFO command would answer, so command overrides drive both.
+      result.nodes = body.nodes.map((node) => {
+        const override = options.command?.(["INFO"], node);
+        if (override?.ok === false) return { host: node.host, port: node.port, reachable: false, error: override.error };
+        return { host: node.host, port: node.port, reachable: true, ms: 1, topology_version: 0, info: override?.value?.text ?? infoText(node.port) };
+      });
+    }
     else if (path === "/api/connect") session = { host: body.host, port: body.port, username: body.username };
     else if (path === "/api/disconnect") session = null;
-    else if (path === "/api/shards") result.shards = shards;
+    else if (path === "/api/shards") result.shards = options.shards ?? shards;
     else if (path === "/api/command") {
       const args = body.args;
       const override = options.command?.(args, body.shard);
       if (override) result = override;
       else if (args[0] === "INFO") {
-        result.value = bulk(`ruvio_backend:evented\r\nruvio_health:ok\r\nruvio_readiness:ready\r\nruvio_persistence_state:ok\r\nruvio_durability:memory\r\nconnected_clients:3\r\nget_commands:4\r\nset_commands:5\r\nincrement_commands:6\r\nother_commands:7\r\ntotal_commands_processed:22\r\nkeys:${body.shard?.port === 6381 ? 8 : 12}\r\ncharged_memory_bytes:1024\r\n`);
+        result.value = bulk(infoText(body.shard?.port));
       } else if (args[0] === "SCAN") {
         result.value = !body.shard && args[1] === "0"
           ? array(bulk("owner:1"), array())
@@ -229,6 +239,7 @@ test("Pub/Sub listens for key events on the chosen database and shard", async ({
 
   await selectShard(page, 1);
   await page.getByRole("button", { name: "Listen for evicted", exact: true }).click();
+  await expect.poll(() => requests.filter((item) => item.path === "/api/pubsub/subscribe").length).toBe(2);
   const pinnedRequest = requests.filter((item) => item.path === "/api/pubsub/subscribe").at(-1);
   expect(pinnedRequest.body.sharded_channels).toEqual(["__keyevent@4__:evicted"]);
   expect(pinnedRequest.body.shard.port).toBe(6381);
@@ -260,7 +271,7 @@ test("unavailable metrics are not zero and HTTP errors leave forms usable", asyn
   await page.getByRole("button", { name: "Open operator panel" }).click();
   await expect(page.locator(".metric-card").first()).toContainText("1 / 2");
   await expect(page.locator(".metric-card").nth(1)).toContainText("Not reported");
-  await expect(page.getByRole("alert")).toContainText("connection refused");
+  await expect(page.locator(".notices")).toContainText("127.0.0.1:6381 (shard 1 primary) is not answering");
   await nav(page, "Tasks");
   await page.getByLabel("Lock key").fill("lock");
   await page.getByLabel("Lifetime (milliseconds)").fill("500");
@@ -372,6 +383,8 @@ test("multiple shard selection filters overview and scans while keyed writes rou
   await page.getByLabel("Lock key").fill("lock:one");
   await page.getByLabel("Lifetime (milliseconds)").fill("5000");
   await page.locator("form").getByRole("button", { name: "Acquire a lock", exact: true }).click();
+  // The click returns before the request reaches the mock: wait for it rather than read it at once.
+  await expect.poll(() => requests.find((item) => item.body?.args?.[0] === "LEASE")?.body).toBeTruthy();
   expect(requests.find((item) => item.body?.args?.[0] === "LEASE").body.shard).toBeNull();
 });
 
@@ -548,4 +561,55 @@ test("JSON task replies render as a tree and forms reject invalid JSON", async (
   await page.locator(".workbench textarea").fill("{nope");
   await page.getByRole("button", { name: "Write a document or path" }).last().click();
   await expect(page.locator(".response")).toContainText("not valid JSON");
+});
+
+test("a shard with several ranges is counted once and its replicas are probed", async ({ page }) => {
+  const split = [
+    { id: 0, host: "127.0.0.1", port: 6380, ranges: [[0, 99], [200, 8191]], slots: 8092, replicas: [{ host: "127.0.0.1", port: 6390, offset: 3 }] },
+    { id: 1, host: "127.0.0.1", port: 6381, ranges: [[100, 199], [8192, 16383]], slots: 8292, replicas: [] },
+  ];
+  const { requests, errors } = await setup(page, { shards: split, command: (args, node) => {
+    if (args[0] !== "INFO") return null;
+    if (node?.port === 6390) return { ok: true, value: bulk("keys:12\r\ncharged_memory_bytes:1024\r\ntotal_commands_processed:5\r\nslave_repl_offset:40\r\nmaster_link_status:up\r\n") };
+    if (node?.port === 6380) return { ok: true, value: bulk("keys:12\r\ncharged_memory_bytes:1024\r\ntotal_commands_processed:22\r\nwal_last_sequence:50\r\n") };
+    return null;
+  } });
+  await signIn(page);
+  await expect(page.locator(".metric-card").nth(1)).toContainText("20");
+  await expect(page.locator(".metric-card").first()).toContainText("Replicas: 1 / 1 answering");
+  await expect(page.locator(".distribution-row:not(.head)")).toHaveCount(2);
+  await expect(page.locator(".distribution-row").nth(1)).toContainText("10 behind");
+  const probe = requests.find((item) => item.path === "/api/probe").body;
+  expect(probe.nodes.map((node) => node.port)).toEqual([6380, 6390, 6381]);
+  expect(probe.extended).toBe(true);
+  await expect(page.locator(".slot-segment")).toHaveCount(4);
+  expect(errors).toEqual([]);
+});
+
+test("the cluster view reads groups and coordinators without sending commands", async ({ page }, testInfo) => {
+  const fieldList = (object) => array(...Object.entries(object).flatMap(([name, value]) => [bulk(name), bulk(String(value))]));
+  const { requests, errors } = await setup(page, { coordinators: () => ({
+    ok: true,
+    configured: true,
+    source: "c2:26400",
+    coordinators: [
+      { address: "c1:26400", ok: false, error: "Connection refused" },
+      { address: "c2:26400", ok: true, info: "coordinator_id:2\r\nleader_id:2\r\nis_leader:1\r\nfailovers_total:1\r\nlast_failover_unix_ms:0\r\ngroup_main:primary=127.0.0.1:6380,epoch=3,members_answering=2/3,state=waiting,state_ms=4000\r\n" },
+    ],
+    masters: array(fieldList({ name: "main", ip: "127.0.0.1", port: 6380 })),
+    replicas: { main: array() },
+    status: fieldList({ state: "moving", id: "m1", first: 100, last: 199, from: "main", to: "other", shard: 0, moved_ranges: 2 }),
+  }) });
+  await signIn(page);
+  await nav(page, "Cluster");
+  await expect(page.getByRole("heading", { name: "Cluster", exact: true })).toBeVisible();
+  await expect(page.locator(".coordinator-list .badge.leader")).toHaveCount(1);
+  await expect(page.locator(".coordinator-list")).toContainText("Connection refused");
+  await expect(page.getByRole("table", { name: "Groups the coordinators watch" })).toContainText("Waiting for a replica with every committed write");
+  await expect(page.locator(".move-status").first()).toContainText("Moving slots 100–199 from main to other");
+  await expect(page.locator(".group-panel")).toHaveCount(1);
+  await noOverflow(page);
+  await page.screenshot({ path: testInfo.outputPath("cluster.png"), fullPage: true });
+  expect(requests.filter((item) => item.path === "/api/command")).toEqual([]);
+  expect(errors).toEqual([]);
 });

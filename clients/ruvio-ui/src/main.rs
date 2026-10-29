@@ -15,6 +15,9 @@ use std::{
 
 use include_dir::{Dir, include_dir};
 
+mod coordinator;
+mod topology;
+
 use ruvio_client::{
     Client, ClientOptions, Error as ClientError, PubSubMessage, RespValue, TlsOptions,
 };
@@ -24,10 +27,15 @@ use serde_json::{Value, json};
 
 static ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/web/dist");
 
+type Shared<T> = Arc<Mutex<T>>;
+
+/// One signed-in browser tab. Its lock is held only for bookkeeping: every RESP call runs under
+/// the lock of the connection it uses, so a slow or unreachable node delays only the requests
+/// that go to it.
 struct Session {
     last_activity: Instant,
-    client: Client,
-    direct: Client,
+    client: Shared<Client>,
+    direct: Shared<Client>,
     host: String,
     port: u16,
     username: String,
@@ -37,7 +45,9 @@ struct Session {
     stop: Arc<AtomicBool>,
     listener: Arc<AtomicBool>,
     bound: Option<(String, u16)>,
-    nodes: HashMap<(String, u16), Client>,
+    nodes: HashMap<(String, u16), Shared<Client>>,
+    /// Nodes whose last connect failed, with when and why; not dialled again for a while.
+    unreachable: HashMap<(String, u16), (Instant, String)>,
 }
 
 struct ListenRequest {
@@ -48,13 +58,25 @@ struct ListenRequest {
     reply: mpsc::Sender<Result<(), String>>,
 }
 
-static SESSIONS: LazyLock<Mutex<HashMap<String, Session>>> =
+static SESSIONS: LazyLock<Mutex<HashMap<String, Shared<Session>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 const SESSION_IDLE: Duration = Duration::from_secs(30 * 60);
+/// How long a node whose connect failed is answered from memory instead of dialled again.
+const UNREACHABLE_FOR: Duration = Duration::from_secs(3);
+const NODE_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+const NODE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_PROBE_NODES: usize = 512;
+
+fn session_of(session_id: &str) -> Option<Shared<Session>> {
+    SESSIONS.lock().expect("sessions").get(session_id).cloned()
+}
 
 fn expire_sessions() {
     SESSIONS.lock().expect("sessions").retain(|_, session| {
+        let session = session.lock().expect("session");
+
         if session.last_activity.elapsed() < SESSION_IDLE {
             true
         } else {
@@ -182,8 +204,8 @@ fn handle(mut stream: TcpStream, disk: Option<&Path>) -> std::io::Result<()> {
             return write_json(&mut stream, 400, json!({"ok": false, "error": error}));
         }
     };
-    if let Some(session) = SESSIONS.lock().expect("sessions").get_mut(&session_id) {
-        session.last_activity = Instant::now();
+    if let Some(session) = session_of(&session_id) {
+        session.lock().expect("session").last_activity = Instant::now();
     }
 
     if method == "POST" && path == "/api/connect" {
@@ -209,8 +231,7 @@ fn handle(mut stream: TcpStream, disk: Option<&Path>) -> std::io::Result<()> {
     }
 
     if method == "POST" && path == "/api/pubsub/reset" {
-        let mut guard = SESSIONS.lock().expect("sessions");
-        let Some(session) = guard.get_mut(&session_id) else {
+        let Some(session) = session_of(&session_id) else {
             return write_json(
                 &mut stream,
                 200,
@@ -218,7 +239,7 @@ fn handle(mut stream: TcpStream, disk: Option<&Path>) -> std::io::Result<()> {
             );
         };
 
-        reset_listener(session);
+        reset_listener(&mut session.lock().expect("session"));
 
         return write_json(&mut stream, 200, json!({"ok": true}));
     }
@@ -237,6 +258,22 @@ fn handle(mut stream: TcpStream, disk: Option<&Path>) -> std::io::Result<()> {
 
     if method == "GET" && path == "/api/shards" {
         return shards(&mut stream, &session_id);
+    }
+
+    if method == "POST" && path == "/api/probe" {
+        return probe(&mut stream, body, &session_id);
+    }
+
+    if method == "GET" && path == "/api/coordinators" {
+        if session_of(&session_id).is_none() {
+            return write_json(
+                &mut stream,
+                200,
+                json!({"ok": false, "error": "not connected"}),
+            );
+        }
+
+        return write_json(&mut stream, 200, coordinator::report());
     }
 
     if method == "GET" && path == "/api/defaults" {
@@ -413,10 +450,10 @@ fn connect(stream: &mut TcpStream, body: &[u8], session_id: &str) -> std::io::Re
 
             SESSIONS.lock().expect("sessions").insert(
                 session_id.to_owned(),
-                Session {
+                Arc::new(Mutex::new(Session {
                     last_activity: Instant::now(),
-                    client,
-                    direct,
+                    client: Arc::new(Mutex::new(client)),
+                    direct: Arc::new(Mutex::new(direct)),
                     host: parsed.host,
                     port: parsed.port,
                     username: parsed.username,
@@ -427,7 +464,8 @@ fn connect(stream: &mut TcpStream, body: &[u8], session_id: &str) -> std::io::Re
                     listener: Arc::new(AtomicBool::new(false)),
                     bound: None,
                     nodes: HashMap::new(),
-                },
+                    unreachable: HashMap::new(),
+                })),
             );
 
             write_json(stream, 200, json!({"ok": true}))
@@ -457,13 +495,12 @@ fn command(stream: &mut TcpStream, body: &[u8], session_id: &str) -> std::io::Re
         return write_json(stream, 400, json!({"ok": false, "error": "args is empty"}));
     }
 
-    let mut sessions = SESSIONS.lock().expect("sessions");
-    let Some(session) = sessions.get_mut(session_id) else {
+    let Some(session) = session_of(session_id) else {
         return write_json(stream, 200, json!({"ok": false, "error": "not connected"}));
     };
 
     let args: Vec<&str> = parsed.args.iter().map(String::as_str).collect();
-    let result = execute_targeted(session, &args, parsed.shard.as_ref());
+    let result = execute_targeted(&session, &args, parsed.shard.as_ref());
 
     match result {
         Ok(value) => write_json(
@@ -477,7 +514,11 @@ fn command(stream: &mut TcpStream, body: &[u8], session_id: &str) -> std::io::Re
 
 fn release_session(session_id: &str) {
     if let Some(session) = SESSIONS.lock().expect("sessions").remove(session_id) {
-        session.stop.store(true, Ordering::Relaxed);
+        session
+            .lock()
+            .expect("session")
+            .stop
+            .store(true, Ordering::Relaxed);
     }
 }
 
@@ -511,10 +552,11 @@ fn pubsub_listen(
     let (reply_tx, reply_rx) = mpsc::channel();
 
     {
-        let mut guard = SESSIONS.lock().expect("sessions");
-        let Some(session) = guard.get_mut(session_id) else {
+        let Some(handle) = session_of(session_id) else {
             return write_json(stream, 200, json!({"ok": false, "error": "not connected"}));
         };
+        let mut guard = handle.lock().expect("session");
+        let session = &mut *guard;
 
         let (host, port) = match parsed.shard.as_ref().filter(|node| !node.host.is_empty()) {
             Some(node) => (node.host.clone(), node.port),
@@ -702,21 +744,23 @@ fn publish(stream: &mut TcpStream, body: &[u8], session_id: &str) -> std::io::Re
         }
     };
 
-    let mut guard = SESSIONS.lock().expect("sessions");
-    let Some(session) = guard.get_mut(session_id) else {
+    let Some(session) = session_of(session_id) else {
         return write_json(stream, 200, json!({"ok": false, "error": "not connected"}));
     };
 
-    let result = if let Some(node) = parsed.shard.as_ref().filter(|node| !node.host.is_empty()) {
-        match node_client(session, node) {
-            Ok(client) => client.publish(&parsed.channel, &parsed.message),
+    let client = match parsed.shard.as_ref().filter(|node| !node.host.is_empty()) {
+        Some(node) => match node_handle(&session, node) {
+            Ok(client) => client,
             Err(error) => {
                 return write_json(stream, 200, json!({"ok": false, "error": error}));
             }
-        }
-    } else {
-        session.direct.publish(&parsed.channel, &parsed.message)
+        },
+        None => Arc::clone(&session.lock().expect("session").direct),
     };
+    let result = client
+        .lock()
+        .expect("client")
+        .publish(&parsed.channel, &parsed.message);
 
     match result {
         Ok(receivers) => write_json(stream, 200, json!({"ok": true, "receivers": receivers})),
@@ -729,12 +773,12 @@ fn publish(stream: &mut TcpStream, body: &[u8], session_id: &str) -> std::io::Re
 }
 
 fn poll_pubsub(stream: &mut TcpStream, session_id: &str) -> std::io::Result<()> {
-    let guard = SESSIONS.lock().expect("sessions");
-    let Some(session) = guard.get(session_id) else {
+    let Some(session) = session_of(session_id) else {
         return write_json(stream, 200, json!({"ok": false, "error": "not connected"}));
     };
 
-    let messages = std::mem::take(&mut *session.mailbox.lock().expect("mailbox"));
+    let mailbox = Arc::clone(&session.lock().expect("session").mailbox);
+    let messages = std::mem::take(&mut *mailbox.lock().expect("mailbox"));
 
     write_json(stream, 200, json!({"ok": true, "messages": messages}))
 }
@@ -758,20 +802,24 @@ fn is_timeout(error: &std::io::Error) -> bool {
 }
 
 fn execute_targeted(
-    session: &mut Session,
+    session: &Shared<Session>,
     args: &[&str],
     shard: Option<&NodeTarget>,
 ) -> Result<RespValue, String> {
-    let client = if let Some(node) = shard.filter(|node| !node.host.is_empty()) {
-        node_client(session, node)?
-    } else {
-        &mut session.client
+    let client = match shard.filter(|node| !node.host.is_empty()) {
+        Some(node) => node_handle(session, node)?,
+        None => Arc::clone(&session.lock().expect("session").client),
     };
+    let mut client = client.lock().expect("client");
 
-    execute_read_retry(client, args).map_err(|error| match error {
+    execute_read_retry(&mut client, args).map_err(error_text)
+}
+
+fn error_text(error: ClientError) -> String {
+    match error {
         ClientError::Server(message) => message,
         other => other.to_string(),
-    })
+    }
 }
 
 fn retryable_read(args: &[&str]) -> bool {
@@ -816,9 +864,9 @@ fn retryable_read(args: &[&str]) -> bool {
         || (args
             .first()
             .is_some_and(|command| command.eq_ignore_ascii_case("CLUSTER"))
-            && args
-                .get(1)
-                .is_some_and(|sub| sub.eq_ignore_ascii_case("SLOTS")))
+            && args.get(1).is_some_and(|sub| {
+                sub.eq_ignore_ascii_case("SLOTS") || sub.eq_ignore_ascii_case("SHARDS")
+            }))
 }
 
 fn execute_read_retry(client: &mut Client, args: &[&str]) -> Result<RespValue, ClientError> {
@@ -848,155 +896,279 @@ fn execute_read_retry(client: &mut Client, args: &[&str]) -> Result<RespValue, C
     }
 }
 
-fn node_client<'a>(session: &'a mut Session, node: &NodeTarget) -> Result<&'a mut Client, String> {
+/// The connection to one node of the session, opened on first use. A node whose connect failed
+/// is not dialled again for [`UNREACHABLE_FOR`]; the remembered error is answered instead.
+fn node_handle(session: &Shared<Session>, node: &NodeTarget) -> Result<Shared<Client>, String> {
     let key = (node.host.clone(), node.port);
+    let (username, password) = {
+        let session = session.lock().expect("session");
 
-    if !session.nodes.contains_key(&key) {
-        let mut options = ClientOptions::default();
+        if let Some(client) = session.nodes.get(&key) {
+            return Ok(Arc::clone(client));
+        }
+        if let Some((at, error)) = session.unreachable.get(&key)
+            && at.elapsed() < UNREACHABLE_FOR
+        {
+            return Err(error.clone());
+        }
 
-        options.host = node.host.clone();
-        options.port = node.port;
-        options.discover_cluster = false;
-        options.tls = target_tls()?;
-        options.username = if session.username.is_empty() {
-            None
-        } else {
-            Some(session.username.clone())
-        };
+        (session.username.clone(), session.password.clone())
+    };
+    let mut options = ClientOptions::default();
 
-        options.password = if session.password.is_empty() {
-            None
-        } else {
-            Some(session.password.clone())
-        };
+    options.host = node.host.clone();
+    options.port = node.port;
+    options.discover_cluster = false;
+    options.tls = target_tls()?;
+    options.connect_timeout = NODE_CONNECT_TIMEOUT;
+    options.max_reconnect_attempts = 1;
+    options.reconnect_base_delay = Duration::from_millis(50);
+    options.username = (!username.is_empty()).then_some(username);
+    options.password = (!password.is_empty()).then_some(password);
 
-        let mut client = Client::connect_with(options).map_err(|error| error.to_string())?;
+    // Dialled without the session lock, so other requests of the session go on meanwhile.
+    let connected = Client::connect_with(options).map_err(|error| error.to_string());
+    let mut session = session.lock().expect("session");
 
-        let _ = client.set_read_timeout(Some(Duration::from_secs(5)));
+    match connected {
+        Ok(mut client) => {
+            let _ = client.set_read_timeout(Some(NODE_READ_TIMEOUT));
+            session.unreachable.remove(&key);
 
-        session.nodes.insert(key.clone(), client);
+            Ok(Arc::clone(
+                session
+                    .nodes
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(Mutex::new(client))),
+            ))
+        }
+        Err(error) => {
+            session
+                .unreachable
+                .insert(key, (Instant::now(), error.clone()));
+
+            Err(error)
+        }
     }
-
-    Ok(session.nodes.get_mut(&key).expect("node client"))
 }
 
+/// Runs `work` for every item, at most 32 at a time, and answers the results in item order.
+pub(crate) fn parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let mut results = Vec::with_capacity(items.len());
+
+    for chunk in items.chunks(32) {
+        thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|item| scope.spawn(|| work(item)))
+                .collect();
+
+            results.extend(
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("worker")),
+            );
+        });
+    }
+
+    results
+}
+
+/// `GET /api/shards`: the shards from the entry node's `CLUSTER SHARDS`, one entry per shard
+/// with all its ranges and replicas. In a multi-node cluster the entry node lists other groups'
+/// shards by their primary only, so those primaries are asked for their own replicas.
 fn shards(stream: &mut TcpStream, session_id: &str) -> std::io::Result<()> {
-    let mut guard = SESSIONS.lock().expect("sessions");
-    let Some(session) = guard.get_mut(session_id) else {
+    let Some(session) = session_of(session_id) else {
         return write_json(stream, 200, json!({"ok": false, "error": "not connected"}));
     };
+    let (direct, host, port) = {
+        let session = session.lock().expect("session");
 
+        (
+            Arc::clone(&session.direct),
+            session.host.clone(),
+            session.port,
+        )
+    };
+    let (listed, version) = {
+        let mut direct = direct.lock().expect("client");
+        let listed = execute_read_retry(&mut direct, &["CLUSTER", "SHARDS"]);
+        let version = direct
+            .execute(&["RUVIO", "TOPOLOGY", "VERSION"])
+            .ok()
+            .as_ref()
+            .and_then(topology::integer_of)
+            .unwrap_or(0);
+
+        (listed, version)
+    };
     let fallback = json!([{
         "id": 0,
-        "host": session.host,
-        "port": session.port,
-        "start": 0,
-        "end": 16383,
+        "host": host,
+        "port": port,
+        "ranges": [[0, 16383]],
+        "slots": 16384,
+        "replicas": [],
     }]);
 
-    let (listed, warning) = match execute_read_retry(&mut session.client, &["CLUSTER", "SLOTS"]) {
-        Ok(value) => match slots_json(&value).filter(|items| !items.is_empty()) {
-            Some(mut nodes) => {
-                let note = reroute_loopback(&mut nodes, &session.host);
-                (Some(nodes), note)
+    let mut warnings = Vec::new();
+    let listed = match listed {
+        Ok(value) => match topology::parse_shards(&value).filter(|items| !items.is_empty()) {
+            Some(mut found) => {
+                warnings.extend(topology::reroute_loopback(&mut found, &host));
+
+                if version > 0 {
+                    let lone = topology::lone_primaries(&found);
+                    let answers = parallel(&lone, |(host, port)| {
+                        let node = NodeTarget {
+                            host: host.clone(),
+                            port: *port,
+                        };
+                        let client = node_handle(&session, &node)?;
+                        let reply = execute_read_retry(
+                            &mut client.lock().expect("client"),
+                            &["CLUSTER", "SHARDS"],
+                        )
+                        .map_err(error_text)?;
+
+                        topology::parse_shards(&reply).ok_or_else(|| "unexpected reply".to_owned())
+                    });
+
+                    for ((host, port), answer) in lone.iter().zip(answers) {
+                        match answer {
+                            Ok(mut answer) => {
+                                topology::reroute_loopback(&mut answer, host);
+                                topology::merge_members(&mut found, &answer);
+                            }
+                            Err(error) => {
+                                warnings.push(format!("Replicas of {host}:{port} unknown: {error}"))
+                            }
+                        }
+                    }
+                }
+
+                topology::sort_by_slots(&mut found);
+
+                Some(topology::shards_json(&found))
             }
-            None => (
-                None,
-                Some("No shard topology reported. Showing the entry node only.".to_owned()),
-            ),
+            None => {
+                warnings
+                    .push("No shard topology reported. Showing the entry node only.".to_owned());
+
+                None
+            }
         },
-        Err(error) => (
-            None,
-            Some(format!(
-                "Shard discovery unavailable: {error}. Showing the entry node only."
-            )),
-        ),
+        Err(error) => {
+            warnings.push(format!(
+                "Shard discovery unavailable: {}. Showing the entry node only.",
+                error_text(error)
+            ));
+
+            None
+        }
     };
+    let warning = (!warnings.is_empty()).then(|| warnings.join(" "));
 
     write_json(
         stream,
         200,
-        json!({"ok": true, "shards": listed.unwrap_or(vec![fallback[0].clone()]), "warning": warning}),
+        json!({
+            "ok": true,
+            "shards": listed.unwrap_or_else(|| vec![fallback[0].clone()]),
+            "topology_version": version,
+            "warning": warning,
+        }),
     )
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    let host = host.trim_matches(['[', ']']);
-    host.eq_ignore_ascii_case("localhost") || host == "::1" || host.starts_with("127.")
+#[derive(Deserialize)]
+struct ProbeBody {
+    nodes: Vec<NodeTarget>,
+    /// Also read the node's `cluster-group` setting (on topology changes, not every refresh).
+    #[serde(default)]
+    extended: bool,
 }
 
-/// A server that does not set `advertised_host` names its shards `127.0.0.1`, which points back
-/// at this process when the server is elsewhere (another machine, a host the UI container
-/// reaches by name). Such shards are reached through the address the user signed in with.
-fn reroute_loopback(nodes: &mut [Value], entry_host: &str) -> Option<String> {
-    if is_loopback_host(entry_host) {
-        return None;
-    }
-
-    let mut changed = false;
-
-    for node in nodes.iter_mut() {
-        if node["host"].as_str().is_some_and(is_loopback_host) {
-            node["host"] = json!(entry_host);
-            changed = true;
+/// `POST /api/probe`: `INFO` and the cluster map version from every node, in parallel, each
+/// with a short read timeout. A node that cannot be reached is reported, not waited for.
+fn probe(stream: &mut TcpStream, body: &[u8], session_id: &str) -> std::io::Result<()> {
+    let parsed: ProbeBody = match serde_json::from_slice(body) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return write_json(
+                stream,
+                400,
+                json!({"ok": false, "error": error.to_string()}),
+            );
         }
-    }
-
-    changed.then(|| {
-        format!(
-            "The server names its shards 127.0.0.1, so they are reached through {entry_host}. Set RUVIO_ADVERTISE_HOST on the server to a name clients can reach to make this permanent."
-        )
-    })
-}
-
-fn slots_json(value: &RespValue) -> Option<Vec<Value>> {
-    let RespValue::Array(rows) = value else {
-        return None;
     };
-
-    let mut shards = Vec::new();
-
-    for (index, row) in rows.iter().enumerate() {
-        let RespValue::Array(parts) = row else {
-            continue;
-        };
-
-        let start = integer_of(parts.first()?)?;
-        let end = integer_of(parts.get(1)?)?;
-        let RespValue::Array(node) = parts.get(2)? else {
-            continue;
-        };
-
-        let host = text_of(node.first()?)?;
-        let port = integer_of(node.get(1)?)?;
-
-        shards.push(json!({
-            "id": index,
-            "host": host,
-            "port": port,
-            "start": start,
-            "end": end,
-        }));
+    let Some(session) = session_of(session_id) else {
+        return write_json(stream, 200, json!({"ok": false, "error": "not connected"}));
+    };
+    if parsed.nodes.len() > MAX_PROBE_NODES {
+        return write_json(
+            stream,
+            400,
+            json!({"ok": false, "error": format!("at most {MAX_PROBE_NODES} nodes per probe")}),
+        );
     }
 
-    Some(shards)
+    let readings = parallel(&parsed.nodes, |node| {
+        probe_node(&session, node, parsed.extended)
+    });
+
+    write_json(stream, 200, json!({"ok": true, "nodes": readings}))
 }
 
-fn integer_of(value: &RespValue) -> Option<u64> {
-    match value {
-        RespValue::Integer(value) => u64::try_from(*value).ok(),
-        RespValue::Bulk(bytes) => std::str::from_utf8(bytes).ok()?.parse().ok(),
-        RespValue::Simple(text) => text.parse().ok(),
-        _ => None,
-    }
-}
+fn probe_node(session: &Shared<Session>, node: &NodeTarget, extended: bool) -> Value {
+    let started = Instant::now();
+    let client = match node_handle(session, node) {
+        Ok(client) => client,
+        Err(error) => {
+            return json!({"host": node.host, "port": node.port, "reachable": false, "error": error});
+        }
+    };
+    let mut client = client.lock().expect("client");
+    let _ = client.set_read_timeout(Some(PROBE_READ_TIMEOUT));
+    let info = execute_read_retry(&mut client, &["INFO"]);
+    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    let reading = match info {
+        // An error reply (a missing permission, a shard still loading) still means it answered.
+        Err(ClientError::Server(error)) => json!({
+            "host": node.host, "port": node.port, "reachable": true, "error": format!("INFO: {error}"), "ms": ms,
+        }),
+        Err(error) => json!({
+            "host": node.host, "port": node.port, "reachable": false, "error": format!("INFO: {error}"),
+        }),
+        Ok(info) => {
+            let version = client
+                .execute(&["RUVIO", "TOPOLOGY", "VERSION"])
+                .ok()
+                .as_ref()
+                .and_then(topology::integer_of);
+            let group = extended
+                .then(|| client.execute(&["CONFIG", "GET", "cluster-group"]).ok())
+                .flatten()
+                .and_then(|reply| match reply {
+                    RespValue::Array(items) => items.get(1).and_then(topology::text_of),
+                    _ => None,
+                })
+                .filter(|group| !group.is_empty());
 
-fn text_of(value: &RespValue) -> Option<String> {
-    match value {
-        RespValue::Bulk(bytes) => String::from_utf8(bytes.clone()).ok(),
-        RespValue::Simple(text) => Some(text.clone()),
-        _ => None,
-    }
+            json!({
+                "host": node.host,
+                "port": node.port,
+                "reachable": true,
+                "info": topology::text_of(&info),
+                "topology_version": version,
+                "group": group,
+                "ms": ms,
+            })
+        }
+    };
+    let _ = client.set_read_timeout(Some(NODE_READ_TIMEOUT));
+
+    reading
 }
 
 fn parsed_port(port: &str) -> u16 {
@@ -1087,20 +1259,23 @@ fn defaults(stream: &mut TcpStream) -> std::io::Result<()> {
 }
 
 fn session(stream: &mut TcpStream, session_id: &str) -> std::io::Result<()> {
-    let sessions = SESSIONS.lock().expect("sessions");
+    match session_of(session_id) {
+        Some(session) => {
+            let session = session.lock().expect("session");
 
-    match sessions.get(session_id) {
-        Some(session) => write_json(
-            stream,
-            200,
-            json!({
-                "ok": true,
-                "connected": true,
-                "host": session.host,
-                "port": session.port,
-                "username": session.username,
-            }),
-        ),
+            write_json(
+                stream,
+                200,
+                json!({
+                    "ok": true,
+                    "connected": true,
+                    "host": session.host,
+                    "port": session.port,
+                    "username": session.username,
+                    "coordinators": coordinator::configured(),
+                }),
+            )
+        }
         None => write_json(stream, 200, json!({"ok": true, "connected": false})),
     }
 }
@@ -1236,11 +1411,10 @@ fn write_json(stream: &mut TcpStream, status: u16, body: Value) -> std::io::Resu
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_read_retry, password_for_target, read_request, request_session_id,
-        reroute_loopback, retryable_read, tls_from,
+        execute_read_retry, password_for_target, read_request, request_session_id, retryable_read,
+        tls_from,
     };
     use ruvio_client::{Client, ClientOptions, RespValue};
-    use serde_json::json;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::time::{Duration, Instant};
@@ -1308,25 +1482,6 @@ mod tests {
             )
             .is_err()
         );
-    }
-
-    #[test]
-    fn loopback_shards_are_reached_through_the_entry_host() {
-        let mut nodes = vec![
-            json!({"id": 0, "host": "127.0.0.1", "port": 6379}),
-            json!({"id": 1, "host": "localhost", "port": 6380}),
-            json!({"id": 2, "host": "10.0.0.9", "port": 6381}),
-        ];
-        let note = reroute_loopback(&mut nodes, "ruvio");
-        assert!(note.is_some_and(|text| text.contains("through ruvio")));
-        assert_eq!(nodes[0]["host"], "ruvio");
-        assert_eq!(nodes[1]["host"], "ruvio");
-        assert_eq!(nodes[2]["host"], "10.0.0.9");
-
-        let mut local = vec![json!({"id": 0, "host": "127.0.0.1", "port": 6379})];
-        assert!(reroute_loopback(&mut local, "127.0.0.1").is_none());
-        assert!(reroute_loopback(&mut local, "localhost").is_none());
-        assert_eq!(local[0]["host"], "127.0.0.1");
     }
 
     #[test]

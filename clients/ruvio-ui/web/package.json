@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test": "node --test tests/operator.test.js tests/console.test.js tests/theme.test.js",
+    "test": "node --test tests/operator.test.js tests/console.test.js tests/theme.test.js tests/monitor.test.js",
     "test:browser": "playwright test"
   },
   "devDependencies": {

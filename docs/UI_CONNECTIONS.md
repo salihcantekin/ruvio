@@ -87,9 +87,12 @@ shard 0 on `6379`, shard 1 on `6380`. You only sign in to one of them. Any shard
 port serves every key, because a command for a key owned by another shard is
 forwarded to it.
 
-After sign-in the UI asks that server for its shard map (`CLUSTER SLOTS`) and
-then opens a connection to each shard at the host and port the server names.
-That is what fills the Shard health cards.
+After sign-in the UI asks that server for its shard map (`CLUSTER SHARDS`) and
+then opens a connection to each shard, and to each replica that finished
+copying, at the host and port the server names. That is what fills Overview and
+the Cluster screen. In a multi-node cluster (`cluster_topology`) the server lists
+the other groups by their primary only, so the UI asks each of those primaries
+for its own replicas.
 
 - The host in the map is the server's `advertised_host` (`RUVIO_ADVERTISE_HOST`,
   `--advertised-host`), which is `127.0.0.1` by default. Set it to a name the UI
@@ -120,6 +123,30 @@ Two shards in one server, UI in Docker, Windows:
 | Only one shard appears, notice says cluster mode is disabled | The server is older than 0.3.3, or runs one shard | Run Ruvio 0.3.3 or newer with `--shards 2` |
 | A shard shows `Up` but empty metrics | Another program owns that port, for example a Redis on `6380` | Free the port or move the other program |
 | `host.docker.internal` does not resolve (Linux) | Docker on Linux does not define it | Add `--add-host=host.docker.internal:host-gateway` |
+
+## Coordinators
+
+With `ruvio coordinator` running, the Cluster screen can also show the
+coordinators: which one leads, each group's agreed primary and epoch, how many
+members answer, the slot move or rebalance in progress, and the failovers seen
+while the screen is open. Give the UI process their addresses and the
+coordinators' `secret`:
+
+```text
+docker run --rm -p 127.0.0.1:8080:8080 \
+  -e RUVIO_UI_TARGET_HOST=ruvio-1 \
+  -e RUVIO_UI_COORDINATORS=ruvio-1:26400,ruvio-2:26400,ruvio-3:26400 \
+  -e RUVIO_UI_COORDINATOR_SECRET=change-me \
+  salihcantekin/ruvio-ui:linux
+```
+
+The secret stays in the UI process; the browser never receives it. The UI sends
+the coordinators only `INFO`, `SENTINEL masters`, `SENTINEL replicas` and
+`COORDINATOR STATUS`, and has no way to send anything else to them, so it cannot
+move slots or fail a group over. The coordinators' `secret` gives full control
+to whoever holds it, so keep the UI's port private. Connections to the
+coordinators are plain TCP; a coordinator port with TLS (`tls_cert`) is not
+supported by this version of the UI.
 
 See also [SETUP](SETUP.md), [CONFIGURATION](CONFIGURATION.md) and the
 [connection model](CONNECTION_MODEL.md).
