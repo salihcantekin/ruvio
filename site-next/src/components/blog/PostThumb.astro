@@ -1,0 +1,28 @@
+---
+// A post's small thumbnail: its line icon on a tile in the rust-to-dusk tones of the page intro.
+import { icon } from "../../lib/blog";
+
+interface Props { name: string; size?: "s" | "m" | "l" }
+const { name, size = "m" } = Astro.props;
+---
+
+<span class={`thumb-tile ${size}`} aria-hidden="true" set:html={icon(name)} />
+
+<style>
+  .thumb-tile {
+    display: inline-grid; place-items: center; flex: none; border-radius: 10px;
+    color: var(--ink);
+    background:
+      radial-gradient(120% 120% at 100% 100%, rgba(var(--dusk), 0.55), transparent 60%),
+      linear-gradient(145deg, var(--sky-1), var(--sky-2));
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  }
+  .thumb-tile.s { width: 34px; height: 34px; border-radius: 8px; }
+  .thumb-tile.m { width: 48px; height: 48px; }
+  .thumb-tile.l { width: 64px; height: 64px; border-radius: 14px; }
+  .thumb-tile :global(svg) { fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  .s :global(svg) { width: 18px; height: 18px; }
+  .m :global(svg) { width: 24px; height: 24px; }
+  .l :global(svg) { width: 32px; height: 32px; }
+</style>

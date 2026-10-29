@@ -2,8 +2,10 @@
 title: "Delayed jobs without a scheduler"
 description: "Send the reminder in 30 minutes, retry the webhook in 5. Two ways to do it with nothing but Ruvio: a stream entry that stays hidden until its time, and a sorted set you drain in one call."
 date: 2026-10-29
-tags: [Queues, Streams]
+tags: [Queues]
 scene: delayed
+icon: calendar
+commands: [XADD DELAY, XREADGROUP, XACK, XAUTOCLAIM, ZPOPBYSCORE, ZMOVEDUE]
 facts:
   - { value: "DELAY", label: "one option on XADD; the entry is stored at once and delivered later" }
   - { value: "10,000", label: "due jobs ZMOVEDUE can hand to a list queue in one call" }
@@ -45,7 +47,8 @@ for _stream, entries in read or []:
         r.xack("jobs", "workers", entry.id)
 ```
 
-The hold is a WAL record, and it is only written when a delay is set. Streams that never use `DELAY` pay nothing for it.
+> [!NOTE] Free when unused
+> The hold is a WAL record, and it is only written when a delay is set. Streams that never use `DELAY` pay nothing for it.
 
 ## Option 2: a sorted set as a timetable
 
@@ -66,7 +69,10 @@ ZMOVEDUE {jobs}:due {jobs}:ready 1700000400 COUNT 100
 # 1 -> one job moved to the tail of {jobs}:ready
 ```
 
-It is one recorded step, up to 10,000 members per call. Run it from a small loop, or from any worker before it blocks on the list. The two keys have to live in the same slot, so give them a common hash tag like `{jobs}`; without one the server answers `CROSSSLOT` instead of guessing.
+It is one recorded step, up to 10,000 members per call. Run it from a small loop, or from any worker before it blocks on the list.
+
+> [!TIP] One hash tag for both keys
+> The sorted set and the list have to live in the same slot, so give them a common hash tag like `{jobs}`. Without one the server answers `CROSSSLOT` instead of guessing.
 
 ## Which one to pick
 
@@ -82,8 +88,9 @@ My own rule: if losing a job would be a bug report, use the stream. If jobs get 
 
 ## Things worth knowing
 
-- Times are milliseconds for `DELAY`, and whatever unit you choose for sorted-set scores. Pick one and stick to it; I use Unix milliseconds everywhere.
-- A delayed entry still counts toward the stream's length, so `MAXLEN` trimming can remove it before it is delivered. Size the trim with that in mind.
-- Both options are ordinary writes. With durability set to `everysec` or `always` they are in the WAL and replicate like everything else.
+<!-- cards -->
+- {timer} **One time unit** `DELAY` takes milliseconds; sorted-set scores take whatever you choose. I use Unix milliseconds everywhere.
+- {alert} **Trimming counts them** A delayed entry is part of the stream's length, so `MAXLEN` can remove it before it is delivered.
+- {database} **Ordinary writes** With `everysec` or `always` durability both options are in the WAL and replicate like everything else.
 
 If you also want to *see* jobs as they are written, without polling, `CHANGES SUBSCRIBE MATCH jobs*` gives you a resumable feed of every write when the server runs with a WAL. That is a story for another post. The full syntax for everything here is in the [command reference](/docs/commands/) and on the [use cases page](/use-cases/#delayed).

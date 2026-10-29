@@ -4,6 +4,8 @@ description: "A lock with a TTL keeps two workers apart until one of them pauses
 date: 2026-10-29
 tags: [Locks, Patterns]
 scene: locks
+icon: lock
+commands: [LEASE, RENEW, RELEASE, SEMAPHORE, CLIENT DURABILITY]
 facts:
   - { value: "64-bit", label: "fencing token on every grant, and it only grows" }
   - { value: "3", label: "commands: LEASE, RENEW, RELEASE" }
@@ -31,7 +33,8 @@ RELEASE job:nightly-report 114770882368960
 
 `LEASE` gives you the lock and a token, or a null when someone else has it. `RENEW` moves the deadline for a long job, but only for the token that holds the lock right now. `RELEASE` frees it, again only for the right token. A stale worker calling `RENEW` or `RELEASE` gets `0` back and changes nothing, so it cannot free a lock that by now belongs to someone else.
 
-The token is an opaque 64-bit integer. Do not read meaning into its digits; the only promise is that the next grant on the same key gets a larger one. That stays true after the lease expires, after a restart and after a failover.
+> [!NOTE] Treat the token as opaque
+> It is a 64-bit integer. Do not read meaning into its digits; the only promise is that the next grant on the same key gets a larger one. That stays true after the lease expires, after a restart and after a failover.
 
 ## Where the token earns its keep
 
@@ -92,8 +95,9 @@ Keep the nodes' clocks synchronized as well, since a lease is a deadline. None o
 
 ## Rules of thumb
 
-- Pick a TTL longer than a normal run, and `RENEW` from the job for the long ones.
-- Release as soon as you are done. Waiting for the TTL just makes the next worker wait.
-- Always pass the token to the write you are protecting. A lock without a fence is a hint, not a guarantee.
+<!-- cards -->
+- {timer} **Size the TTL** Longer than a normal run. Long jobs call `RENEW` with their token instead of guessing a huge TTL.
+- {check} **Release early** Free the lock as soon as you are done. Waiting for the TTL just makes the next worker wait.
+- {shield} **Always fence** Pass the token to the write you protect. A lock without a fence is a hint, not a guarantee.
 
 The full syntax is in the [command reference](/docs/commands/). If you have a lock story of your own, good or bad, I would like to hear it in [Discussions](https://github.com/salihcantekin/ruvio/discussions).

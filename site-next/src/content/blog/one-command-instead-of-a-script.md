@@ -4,6 +4,8 @@ description: "Moving credit between wallets, selling the last ticket, keeping th
 date: 2026-10-29
 tags: [Commands, Patterns]
 scene: balances
+icon: zap
+commands: [TRANSFER, HTRANSFER, TAKE, INCRBY MAX, INCR EX, SET IFGT, LIMIT, ZPOPBYSCORE, ZMOVEDUE, SETV]
 facts:
   - { value: "1", label: "WAL record for both sides of a TRANSFER" }
   - { value: "nil", label: "the answer when a command refuses; nothing was written" }
@@ -29,7 +31,12 @@ TRANSFER {user:42}:wallet {user:42}:escrow 30
 # (nil)  -> only 20 left, nothing changed
 ```
 
-Both balances change in one WAL record, so a crash cannot leave you with only half of the move on disk. The two keys have to live in the same slot, which is what the `{user:42}` hash tag is for. When the balances are fields of one hash, `HTRANSFER account:7 available held 30 MAX 1000` does the same between two fields and also refuses if the destination would pass the cap.
+Both balances change in one WAL record, so a crash cannot leave you with only half of the move on disk.
+
+> [!TIP] Keep both keys in one slot
+> `TRANSFER` works on two keys of the same slot. The `{user:42}` hash tag in the key names is what puts them there, in a single server as well as in a cluster.
+
+When the balances are fields of one hash, `HTRANSFER account:7 available held 30 MAX 1000` does the same between two fields and also refuses if the destination would pass the cap.
 
 ## 2. Sell the last ticket once
 
@@ -78,7 +85,8 @@ SET price:best 499 IFLT PX 3600000
 # OK    -> new lowest price, expires in an hour
 ```
 
-It is integers only. A stored value that is not a number is an error and stays as it was, which I prefer to a silent string comparison.
+> [!WARNING] Integers only
+> A stored value that is not a number is an error and stays as it was. I prefer that to a silent string comparison.
 
 ## 5. A rate limit in one round trip
 
@@ -130,7 +138,12 @@ No `WATCH`, no retry loop around `MULTI`.
 
 ## What I did not turn into commands
 
-Not every script deserves to become a command. Anything with real business rules, several branches and a dozen keys is still better as code in your application, or as a script if you really need it next to the data. Ruvio runs Lua for exactly that. The commands above made the cut because they are small, they come up in almost every codebase, and they all follow the same rule: **either the whole thing happens or nothing is written**, not to the key and not to the log.
+Not every script deserves to become a command. Anything with real business rules, several branches and a dozen keys is still better as code in your application, or as a script if you really need it next to the data. Ruvio runs Lua for exactly that. The commands above made the cut because they are small, they come up in almost every codebase, and they share three properties:
+
+<!-- cards -->
+- {check} **All or nothing** Either the whole thing happens or nothing is written, not to the key and not to the log.
+- {shield} **One record** A refused call leaves no trace, and an accepted one is a single WAL record that replicas apply the same way.
+- {code} **A typed method** Each one is a method in all six clients, so there is no script text to send and no reply to parse by hand.
 
 There is also a speed side. Every one of these is measured against the script it replaces on the [benchmarks page](/benchmarks/#scripted), together with the memory each key takes. I will let the table speak there rather than paste numbers here.
 

@@ -4,6 +4,8 @@ description: "A popular cache entry expires and a thousand requests hit the data
 date: 2026-10-29
 tags: [Caching, Patterns]
 scene: cache
+icon: layers
+commands: [FILLGET, FILLSET]
 facts:
   - { value: "1", label: "caller rebuilds an expired key; the rest wait or read the stale copy" }
   - { value: "5", label: "possible answers, so the client never has to guess" }
@@ -55,7 +57,8 @@ FILLGET product:42 5000 WAIT 200
 # waits up to 200 ms for the filler's FILLSET, then answers HIT or BUSY
 ```
 
-`WAIT` is meant for connections that belong to one request. On a connection shared by many callers, a held command would make everyone behind it wait too, so the clients do not use it there. `WAIT` is also refused inside `MULTI` and scripts.
+> [!WARNING] Not on a shared connection
+> `WAIT` is meant for connections that belong to one request. On a connection shared by many callers, a held command would make everyone behind it wait too, so the clients do not use it there. It is also refused inside `MULTI` and scripts.
 
 ## From application code
 
@@ -74,8 +77,9 @@ If you are in ASP.NET Core, the `Ruvio.Extensions.Caching` package gives you an 
 
 ## The fine print
 
-- Fill markers live in memory only. After a restart nobody is filling, which is fine: the next caller simply becomes the filler.
-- Pick `fill_ms` a little above your slowest normal load. Too short and two callers may fill; too long and a crashed filler holds everyone up.
-- `FILLSET` is an ordinary write with a TTL. The value itself is as durable as your durability setting makes it.
+<!-- cards -->
+- {cpu} **Markers in memory** After a restart nobody is filling, which is fine: the next caller simply becomes the filler.
+- {timer} **Size fill_ms** A little above your slowest normal load. Too short and two callers may fill; too long and a crashed filler holds everyone up.
+- {database} **The value is a write** `FILLSET` is an ordinary write with a TTL, as durable as your durability setting makes it.
 
 The animation at the top shows the whole thing: one request goes to the database, the rest are served from memory. The reference for both commands is in the [command reference](/docs/commands/), and the [use cases page](/use-cases/#cache) has the same example in all six clients.
