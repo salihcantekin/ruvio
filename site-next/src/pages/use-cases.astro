@@ -5,6 +5,7 @@ import { clientExamples } from "../data/client-examples";
 import { clients } from "../config/site";
 import SideNav from "../components/content/SideNav.astro";
 import PageIntro from "../components/PageIntro.astro";
+import UseCaseScene from "../components/animations/UseCaseScene.astro";
 import { cases, type UseCase } from "../data/use-cases";
 import { integrationsFor } from "../data/integrations";
 
@@ -42,6 +43,7 @@ const tabsFor = (c: UseCase): CodeTab[] => [
                   <p class="problem">{c.problem}</p>
                 </div>
               </header>
+              <UseCaseScene id={c.id} />
               <div class="case-grid">
                 <div class="prose">
                   <p set:html={c.body} />
