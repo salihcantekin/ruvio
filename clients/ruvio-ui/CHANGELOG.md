@@ -4,6 +4,16 @@ Notable changes to `ruvio-ui`, the web console (Docker image and host binaries).
 
 ## Unreleased
 
+- New **Cluster** screen, read only: groups (by each node's `cluster-group`, else by process), shards with every slot range, a slot map, primaries and replicas with how far each replica is behind, and the cluster map version every node serves.
+- Optional coordinator view: set `RUVIO_UI_COORDINATORS` (`host:port,host:port`) and `RUVIO_UI_COORDINATOR_SECRET` to show the leader, each group's agreed primary, epoch, members answering and state, the slot move or rebalance in progress, and the failovers seen while the screen is open. The secret never reaches the browser, and the UI sends the coordinators only `INFO`, `SENTINEL masters`, `SENTINEL replicas` and `COORDINATOR STATUS`.
+- New **Dashboard** screen (below Console): time charts of the INFO fields, chosen from 13 (commands per second, command mix, network bytes per second, connections, clients, charged memory, memory breakdown, keys, expired and evicted keys, WAL records, bytes not yet on disk, largest buffers, replication send lag), over the last 5, 15 or 30 minutes, added up or one line per node. The choice is remembered in the browser. Charts are drawn from the same single `INFO` per node each refresh already reads, so they add no load on the server; readings are kept in the tab for up to 30 minutes.
+- Overview: keys and memory per shard, a slot map, and a "Needs attention" list (a node not answering, a persistence error, a fenced primary, a replica whose link is down or that takes a full copy, nodes on different cluster map versions, slots not covered).
+- Fixed: a shard that owns several slot ranges (after `COORDINATOR MOVE`, `COORDINATOR REBALANCE` or `RUVIO MOVESLOTS`) was listed once per range, so Overview counted its keys and memory more than once and a scan of the selected shards read it twice. Shards now come from `CLUSTER SHARDS`, numbered by their first slot, and keys and memory are summed over primaries only.
+- Fixed: one slow or unreachable node no longer holds up every other request. Each connection has its own lock, node readings are taken in parallel with a 1 s connect and 2 s read limit, and a node whose connect failed is not dialled again for 3 s.
+- After a failover or slot move raises the cluster map version, the UI reads the topology again by itself.
+- The Cluster menu entry, the Overview replica column and the replication chart show only when there is a cluster: more than one server process, a replica, a `cluster-group`, or coordinators configured.
+- Website Get started page: the Operator UI section shows the Dashboard and Cluster screens, with new screenshots from a two-group cluster with coordinators.
+
 ## 0.2.0 - 2026-10-29
 
 - TLS to the target: set `RUVIO_UI_TLS=true` to connect to the Ruvio server over TLS, with the certificate chain and host name checked. `RUVIO_UI_TLS_CA` (PEM file of the CA to trust), `RUVIO_UI_TLS_CLIENT_CERT` and `RUVIO_UI_TLS_CLIENT_KEY` (mutual TLS), `RUVIO_UI_TLS_SERVER_NAME` and `RUVIO_UI_TLS_INSECURE=true` (skip verification, tests only) refine it. Without `RUVIO_UI_TLS` the UI connects as before.

@@ -14,6 +14,9 @@
   import { preference, savePreference } from "./preferences.js";
   import { summarize } from "./value.js";
   import Overview from "./Overview.svelte";
+  import Cluster from "./Cluster.svelte";
+  import Dashboard from "./Dashboard.svelte";
+  import { probeTargets, readingsFrom, snapshot, keepRecent, coordinatorModel, failoverEvents, nodeKey, rangeText, isCluster } from "./monitor.js";
   import Tasks from "./Tasks.svelte";
   import Browser from "./Browser.svelte";
   import PubSub from "./PubSub.svelte";
@@ -23,12 +26,16 @@
 
   const navigation = [
     { id: "overview", label: "Overview", icon: "overview" },
+    { id: "cluster", label: "Cluster", icon: "cluster" },
     { id: "data", label: "Data", icon: "data" },
     { id: "tasks", label: "Tasks", icon: "tasks" },
     { id: "pubsub", label: "Pub/Sub", icon: "pubsub" },
     { id: "users", label: "ACL", icon: "users" },
   ];
-  const dock = { id: "console", label: "Console", icon: "terminal" };
+  const dock = [
+    { id: "console", label: "Console", icon: "terminal" },
+    { id: "dashboard", label: "Dashboard", icon: "chart" },
+  ];
   const logLimit = 100;
   let host = $state("127.0.0.1");
   let port = $state(6379);
@@ -43,7 +50,6 @@
   let selectedIds = $state([]);
   let selectedNodes = $derived(shards.filter((item) => selectedIds.includes(nodeId(item))));
   let shard = $derived(selectedNodes.length === 1 ? selectedNodes[0] : null);
-  let overviewNodes = $derived(selectedNodes.length ? selectedNodes : shards);
   let topologyError = $state("");
   let topologyNotice = $state("");
   let sessionError = $state("");
@@ -57,6 +63,83 @@
   let consoleOpen = $state(false);
   let sidebarCollapsed = $state(false);
   let scope = $derived(selectedIds.length ? selectedIds.join(",") : "all");
+  // Live readings shared by Overview and Cluster: every primary and replica, refreshed together.
+  let readings = $state([]);
+  let history = $state([]);
+  let coordinator = $state(null);
+  let coordinatorsConfigured = $state(false);
+  let failovers = $state([]);
+  let topologyVersion = 0;
+  // Group names are read once per topology, not on every refresh.
+  let readGroups = true;
+  let refreshing = $state(false);
+  let probeError = $state("");
+  let updated = $state("");
+  let paused = $state(preference("overview.paused", false) === true);
+  const savedInterval = Number(preference("overview.interval", 5));
+  let interval = $state([2, 5, 10, 30, 60].includes(savedInterval) ? savedInterval : 5);
+  let refreshNow = $state(() => {});
+  let live = $derived(connected && ["overview", "cluster", "dashboard"].includes(section));
+  // The Cluster screen is offered only when there is a cluster to show.
+  let clustered = $derived(isCluster(shards, readings, coordinatorsConfigured));
+  let menu = $derived(navigation.filter((item) => item.id !== "cluster" || clustered || section === "cluster"));
+
+  $effect(() => {
+    savePreference("overview.paused", paused);
+    savePreference("overview.interval", interval);
+  });
+
+  $effect(() => {
+    if (!live) return;
+    const targets = probeTargets(shards);
+    const withCoordinators = coordinatorsConfigured;
+    const seconds = interval;
+    const isPaused = paused;
+    let alive = true;
+    let pending = false;
+    async function refresh() {
+      if (pending || !targets.length) return;
+      pending = true;
+      refreshing = true;
+      const extended = readGroups;
+      try {
+        const [probe, report] = await Promise.all([
+          api("/api/probe", { nodes: targets.map(({ host, port }) => ({ host, port })), extended }),
+          withCoordinators ? api("/api/coordinators").catch((error) => ({ configured: true, coordinators: [], error: error.message })) : null,
+        ]);
+        if (!alive) return;
+        const at = Date.now();
+        const next = readingsFrom(targets, probe.nodes, at);
+        if (extended) readGroups = false;
+        else {
+          const known = new Map(readings.map((reading) => [nodeKey(reading.node), reading.group]));
+          for (const reading of next) reading.group = known.get(nodeKey(reading.node)) ?? null;
+        }
+        readings = next;
+        history = keepRecent(history, snapshot(next, at));
+        if (report) {
+          const model = coordinatorModel(report);
+          model.error = report.error ?? "";
+          failovers = [...failoverEvents(coordinator, model, at), ...failovers].slice(0, 50);
+          coordinator = model;
+        }
+        updated = new Date(at).toLocaleTimeString();
+        probeError = "";
+        // A failover or a slot move raises the cluster map version: read the topology again.
+        const newest = Math.max(0, ...next.map((reading) => reading.topologyVersion ?? 0));
+        if (newest > topologyVersion) loadShards();
+      } catch (error) {
+        if (alive) probeError = `Could not read the nodes: ${error.message}`;
+      } finally {
+        pending = false;
+        if (alive) refreshing = false;
+      }
+    }
+    refreshNow = refresh;
+    refresh();
+    const timer = isPaused ? null : setInterval(refresh, seconds * 1000);
+    return () => { alive = false; clearInterval(timer); };
+  });
   let scopeLabel = $derived(shard ? nodeId(shard) : selectedNodes.length ? `${selectedNodes.length} selected shards` : "All shards");
 
   onMount(() => {
@@ -107,6 +190,10 @@
       section = "overview";
       selectedIds = [];
       lines = [];
+      readings = [];
+      history = [];
+      coordinator = null;
+      failovers = [];
       sessionError = "";
       note("CONNECT", `${username || "default"} @ ${host}:${port}`);
       await loadShards();
@@ -121,8 +208,12 @@
     topologyError = "";
     try {
       const result = await api("/api/shards");
+      topologyVersion = result.topology_version ?? 0;
+      readGroups = true;
       shards = result.shards;
       topologyNotice = result.warning || "";
+      const session = await api("/api/session");
+      coordinatorsConfigured = !!session.coordinators;
     } catch (error) {
       topologyError = `Could not discover shards: ${error.message}`;
     }
@@ -242,7 +333,7 @@
         <div class="scope-menu" role="group" aria-label="Shard scope">
           <button class:on={!selectedIds.length} disabled={scopeBusy} onclick={() => pickShards([])}>All shards</button>
           {#each shards as item}
-            <label><input type="checkbox" checked={selectedIds.includes(nodeId(item))} disabled={scopeBusy} onchange={(event) => pickShards(event.currentTarget.checked ? [...selectedIds, nodeId(item)] : selectedIds.filter((id) => id !== nodeId(item)))} /><span>Shard {item.id}<small>{nodeId(item)} &middot; {item.start}&ndash;{item.end}</small></span></label>
+            <label><input type="checkbox" checked={selectedIds.includes(nodeId(item))} disabled={scopeBusy} onchange={(event) => pickShards(event.currentTarget.checked ? [...selectedIds, nodeId(item)] : selectedIds.filter((id) => id !== nodeId(item)))} /><span>Shard {item.id}<small>{nodeId(item)} &middot; {rangeText(item)}</small></span></label>
           {/each}
           <p class="hint">Multiple selections filter Overview and Data scans. Keyed commands still route to their owner. One selection pins commands to that shard.</p>
         </div>
@@ -262,16 +353,20 @@
           </button>
         {/snippet}
         <nav aria-label="Main navigation">
-          {#each navigation as item}{@render navButton(item)}{/each}
+          {#each menu as item}{@render navButton(item)}{/each}
         </nav>
-        <nav class="nav-dock" aria-label="Tools">{@render navButton(dock)}</nav>
+        <nav class="nav-dock" aria-label="Tools">{#each dock as item}{@render navButton(item)}{/each}</nav>
         <div class="sidebar-foot"><span class="status-dot"></span><span class="sidebar-foot-label"> HTTP to RESP</span><p>Connected as {username || "default"}</p></div>
       </aside>
       <main class="workspace">
         {#if sessionError}<div class="error-box" role="alert">{sessionError}</div>{/if}
         <div class="screen">
           {#if section === "overview"}
-            <Overview shards={overviewNodes} {shard} {openTask} {lines} onData={() => navigate("data")} />
+            <Overview {shards} selected={selectedNodes} {readings} {openTask} {lines} onData={() => navigate("data")} onCluster={clustered ? () => navigate("cluster") : null} onDashboard={() => navigate("dashboard")} bind:interval bind:paused {refreshing} {updated} {probeError} refresh={refreshNow} />
+          {:else if section === "dashboard"}
+            <Dashboard {readings} {history} {clustered} selected={selectedNodes} bind:interval bind:paused {refreshing} {updated} {probeError} refresh={refreshNow} ready={shards.length > 0} />
+          {:else if section === "cluster"}
+            <Cluster {shards} {readings} {coordinator} {coordinatorsConfigured} {failovers} {topologyNotice} bind:interval bind:paused {refreshing} {updated} {probeError} refresh={refreshNow} reload={loadShards} />
           {:else if section === "data"}
             <header class="page-head"><div><p class="eyebrow">EXPLORE & MANAGE</p><h1>Data</h1><p>Find a key, inspect its value, or manage its lifetime.</p></div><button onclick={() => openTask("strings")}>Write data <span aria-hidden="true">&rarr;</span></button></header>
             {#key scope}<Browser {run} />{/key}

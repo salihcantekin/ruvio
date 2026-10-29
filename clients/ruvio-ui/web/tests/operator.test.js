@@ -2,7 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { families, findTasks } from "../src/catalog.js";
-import { scanOwners, scanSelected, parseInfo, metric, totalMetric, bytes, execute } from "../src/operator.js";
+import { scanOwners, scanSelected, metric, bytes, execute } from "../src/operator.js";
+import { parseInfoText, sum } from "../src/monitor.js";
 import { present } from "../src/value.js";
 import { api } from "../src/api.js";
 
@@ -98,15 +99,15 @@ test("selected-owner scans keep node-local continuation and deduplicate keys", a
 });
 
 test("metrics use charged memory, preserve zero, and do not fabricate incomplete totals", () => {
-  const info = parseInfo(bulk("# Memory\r\ncharged_memory_bytes:1024\r\n# Keyspace\r\nkeys:0\r\n"));
+  const info = parseInfoText("# Memory\r\ncharged_memory_bytes:1024\r\n# Keyspace\r\nkeys:0\r\n");
   assert.equal(metric(info, "keys"), 0);
   assert.equal(metric(info, "total_commands_processed"), null);
-  assert.equal(totalMetric([{ info }, { info: { keys: "4" } }], "keys"), 4);
-  assert.equal(totalMetric([{ info }, { info: null }], "keys"), null);
-  assert.equal(totalMetric([], "keys"), null);
+  assert.equal(sum([{ info }, { info: { keys: "4" } }], "keys"), 4);
+  assert.equal(sum([{ info }, { info: null }], "keys"), null);
+  assert.equal(sum([], "keys"), null);
   assert.equal(metric({ keys: "bad" }, "keys"), null);
   assert.equal(bytes(metric(info, "charged_memory_bytes")), "1.0 KiB");
-  assert.throws(() => parseInfo(bulk("")), /no metrics/);
+  assert.equal(parseInfoText(""), null);
 });
 
 test("change-feed notes are not mislabelled as SCAN keys", () => {

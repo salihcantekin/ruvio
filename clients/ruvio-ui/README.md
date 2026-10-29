@@ -4,7 +4,7 @@
 
 <h1 align="center">Ruvio UI</h1>
 
-<p align="center">Browser operator UI for one running <a href="https://ruviodb.com/">Ruvio</a> server: data, command forms, Pub/Sub and ACL users.</p>
+<p align="center">Browser operator UI for a running <a href="https://ruviodb.com/">Ruvio</a> server or cluster: a live dashboard, a read-only cluster view, data, command forms, Pub/Sub and ACL users.</p>
 
 <p align="center">
   <a href="https://hub.docker.com/r/salihcantekin/ruvio-ui"><img alt="Docker" src="https://img.shields.io/docker/v/salihcantekin/ruvio-ui?sort=semver&label=docker"></a>
@@ -50,7 +50,8 @@ rules = "on >app-secret ~app:* +@read +ping +auth +info"
 The ACL screen can run `ACL SETUSER`. That change lasts until the process
 restarts. The next start reads `[[security.users]]` again.
 
-The header contains a compact shard dropdown. **All shards** routes keyed commands and
+The header contains a compact shard dropdown, one entry per shard with its slot ranges
+(numbered by their first slot). **All shards** routes keyed commands and
 walks `SCAN` until the page is full or every shard has been read. One shard
 pins Data, command forms, and Pub/Sub to that node. Multiple selections filter
 Overview readings and Data scans to those nodes; keyed commands still route to
@@ -75,23 +76,59 @@ keyboard-accessible controls. Every color and font lives in
 `web/src/tokens.css`; change the look there.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/salihcantekin/ruvio/main/docs/images/ui-overview.png" width="90%" alt="Overview: shard health, keys, memory and command counters">
+  <img src="https://raw.githubusercontent.com/salihcantekin/ruvio/main/docs/images/ui-overview.png" width="90%" alt="Overview: shards and replicas responding, keys, memory, commands and the slot map">
+</p>
+<p align="center">
+  <img src="https://raw.githubusercontent.com/salihcantekin/ruvio/main/docs/images/ui-dashboard.png" width="90%" alt="Dashboard: time charts of commands per second, command mix, network bytes, clients and memory, with a chart picker">
+</p>
+<p align="center">
+  <img src="https://raw.githubusercontent.com/salihcantekin/ruvio/main/docs/images/ui-cluster.png" width="90%" alt="Cluster: groups, shards, the hash slot map and the coordinators with their leader">
 </p>
 <p align="center">
   <img src="https://raw.githubusercontent.com/salihcantekin/ruvio/main/docs/images/ui-data.png" width="45%" alt="Data: a JSON document as a tree">
   <img src="https://raw.githubusercontent.com/salihcantekin/ruvio/main/docs/images/ui-console.png" width="45%" alt="Console: commands and a formatted JSON reply">
 </p>
 
-- **Overview** is the first screen after sign-in. It refreshes shard health,
-  key counts, charged store memory, persistence state, and available command
-  counters every five seconds by default. Choose 2, 5, 10, 30, or 60 seconds,
-  pause, or refresh manually. The interval and pause setting survive navigation
-  and reloads. Missing
+- **Overview** is the first screen after sign-in. It reads every primary and
+  replica in parallel (`INFO`, one short-timeout request for all of them) every
+  five seconds by default. Choose 2, 5, 10, 30, or 60 seconds, pause, or refresh
+  manually. The interval and pause setting survive navigation and reloads. Keys
+  and charged store memory are summed over primaries, since replicas hold copies.
+  A slot map and a per-shard table show how slots, keys and memory are spread and
+  how far replicas are behind. **Needs attention** lists a node that does not
+  answer, a persistence error, a primary a newer one replaced, a replica whose
+  link is down or that takes a full copy, nodes on different cluster map
+  versions, and slots no shard covers. Missing
   metrics show **Not reported**, not zero; incomplete shard readings do not
   produce misleading totals. Command counters come from the server's `INFO`
   response. Memory breakdowns distinguish live data, index capacity, and reusable
   buffers from process RSS. Deleting the last key releases empty index capacity;
   retained reusable buffers can still account for a nonzero memory charge.
+- **Dashboard** (below Console) draws time charts of the `INFO` fields the
+  refresh already reads: commands per second and the command mix, network bytes
+  per second, connections and clients, charged memory and its breakdown (keys,
+  values, collections, index, reusable and persistence buffers, memory waiting
+  to be freed), keys and expiry, WAL records and bytes not yet on disk, the
+  largest buffers and the replication send lag. **Charts** picks which ones to
+  show; the window is 5, 15 or 30 minutes; **Total** adds the nodes up and **Per
+  node** draws one line per node (seven at most, the rest as "Other"). The
+  choices are kept in the browser. Point at a chart, or focus it and use the
+  arrow keys, to read every series at one moment. The charts send nothing extra
+  to the server: one `INFO` per node per refresh, only while Overview, Cluster or
+  Dashboard is open, and the readings stay in the tab for up to 30 minutes.
+- **Cluster** shows the topology and changes nothing. It is in the menu only when
+  there is a cluster: more than one server process, a replica, a `cluster-group`, or
+  coordinators configured; one process with several shards shows them on Overview.
+  Without a cluster, the replica column and the replication chart are hidden too.
+  Shards are grouped by each
+  node's `cluster-group` (or by server process), with their slot ranges, the
+  primary, each replica with its link state and how many records it is behind,
+  and the cluster map version every node serves. After a failover or a slot
+  move raises that version, the topology is read again. With coordinators
+  configured (below) it also shows which coordinator leads, each group's agreed
+  primary, epoch, members answering and state, the slot move or rebalance in
+  progress, and failovers seen while the screen is open. Rebalancing, slot
+  moves and failovers are not started from the UI.
 - **Data** scans across owners in All shards, or only the pinned node. Inspect
   strings, lists, sets, hashes, sorted sets, streams, and JSON documents; refresh values, change
   expiry, or delete with confirmation. Large sets use membership checks rather
@@ -199,6 +236,8 @@ not used to publish them while this repository is private.
 | `RUVIO_UI_TLS_CLIENT_CERT`, `RUVIO_UI_TLS_CLIENT_KEY` | empty | PEM files for a server that demands a client certificate (`tls_client_auth`) |
 | `RUVIO_UI_TLS_SERVER_NAME` | empty | The name the certificate carries, when it differs from the host you sign in to |
 | `RUVIO_UI_TLS_INSECURE` | off | `true` skips the certificate check; for a throwaway test only |
+| `RUVIO_UI_COORDINATORS` | empty | `ruvio coordinator` addresses, `host:port,host:port`, for the Cluster screen; empty hides the coordinator part |
+| `RUVIO_UI_COORDINATOR_SECRET` | empty | The coordinators' `secret`. It stays in this process; the UI sends the coordinators only `INFO`, `SENTINEL masters`, `SENTINEL replicas` and `COORDINATOR STATUS`. Coordinator connections are plain TCP |
 
 The first argument can be a directory of built screens, used instead of the
 files embedded in the binary. `npm run dev` in `web/` proxies `/api` to the

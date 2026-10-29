@@ -80,29 +80,11 @@ export async function scanSelected(args, nodes, command = execute) {
   };
 }
 
-export function parseInfo(value) {
-  if (!["bulk", "simple"].includes(value?.kind)) throw new Error("Unexpected INFO reply.");
-  const info = {};
-  for (const line of scalar(value).split(/\r?\n/)) {
-    const colon = line.indexOf(":");
-    if (colon > 0 && !line.startsWith("#")) info[line.slice(0, colon)] = line.slice(colon + 1);
-  }
-  if (!Object.keys(info).length) throw new Error("INFO returned no metrics.");
-  return info;
-}
-
 export function metric(info, name) {
   const raw = info?.[name];
   if (raw == null || raw.trim() === "") return null;
   const value = Number(raw);
   return Number.isFinite(value) && value >= 0 ? value : null;
-}
-
-export function totalMetric(nodes, name) {
-  const values = nodes.map((node) => metric(node.info, name));
-  return values.length && values.every((value) => value !== null)
-    ? values.reduce((total, value) => total + value, 0)
-    : null;
 }
 
 export function number(value) {

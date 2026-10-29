@@ -225,7 +225,9 @@ cd ruvio-$v-linux-x64
       <section class="step panel prose" id="ui" aria-labelledby="ui-h">
         <h2 id="ui-h">Operator UI</h2>
         <p>
-          A browser view of one running server: data, command forms, a command console, Pub/Sub and ACL users. The container serves the
+          A browser view of a running server or cluster: a dashboard of time charts you choose, a read-only cluster view (groups, shards,
+          slots, replicas and, with <code>RUVIO_UI_COORDINATORS</code>, the coordinators), data, command forms, a
+          command console, Pub/Sub and ACL users. The container serves the
           browser and connects to the Ruvio server named by <code>RUVIO_UI_TARGET_HOST</code> and{" "}
           <code>RUVIO_UI_TARGET_PORT</code>. Sign-in is the server ACL user.
         </p>
@@ -236,8 +238,21 @@ docker run --rm -p 8080:8080 \\
   salihcantekin/ruvio-ui:linux`} />
         <p>Then open <code>http://127.0.0.1:8080</code>. Port 8080 is only the UI.</p>
         <figure class="shot">
-          <img src="/images/ui-overview.png" alt="Operator UI overview: shard health, keys, memory and command counters" width="1440" height="1000" loading="lazy" />
+          <img src="/images/ui-overview.png" alt="Operator UI overview: groups, slot map, keys, memory and shard health of a two-group cluster" width="1440" height="1100" loading="lazy" />
         </figure>
+        <h3 id="ui-dashboard">Dashboard and cluster view</h3>
+        <p>
+          The Dashboard, below Console in the menu, draws time charts of the <code>INFO</code> fields: commands per
+          second, network bytes, memory and its breakdown, keys, WAL records, replication lag and more. You pick the
+          charts, a 5, 15 or 30 minute window, and whether lines are added up or drawn per node. The charts come from
+          the same single <code>INFO</code> per node that each refresh already reads, so they add no load on the server.
+          The Cluster screen shows each group with its shards, slot ranges, primaries and replicas, and, with
+          coordinators configured, the leader, each group's agreed primary and the failovers seen while it is open.
+        </p>
+        <div class="shots">
+          <figure class="shot"><img src="/images/ui-dashboard.png" alt="Dashboard with time charts of commands per second, network bytes and memory" width="1440" height="1100" loading="lazy" /></figure>
+          <figure class="shot"><img src="/images/ui-cluster.png" alt="Cluster screen with two groups, their replicas and three coordinators" width="1440" height="1100" loading="lazy" /></figure>
+        </div>
         <h3 id="ui-console">Console</h3>
         <p>
           The Console tab, at the bottom of the menu, runs server commands from the browser. It opens only when you
@@ -250,7 +265,7 @@ docker run --rm -p 8080:8080 \\
         </p>
         <div class="shots">
           <figure class="shot"><img src="/images/ui-console.png" alt="Console running commands and showing a formatted JSON reply" width="1440" height="1100" loading="lazy" /></figure>
-          <figure class="shot"><img src="/images/ui-data.png" alt="Data screen showing a JSON document as a tree" width="1440" height="1000" loading="lazy" /></figure>
+          <figure class="shot"><img src="/images/ui-data.png" alt="Data screen showing a JSON document as a tree" width="1440" height="1100" loading="lazy" /></figure>
         </div>
         <h3 id="ui-docker">UI in Docker, Ruvio on the same machine</h3>
         <p>
