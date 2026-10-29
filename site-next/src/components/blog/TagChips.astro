@@ -1,0 +1,23 @@
+---
+// A post's topics as chips. As links they open the listing filtered to that topic
+// (/blog/?topic=Locks); inside a card, which is itself a link, they are plain labels.
+interface Props { tags: string[]; link?: boolean }
+const { tags, link = false } = Astro.props;
+const href = (t: string) => `/blog/?topic=${encodeURIComponent(t)}`;
+---
+
+<ul class="tag-chips" role="list" aria-label="Topics">
+  {tags.map((t) => <li>{link ? <a href={href(t)}>{t}</a> : <span>{t}</span>}</li>)}
+</ul>
+
+<style>
+  .tag-chips { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+  .tag-chips :is(a, span) {
+    display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+    font-size: 13px; font-weight: 600; line-height: 1.5; color: var(--ink);
+    background: color-mix(in srgb, var(--c2) 12%, var(--surface));
+    border: 1px solid color-mix(in srgb, var(--c2) 30%, var(--line));
+  }
+  .tag-chips :is(a, span)::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--c2); }
+  .tag-chips a:hover { background: color-mix(in srgb, var(--c2) 22%, var(--surface)); }
+</style>

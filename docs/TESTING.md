@@ -29,7 +29,9 @@ tests skip themselves without `RUVIO_TEST_ADDR`, so a suite run without a
 server proves only the offline tests. The script also starts three
 `ruvio coordinator` processes over a two-node group, and each client has one
 live test that kills that group's primary and follows the failover; it adds
-about 5-8 s to each client suite (see `docs/CLIENT_BEHAVIOR.md`, *Tests*). The extended workflow at
+about 5-8 s to each client suite (see `docs/CLIENT_BEHAVIOR.md`, *Tests*). A change that only edits
+blog posts (`site-next/src/content/blog/`) skips every job; skipped jobs count as passed for the
+required checks. The extended workflow at
 `.github/workflows/ci.yml` is **manual-dispatch only**. When dispatched, it
 defines these additional checks:
 

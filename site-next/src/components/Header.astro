@@ -98,6 +98,15 @@ const isCurrent = (href: string) => href !== "/" && !href.startsWith("/#") && pa
   }
   .menu-panel a { padding: 9px 12px; border-radius: var(--radius-s); color: var(--ink); }
   .menu-panel a:hover { background: var(--surface-2); }
+  .nav a, .actions .btn { white-space: nowrap; }
+  /* Seven menu items: tighten before the menu turns into the burger at 900px. */
+  @media (max-width: 1180px) {
+    .bar { gap: 16px; }
+    .nav { gap: 0; font-size: 15px; }
+    .nav a { padding: 8px 9px; }
+    .nav a[aria-current="page"]::after { left: 9px; right: 9px; }
+    .gh span { display: none; }
+  }
   @media (max-width: 900px) {
     .nav, .gh { display: none; }
     .bar { justify-content: space-between; }

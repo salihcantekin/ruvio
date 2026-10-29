@@ -1,0 +1,241 @@
+---
+// One blog post: title band, the post's scene and outline, the Markdown body, the commands it
+// covers, the licence note and more posts. Source: src/content/blog/<slug>.md (see src/lib/blog.ts).
+import Page from "../../layouts/Page.astro";
+import UseCaseScene from "../../components/animations/UseCaseScene.astro";
+import PostThumb from "../../components/blog/PostThumb.astro";
+import TagChips from "../../components/blog/TagChips.astro";
+import { site } from "../../config/site";
+import { posts, readingMinutes, longDate, renderBody, type Post } from "../../lib/blog";
+
+export async function getStaticPaths() {
+  const all = await posts();
+  // "Keep reading": up to three other posts, those sharing a tag first.
+  return all.map((post) => {
+    const others = all.filter((p) => p.id !== post.id);
+    const shared = (p: Post) => p.data.tags.filter((t) => post.data.tags.includes(t)).length;
+    const more = [...others].sort((a, b) => shared(b) - shared(a)).slice(0, 3);
+    return { params: { slug: post.id }, props: { post, more } };
+  });
+}
+
+const { post, more } = Astro.props as { post: Post; more: Post[] };
+const { title, description, date, author, tags, scene, icon, commands, facts } = post.data;
+const { pieces, headings } = await renderBody(post.body ?? "");
+const minutes = readingMinutes(post.body);
+const source = `${site.github}/blob/dev/site-next/src/content/blog/${post.id}.md`;
+---
+
+<Page title={title} description={description}>
+  <article class="post">
+    <header class="page-intro post-head">
+      <div class="wrap narrow">
+        <div class="kicker-row">
+          <PostThumb name={icon} size="l" />
+          <div class="kicker-col">
+            <p class="kicker"><a href="/blog/">Blog</a></p>
+            <TagChips tags={tags} link />
+          </div>
+        </div>
+        <h1>{title}</h1>
+        <p class="lede">{description}</p>
+        <p class="meta">
+          <b>{author}</b> · <time datetime={date.toISOString().slice(0, 10)}>{longDate(date)}</time> · {minutes} min read
+        </p>
+      </div>
+    </header>
+
+    <div class="reading">
+      <div class="wrap narrow">
+        <UseCaseScene id={scene} />
+        {headings.length > 2 && (
+          <nav class="panel outline" aria-labelledby="outline-h">
+            <p id="outline-h" class="outline-h">In this post</p>
+            <ol>
+              {headings.map((h, i) => (
+                <li><a href={`#${h.slug}`}><span class="n">{String(i + 1).padStart(2, "0")}</span>{h.text.replace(/^\d+\.\s*/, "")}</a></li>
+              ))}
+            </ol>
+          </nav>
+        )}
+        <div class="prose post-body">
+          {pieces.map((p) =>
+            "html" in p ? (
+              <Fragment set:html={p.html} />
+            ) : "scene" in p ? (
+              <UseCaseScene id={p.scene} />
+            ) : (
+              facts.length > 0 && (
+                <dl class="facts">
+                  {facts.map((f) => (
+                    <div><dt>{f.value}</dt><dd>{f.label}</dd></div>
+                  ))}
+                </dl>
+              )
+            ),
+          )}
+        </div>
+
+        <footer class="post-foot">
+          {commands.length > 0 && (
+            <section class="panel used" aria-labelledby="used-h">
+              <p id="used-h" class="outline-h">Commands in this post</p>
+              <div class="cmds">
+                {commands.map((c) => <a class="cmd" href="/docs/commands/"><code>{c}</code></a>)}
+              </div>
+            </section>
+          )}
+          <p class="licence">
+            Text on this page is licensed under{" "}
+            <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>; code samples are MIT. ·{" "}
+            <a href={source}>Source of this post</a> · Questions go to{" "}
+            <a href={site.discussions}>GitHub Discussions</a>.
+          </p>
+          {more.length > 0 && (
+            <nav class="more" aria-labelledby="more-h">
+              <h2 id="more-h">Keep reading</h2>
+              <ul role="list">
+                {more.map((p) => (
+                  <li>
+                    <a class="more-card" href={`/blog/${p.id}/`}>
+                      <PostThumb name={p.data.icon} size="m" />
+                      <span><b>{p.data.title}</b><small>{p.data.tags.join(", ")} · {readingMinutes(p.body)} min read</small></span>
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            </nav>
+          )}
+        </footer>
+      </div>
+    </div>
+  </article>
+</Page>
+
+<style>
+  .narrow { max-width: 820px; }
+  .post-head .kicker a { color: var(--mute); }
+  .post-head .kicker a:hover { color: var(--ink); }
+  .post-head h1 { max-width: 24ch; }
+  .meta { margin: 22px 0 0; font-size: 15px; color: var(--mute); }
+  .meta b { color: var(--ink); font-weight: 500; }
+
+  .post-body { font-size: 18px; }
+  .post-body :global(> * + *) { margin-top: 18px; }
+  .post-body :global(h2) { margin-top: 44px; font-size: clamp(24px, 2.6vw, 30px); line-height: 1.2; color: var(--ink); }
+  .post-body :global(h3) { margin-top: 30px; font-size: 21px; color: var(--ink); }
+  .post-body :global(ul), .post-body :global(ol) { padding-left: 1.3em; }
+  .post-body :global(li + li) { margin-top: 6px; }
+  .post-body :global(blockquote) {
+    margin-inline: 0; padding: 4px 0 4px 18px; border-left: 3px solid var(--accent); color: var(--ink);
+    font-size: 19px;
+  }
+  .post-body :global(blockquote p) { margin: 0; }
+  .post-body :global(.code-block) { margin-block: 24px; }
+  .post-body :global(.code-block pre) { font-size: 14.5px; line-height: 1.7; }
+  .post-body :global(.code-block .term-bar) { align-items: center; min-height: 40px; padding-block: 6px; }
+  .post-body :global(.code-block .label b) { font-weight: 500; color: var(--code-ink); }
+  .post-body :global(.copy) {
+    font: inherit; font-size: 13px; color: var(--code-dim); background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 4px; padding: 3px 9px; cursor: pointer;
+  }
+  .post-body :global(.copy:hover) { color: var(--code-ink); border-color: rgba(255, 255, 255, 0.22); }
+  .post-body :global(.table-wrap) { margin-block: 24px; }
+  .post-body :global(.table-wrap table) { font-size: 15.5px; }
+  .post-body :global(.case-scene) { margin-block: 30px; }
+  .post-body :global(hr) { border: 0; border-top: 1px solid var(--line); margin-block: 36px; }
+
+  .facts {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1px; margin-block: 30px;
+    background: var(--line); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden;
+  }
+  .facts div { background: var(--surface); padding: 16px 18px; }
+  .facts dt { font-family: var(--f-mono); font-size: 26px; font-weight: 500; color: var(--c1); line-height: 1.2; }
+  .facts dd { margin: 6px 0 0; font-size: 14.5px; line-height: 1.45; color: var(--mute); }
+
+  .post-foot { margin-top: 56px; padding-top: 24px; border-top: 1px solid var(--line); }
+  .licence { margin: 0; font-size: 14.5px; color: var(--mute); }
+  .licence a { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--line-soft); }
+  .kicker-row { display: flex; align-items: center; gap: 16px; margin-bottom: 18px; }
+  .kicker-row .kicker { margin: 0 0 8px; }
+
+  .outline { margin: 8px 0 34px; padding: 20px 24px; }
+  .outline-h { margin: 0 0 12px; font-size: 13.5px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--mute); }
+  .outline ol { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 24px; }
+  .outline a { display: flex; gap: 12px; align-items: baseline; padding: 6px 8px; margin-inline: -8px; border-radius: var(--radius-s); color: var(--ink-body); font-size: 16px; line-height: 1.4; }
+  .outline a:hover { background: var(--surface-2); color: var(--ink); }
+  .outline .n { font-family: var(--f-mono); font-size: 13px; color: var(--c1); }
+
+  .used { padding: 18px 22px; margin-bottom: 26px; }
+  .cmds { display: flex; flex-wrap: wrap; gap: 8px; }
+  .cmd { padding: 5px 10px; border-radius: var(--radius-s); background: var(--surface-2); border: 1px solid var(--line); }
+  .cmd:hover { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); }
+  .cmd code { font-family: var(--f-mono); font-size: 14px; color: var(--ink); }
+
+  .more { margin-top: 40px; }
+  .more h2 { margin: 0 0 16px; font-size: 22px; color: var(--ink); }
+  .more ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
+  .more-card {
+    display: flex; gap: 16px; align-items: center; padding: 14px 16px; color: inherit;
+    background: var(--paper); border: 1px solid var(--paper-line); border-radius: var(--radius);
+    transition: border-color .15s ease;
+  }
+  .more-card:hover { border-color: color-mix(in srgb, var(--accent) 55%, var(--paper-line)); }
+  .more-card span { display: grid; gap: 4px; }
+  .more-card b { color: var(--ink); font-weight: 600; line-height: 1.35; }
+  .more-card small { font-size: 14px; color: var(--mute); }
+
+  /* Icon panels from GitHub-style alerts ("> [!TIP]") and card grids ("<!-- cards -->"), see src/lib/blog.ts. */
+  .post-body :global(.bi) { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; width: 20px; height: 20px; }
+  .post-body :global(.note) {
+    display: flex; gap: 14px; padding: 16px 18px; margin-block: 26px; border-radius: var(--radius);
+    background: color-mix(in srgb, var(--note) 8%, var(--paper));
+    border: 1px solid color-mix(in srgb, var(--note) 28%, var(--paper-line));
+    font-size: 16.5px; line-height: 1.65;
+  }
+  .post-body :global(.note-tip) { --note: var(--ok); }
+  .post-body :global(.note-note) { --note: var(--c2); }
+  .post-body :global(.note-warning) { --note: var(--bad); }
+  .post-body :global(.note-important) { --note: var(--c1); }
+  .post-body :global(.note-icon) {
+    display: grid; place-items: center; flex: none; width: 36px; height: 36px; border-radius: 9px;
+    color: var(--note); background: color-mix(in srgb, var(--note) 16%, transparent);
+  }
+  .post-body :global(.note-body > * + *) { margin-top: 8px; }
+  .post-body :global(.note-body p) { margin: 0; }
+  .post-body :global(.note-title) { font-weight: 600; color: var(--ink); }
+  .post-body :global(.bcards) { list-style: none; padding: 0; margin-block: 26px; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+  .post-body :global(.bcard) {
+    display: grid; gap: 8px; align-content: start; padding: 18px; margin: 0;
+    background: var(--paper); border: 1px solid var(--paper-line); border-radius: var(--radius);
+    font-size: 15.5px; line-height: 1.55;
+  }
+  .post-body :global(.bcard-icon) {
+    display: grid; place-items: center; width: 38px; height: 38px; border-radius: 9px; margin-bottom: 4px;
+    color: var(--c1); background: color-mix(in srgb, var(--c1) 14%, transparent);
+  }
+  .post-body :global(.bcard b) { color: var(--ink); font-size: 16.5px; }
+  @media (max-width: 600px) {
+    .post-body { font-size: 17px; }
+    .post-body :global(.code-block pre) { font-size: 13.5px; padding: 14px 16px 16px; }
+    .outline ol { grid-template-columns: minmax(0, 1fr); }
+    .kicker-row { gap: 12px; }
+  }
+</style>
+
+<script>
+  for (const btn of document.querySelectorAll<HTMLButtonElement>(".post-body [data-copy]")) {
+    if (!navigator.clipboard) continue;
+    btn.hidden = false;
+    btn.addEventListener("click", async () => {
+      const code = btn.closest(".code-block")?.querySelector("code")?.textContent ?? "";
+      try {
+        await navigator.clipboard.writeText(code);
+        btn.textContent = "Copied";
+      } catch {
+        btn.textContent = "Copy failed";
+      }
+      setTimeout(() => (btn.textContent = "Copy"), 1600);
+    });
+  }
+</script>

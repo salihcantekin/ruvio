@@ -1,0 +1,26 @@
+---
+// A post's small thumbnail: its line icon on a flat tile in the cool data colour (--c2), which
+// reads on both themes.
+import { icon } from "../../lib/blog";
+
+interface Props { name: string; size?: "s" | "m" | "l" }
+const { name, size = "m" } = Astro.props;
+---
+
+<span class={`thumb-tile ${size}`} aria-hidden="true" set:html={icon(name)} />
+
+<style>
+  .thumb-tile {
+    display: inline-grid; place-items: center; flex: none; border-radius: 10px;
+    color: var(--c2);
+    background: color-mix(in srgb, var(--c2) 14%, var(--surface));
+    border: 1px solid color-mix(in srgb, var(--c2) 32%, var(--line));
+  }
+  .thumb-tile.s { width: 34px; height: 34px; border-radius: 8px; }
+  .thumb-tile.m { width: 48px; height: 48px; }
+  .thumb-tile.l { width: 64px; height: 64px; border-radius: 14px; }
+  .thumb-tile :global(svg) { fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  .s :global(svg) { width: 18px; height: 18px; }
+  .m :global(svg) { width: 24px; height: 24px; }
+  .l :global(svg) { width: 32px; height: 32px; }
+</style>
