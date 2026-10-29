@@ -15,9 +15,9 @@ const href = (t: string) => `/blog/?topic=${encodeURIComponent(t)}`;
   .tag-chips :is(a, span) {
     display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
     font-size: 13px; font-weight: 600; line-height: 1.5; color: var(--ink);
-    background: color-mix(in srgb, var(--c1) 12%, transparent);
-    border: 1px solid color-mix(in srgb, var(--c1) 35%, var(--line));
+    background: color-mix(in srgb, var(--c2) 12%, var(--surface));
+    border: 1px solid color-mix(in srgb, var(--c2) 30%, var(--line));
   }
-  .tag-chips :is(a, span)::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--c1); }
-  .tag-chips a:hover { background: color-mix(in srgb, var(--c1) 22%, transparent); }
+  .tag-chips :is(a, span)::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--c2); }
+  .tag-chips a:hover { background: color-mix(in srgb, var(--c2) 22%, var(--surface)); }
 </style>
