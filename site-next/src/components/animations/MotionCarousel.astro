@@ -1,0 +1,94 @@
+---
+import Failover from "./Failover.astro";
+import SlotMigration from "./SlotMigration.astro";
+import Lease from "./Lease.astro";
+import Cache from "./Cache.astro";
+import RateLimit from "./RateLimit.astro";
+
+// One slide per scene. `ms` is how long its loop runs, so the carousel moves on after one full pass.
+const slides = [
+  { id: "failover", tab: "Failover", ms: 14000, href: "/use-cases/#multi-node", more: "Multi-node and failover", Scene: Failover },
+  { id: "slots", tab: "Slot moves", ms: 10000, href: "/use-cases/#rebalance", more: "Rebalancing slots", Scene: SlotMigration },
+  { id: "lease", tab: "Locks", ms: 12000, href: "/use-cases/#locks", more: "Locks and leases", Scene: Lease },
+  { id: "cache", tab: "Caches", ms: 10000, href: "/use-cases/#cache", more: "Caches without stampedes", Scene: Cache },
+  { id: "limit", tab: "Rate limits", ms: 8000, href: "/use-cases/#rate-limits", more: "Rate limits", Scene: RateLimit },
+];
+---
+
+<div class="carousel" data-carousel role="region" aria-roledescription="carousel" aria-label="Ruvio features in motion">
+  <div class="slides">
+    {slides.map((s, i) => (
+      <div class="slide" data-slide data-ms={s.ms} hidden={i !== 0} id={`slide-${s.id}`}>
+        <s.Scene />
+        <p class="more-row"><a class="btn ghost" href={s.href}>{s.more} →</a></p>
+      </div>
+    ))}
+  </div>
+  <div class="controls">
+    <button type="button" class="nav" data-prev aria-label="Previous scene">‹</button>
+    <div class="tabs" role="tablist">
+      {slides.map((s, i) => (
+        <button type="button" role="tab" class="tab" data-tab aria-selected={i === 0 ? "true" : "false"} aria-controls={`slide-${s.id}`}>{s.tab}</button>
+      ))}
+    </div>
+    <button type="button" class="nav" data-next aria-label="Next scene">›</button>
+    <button type="button" class="nav pause" data-pause aria-label="Pause autoplay" aria-pressed="false">❚❚</button>
+  </div>
+</div>
+
+<script>
+  document.querySelectorAll<HTMLElement>("[data-carousel]").forEach((root) => {
+    const slides = [...root.querySelectorAll<HTMLElement>("[data-slide]")];
+    const tabs = [...root.querySelectorAll<HTMLElement>("[data-tab]")];
+    const pauseBtn = root.querySelector<HTMLButtonElement>("[data-pause]")!;
+    const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    let index = 0, timer = 0, userPaused = reduce, hovering = false, visible = false;
+
+    const show = (n: number) => {
+      index = (n + slides.length) % slides.length;
+      slides.forEach((s, i) => (s.hidden = i !== index));
+      tabs.forEach((t, i) => t.setAttribute("aria-selected", String(i === index)));
+      // A hidden-then-shown scene restarts on its own; this also covers a scene that was running.
+      slides[index].getAnimations({ subtree: true }).forEach((a) => { a.cancel(); a.play(); });
+      schedule();
+    };
+    const schedule = () => {
+      clearTimeout(timer);
+      if (userPaused || hovering || !visible || document.hidden) return;
+      timer = window.setTimeout(() => show(index + 1), Number(slides[index].dataset.ms) + 600);
+    };
+    root.querySelector("[data-prev]")!.addEventListener("click", () => show(index - 1));
+    root.querySelector("[data-next]")!.addEventListener("click", () => show(index + 1));
+    tabs.forEach((t, i) => t.addEventListener("click", () => show(i)));
+    pauseBtn.addEventListener("click", () => {
+      userPaused = !userPaused;
+      pauseBtn.setAttribute("aria-pressed", String(userPaused));
+      pauseBtn.setAttribute("aria-label", userPaused ? "Resume autoplay" : "Pause autoplay");
+      pauseBtn.textContent = userPaused ? "▶" : "❚❚";
+      schedule();
+    });
+    if (reduce) { pauseBtn.textContent = "▶"; pauseBtn.setAttribute("aria-pressed", "true"); }
+    root.addEventListener("mouseenter", () => { hovering = true; schedule(); });
+    root.addEventListener("mouseleave", () => { hovering = false; schedule(); });
+    document.addEventListener("visibilitychange", schedule);
+    new IntersectionObserver((e) => { visible = e[0].isIntersecting; schedule(); }).observe(root);
+  });
+</script>
+
+<style>
+  .carousel { max-width: 760px; margin: 36px auto 0; }
+  .slides { min-height: 0; }
+  .slide[hidden] { display: none; }
+  .more-row { margin: 14px 0 0; text-align: center; }
+  .controls { display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 18px; flex-wrap: wrap; }
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; }
+  .tab, .nav {
+    font: inherit; font-size: 14.5px; color: var(--mute); background: transparent; cursor: pointer;
+    border: 1px solid var(--line); border-radius: var(--radius-s); padding: 6px 12px;
+  }
+  .nav { min-width: 36px; padding-inline: 10px; }
+  .tab:hover, .nav:hover { color: var(--ink); border-color: color-mix(in srgb, var(--ink) 30%, var(--line)); }
+  .tab[aria-selected="true"] { color: var(--ink); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+  .pause { font-size: 11px; }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
