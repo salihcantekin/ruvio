@@ -3,7 +3,6 @@ import starlight from "@astrojs/starlight";
 import { starlightSidebar } from "./scripts/docs-nav.mjs";
 import { site } from "./src/config/site.ts";
 import { sidebarCss } from "./scripts/docs-icons.mjs";
-import { redis, redisSession } from "./src/lib/grammars.ts";
 
 const fonts =
   "https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap";
@@ -20,9 +19,7 @@ export default defineConfig({
       logo: { src: "./public/images/ruvio-mark-128.png", alt: "Ruvio" },
       favicon: "/favicon.png",
       // One dark code theme in both modes: pale syntax colours on a light panel were hard to read.
-      // The redis-cli grammars are also known here: Astro renders the blog's Markdown through this
-      // pipeline too (the blog pages themselves highlight with src/lib/highlight.ts).
-      expressiveCode: { themes: ["night-owl"], useStarlightUiThemeColors: false, shiki: { langs: [redis, redisSession] } },
+      expressiveCode: { themes: ["night-owl"], useStarlightUiThemeColors: false },
       customCss: ["./src/styles/starlight.css"],
       social: [{ icon: "github", label: "GitHub", href: "https://github.com/salihcantekin/ruvio" }],
       // Each generated page sets its own editUrl to its real source file on GitHub.
