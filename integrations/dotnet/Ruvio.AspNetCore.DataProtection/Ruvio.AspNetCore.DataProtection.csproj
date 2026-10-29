@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
-    <Version>0.1.2</Version>
+    <Version>0.2.0</Version>
     <Description>Append-only ASP.NET Core Data Protection key-ring storage on Ruvio.</Description>
     <PackageId>Ruvio.AspNetCore.DataProtection</PackageId>
     <PackageReadmeFile>README.md</PackageReadmeFile>

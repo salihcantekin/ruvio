@@ -4,6 +4,8 @@ Notable changes to the Python client `ruvio-client` on PyPI. New entries go unde
 
 ## Unreleased
 
+## 0.2.0 - 2026-10-29
+
 - A pipeline command that is redirected with `-MOVED` or `-ASK` and then refused with `-TRYAGAIN` now shares one `TRYAGAIN` budget (the 635 ms schedule, cut to `socket_timeout` when that is shorter) with the other commands of its pipeline, in the sync and the asyncio client, instead of waiting up to 635 ms for each in turn. A command not yet re-sent when the budget has run out still gets one more try. A single command waits as before; a pipeline reply that is `TRYAGAIN` from the start is still returned as that command's error (issue #312).
 - `renew(key, token, ttl_ms)` sends the server's `RENEW`: it extends a `LEASE` or `SEMAPHORE` holder by its token without releasing it (1 when the token is a live holder, 0 otherwise). Lease and permit handles gain `renew(ttl_ms)`. Needs a server that has `RENEW`.
 - `ruvio.is_transient(e)` and `ruvio.may_have_run(e)` sort an exception for a retry policy of your own (tenacity, a loop): transient means trying again later can succeed (`ConnectionError`, `TimeoutError`, or the replies `LOADING`, `MASTERDOWN`, `CLUSTERDOWN`, `TRYAGAIN`, `READONLY`, `NOREPLICAS`); may have run is false only for a server error reply other than `NOREPLICAS`. The same rules as the other clients. Nothing changes on the command path.

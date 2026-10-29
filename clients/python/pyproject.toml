@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ruvio-client"
-version = "0.1.2"
+version = "0.2.0"
 description = "Fast sync and asyncio Python client for the Ruvio key-value server (RESP2/RESP3)"
 readme = "README.md"
 license = { text = "MIT" }

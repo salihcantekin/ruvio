@@ -102,7 +102,7 @@ Download a binary from [GitHub Releases](https://github.com/salihcantekin/ruvio/
 
 ```bash
 # Linux x64; swap the platform for linux-arm64 or macos-arm64
-v=0.3.4
+v=0.4.0
 curl -LO https://github.com/salihcantekin/ruvio/releases/download/ruvio-$v/ruvio-$v-linux-x64.tar.gz
 tar xzf ruvio-$v-linux-x64.tar.gz
 cd ruvio-$v-linux-x64
