@@ -22,7 +22,7 @@ import Logo from "./Logo.astro";
     </div>
     <div class="legal">
       <span>© {new Date().getFullYear()} Ruvio · v{serverVersion}</span>
-      <span>Server AGPL-3.0 · Clients MIT</span>
+      <span>Server AGPL-3.0 · Clients MIT <button type="button" class="cookie-settings" data-cookie-settings hidden>Cookie settings</button></span>
     </div>
   </div>
 </footer>
@@ -35,6 +35,7 @@ import Logo from "./Logo.astro";
   ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 9px; font-size: 15.5px; }
   ul a:hover { color: var(--c2); }
   .legal { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 20px; margin-top: 44px; padding-top: 20px; border-top: 1px solid var(--line); font-size: 14px; color: var(--faint); }
+  .cookie-settings { font: inherit; color: inherit; background: none; border: 0; padding: 0; margin-left: 12px; cursor: pointer; text-decoration: underline; }
   @media (max-width: 900px) {
     .cols { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .about { grid-column: 1 / -1; }
