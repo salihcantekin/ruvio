@@ -4,6 +4,8 @@ Notable changes to the Node.js client `ruvio-client` on npm. New entries go unde
 
 ## Unreleased
 
+## 0.3.0 - 2026-10-29
+
 - The blocking-command wait parser uses a regular expression that is linear in the argument length (the old one could backtrack on long runs of zeros; the argument was already bounded, so no behaviour changes).
 - Fixed: TLS to a host given as an IP address no longer sets `servername`, so Node does not print its DEP0123 deprecation warning; a host name still sets it.
 - `renew(key, token, ttlMs)` sends the server's `RENEW`: it extends a `LEASE` or `SEMAPHORE` holder by its token without releasing it (true when the token is a live holder). Lock and lease handles gain `renew(ttlMs)`. Needs a server that has `RENEW`.

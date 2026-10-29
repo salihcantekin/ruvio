@@ -6,7 +6,7 @@
 
   <groupId>io.github.salihcantekin</groupId>
   <artifactId>ruvio-client</artifactId>
-  <version>0.1.2</version>
+  <version>0.2.0</version>
   <packaging>jar</packaging>
 
   <name>ruvio-client</name>

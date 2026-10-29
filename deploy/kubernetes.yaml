@@ -35,7 +35,7 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
-          image: salihcantekin/ruvio:0.3.4
+          image: salihcantekin/ruvio:0.4.0
           ports:
             - name: resp
               containerPort: 6379

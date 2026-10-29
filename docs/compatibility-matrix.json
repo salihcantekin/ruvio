@@ -3151,7 +3151,7 @@
       "language": "Rust",
       "library": "ruvio-client",
       "package": "ruvio-client",
-      "version": "0.4.0",
+      "version": "0.5.0",
       "protocol": "RESP2",
       "suite": "clients/ruvio-client/src/commands.rs"
     },

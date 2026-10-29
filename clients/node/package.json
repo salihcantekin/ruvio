@@ -1,6 +1,6 @@
 {
   "name": "ruvio-client",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Fast, zero-dependency, pipelined RESP client for the Ruvio server (Node.js 18+).",
   "license": "MIT",
   "author": "Salih Cantekin <17653555+salihcantekin@users.noreply.github.com>",
