@@ -5,8 +5,8 @@ export const site = {
   url: "https://ruviodb.com",
   description:
     "Ruvio is a Rust key-value server that speaks the Redis protocol: one process for caching, locks, conditional writes, change feeds and delayed work.",
-  image: "/images/ruvio-social.png",
-  imageAlt: "Ruvio: a Redis-compatible server in Rust",
+  image: "/images/ruvio-og.png",
+  imageAlt: "Ruvio: locks, rate limits and job queues are one command. An in-memory key-value server in Rust that speaks RESP.",
   github: "https://github.com/salihcantekin/ruvio",
   releases: "https://github.com/salihcantekin/ruvio/releases/latest",
   discussions: "https://github.com/salihcantekin/ruvio/discussions",
