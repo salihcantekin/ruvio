@@ -38,6 +38,7 @@ $ redis-cli -a change-me
         <p class="hero-lede">Ruvio speaks RESP, so <code>redis-cli</code> and your existing clients connect. Each shard owns its keys: no lock on the hot path, and the durability you choose at startup.</p>
         <div class="ctas">
           <a class="btn" href="/get-started/">Get started</a>
+          <a class="btn ghost" href="/get-started/wizard/">Setup wizard</a>
           <a class="btn ghost" href="/docs/">Read the docs</a>
         </div>
         <ul class="facts">
@@ -139,10 +140,11 @@ $ redis-cli -a change-me
     <div class="wrap cta-in">
       <div>
         <h2>Run it next to your app in a minute</h2>
-        <p>One binary or one container. Your Redis client already knows how to talk to it.</p>
+        <p>One binary or one container. Your Redis client already knows how to talk to it. For replicas, automatic failover or a cluster, the setup wizard writes the Compose file or script for you.</p>
       </div>
       <div class="ctas">
         <a class="btn" href="/get-started/">Get started</a>
+        <a class="btn ghost" href="/get-started/wizard/">Setup wizard</a>
         <a class="btn ghost" href={site.releases}>Download v{serverVersion}</a>
       </div>
     </div>

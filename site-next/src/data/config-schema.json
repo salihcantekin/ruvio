@@ -1,0 +1,813 @@
+{
+  "settings": [
+    {
+      "env": "RUVIO_ADDR",
+      "file": "address",
+      "flag": "--address",
+      "config_set": null,
+      "type": "string",
+      "values": [],
+      "default": "127.0.0.1:6379"
+    },
+    {
+      "env": "RUVIO_SHARDS",
+      "file": "shards",
+      "flag": "--shards",
+      "config_set": null,
+      "type": "integer",
+      "values": [],
+      "default": 1
+    },
+    {
+      "env": "RUVIO_PORT_MODE",
+      "file": "port_mode",
+      "flag": null,
+      "config_set": null,
+      "type": "enum",
+      "values": [
+        "per-shard",
+        "single"
+      ],
+      "default": null
+    },
+    {
+      "env": "RUVIO_ADVERTISE_HOST",
+      "file": "advertised_host",
+      "flag": "--advertised-host",
+      "config_set": null,
+      "type": "string",
+      "values": [],
+      "default": "127.0.0.1"
+    },
+    {
+      "env": "RUVIO_ADVERTISE_PORT",
+      "file": "advertised_port",
+      "flag": "--advertised-port",
+      "config_set": null,
+      "type": "integer",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": "RUVIO_CLUSTER_TOPOLOGY",
+      "file": "cluster_topology",
+      "flag": null,
+      "config_set": null,
+      "type": "string",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": "RUVIO_CLUSTER_GROUP",
+      "file": "cluster_group",
+      "flag": null,
+      "config_set": null,
+      "type": "string",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": "RUVIO_MIGRATION_MAX_BYTES_PER_SEC",
+      "file": "migration_max_bytes_per_sec",
+      "flag": null,
+      "config_set": null,
+      "type": "integer",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": "RUVIO_CPUSET",
+      "file": "cpu_set",
+      "flag": "--cpu-set",
+      "config_set": null,
+      "type": "string",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": "RUVIO_CORE",
+      "file": "cpu_set",
+      "flag": null,
+      "config_set": null,
+      "type": "string",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": "RUVIO_SHUTDOWN_GRACE_MS",
+      "file": "shutdown_grace_ms",
+      "flag": "--shutdown-grace-ms",
+      "config_set": null,
+      "type": "integer",
+      "values": [],
+      "default": 30000
+    },
+    {
+      "env": "RUVIO_SLOWLOG_THRESHOLD_MICROS",
+      "file": "slowlog_threshold_micros",
+      "flag": null,
+      "config_set": "slowlog-log-slower-than",
+      "type": "integer",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": "RUVIO_SLOWLOG_MAX_LEN",
+      "file": "slowlog_max_len",
+      "flag": null,
+      "config_set": "slowlog-max-len",
+      "type": "integer",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": "RUVIO_LATENCY_HISTOGRAMS",
+      "file": "latency_histograms",
+      "flag": null,
+      "config_set": "latency-histograms",
+      "type": "boolean",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": "RUVIO_KEY_STATS",
+      "file": "key_stats",
+      "flag": null,
+      "config_set": "key-stats",
+      "type": "boolean",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": "RUVIO_MAX_ARGUMENTS",
+      "file": "protocol.max_arguments",
+      "flag": null,
+      "config_set": null,
+      "type": "integer",
+      "values": [],
+      "default": 1048576
+    },
+    {
+      "env": "RUVIO_MAX_KEY_BYTES",
+      "file": "protocol.max_key_bytes",
+      "flag": null,
+      "config_set": null,
+      "type": "integer",
+      "values": [],
+      "default": 1048576
+    },
+    {
+      "env": "RUVIO_MAX_VALUE_BYTES",
+      "file": "protocol.max_value_bytes",
+      "flag": null,
+      "config_set": null,
+      "type": "integer",
+      "values": [],
+      "default": 16777216
+    },
+    {
+      "env": "RUVIO_MAX_COMMAND_BYTES",
+      "file": "protocol.max_command_bytes",
+      "flag": null,
+      "config_set": null,
+      "type": "integer",
+      "values": [],
+      "default": 67108864
+    },
+    {
+      "env": "RUVIO_MAX_PIPELINE_COMMANDS",
+      "file": "protocol.max_pipeline_commands",
+      "flag": null,
+      "config_set": null,
+      "type": "integer",
+      "values": [],
+      "default": 1024
+    },
+    {
+      "env": "RUVIO_MAX_CONNECTION_BUFFER_BYTES",
+      "file": "protocol.max_connection_buffer_bytes",
+      "flag": null,
+      "config_set": null,
+      "type": "integer",
+      "values": [],
+      "default": 67108864
+    },
+    {
+      "env": "RUVIO_DATABASES",
+      "file": "protocol.databases",
+      "flag": null,
+      "config_set": null,
+      "type": "integer",
+      "values": [],
+      "default": 16
+    },
+    {
+      "env": "RUVIO_IDLE_TIMEOUT_MS",
+      "file": "timeouts.idle_ms",
+      "flag": "--idle-timeout-ms",
+      "config_set": "idle-timeout-ms",
+      "type": "integer",
+      "values": [],
+      "default": 300000
+    },
+    {
+      "env": "RUVIO_READ_TIMEOUT_MS",
+      "file": "timeouts.read_ms",
+      "flag": "--read-timeout-ms",
+      "config_set": "read-timeout-ms",
+      "type": "integer",
+      "values": [],
+      "default": 30000
+    },
+    {
+      "env": "RUVIO_WRITE_TIMEOUT_MS",
+      "file": "timeouts.write_ms",
+      "flag": "--write-timeout-ms",
+      "config_set": "write-timeout-ms",
+      "type": "integer",
+      "values": [],
+      "default": 30000
+    },
+    {
+      "env": "RUVIO_MAX_CONNECTIONS",
+      "file": "connections.max_global",
+      "flag": "--max-connections",
+      "config_set": "max-connections",
+      "type": "integer",
+      "values": [],
+      "default": 10000
+    },
+    {
+      "env": "RUVIO_MAX_CONNECTIONS_PER_IP",
+      "file": "connections.max_per_ip",
+      "flag": "--max-connections-per-ip",
+      "config_set": "max-connections-per-ip",
+      "type": "integer",
+      "values": [],
+      "default": 256
+    },
+    {
+      "env": "RUVIO_MAX_CONNECTIONS_PER_USER",
+      "file": "connections.max_per_user",
+      "flag": "--max-connections-per-user",
+      "config_set": "max-connections-per-user",
+      "type": "integer",
+      "values": [],
+      "default": 0
+    },
+    {
+      "env": "RUVIO_MAX_COMMANDS_PER_SECOND",
+      "file": "connections.max_commands_per_second",
+      "flag": "--max-commands-per-second",
+      "config_set": "max-commands-per-second",
+      "type": "integer",
+      "values": [],
+      "default": 0
+    },
+    {
+      "env": "RUVIO_MAX_QUEUED_REQUESTS",
+      "file": "requests.max_queued_requests",
+      "flag": "--max-queued-requests",
+      "config_set": null,
+      "type": "integer",
+      "values": [],
+      "default": 1024
+    },
+    {
+      "env": "RUVIO_MAX_OUTPUT_BUFFER_BYTES",
+      "file": "requests.max_output_buffer_bytes",
+      "flag": "--max-output-buffer-bytes",
+      "config_set": "max-output-buffer-bytes",
+      "type": "integer",
+      "values": [],
+      "default": 67108864
+    },
+    {
+      "env": "RUVIO_DURABILITY",
+      "file": "persistence.profile",
+      "flag": "--durability",
+      "config_set": null,
+      "type": "enum",
+      "values": [
+        "memory",
+        "snapshot",
+        "everysec",
+        "always"
+      ],
+      "default": "memory"
+    },
+    {
+      "env": "RUVIO_DATA_DIR",
+      "file": "persistence.data_dir",
+      "flag": "--data-dir",
+      "config_set": null,
+      "type": "string",
+      "values": [],
+      "default": "./data"
+    },
+    {
+      "env": "RUVIO_WAL_SEGMENT_BYTES",
+      "file": "persistence.wal_segment_bytes",
+      "flag": "--wal-segment-bytes",
+      "config_set": null,
+      "type": "integer",
+      "values": [],
+      "default": 268435456
+    },
+    {
+      "env": "RUVIO_WAL_SYNC_INTERVAL_MS",
+      "file": "persistence.sync_interval_ms",
+      "flag": "--wal-sync-interval-ms",
+      "config_set": null,
+      "type": "integer",
+      "values": [],
+      "default": 1000
+    },
+    {
+      "env": "RUVIO_EXPERIMENTAL_SYNC_WORKER",
+      "file": "persistence.experimental_sync_worker",
+      "flag": null,
+      "config_set": null,
+      "type": "boolean",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": "RUVIO_SYNC_WORKER",
+      "file": "persistence.sync_worker",
+      "flag": null,
+      "config_set": null,
+      "type": "enum",
+      "values": [
+        "auto",
+        "on",
+        "off"
+      ],
+      "default": null
+    },
+    {
+      "env": "RUVIO_WAL_PREFILL",
+      "file": null,
+      "flag": null,
+      "config_set": null,
+      "type": "enum",
+      "values": [
+        "auto",
+        "on",
+        "off"
+      ],
+      "default": null
+    },
+    {
+      "env": "RUVIO_SNAPSHOT_MAX_BYTES",
+      "file": "persistence.snapshot_max_bytes",
+      "flag": "--snapshot-max-bytes",
+      "config_set": null,
+      "type": "integer",
+      "values": [],
+      "default": 17179869184
+    },
+    {
+      "env": "RUVIO_SNAPSHOT_JOURNAL_BYTES",
+      "file": "persistence.snapshot_journal_bytes",
+      "flag": "--snapshot-journal-bytes",
+      "config_set": null,
+      "type": "integer",
+      "values": [],
+      "default": 67108864
+    },
+    {
+      "env": "RUVIO_SNAPSHOT_INTERVAL_MS",
+      "file": "persistence.snapshot_interval_ms",
+      "flag": "--snapshot-interval-ms",
+      "config_set": null,
+      "type": "integer",
+      "values": [],
+      "default": 60000
+    },
+    {
+      "env": "RUVIO_SNAPSHOT_MIN_MUTATIONS",
+      "file": "persistence.snapshot_min_mutations",
+      "flag": "--snapshot-min-mutations",
+      "config_set": null,
+      "type": "integer",
+      "values": [],
+      "default": 0
+    },
+    {
+      "env": "RUVIO_CDC_RETAIN_BYTES",
+      "file": "persistence.cdc_retain_bytes",
+      "flag": null,
+      "config_set": null,
+      "type": "integer",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": "RUVIO_REPLICA_RETAIN_MAX_BYTES",
+      "file": "persistence.replica_retain_max_bytes",
+      "flag": null,
+      "config_set": null,
+      "type": "integer",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": "RUVIO_REQUIREPASS",
+      "file": "security.requirepass",
+      "flag": "--requirepass",
+      "config_set": "requirepass",
+      "type": "string",
+      "values": [],
+      "default": ""
+    },
+    {
+      "env": "RUVIO_TLS_CERT",
+      "file": "security.tls_cert",
+      "flag": "--tls-cert",
+      "config_set": null,
+      "type": "string",
+      "values": [],
+      "default": ""
+    },
+    {
+      "env": "RUVIO_TLS_KEY",
+      "file": "security.tls_key",
+      "flag": "--tls-key",
+      "config_set": null,
+      "type": "string",
+      "values": [],
+      "default": ""
+    },
+    {
+      "env": "RUVIO_TLS_CLIENT_CA",
+      "file": "security.tls_client_ca",
+      "flag": "--tls-client-ca",
+      "config_set": null,
+      "type": "string",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": "RUVIO_TLS_CLIENT_AUTH",
+      "file": "security.tls_client_auth",
+      "flag": "--tls-client-auth",
+      "config_set": null,
+      "type": "boolean",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": "RUVIO_ACL_FILE",
+      "file": "security.acl_file",
+      "flag": null,
+      "config_set": null,
+      "type": "string",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": "RUVIO_PROTECTED_MODE",
+      "file": "security.protected_mode",
+      "flag": "--protected-mode",
+      "config_set": null,
+      "type": "boolean",
+      "values": [],
+      "default": true
+    },
+    {
+      "env": "RUVIO_ALLOW_UNAUTHENTICATED",
+      "file": "security.allow_unauthenticated_public",
+      "flag": null,
+      "config_set": null,
+      "type": "boolean",
+      "values": [],
+      "default": false
+    },
+    {
+      "env": "RUVIO_METRICS_TOKEN",
+      "file": "security.metrics_token",
+      "flag": null,
+      "config_set": null,
+      "type": "string",
+      "values": [],
+      "default": ""
+    },
+    {
+      "env": "RUVIO_REPLICATION_PASSWORD",
+      "file": "security.replication_password",
+      "flag": null,
+      "config_set": null,
+      "type": "string",
+      "values": [],
+      "default": ""
+    },
+    {
+      "env": "RUVIO_MAXMEMORY",
+      "file": "memory.max_process_bytes",
+      "flag": "--maxmemory",
+      "config_set": "maxmemory",
+      "type": "integer",
+      "values": [],
+      "default": 0
+    },
+    {
+      "env": "RUVIO_MAX_SHARD_BYTES",
+      "file": "memory.max_shard_bytes",
+      "flag": "--max-shard-bytes",
+      "config_set": "max-shard-bytes",
+      "type": "integer",
+      "values": [],
+      "default": 0
+    },
+    {
+      "env": "RUVIO_MEMORY_HEADROOM_BYTES",
+      "file": "memory.reserved_headroom_bytes",
+      "flag": "--memory-headroom-bytes",
+      "config_set": "memory-headroom-bytes",
+      "type": "integer",
+      "values": [],
+      "default": 16777216
+    },
+    {
+      "env": "RUVIO_MAXMEMORY_POLICY",
+      "file": "memory.maxmemory_policy",
+      "flag": "--maxmemory-policy",
+      "config_set": "maxmemory-policy",
+      "type": "enum",
+      "values": [
+        "noeviction",
+        "allkeys-lru",
+        "allkeys-lfu",
+        "volatile-lru",
+        "volatile-ttl"
+      ],
+      "default": "noeviction"
+    },
+    {
+      "env": "RUVIO_MAXMEMORY_SAMPLES",
+      "file": "memory.maxmemory_samples",
+      "flag": "--maxmemory-samples",
+      "config_set": "maxmemory-samples",
+      "type": "integer",
+      "values": [],
+      "default": 16
+    },
+    {
+      "env": "RUVIO_ACTIVE_EXPIRE_KEYS",
+      "file": "memory.active_expire_keys",
+      "flag": "--active-expire-keys",
+      "config_set": "active-expire-keys",
+      "type": "integer",
+      "values": [],
+      "default": 16
+    },
+    {
+      "env": "RUVIO_ACTIVE_EXPIRE_MAINTENANCE_KEYS",
+      "file": "memory.active_expire_maintenance_keys",
+      "flag": "--active-expire-maintenance-keys",
+      "config_set": "active-expire-maintenance-keys",
+      "type": "integer",
+      "values": [],
+      "default": 16
+    },
+    {
+      "env": "RUVIO_HASH_MAX_COMPACT_ENTRIES",
+      "file": "memory.hash_max_compact_entries",
+      "flag": "--hash-max-compact-entries",
+      "config_set": "hash-max-compact-entries",
+      "type": "integer",
+      "values": [],
+      "default": 64
+    },
+    {
+      "env": "RUVIO_HASH_MAX_COMPACT_VALUE_BYTES",
+      "file": "memory.hash_max_compact_value_bytes",
+      "flag": "--hash-max-compact-value-bytes",
+      "config_set": "hash-max-compact-value-bytes",
+      "type": "integer",
+      "values": [],
+      "default": 64
+    },
+    {
+      "env": "RUVIO_SET_MAX_INTSET_ENTRIES",
+      "file": "memory.set_max_intset_entries",
+      "flag": "--set-max-intset-entries",
+      "config_set": "set-max-intset-entries",
+      "type": "integer",
+      "values": [],
+      "default": 512
+    },
+    {
+      "env": "RUVIO_LIST_MAX_COMPACT_ENTRIES",
+      "file": "memory.list_max_compact_entries",
+      "flag": "--list-max-compact-entries",
+      "config_set": "list-max-compact-entries",
+      "type": "integer",
+      "values": [],
+      "default": 128
+    },
+    {
+      "env": "RUVIO_LIST_MAX_COMPACT_VALUE_BYTES",
+      "file": "memory.list_max_compact_value_bytes",
+      "flag": "--list-max-compact-value-bytes",
+      "config_set": "list-max-compact-value-bytes",
+      "type": "integer",
+      "values": [],
+      "default": 64
+    },
+    {
+      "env": "RUVIO_NOTIFY_KEYSPACE_EVENTS",
+      "file": "notify_keyspace_events",
+      "flag": null,
+      "config_set": "notify-keyspace-events",
+      "type": "string",
+      "values": [],
+      "default": ""
+    },
+    {
+      "env": "RUVIO_METRICS_ADDR",
+      "file": "metrics_address",
+      "flag": "--metrics-address",
+      "config_set": null,
+      "type": "string",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": "RUVIO_SCRIPT_MAX_BYTES",
+      "file": "scripts.max_bytes",
+      "flag": null,
+      "config_set": "script-max-bytes",
+      "type": "integer",
+      "values": [],
+      "default": 16384
+    },
+    {
+      "env": "RUVIO_SCRIPT_MAX_CACHED",
+      "file": "scripts.max_cached",
+      "flag": null,
+      "config_set": "script-max-cached",
+      "type": "integer",
+      "values": [],
+      "default": 1024
+    },
+    {
+      "env": "RUVIO_SCRIPT_MAX_CALLS",
+      "file": "scripts.max_calls",
+      "flag": null,
+      "config_set": "script-max-calls",
+      "type": "integer",
+      "values": [],
+      "default": 1024
+    },
+    {
+      "env": "RUVIO_SCRIPT_MAX_INSTRUCTIONS",
+      "file": "scripts.max_instructions",
+      "flag": null,
+      "config_set": "script-max-instructions",
+      "type": "integer",
+      "values": [],
+      "default": 1000000
+    },
+    {
+      "env": "RUVIO_SCRIPT_MAX_TIME_MS",
+      "file": "scripts.max_time_ms",
+      "flag": null,
+      "config_set": "script-max-time-ms",
+      "type": "integer",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": "RUVIO_HOT_KEYS",
+      "file": "hot_keys",
+      "flag": null,
+      "config_set": null,
+      "type": "list",
+      "values": [],
+      "default": []
+    },
+    {
+      "env": "RUVIO_REPLICATION_ROLE",
+      "file": "replication.role",
+      "flag": null,
+      "config_set": null,
+      "type": "enum",
+      "values": [
+        "off",
+        "primary",
+        "replica"
+      ],
+      "default": "off"
+    },
+    {
+      "env": "RUVIO_REPLICATION_LISTEN",
+      "file": "replication.listen",
+      "flag": null,
+      "config_set": null,
+      "type": "string",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": "RUVIO_REPLICATION_PRIMARY",
+      "file": "replication.primary",
+      "flag": null,
+      "config_set": null,
+      "type": "string",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": "RUVIO_MIN_REPLICAS_TO_WRITE",
+      "file": "replication.min_replicas_to_write",
+      "flag": null,
+      "config_set": "min-replicas-to-write",
+      "type": "integer",
+      "values": [],
+      "default": 0
+    },
+    {
+      "env": "RUVIO_MIN_REPLICAS_MAX_LAG",
+      "file": "replication.min_replicas_max_lag",
+      "flag": null,
+      "config_set": "min-replicas-max-lag",
+      "type": "integer",
+      "values": [],
+      "default": 10
+    },
+    {
+      "env": "RUVIO_PRIMARY_LEASE",
+      "file": "replication.primary_lease",
+      "flag": null,
+      "config_set": "primary-lease",
+      "type": "boolean",
+      "values": [],
+      "default": false
+    },
+    {
+      "env": "RUVIO_PRIMARY_LEASE_COORDINATORS",
+      "file": "replication.primary_lease_coordinators",
+      "flag": null,
+      "config_set": null,
+      "type": "list",
+      "values": [],
+      "default": []
+    },
+    {
+      "env": "RUVIO_REPLICA_ANNOUNCED",
+      "file": "replication.announced",
+      "flag": null,
+      "config_set": null,
+      "type": "boolean",
+      "values": [],
+      "default": true
+    },
+    {
+      "env": null,
+      "file": "replication.tls",
+      "flag": null,
+      "config_set": null,
+      "type": "boolean",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": null,
+      "file": "replication.tls_ca",
+      "flag": null,
+      "config_set": null,
+      "type": "string",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": null,
+      "file": "replication.tls_client_cert",
+      "flag": null,
+      "config_set": null,
+      "type": "string",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": null,
+      "file": "replication.tls_client_key",
+      "flag": null,
+      "config_set": null,
+      "type": "string",
+      "values": [],
+      "default": null
+    },
+    {
+      "env": null,
+      "file": "security.users",
+      "flag": null,
+      "config_set": null,
+      "type": "list",
+      "values": [],
+      "default": null
+    }
+  ]
+}

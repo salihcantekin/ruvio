@@ -223,6 +223,12 @@ container with `--health-cmd 'ruvio-ctl ping --connect-only'` (it only opens the
 The base images in both Dockerfiles are pinned by digest; Dependabot (`.github/dependabot.yml`,
 weekly) opens a PR when a digest moves, so security updates still arrive.
 
+For replicas, automatic failover or a cluster in containers, the
+[setup wizard](https://ruviodb.com/get-started/wizard/) writes the Compose file. A coordinator container
+needs its own health check, because the image's pings the data port, which a coordinator does not open:
+`ruvio-ctl ping --address 127.0.0.1:<coordinator port>`. `ruvio --check-config` checks a container's
+settings without starting it ([Configuration](CONFIGURATION.md#checking-settings-before-a-start)).
+
 `Dockerfile.linux` is the same runtime, used by the benchmark script. It does not need `seccomp=unconfined`.
 
 ## Operator UI

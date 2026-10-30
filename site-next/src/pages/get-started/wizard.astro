@@ -1,0 +1,285 @@
+---
+// The setup wizard: questions on the left, the generated files on the right. The engine is
+// src/lib/wizard.mjs; the page script (src/scripts/wizard.ts) runs it in the browser, so the
+// answers and the generated passwords never leave the page.
+import Page from "../../layouts/Page.astro";
+import PageIntro from "../../components/PageIntro.astro";
+import { serverVersion } from "../../data/bench";
+import schema from "../../data/config-schema.json";
+import { checkSchema } from "../../lib/wizard.mjs";
+
+// The build stops when the wizard writes a setting this server version does not have.
+checkSchema(schema);
+
+type Choice = { value: string; title: string; text: string; badge?: string };
+type Question = { name: string; legend: string; hint?: string; choices: Choice[]; show?: string };
+
+const questions: Question[] = [
+  {
+    name: "topology",
+    legend: "What are you setting up?",
+    choices: [
+      { value: "single", title: "One server", text: "One process. The quickest start, for development, a cache or a small service.", badge: "Start here" },
+      { value: "replicas", title: "Primary with replicas", text: "Copies on other nodes serve reads and survive the loss of the primary. You promote a replica yourself." },
+      { value: "failover", title: "Automatic failover", text: "A primary, replicas and three coordinators that promote a replica within seconds when the primary stops answering." },
+      { value: "cluster", title: "Cluster", text: "Several groups share the 16,384 hash slots, each a primary with replicas and automatic failover. Grows past one machine." },
+    ],
+  },
+  {
+    name: "shards",
+    legend: "Shards per server",
+    hint: "One thread per shard, each on its own port (6379, 6380, ...). Use up to one per core you can give Ruvio. Clients find the extra ports on their own.",
+    choices: [
+      { value: "1", title: "1", text: "One core" },
+      { value: "2", title: "2", text: "Two cores" },
+      { value: "4", title: "4", text: "Four cores" },
+      { value: "8", title: "8", text: "Eight cores" },
+    ],
+  },
+  {
+    name: "groups",
+    legend: "Groups in the cluster",
+    hint: "Each group owns an equal part of the hash slots. More groups spread data and writes over more machines.",
+    show: "cluster",
+    choices: [
+      { value: "2", title: "2 groups", text: "Half of the keys each" },
+      { value: "3", title: "3 groups", text: "A third each" },
+      { value: "4", title: "4 groups", text: "A quarter each" },
+    ],
+  },
+  {
+    name: "replicas",
+    legend: "Replicas per primary",
+    hint: "Replicas copy the primary's write-ahead log and serve reads. With automatic failover, two replicas keep a spare after the first failover.",
+    show: "replicas failover cluster",
+    choices: [
+      { value: "1", title: "1 replica", text: "Two copies of the data" },
+      { value: "2", title: "2 replicas", text: "Three copies of the data" },
+    ],
+  },
+  {
+    name: "coordinators",
+    legend: "Coordinators",
+    hint: "Coordinators hold no data. They agree through Raft that a primary is down, so they need a majority: three survive the loss of one, five survive two.",
+    show: "failover cluster",
+    choices: [
+      { value: "3", title: "3", text: "Survive one lost coordinator" },
+      { value: "5", title: "5", text: "Survive two" },
+    ],
+  },
+  {
+    name: "durability",
+    legend: "How much may a crash lose?",
+    hint: "Durability is chosen at startup. Replicas copy the write-ahead log, so with replicas only the last two apply.",
+    choices: [
+      { value: "memory", title: "Everything", text: "memory: nothing is written to disk. Fastest; for a cache you can refill." },
+      { value: "snapshot", title: "Since the last snapshot", text: "snapshot: a checkpoint every 60 s, no log." },
+      { value: "everysec", title: "About one second", text: "everysec: a log, synced every second. The usual choice.", badge: "Recommended" },
+      { value: "always", title: "Nothing acknowledged", text: "always: every write is synced before the reply. Slowest writes." },
+    ],
+  },
+  {
+    name: "usage",
+    legend: "What will it hold?",
+    choices: [
+      { value: "store", title: "Data I keep", text: "Writes are refused when a memory limit is hit; nothing is evicted (noeviction)." },
+      { value: "cache", title: "A cache", text: "Least recently used keys are evicted at the memory limit (allkeys-lru)." },
+    ],
+  },
+  {
+    name: "placement",
+    legend: "Where does it run?",
+    show: "replicas failover cluster",
+    choices: [
+      { value: "one", title: "One machine", text: "Every node in containers on this machine. To try it out, or to develop against." },
+      { value: "many", title: "Separate machines", text: "One node per machine, so a machine can fail. You get one file per machine." },
+    ],
+  },
+  {
+    name: "access",
+    legend: "Who connects to it?",
+    show: "access",
+    choices: [
+      { value: "local", title: "Only this machine", text: "Ports are published on 127.0.0.1." },
+      { value: "network", title: "Other machines too", text: "Ports are published on every interface; a password is required." },
+    ],
+  },
+  {
+    name: "format",
+    legend: "How do you want it?",
+    choices: [
+      { value: "compose", title: "Docker Compose", text: "compose.yml and .env, then docker compose up -d." },
+      { value: "bash", title: "Bash script", text: "One script for Linux or macOS that writes the files and starts everything." },
+      { value: "powershell", title: "PowerShell script", text: "The same for Windows with Docker Desktop." },
+      { value: "docker-run", title: "docker run", text: "One command line. One server only." },
+    ],
+  },
+];
+---
+
+<Page title="Setup wizard" description="Answer a few questions and copy a ready Docker Compose file or script for Ruvio: one server, replicas, automatic failover or a cluster.">
+  <PageIntro title="Set up Ruvio in a few answers" kicker="Setup wizard">
+    Pick what you need: one server, replicas, automatic failover or a cluster. You get one Compose file or script to
+    paste and run, and the commands that show it working. Passwords are generated in your browser and nothing is sent
+    anywhere.
+    <a slot="after" class="jump" href="#result">Jump to the files</a>
+  </PageIntro>
+
+  <div class="reading">
+    <div class="wrap wizard" data-wizard data-version={serverVersion}>
+      <form class="questions" data-questions>
+        {questions.map((q, i) => (
+          <fieldset class="question panel" data-question={q.name} data-show={q.show}>
+            <legend><span class="q-no" aria-hidden="true">{String(i + 1).padStart(2, "0")}</span>{q.legend}</legend>
+            {q.hint && <p class="hint">{q.hint}</p>}
+            <div class:list={["choices", { compact: q.choices.every((c) => c.title.length <= 10) }]}>
+              {q.choices.map((c) => (
+                <label class="choice">
+                  <input type="radio" name={q.name} value={c.value} />
+                  <span class="choice-body">
+                    <span class="choice-title">{c.title}{c.badge && <em>{c.badge}</em>}</span>
+                    <span class="choice-text">{c.text}</span>
+                  </span>
+                </label>
+              ))}
+            </div>
+            {q.name === "usage" && (
+              <label class="field" data-field="memory">
+                <span>Memory limit (MiB, 0 = none)</span>
+                <input type="number" name="maxmemoryMb" min="0" step="256" inputmode="numeric" />
+              </label>
+            )}
+            {q.name === "placement" && (
+              <label class="field" data-field="hosts">
+                <span>Machine addresses, one per node, in order (<b data-hosts-count></b>)</span>
+                <textarea name="hosts" rows="4" spellcheck="false" placeholder="10.0.0.1&#10;10.0.0.2&#10;10.0.0.3"></textarea>
+              </label>
+            )}
+            {q.name === "access" && (
+              <label class="field" data-field="host">
+                <span>Address clients use to reach this machine</span>
+                <input type="text" name="host" placeholder="10.0.0.5 or ruvio.internal" spellcheck="false" />
+              </label>
+            )}
+          </fieldset>
+        ))}
+        <fieldset class="question panel" data-question="extras">
+          <legend><span class="q-no" aria-hidden="true">{String(questions.length + 1).padStart(2, "0")}</span>Extras</legend>
+          <label class="check"><input type="checkbox" name="password" /><span><b>Password</b> Clients must log in. Required for anything other machines can reach.</span></label>
+          <label class="check" data-show="replicas failover cluster"><input type="checkbox" name="safeWrites" /><span><b>Refuse writes when no replica keeps up</b> A primary cut off from every replica stops taking writes after 10 s, so a failover cannot drop a long run of acknowledged writes.</span></label>
+          <label class="check"><input type="checkbox" name="ui" /><span><b>Operator UI</b> A browser console on http://127.0.0.1:8080 for keys, commands and the cluster.</span></label>
+        </fieldset>
+      </form>
+
+      <aside class="output" id="result" aria-live="polite">
+        <section class="summary panel">
+          <h2>What you get</h2>
+          <ul data-summary></ul>
+          <ul class="notes" data-notes hidden></ul>
+          <div class="summary-actions">
+            <button type="button" class="btn small ghost" data-new-secrets>New passwords</button>
+            <button type="button" class="btn small ghost" data-share>Copy link to these answers</button>
+          </div>
+        </section>
+        <section class="files" data-files>
+          <noscript><p class="panel">The wizard builds the files in your browser and needs JavaScript.</p></noscript>
+        </section>
+        <section class="verify panel">
+          <h2>Then check it</h2>
+          <ol data-verify></ol>
+          <p class="connect">Give your client these addresses: <code data-seeds></code>. The first-party clients read the slot map and follow a failover on their own (<a href="/docs/clients/">client guides</a>).</p>
+          <p class="fine">Built for Ruvio {serverVersion}. Every setting is described in <a href="/docs/configuration/">Configuration</a>; failover and clusters in <a href="/docs/coordinator/">Automatic failover</a>.</p>
+        </section>
+      </aside>
+    </div>
+  </div>
+</Page>
+
+<script>
+  import "../../scripts/wizard.ts";
+</script>
+
+<style>
+  .jump { display: none; margin-top: 18px; font-weight: 600; color: var(--ink); }
+  .jump::after { content: " ↓"; color: var(--mute); }
+  @media (max-width: 1020px) { .jump { display: inline-block; } .output { scroll-margin-top: 80px; } }
+  .wizard { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.12fr); gap: 24px; align-items: start; }
+  @media (max-width: 1020px) { .wizard { grid-template-columns: minmax(0, 1fr); } }
+  .questions { display: grid; gap: 16px; margin: 0; }
+  .question { margin: 0; display: grid; gap: 12px; padding: 20px 22px; }
+  .question[hidden] { display: none; }
+  .question legend {
+    float: left; width: 100%; padding: 0; margin: 0 0 2px; display: flex; align-items: center; gap: 12px;
+    font-size: 19px; font-weight: 600; color: var(--ink);
+  }
+  .question legend + * { clear: both; }
+  .q-no {
+    display: inline-grid; place-items: center; width: 28px; height: 28px; flex: none; font-family: var(--f-mono);
+    font-size: 13px; font-weight: 500; color: var(--c1); border: 1px solid color-mix(in srgb, var(--c1) 45%, var(--paper-line)); border-radius: 4px;
+  }
+  .hint { margin: 0; font-size: 15px; color: var(--mute); line-height: 1.55; }
+  .choices { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .choices.compact { grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); }
+  @media (max-width: 560px) { .choices { grid-template-columns: minmax(0, 1fr); } .choices.compact { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .choice { position: relative; display: block; cursor: pointer; }
+  .choice input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
+  .choice-body {
+    display: grid; gap: 4px; height: 100%; padding: 12px 14px; border: 1px solid var(--paper-line); border-radius: var(--radius-s);
+    background: var(--surface); transition: border-color 0.15s, background 0.15s;
+  }
+  .choice:hover .choice-body { border-color: color-mix(in srgb, var(--c2) 45%, var(--paper-line)); }
+  .choice input:checked + .choice-body { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 9%, var(--surface)); box-shadow: inset 0 0 0 1px var(--accent); }
+  .choice input:focus-visible + .choice-body { outline: 2px solid var(--c2); outline-offset: 2px; }
+  .choice input:disabled + .choice-body { opacity: 0.45; cursor: not-allowed; }
+  .choice-title { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; font-weight: 600; color: var(--ink); font-size: 16px; }
+  .choice-title em { font-style: normal; font-size: 12px; font-weight: 600; color: var(--c1); border: 1px solid color-mix(in srgb, var(--c1) 40%, transparent); border-radius: 3px; padding: 0 6px; }
+  .choice-text { font-size: 14px; line-height: 1.45; color: var(--mute); }
+  .compact .choice-text { font-size: 13px; }
+  .field { display: grid; gap: 6px; font-size: 15px; color: var(--ink-body); }
+  .field[hidden] { display: none; }
+  .field input, .field textarea {
+    font: inherit; font-family: var(--f-mono); font-size: 14.5px; color: var(--ink); background: var(--surface);
+    border: 1px solid var(--paper-line); border-radius: var(--radius-s); padding: 9px 11px; min-width: 0;
+  }
+  .field input:focus, .field textarea:focus { outline: 2px solid var(--c2); outline-offset: 1px; }
+  .check { display: grid; grid-template-columns: auto 1fr; gap: 10px; align-items: start; font-size: 15px; color: var(--mute); line-height: 1.5; cursor: pointer; }
+  .check[hidden] { display: none; }
+  .check input { margin-top: 4px; accent-color: var(--accent); width: 16px; height: 16px; }
+  .check b { display: block; color: var(--ink); font-weight: 600; font-size: 16px; }
+
+  .output { display: grid; gap: 16px; position: sticky; top: 84px; max-height: calc(100vh - 100px); overflow-y: auto; scrollbar-width: thin; padding-bottom: 4px; }
+  @media (max-width: 1020px) { .output { position: static; max-height: none; overflow: visible; } }
+  .output h2 { margin: 0 0 10px; font-size: 19px; color: var(--ink); }
+  .summary, .verify { padding: 20px 22px; }
+  .summary ul { margin: 0; padding-left: 20px; display: grid; gap: 6px; color: var(--ink-body); font-size: 15.5px; line-height: 1.5; }
+  .summary .notes { margin-top: 12px; padding: 10px 12px 10px 30px; border-left: 2px solid var(--c1); background: color-mix(in srgb, var(--c1) 8%, transparent); color: var(--ink-body); font-size: 14.5px; }
+  .summary-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+  .files { display: grid; gap: 14px; min-width: 0; }
+  .machine { margin: 0; font-size: 15px; font-weight: 600; color: var(--ink); }
+  .machine span { font-weight: 400; color: var(--mute); }
+  .files :global(pre) { max-height: 520px; overflow: auto; font-size: 13.5px; line-height: 1.6; }
+  .verify ol { margin: 0; padding-left: 22px; display: grid; gap: 12px; color: var(--ink-body); font-size: 15.5px; }
+  .verify ol :global(pre) { border-radius: var(--radius-s); margin: 6px 0 0; padding: 10px 12px; font-size: 13.5px; white-space: pre-wrap; word-break: break-all; }
+  .connect, .fine { margin: 14px 0 0; font-size: 15px; color: var(--ink-body); line-height: 1.55; }
+  .connect code { font-family: var(--f-mono); font-size: 14px; color: var(--ink); word-break: break-all; }
+  .fine { color: var(--mute); font-size: 14px; }
+  .fine a, .connect a { color: inherit; }
+
+  .files :global(.code-block) { margin: 0; }
+  .files :global(.term-bar) { align-items: center; min-height: 40px; padding-block: 6px; }
+  .files :global(.label) { display: flex; gap: 8px; align-items: baseline; min-width: 0; }
+  .files :global(.label b) { font-weight: 500; color: var(--code-ink); }
+  .files :global(.label span::before) { content: "·"; margin-right: 8px; color: var(--code-dim); }
+  .files :global(.copy) {
+    font: inherit; font-size: 13px; color: var(--code-dim); background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 4px; padding: 3px 9px; cursor: pointer;
+  }
+  .files :global(.copy:hover) { color: var(--code-ink); border-color: rgba(255, 255, 255, 0.22); }
+  .files :global(pre:focus-visible) { outline: 2px solid var(--c2); outline-offset: -2px; }
+  .output :global(.tk-c) { color: #8e9bb3; }
+  .output :global(.tk-k) { color: #7fdbca; }
+  .output :global(.tk-s) { color: #ecc48d; }
+  .output :global(.tk-v) { color: #82aaff; }
+  .output :global(.tk-n) { color: #f78c6c; }
+  .output :global(.tk-x) { color: #c792ea; }
+</style>
