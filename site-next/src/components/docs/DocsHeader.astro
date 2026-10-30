@@ -6,7 +6,7 @@ import Search from "@astrojs/starlight/components/Search.astro";
 import SocialIcons from "@astrojs/starlight/components/SocialIcons.astro";
 import ThemeSelect from "@astrojs/starlight/components/ThemeSelect.astro";
 import Logo from "../Logo.astro";
-import { mainNav } from "../../config/site";
+import { flatNav } from "../../config/site";
 import { currentNavHref } from "./nav";
 
 const current = currentNavHref(Astro.url.pathname);
@@ -17,7 +17,7 @@ const current = currentNavHref(Astro.url.pathname);
     <Logo size={28} />
   </div>
   <nav class="site-nav sl-hidden md:sl-flex print:hidden" aria-label="Main">
-    {mainNav.map((item) => (
+    {flatNav.map((item) => (
       <a href={item.href} aria-current={item.href === current ? "page" : undefined}>{item.label}</a>
     ))}
   </nav>

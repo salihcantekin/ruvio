@@ -1,5 +1,5 @@
 ---
-import { mainNav, site } from "../config/site";
+import { mainNav, flatNav, site } from "../config/site";
 import Logo from "./Logo.astro";
 
 const path = Astro.url.pathname;
@@ -10,9 +10,18 @@ const isCurrent = (href: string) => href !== "/" && !href.startsWith("/#") && pa
   <div class="wrap bar">
     <Logo />
     <nav class="nav" aria-label="Main">
-      {mainNav.map((item) => (
-        <a href={item.href} aria-current={isCurrent(item.href) ? "page" : undefined}>{item.label}</a>
-      ))}
+      {mainNav.map((item) =>
+        "children" in item ? (
+          <details class="drop" data-drop>
+            <summary class:list={{ current: item.children.some((c) => isCurrent(c.href)) }}>{item.label}<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 4.5 6 8l3.5-3.5"/></svg></summary>
+            <div class="drop-panel">
+              {item.children.map((c) => <a href={c.href} aria-current={isCurrent(c.href) ? "page" : undefined}>{c.label}</a>)}
+            </div>
+          </details>
+        ) : (
+          <a href={item.href} aria-current={isCurrent(item.href) ? "page" : undefined}>{item.label}</a>
+        ),
+      )}
     </nav>
     <div class="actions">
       <a class="gh" href={site.github} aria-label="Ruvio on GitHub">
@@ -28,13 +37,20 @@ const isCurrent = (href: string) => href !== "/" && !href.startsWith("/#") && pa
       <details class="menu">
         <summary aria-label="Open menu"><span></span><span></span><span></span></summary>
         <nav class="menu-panel" aria-label="Menu">
-          {mainNav.map((item) => <a href={item.href}>{item.label}</a>)}
+          {flatNav.map((item) => <a href={item.href}>{item.label}</a>)}
           <a href={site.github}>GitHub</a>
         </nav>
       </details>
     </div>
   </div>
 </header>
+
+<script>
+  // The Ecosystem dropdown closes on a click elsewhere, on Escape and when a link is followed.
+  const drops = document.querySelectorAll<HTMLDetailsElement>("[data-drop]");
+  document.addEventListener("click", (e) => drops.forEach((d) => d.open && !d.contains(e.target as Node) && (d.open = false)));
+  document.addEventListener("keydown", (e) => e.key === "Escape" && drops.forEach((d) => (d.open = false)));
+</script>
 
 <script>
   // Cycles system -> light -> dark. Stored under the docs' own key; "" means follow the system.
@@ -98,13 +114,27 @@ const isCurrent = (href: string) => href !== "/" && !href.startsWith("/#") && pa
   }
   .menu-panel a { padding: 9px 12px; border-radius: var(--radius-s); color: var(--ink); }
   .menu-panel a:hover { background: var(--surface-2); }
-  .nav a, .actions .btn { white-space: nowrap; }
-  /* Seven menu items: tighten before the menu turns into the burger at 900px. */
+  .drop { position: relative; }
+  .drop summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 5px; padding: 8px 12px; border-radius: var(--radius-s); color: var(--mute); font-weight: 500; transition: background-color .15s ease, color .15s ease; }
+  .drop summary::-webkit-details-marker { display: none; }
+  .drop summary:hover, .drop[open] summary { color: var(--ink); background: color-mix(in srgb, var(--ink) 7%, transparent); }
+  .drop summary.current { position: relative; color: var(--ink); font-weight: 600; background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .drop summary.current::after { content: ""; position: absolute; left: 12px; right: 12px; bottom: -13px; height: 2px; border-radius: 2px; background: var(--accent); }
+  .drop summary svg { width: 11px; height: 11px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; transition: transform .15s ease; }
+  .drop[open] summary svg { transform: rotate(180deg); }
+  .drop-panel {
+    position: absolute; left: 0; top: calc(100% + 10px); min-width: 180px; display: grid; padding: 6px;
+    background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+    box-shadow: 0 20px 40px -20px rgba(0, 0, 0, 0.6);
+  }
+  .drop-panel a { padding: 9px 12px; }
+  .nav a, .nav summary, .actions .btn { white-space: nowrap; }
+  /* Six menu entries: tighten a little before the menu turns into the burger at 900px. */
   @media (max-width: 1180px) {
     .bar { gap: 16px; }
     .nav { gap: 0; font-size: 15px; }
-    .nav a { padding: 8px 9px; }
-    .nav a[aria-current="page"]::after { left: 9px; right: 9px; }
+    .nav a, .drop summary { padding: 8px 9px; }
+    .nav a[aria-current="page"]::after, .drop summary.current::after { left: 9px; right: 9px; }
     .gh span { display: none; }
   }
   @media (max-width: 900px) {
