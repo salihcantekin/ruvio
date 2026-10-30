@@ -57,10 +57,15 @@ const next = [
   <PageIntro title="Get started" kicker="Four steps">
     Run the server, connect with <code>redis-cli</code>, then add a client. A default process listens on{" "}
     <code>127.0.0.1:6379</code>, and <code>PING</code> answers <code>PONG</code>.
-    <p slot="after" class="wizard-link">
-      Want replicas, automatic failover or a cluster? The <a href="/get-started/wizard/">setup wizard</a> asks a few
-      questions and writes the Compose file or script.
-    </p>
+    <a slot="after" class="wizard-card" href="/get-started/wizard/">
+      <span class="wizard-tag">Setup wizard</span>
+      <span class="wizard-body">
+        <b>Answer a few questions, copy one file.</b>
+        One server, replicas, automatic failover or a cluster: the wizard writes the Docker Compose file or the Bash or
+        PowerShell script, with passwords and the commands that check it.
+      </span>
+      <span class="btn wizard-btn">Open the wizard</span>
+    </a>
   </PageIntro>
 
   <div class="reading">
@@ -310,8 +315,26 @@ docker run --rm -p 8080:8080 \\
 </Page>
 
 <style>
-  .wizard-link { margin: 18px 0 0; max-width: 60ch; font-size: 17px; color: var(--ink-body); }
-  .wizard-link a { color: var(--ink); font-weight: 600; }
+  .wizard-card {
+    display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 18px; align-items: center;
+    margin-top: 26px; max-width: 980px; padding: 18px 22px; text-decoration: none; color: var(--ink-body);
+    border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--paper-line)); border-radius: var(--radius);
+    background: color-mix(in srgb, var(--accent) 10%, var(--paper)); transition: border-color 0.15s, background 0.15s;
+  }
+  .wizard-card:hover { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 15%, var(--paper)); }
+  .wizard-card:focus-visible { outline: 2px solid var(--c2); outline-offset: 3px; }
+  .wizard-tag {
+    font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--c1);
+    border: 1px solid color-mix(in srgb, var(--c1) 45%, transparent); border-radius: 4px; padding: 4px 8px; white-space: nowrap;
+  }
+  .wizard-body { font-size: 16px; line-height: 1.5; }
+  .wizard-body b { display: block; font-size: 18px; color: var(--ink); margin-bottom: 2px; }
+  .wizard-btn { white-space: nowrap; }
+  @media (max-width: 760px) {
+    .wizard-card { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+    .wizard-tag { justify-self: start; }
+    .wizard-btn { justify-self: start; }
+  }
   .step { scroll-margin-top: 88px; display: grid; gap: 16px; }
   .step + .step { margin-top: 20px; }
   .shot { margin: 0; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; background: var(--code-bg); }

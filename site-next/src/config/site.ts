@@ -23,6 +23,7 @@ export const mainNav: NavItem[] = [
   { label: "Integrations", href: "/integrations/" },
   { label: "Blog", href: "/blog/" },
   { label: "Docs", href: "/docs/" },
+  { label: "Setup wizard", href: "/get-started/wizard/" },
 ];
 
 export const footerNav: { title: string; items: NavItem[] }[] = [
