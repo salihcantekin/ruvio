@@ -453,8 +453,8 @@ members = [ { address = "b1:6379", replication = "b1:26379" }, { address = "b2:6
 
 Either every group has `shards` or none does, every slot belongs to one group, and a group may
 have no slots yet (`slots = []`). Start every data node
-with a `cluster_topology` file holding the same groups and slots (version 1, each group named by its
-first member) and its own `cluster_group`. Once every group has an agreed primary the coordinators send
+with a `cluster_topology` file holding the same groups and slots (version 1, each group named as in
+`coordinator.toml`) and its own `cluster_group`. Once every group has an agreed primary the coordinators send
 each member the map with `RUVIO TOPOLOGY SET`, each group named by its agreed primary; its version is 1
 plus the sum of the groups' epochs plus the ranges moved between groups, so every failover and every move
 raises it. A node keeps the newest map it received

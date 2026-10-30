@@ -1,0 +1,16 @@
+# Starting cluster map of deploy/compose.cluster.yml, read by every data node (cluster_topology).
+# Group names match the coordinators' `[[groups]] name`; `address` is the primary's client address (shard 0).
+# Once the coordinators run, they send the nodes newer maps after every failover or slot move.
+version = 1
+
+[[groups]]
+name = "a"
+address = "ruvio-a1:6379"
+shards = 1
+slots = ["0-8191"]
+
+[[groups]]
+name = "b"
+address = "ruvio-b1:6379"
+shards = 1
+slots = ["8192-16383"]
