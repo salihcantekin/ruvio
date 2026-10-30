@@ -117,6 +117,31 @@ watched: an edit applies only on the next start.
 Shard count, bind address, and durability cannot change under a live process;
 the settings listed under *Changing settings at runtime* can.
 
+## Checking settings before a start
+
+`ruvio` with `--check-config` merges the file, the environment and the flags exactly as a start
+does, runs every check a start runs before it opens a listener (value ranges, the
+relationships between settings, TLS files, the `cluster_topology` map against
+`cluster_group` and `shards`), prints one line and exits: 0 when the settings start,
+1 with the reason when they do not. It opens no port and writes no config file; with a
+durability other than `memory` it creates the data directory when it is missing and
+checks that it is writable, as a start does. Without `--config` and with no file found it
+checks the built-in defaults.
+
+```bash
+RUVIO_SHARDS=4 RUVIO_DURABILITY=everysec ruvio --check-config
+# config ok: 4 shard(s) on 127.0.0.1:6379, durability everysec (no file: built-in defaults)
+docker run --rm -e RUVIO_REQUIREPASS=change-me salihcantekin/ruvio --check-config
+```
+
+`ruvio coordinator --config coordinator.toml --check` does the same for a coordinator
+file (see [COORDINATOR.md](COORDINATOR.md#setting-it-up)).
+
+`ruvio` with `--print-config-schema` prints every setting as JSON: its environment variable, file
+key, flag, `CONFIG SET` name (`null` when it changes only with a restart), type, allowed
+values and the value the default file holds (`null` when that file leaves it unset). The
+setup wizard on [ruviodb.com](https://ruviodb.com/get-started/wizard/) is built from it.
+
 ## Changing settings at runtime
 
 `CONFIG SET name value [name value ...]` changes the settings in the table

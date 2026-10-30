@@ -389,6 +389,14 @@ impl CoordinatorConfig {
         self.peers.len() / 2 + 1
     }
 
+    /// The map a cluster's data nodes start with in `cluster_topology`: version 1, each
+    /// group named by its first member. `None` without shards (a single group).
+    pub fn initial_cluster_map(&self) -> Option<String> {
+        self.groups.first()?.shards?;
+
+        Some(cluster_map_text(&self.groups, 1, first_member))
+    }
+
     pub fn group(&self, name: &str) -> Option<&Group> {
         self.groups.iter().find(|group| group.name == name)
     }

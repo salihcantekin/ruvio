@@ -102,6 +102,13 @@ struct Cli {
     /// Print Ruvio's license and the third-party notices embedded in this binary.
     #[arg(long, default_value_t = false)]
     licenses: bool,
+    /// Check the settings (file, environment, flags and the cluster_topology map) and exit
+    /// without opening a listener or writing a file.
+    #[arg(long, default_value_t = false)]
+    check_config: bool,
+    /// Print every setting (variable, file key, flag, type, default) as JSON and exit.
+    #[arg(long, default_value_t = false)]
+    print_config_schema: bool,
     #[command(subcommand)]
     mode: Option<Mode>,
 }
@@ -115,6 +122,9 @@ enum Mode {
         /// The coordinator's TOML file (see docs/COORDINATOR.md).
         #[arg(long)]
         config: PathBuf,
+        /// Check the file and exit; for a cluster, print the map the data nodes start with.
+        #[arg(long, default_value_t = false)]
+        check: bool,
     },
 }
 
@@ -176,25 +186,41 @@ fn run() -> io::Result<()> {
         return Ok(());
     }
 
+    if cli.print_config_schema {
+        print!("{}", ruvio::config::schema::schema_json());
+
+        return Ok(());
+    }
+
     #[cfg(feature = "coordinator")]
-    if let Some(Mode::Coordinator { config }) = &cli.mode {
-        return run_coordinator(config);
+    if let Some(Mode::Coordinator { config, check }) = &cli.mode {
+        return run_coordinator(config, *check);
     }
 
     let config_path = ruvio::config::resolve_config_path(cli.config.as_deref());
+    let check = cli.check_config;
+    // A check reads the defaults in place of a missing file it was not pointed at, and
+    // creates nothing.
+    let file_missing = check && cli.config.is_none() && !config_path.exists();
 
-    ruvio::config::ensure_config_file(&config_path).map_err(invalid_config)?;
+    if !check {
+        ruvio::config::ensure_config_file(&config_path).map_err(invalid_config)?;
+    }
 
     let mut config = ruvio::AppConfig {
         config_file: Some(config_path.clone()),
         ..ruvio::AppConfig::default()
     };
-    let file_text = std::fs::read_to_string(&config_path).map_err(|error| {
-        invalid_config(format!(
-            "failed to read config {}: {error}",
-            config_path.display()
-        ))
-    })?;
+    let file_text = if file_missing {
+        String::new()
+    } else {
+        std::fs::read_to_string(&config_path).map_err(|error| {
+            invalid_config(format!(
+                "failed to read config {}: {error}",
+                config_path.display()
+            ))
+        })?
+    };
 
     config.apply_toml(&file_text).map_err(invalid_config)?;
 
@@ -214,6 +240,9 @@ fn run() -> io::Result<()> {
     config.resolve_sync_worker();
     config.validate().map_err(invalid_config)?;
     operational_checks(&config).map_err(invalid_config)?;
+    if check {
+        return check_report(&config, (!file_missing).then_some(config_path.as_path()));
+    }
     if write_config {
         config
             .write_overrides(&config_path, &loaded)
@@ -233,11 +262,58 @@ fn run() -> io::Result<()> {
     ruvio::runtime::evented::run_with_force(&config, shutdown, force_promote_incomplete)
 }
 
+/// `--check-config`: the checks a start runs before it opens a listener, plus the
+/// `cluster_topology` map, then one line naming what the settings start.
+fn check_report(config: &ruvio::AppConfig, file: Option<&std::path::Path>) -> io::Result<()> {
+    if let Some(path) = &config.cluster_topology {
+        ruvio::topology::Topology::load(path, &config.cluster_group, config.shards)
+            .map_err(invalid_config)?;
+    }
+    let mut line = format!(
+        "config ok: {} shard(s) on {}, durability {}",
+        config.shards,
+        config.address,
+        format!("{:?}", config.persistence.profile).to_lowercase()
+    );
+
+    if config.replication.role != ruvio::config::ReplicationRole::Off {
+        line.push_str(&format!(
+            ", replication {}",
+            format!("{:?}", config.replication.role).to_lowercase()
+        ));
+    }
+    if config.cluster_topology.is_some() {
+        line.push_str(&format!(", cluster group {}", config.cluster_group));
+    }
+    match file {
+        Some(path) => line.push_str(&format!(" (file {})", path.display())),
+        None => line.push_str(" (no file: built-in defaults)"),
+    }
+    println!("{line}");
+
+    Ok(())
+}
+
 #[cfg(feature = "coordinator")]
-fn run_coordinator(path: &std::path::Path) -> io::Result<()> {
+fn run_coordinator(path: &std::path::Path, check: bool) -> io::Result<()> {
     let text = std::fs::read_to_string(path)
         .map_err(|error| invalid_config(format!("failed to read {}: {error}", path.display())))?;
     let config = ruvio::coordinator::CoordinatorConfig::parse(&text).map_err(invalid_config)?;
+
+    if check {
+        println!(
+            "coordinator config ok: id {}, {} peer(s), {} group(s)",
+            config.id,
+            config.peers.len(),
+            config.groups.len()
+        );
+        // The map every data node of a cluster starts with (`cluster_topology`).
+        if let Some(map) = config.initial_cluster_map() {
+            print!("{map}");
+        }
+
+        return Ok(());
+    }
     let shutdown = ruvio::ShutdownToken::default();
     let signal_token = shutdown.clone();
 
@@ -541,5 +617,43 @@ mod tests {
             missing.is_empty(),
             "flags missing from docs/CONFIGURATION.md: {missing:?}"
         );
+    }
+
+    /// The schema's flags are this binary's flags, and every flag that sets a setting is in
+    /// the schema.
+    #[test]
+    fn the_config_schema_names_every_setting_flag() {
+        let flags: Vec<String> = super::Cli::command()
+            .get_arguments()
+            .filter_map(|argument| argument.get_long())
+            .map(|long| format!("--{long}"))
+            .collect();
+        let listed: Vec<&str> = ruvio::config::schema::SETTINGS
+            .iter()
+            .map(|setting| setting.flag)
+            .filter(|flag| !flag.is_empty())
+            .collect();
+        // Flags that run a mode or act on the file instead of setting a value.
+        let actions = [
+            "--config",
+            "--force-promote-incomplete",
+            "--write-config",
+            "--licenses",
+            "--check-config",
+            "--print-config-schema",
+        ];
+
+        for flag in &listed {
+            assert!(
+                flags.iter().any(|known| known == flag),
+                "{flag} is not a flag"
+            );
+        }
+        for flag in &flags {
+            assert!(
+                actions.contains(&flag.as_str()) || listed.contains(&flag.as_str()),
+                "{flag} is missing from the config schema"
+            );
+        }
     }
 }
