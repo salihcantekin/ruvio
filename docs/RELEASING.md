@@ -8,7 +8,7 @@ No release runs on its own. Every workflow in `.github/workflows/` is started by
 | `ci` | Wider checks: three operating systems, clippy, supply chain, every client against a standalone and a cluster server, the applications (tours, site, UI), fuzz, container and fault tests |
 | `release` | Publishes the packages below; choose one target or `all` |
 | `integration-packages` | Builds and optionally publishes the .NET integration packages |
-| `site-azure` | Builds `site-next/` and publishes it to Azure Static Web Apps; target `production` builds `main` (ruviodb.com), target `dev` builds `dev` to the Ruvio-Dev app (secret `AZURE_STATIC_WEB_APPS_API_TOKEN_DEV`, noindex). Google Analytics is on only when the repository variable `PUBLIC_GA_ID` holds a GA4 measurement ID (`G-XXXXXXXXXX`); when it is unset, the site has no analytics code |
+| `site-azure` | Builds `site-next/` and publishes it to Azure Static Web Apps; it builds the branch chosen in "Use workflow from"; target `production` publishes it to ruviodb.com, target `dev` publishes it to the Ruvio-Dev app (secret `AZURE_STATIC_WEB_APPS_API_TOKEN_DEV`, noindex). Google Analytics is on only when the repository variable `PUBLIC_GA_ID` holds a GA4 measurement ID (`G-XXXXXXXXXX`); when it is unset, the site has no analytics code |
 
 ## What `release` publishes
 
