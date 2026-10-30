@@ -4,8 +4,8 @@ name: site-azure
 # Builds site-next/ (Astro) and uploads the static output to Azure Static Web Apps.
 # Azure does not build: the docs are generated from docs/, clients/ and integrations/ in this
 # repository, so the build runs here with a pinned Node and Azure only receives site-next/dist.
-# Targets: production builds main and publishes to the production Static Web App; dev builds the
-# dev branch (with a noindex header) and publishes to the Ruvio-Dev Static Web App.
+# The branch chosen in "Use workflow from" is the one that is built. Target production publishes it to the
+# production Static Web App; target dev publishes it to the Ruvio-Dev Static Web App (with a noindex header).
 # Secrets: AZURE_STATIC_WEB_APPS_API_TOKEN (production) and AZURE_STATIC_WEB_APPS_API_TOKEN_DEV
 # (Ruvio-Dev), the deployment tokens from each Static Web App's Overview page
 # ("Manage deployment token").
@@ -32,7 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.target == 'dev' && 'dev' || 'main' }}
+          ref: ${{ github.ref_name }}
           # The changelog page is built from the history of main and dev and the release tags.
           fetch-depth: 0
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
