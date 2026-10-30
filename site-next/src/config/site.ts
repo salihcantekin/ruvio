@@ -14,17 +14,25 @@ export const site = {
 };
 
 export type NavItem = { label: string; href: string };
+export type MainNavItem = NavItem | { label: string; children: NavItem[] };
 
-export const mainNav: NavItem[] = [
+export const mainNav: MainNavItem[] = [
   { label: "Product", href: "/#in-motion" },
   { label: "Use cases", href: "/use-cases/" },
   { label: "Benchmarks", href: "/benchmarks/" },
-  { label: "Clients", href: "/docs/clients/" },
-  { label: "Integrations", href: "/integrations/" },
   { label: "Blog", href: "/blog/" },
   { label: "Docs", href: "/docs/" },
-  { label: "Setup wizard", href: "/get-started/wizard/" },
+  {
+    label: "Ecosystem",
+    children: [
+      { label: "Clients", href: "/docs/clients/" },
+      { label: "Integrations", href: "/integrations/" },
+    ],
+  },
 ];
+
+/** The menu without groups: the docs header and the phone menus list every link. */
+export const flatNav: NavItem[] = mainNav.flatMap((item) => ("children" in item ? item.children : [item]));
 
 export const footerNav: { title: string; items: NavItem[] }[] = [
   {

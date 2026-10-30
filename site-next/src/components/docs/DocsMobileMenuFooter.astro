@@ -2,14 +2,14 @@
 // Mobile menu footer override: the site's main menu above Starlight's social icons and theme select,
 // so phone-width visitors keep the same menu as the marketing pages.
 import Default from "@astrojs/starlight/components/MobileMenuFooter.astro";
-import { mainNav } from "../../config/site";
+import { flatNav } from "../../config/site";
 import { currentNavHref } from "./nav";
 
 const current = currentNavHref(Astro.url.pathname);
 ---
 
 <nav class="mobile-site-nav" aria-label="Menu">
-  {mainNav.map((item) => (
+  {flatNav.map((item) => (
     <a href={item.href} aria-current={item.href === current ? "page" : undefined}>{item.label}</a>
   ))}
 </nav>
