@@ -6,6 +6,7 @@ Notable changes to the Ruvio server (`ruvio`, `ruvio-ctl`, the Docker image and 
 
 - Server: `ruvio --check-config` runs every check a start runs (settings, TLS files, the data directory, the `cluster_topology` map) and exits without opening a port; `ruvio coordinator --config FILE --check` checks a coordinator file and prints the map a cluster's data nodes start with; `ruvio --print-config-schema` prints every setting (variable, file key, flag, `CONFIG SET` name, type, default) as JSON.
 - Site: a setup wizard at `/get-started/wizard/` writes a Docker Compose file, a Bash or PowerShell script or a `docker run` line for one server, a primary with replicas, automatic failover or a multi-node cluster, on one machine or one file per machine. Passwords are generated in the browser. The PR gate runs every setup it can write through `--check-config` and `coordinator --check`.
+- Site: the setup wizard has a link in the header and a card with an "Open the wizard" button at the top of Get Started, in place of the earlier one-line link.
 
 - Site: a new link preview image (`og:image`) in the site's dark theme, with current facts; the old one still showed the light theme and an outdated command count.
 - Docs: the README opens with a short terminal recording of `LEASE`, `LIMIT`, `INCRBY ... MAX` and `ZMOVEDUE`, and `docs/COORDINATOR.md` shows a recorded failover with a client that keeps writing.
