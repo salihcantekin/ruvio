@@ -4,6 +4,7 @@ Notable changes to the Ruvio server (`ruvio`, `ruvio-ctl`, the Docker image and 
 
 ## Unreleased
 
+- Site: the `site-azure` workflow builds the branch chosen in "Use workflow from" for either target; before, target `production` always built `main` and target `dev` always built `dev`, whichever branch was chosen.
 - Docs: Get Started has a "Replicas, failover and clusters" step (replica, three nodes with three coordinators, and a two-group cluster), and `deploy/compose.cluster.yml` with `deploy/cluster/` starts two groups of two nodes with three coordinators. `docs/COORDINATOR.md` now says the starting `cluster_topology` names groups as `coordinator.toml` does.
 - Server: `ruvio --check-config` runs every check a start runs (settings, TLS files, the data directory, the `cluster_topology` map) and exits without opening a port; `ruvio coordinator --config FILE --check` checks a coordinator file and prints the map a cluster's data nodes start with; `ruvio --print-config-schema` prints every setting (variable, file key, flag, `CONFIG SET` name, type, default) as JSON.
 - Site: a setup wizard at `/get-started/wizard/` writes a Docker Compose file, a Bash or PowerShell script or a `docker run` line for one server, a primary with replicas, automatic failover or a multi-node cluster, on one machine or one file per machine. Passwords are generated in the browser. The PR gate runs every setup it can write through `--check-config` and `coordinator --check`.
