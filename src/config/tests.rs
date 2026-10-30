@@ -1288,3 +1288,137 @@ fn the_primary_lease_needs_the_coordinator_ids() {
             .is_err()
     );
 }
+
+/// The value a schema test sets for a setting: one that differs from the default, as it
+/// is written in the file (TOML) and in the environment.
+fn schema_sample(setting: &super::schema::Setting) -> (String, String) {
+    use super::schema::Kind;
+
+    let text = match setting.file {
+        "address" => "127.0.0.1:7100",
+        "advertised_host" => "10.0.0.9",
+        "replication.listen" => "127.0.0.1:27100",
+        "replication.primary" => "10.0.0.9:27100",
+        "metrics_address" => "127.0.0.1:9100",
+        "cpu_set" => "0-1",
+        "notify_keyspace_events" => "KEA",
+        "cluster_group" => "a",
+        _ => "/tmp/ruvio-schema-sample",
+    };
+
+    match setting.kind {
+        Kind::Integer => ("7".into(), "7".into()),
+        Kind::Boolean => {
+            let default = !matches!(
+                setting.file,
+                "security.protected_mode"
+                    | "replication.announced"
+                    | "latency_histograms"
+                    | "key_stats"
+            );
+            (default.to_string(), default.to_string())
+        }
+        Kind::Text => (format!("{text:?}"), text.to_owned()),
+        Kind::List if setting.file == "hot_keys" => ("[\"a*\", \"b*\"]".into(), "a*,b*".into()),
+        Kind::List => ("[1, 2]".into(), "1,2".into()),
+        // The first value of every list is the default.
+        Kind::Enum(values) => (format!("{:?}", values[1]), values[1].to_owned()),
+    }
+}
+
+/// Every variable `apply_environment` reads has one row in the schema, and no row names
+/// a variable it does not read.
+#[test]
+fn the_schema_lists_every_environment_variable() {
+    let mut listed: Vec<String> = super::schema::SETTINGS
+        .iter()
+        .filter(|setting| !setting.env.is_empty())
+        .map(|setting| setting.env.to_owned())
+        .collect();
+
+    listed.sort();
+    assert_eq!(listed, environment_names());
+}
+
+/// Every key the file accepts has a row in the schema, and every row's key is accepted.
+#[test]
+fn the_schema_lists_every_file_setting() {
+    let mut listed: Vec<String> = super::schema::SETTINGS
+        .iter()
+        .filter(|setting| !setting.file.is_empty())
+        .map(|setting| setting.file.to_owned())
+        .collect();
+
+    listed.sort();
+    listed.dedup();
+    let mut keys = file_keys();
+
+    keys.sort();
+    assert_eq!(listed, keys);
+}
+
+#[test]
+fn schema_config_set_names_change_at_runtime() {
+    for setting in super::schema::SETTINGS {
+        if !setting.config_set.is_empty() {
+            assert!(
+                LIVE_SETTINGS.contains(&setting.config_set),
+                "{} names {}, which CONFIG SET does not change",
+                setting.env,
+                setting.config_set
+            );
+        }
+    }
+}
+
+/// A row's variable and file key set the same field: the same value through either one
+/// gives the same configuration, and it differs from the default.
+#[test]
+fn schema_variable_and_file_key_set_the_same_setting() {
+    for setting in super::schema::SETTINGS {
+        // Older names for a setting that another variable also sets.
+        if setting.env.is_empty() || setting.file.is_empty() || setting.env == "RUVIO_CORE" {
+            continue;
+        }
+        let (toml_value, env_value) = schema_sample(setting);
+        let document = match setting.file.split_once('.') {
+            Some((section, key)) => format!("[{section}]\n{key} = {toml_value}\n"),
+            None => format!("{} = {toml_value}\n", setting.file),
+        };
+        let mut from_file = AppConfig::default();
+
+        from_file
+            .apply_toml(&document)
+            .unwrap_or_else(|error| panic!("{}: {error}", setting.file));
+        let mut from_env = AppConfig::default();
+
+        from_env
+            .apply_environment(|name| (name == setting.env).then(|| env_value.clone()))
+            .unwrap_or_else(|error| panic!("{}: {error}", setting.env));
+        assert!(
+            from_file != AppConfig::default(),
+            "{} = {toml_value} left the default unchanged",
+            setting.file
+        );
+        assert!(
+            from_file == from_env,
+            "{} and {} set different fields",
+            setting.file,
+            setting.env
+        );
+    }
+}
+
+/// The site's copy of the schema matches the table. Regenerate it with
+/// `cargo run --bin ruvio -- --print-config-schema > site-next/src/data/config-schema.json`.
+#[test]
+fn the_site_schema_file_is_current() {
+    let committed =
+        include_str!("../../site-next/src/data/config-schema.json").replace("\r\n", "\n");
+
+    assert!(
+        committed == super::schema::schema_json(),
+        "site-next/src/data/config-schema.json is stale: run \
+         `cargo run --bin ruvio -- --print-config-schema > site-next/src/data/config-schema.json`"
+    );
+}

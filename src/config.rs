@@ -2926,6 +2926,7 @@ fn parse_bool(value: &str, name: &str) -> Result<bool, String> {
 }
 
 mod live;
+pub mod schema;
 
 pub use live::{LIVE_SETTINGS, RESTART_ONLY_SETTINGS};
 

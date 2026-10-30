@@ -57,6 +57,10 @@ const next = [
   <PageIntro title="Get started" kicker="Four steps">
     Run the server, connect with <code>redis-cli</code>, then add a client. A default process listens on{" "}
     <code>127.0.0.1:6379</code>, and <code>PING</code> answers <code>PONG</code>.
+    <p slot="after" class="wizard-link">
+      Want replicas, automatic failover or a cluster? The <a href="/get-started/wizard/">setup wizard</a> asks a few
+      questions and writes the Compose file or script.
+    </p>
   </PageIntro>
 
   <div class="reading">
@@ -306,6 +310,8 @@ docker run --rm -p 8080:8080 \\
 </Page>
 
 <style>
+  .wizard-link { margin: 18px 0 0; max-width: 60ch; font-size: 17px; color: var(--ink-body); }
+  .wizard-link a { color: var(--ink); font-weight: 600; }
   .step { scroll-margin-top: 88px; display: grid; gap: 16px; }
   .step + .step { margin-top: 20px; }
   .shot { margin: 0; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; background: var(--code-bg); }

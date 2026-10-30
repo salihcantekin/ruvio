@@ -33,6 +33,7 @@ Several replication groups share the hash slots, each group on its own machines.
 
 ## Where to go next
 
+- Try it: the [setup wizard](https://ruviodb.com/get-started/wizard/) writes a Docker Compose file or a Bash or PowerShell script for a primary with replicas, automatic failover or a multi-node cluster, on one machine or one file per machine.
 - Run it: [Automatic failover with `ruvio coordinator`](COORDINATOR.md), setting up, upgrading and limits.
 - What a failure costs: [Recovery, backup and integrity](RECOVERY.md), [Resilience tests](RESILIENCE.md).
 - Hours of load and injected faults on a three-node cluster: [long-run tests](https://ruviodb.com/testing/).

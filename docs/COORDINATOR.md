@@ -357,6 +357,10 @@ members = [
 ruvio coordinator --config coordinator.toml
 ```
 
+`ruvio coordinator --config coordinator.toml --check` reads and checks the file the same way, then
+exits without starting. For a multi-node cluster it also prints the map every data node must start
+with as its `cluster_topology` file (see [A multi-node cluster](#a-multi-node-cluster)).
+
 The coordinator is part of the `ruvio` binary in every release (Linux, macOS, Windows) and in the Docker
 image; there is nothing extra to download. For a binary install,
 [deploy/coordinator.toml](../deploy/coordinator.toml) is a starting config and

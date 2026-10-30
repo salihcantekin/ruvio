@@ -250,6 +250,12 @@ jobs:
       - name: Check the package contents
         run: npm pack --dry-run
         working-directory: clients/node
+      # The site's setup wizard: its engine's tests, then every setup it can write through
+      # this server's --check-config and coordinator --check. Needs no npm install.
+      - name: Setup wizard
+        run: |
+          node --test site-next/scripts/wizard.test.mjs
+          node site-next/scripts/check-wizard.mjs server-bin/ruvio
 
   python-client:
     needs: [changes, server-binary]
