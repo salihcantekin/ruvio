@@ -9,6 +9,7 @@
 | `kubernetes.yaml` | Example Kubernetes manifest |
 | `coordinator.toml`, `ruvio-coordinator.service` | A coordinator for a binary install: example config and systemd unit (`ruvio coordinator --config /etc/ruvio/coordinator.toml`) |
 | `compose.failover.yml`, `coordinator/` | Three data nodes and three `ruvio coordinator` processes with automatic failover ([docs/COORDINATOR.md](../docs/COORDINATOR.md)); needs an image built with the coordinator |
+| `compose.cluster.yml`, `cluster/` | Two replication groups of two nodes that share the hash slots, plus three coordinators (a multi-node cluster, [docs/COORDINATOR.md](../docs/COORDINATOR.md#a-multi-node-cluster)); the starting map and the coordinator files are in `cluster/` |
 
 The Docker image and its environment variables are described in the [main README](../README.md#start-the-server) and in [docs/SETUP.md](../docs/SETUP.md). 
 > [!NOTE]

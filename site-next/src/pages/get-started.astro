@@ -31,6 +31,7 @@ const nav = [
   { id: "connect", label: "Connect with redis-cli" },
   { id: "durability", label: "Choose durability" },
   { id: "clients", label: "Add a client" },
+  { id: "grow", label: "Replicas and clusters" },
   { id: "tls", label: "Encrypt with TLS" },
   { id: "ui", label: "Operator UI" },
   { id: "next", label: "Next steps" },
@@ -53,7 +54,7 @@ const next = [
 ];
 ---
 
-<Page title="Get started" description="Run Ruvio with Docker or a prebuilt binary, connect with redis-cli, choose a durability profile and add a client.">
+<Page title="Get started" description="Run Ruvio with Docker or a prebuilt binary, connect with redis-cli, choose a durability profile, add a client and grow to replicas, failover and a multi-group cluster.">
   <PageIntro title="Get started" kicker="Four steps">
     Run the server, connect with <code>redis-cli</code>, then add a client. A default process listens on{" "}
     <code>127.0.0.1:6379</code>, and <code>PING</code> answers <code>PONG</code>.
@@ -210,6 +211,81 @@ cd ruvio-$v-linux-x64
           For ASP.NET Core, <code>Ruvio.Client.AspNetCore</code> registers the connection with dependency injection:{" "}
           <code>dotnet add package Ruvio.Client.AspNetCore</code>.
         </p>
+      </section>
+
+      <section class="step panel prose" id="grow" aria-labelledby="grow-h">
+        <h2 id="grow-h">Replicas, failover and clusters</h2>
+        <p>
+          One process is enough to start. When you need a copy of the data, automatic failover or more than one machine's
+          worth of keys, grow in this order. Each step keeps the one before it. The <a href="/get-started/wizard/">setup wizard</a> writes these files for your own sizes.
+        </p>
+        <Tabs id="grow-tabs" label="How to grow Ruvio" labels={["Replica", "Automatic failover", "Multi-group cluster"]}>
+          <div>
+            <p>
+              A replica copies one primary. The primary opens a replication port with a password; the replica dials it.
+              Set the same password on both. The replica is read-only; a client with a read policy can send reads to it.
+            </p>
+            <CodeBlock lang="shell" code={`# primary
+ruvio --requirepass change-me --durability everysec --data-dir ./data \
+  --address 0.0.0.0:6379
+# with environment variables: RUVIO_REPLICATION_ROLE=primary
+#   RUVIO_REPLICATION_LISTEN=0.0.0.0:26379 RUVIO_REPLICATION_PASSWORD=change-me-too
+
+# replica, on another machine (or another port and data dir)
+RUVIO_REPLICATION_ROLE=replica RUVIO_REPLICATION_PRIMARY=PRIMARY_HOST:26379 \
+RUVIO_REPLICATION_PASSWORD=change-me-too \
+  ruvio --requirepass change-me --durability everysec --data-dir ./data`} />
+            <p>
+              <code>INFO replication</code> shows <code>replication_role</code> and the replica count. On its own a
+              replica does not take over: if the primary dies you promote one with <code>REPLICAOF NO ONE</code>.
+              <code>RUVIO_REPLICATION_ROLE</code>, <code>RUVIO_REPLICATION_LISTEN</code> and{" "}
+              <code>RUVIO_REPLICATION_PRIMARY</code> are in <a href="/docs/configuration/">Configuration</a>.
+            </p>
+          </div>
+          <div>
+            <p>
+              Three data nodes and three <code>ruvio coordinator</code> processes: the coordinators watch the group, agree
+              by majority that the primary is gone, promote the best replica and point the others at it. Clients that follow
+              failover (the default in all six) reconnect on their own. Run three or five coordinators, never two.
+            </p>
+            <CodeBlock lang="shell" code={`git clone https://github.com/salihcantekin/ruvio && cd ruvio
+export RUVIO_COORDINATOR_SECRET=change-me RUVIO_REPLICATION_PASSWORD=change-me-too
+docker compose -f deploy/compose.failover.yml up -d
+
+printf 'AUTH change-me\nSENTINEL get-master-addr-by-name main\n' | redis-cli -p 26401
+docker compose -f deploy/compose.failover.yml stop ruvio-1   # ruvio-2 or ruvio-3 takes over`} />
+            <p>
+              The compose file sets <code>RUVIO_MIN_REPLICAS_TO_WRITE=1</code>, so a primary cut off from its replicas stops
+              taking writes after 10 s instead of diverging. For machines without Docker, <code>deploy/coordinator.toml</code>{" "}
+              and <code>deploy/ruvio-coordinator.service</code> are the same setup; the details are in{" "}
+              <a href="/docs/coordinator/">Automatic failover</a>.
+            </p>
+          </div>
+          <div>
+            <p>
+              Several groups split the 16384 hash slots, and each group is a primary with replicas. A node answers a key
+              of another group with <code>MOVED</code>; cluster-aware clients follow it from any one seed address. The
+              coordinators keep the map current after every failover and every slot move.
+            </p>
+            <CodeBlock lang="shell" code={`export RUVIO_COORDINATOR_SECRET=change-me RUVIO_REPLICATION_PASSWORD=change-me-too
+docker compose -f deploy/compose.cluster.yml up -d   # groups a and b, two nodes each, three coordinators
+
+redis-cli -p 6381 SET c 1   # slot belongs to group a: OK
+redis-cli -p 6381 SET a 1   # slot 15495 belongs to group b: MOVED ruvio-b1:6379
+printf 'AUTH change-me\nSENTINEL masters\n' | redis-cli -p 26401
+docker compose -f deploy/compose.cluster.yml stop ruvio-a1   # ruvio-a2 becomes the primary of group a`} />
+            <p>
+              Three files have to agree: each data node's <code>cluster_topology</code> map (<code>RUVIO_CLUSTER_TOPOLOGY</code>)
+              and <code>cluster_group</code> (<code>RUVIO_CLUSTER_GROUP</code>), and the coordinators' <code>[[groups]]</code> with
+              the same names, shard counts and slots. <code>deploy/cluster/</code> holds a working set. Because nodes name
+              each other by service name here, run clients inside the compose network or advertise an address they can reach
+              (<code>RUVIO_ADVERTISE_HOST</code>). A group of two nodes stops taking writes while its replica is down; add a
+              third node per group for production. Moving slots between groups, rebalancing and upgrades are in{" "}
+              <a href="/docs/coordinator/#a-multi-node-cluster">A multi-node cluster</a> and{" "}
+              <a href="/docs/cluster/">Cluster and failover</a>.
+            </p>
+          </div>
+        </Tabs>
       </section>
 
       <section class="step panel prose" id="tls" aria-labelledby="tls-h">

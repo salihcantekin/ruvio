@@ -1,0 +1,96 @@
+# Two replication groups of two Ruvio nodes each, split over the 16384 hash slots, with three
+# coordinators that fail each group over. Group a owns slots 0-8191 and group b 8192-16383.
+# Needs an image with `ruvio coordinator` (0.4.0 or later); see docs/COORDINATOR.md.
+# Each node's client port is published on 127.0.0.1:6381-6384 and the coordinators' Sentinel API on
+# 127.0.0.1:26401-26403. Nodes name each other by service name (MOVED replies say ruvio-b1:6379), so
+# use redis-cli inside the network or an app in the same compose project. Set RUVIO_COORDINATOR_SECRET
+# (coordinators) and RUVIO_REPLICATION_PASSWORD (replication between data nodes) before `up`.
+#
+#   export RUVIO_COORDINATOR_SECRET=change-me RUVIO_REPLICATION_PASSWORD=change-me-too
+#   docker compose -f deploy/compose.cluster.yml up -d
+#   redis-cli -p 6381 SET a 1     # slot 15495 belongs to group b: the reply is MOVED ruvio-b1:6379
+#   printf 'AUTH change-me\nSENTINEL masters\n' | redis-cli -p 26401
+#   docker compose -f deploy/compose.cluster.yml stop ruvio-a1     # ruvio-a2 takes over group a
+# A group of two nodes has one replica: while it is down the primary refuses writes (NOREPLICAS)
+# because RUVIO_MIN_REPLICAS_TO_WRITE is 1. Add a third node per group, or set it to 0, to keep writing.
+name: ruvio-cluster
+x-node: &node
+  image: ${RUVIO_IMAGE:-salihcantekin/ruvio:latest}
+  restart: unless-stopped
+  command: ["--shards", "1", "--durability", "everysec"]
+x-node-env: &node-env
+  RUVIO_ALLOW_UNAUTHENTICATED: "true"
+  RUVIO_REPLICATION_LISTEN: 0.0.0.0:26379
+  # A replication listener on a public address needs a password.
+  RUVIO_REPLICATION_PASSWORD: ${RUVIO_REPLICATION_PASSWORD:?set RUVIO_REPLICATION_PASSWORD}
+  # A primary cut off from its replicas stops taking writes after 10 s.
+  RUVIO_MIN_REPLICAS_TO_WRITE: "1"
+  RUVIO_MIN_REPLICAS_MAX_LAG: "10"
+  RUVIO_CLUSTER_TOPOLOGY: /etc/ruvio/topology.toml
+x-coordinator: &coordinator
+  image: ${RUVIO_IMAGE:-salihcantekin/ruvio:latest}
+  restart: unless-stopped
+  environment:
+    RUVIO_COORDINATOR_SECRET: ${RUVIO_COORDINATOR_SECRET:?set RUVIO_COORDINATOR_SECRET}
+services:
+  ruvio-a1:
+    <<: *node
+    environment:
+      <<: *node-env
+      RUVIO_CLUSTER_GROUP: a
+      RUVIO_ADVERTISE_HOST: ruvio-a1
+      RUVIO_REPLICATION_ROLE: primary
+    ports: ["127.0.0.1:6381:6379"]
+    volumes: ["./cluster/topology.toml:/etc/ruvio/topology.toml:ro", "ruvio-a1:/data"]
+  ruvio-a2:
+    <<: *node
+    environment:
+      <<: *node-env
+      RUVIO_CLUSTER_GROUP: a
+      RUVIO_ADVERTISE_HOST: ruvio-a2
+      RUVIO_REPLICATION_ROLE: replica
+      RUVIO_REPLICATION_PRIMARY: ruvio-a1:26379
+    ports: ["127.0.0.1:6382:6379"]
+    volumes: ["./cluster/topology.toml:/etc/ruvio/topology.toml:ro", "ruvio-a2:/data"]
+  ruvio-b1:
+    <<: *node
+    environment:
+      <<: *node-env
+      RUVIO_CLUSTER_GROUP: b
+      RUVIO_ADVERTISE_HOST: ruvio-b1
+      RUVIO_REPLICATION_ROLE: primary
+    ports: ["127.0.0.1:6383:6379"]
+    volumes: ["./cluster/topology.toml:/etc/ruvio/topology.toml:ro", "ruvio-b1:/data"]
+  ruvio-b2:
+    <<: *node
+    environment:
+      <<: *node-env
+      RUVIO_CLUSTER_GROUP: b
+      RUVIO_ADVERTISE_HOST: ruvio-b2
+      RUVIO_REPLICATION_ROLE: replica
+      RUVIO_REPLICATION_PRIMARY: ruvio-b1:26379
+    ports: ["127.0.0.1:6384:6379"]
+    volumes: ["./cluster/topology.toml:/etc/ruvio/topology.toml:ro", "ruvio-b2:/data"]
+  coordinator-1:
+    <<: *coordinator
+    command: ["coordinator", "--config", "/etc/ruvio/coordinator.toml"]
+    ports: ["127.0.0.1:26401:26400"]
+    volumes: ["./cluster/coordinator-1.toml:/etc/ruvio/coordinator.toml:ro", "coordinator-1:/data"]
+  coordinator-2:
+    <<: *coordinator
+    command: ["coordinator", "--config", "/etc/ruvio/coordinator.toml"]
+    ports: ["127.0.0.1:26402:26400"]
+    volumes: ["./cluster/coordinator-2.toml:/etc/ruvio/coordinator.toml:ro", "coordinator-2:/data"]
+  coordinator-3:
+    <<: *coordinator
+    command: ["coordinator", "--config", "/etc/ruvio/coordinator.toml"]
+    ports: ["127.0.0.1:26403:26400"]
+    volumes: ["./cluster/coordinator-3.toml:/etc/ruvio/coordinator.toml:ro", "coordinator-3:/data"]
+volumes:
+  ruvio-a1:
+  ruvio-a2:
+  ruvio-b1:
+  ruvio-b2:
+  coordinator-1:
+  coordinator-2:
+  coordinator-3:

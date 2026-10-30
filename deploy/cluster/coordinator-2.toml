@@ -1,0 +1,27 @@
+# Coordinator 2 of deploy/compose.cluster.yml (two groups of two nodes). See docs/COORDINATOR.md.
+id = 2
+listen = "0.0.0.0:26400"
+data_dir = "/data/coordinator"
+peers = ["1@coordinator-1:26400", "2@coordinator-2:26400", "3@coordinator-3:26400"]
+# The compose file sets RUVIO_COORDINATOR_SECRET; it overrides this value.
+secret = ""
+ping_interval_ms = 500
+down_after_ms = 3000
+
+[[groups]]
+name = "a"
+shards = 1
+slots = ["0-8191"]
+members = [
+  { address = "ruvio-a1:6379", replication = "ruvio-a1:26379" },
+  { address = "ruvio-a2:6379", replication = "ruvio-a2:26379" },
+]
+
+[[groups]]
+name = "b"
+shards = 1
+slots = ["8192-16383"]
+members = [
+  { address = "ruvio-b1:6379", replication = "ruvio-b1:26379" },
+  { address = "ruvio-b2:6379", replication = "ruvio-b2:26379" },
+]
