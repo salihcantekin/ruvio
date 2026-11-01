@@ -34,3 +34,21 @@ if (empty.length) {
   process.exit(1);
 }
 console.log(`check-dist: ${count} docs pages have a body`);
+
+// The files for LLM tools (scripts/llms.mjs) must be in the build, and every page file llms.txt links must exist.
+const DIST = path.resolve(DOCS, "..");
+const llms = readFileSync(path.join(DIST, "llms.txt"), "utf8");
+statSync(path.join(DIST, "llms-full.txt"));
+const linked = [...llms.matchAll(/\(https:\/\/ruviodb\.com\/(llms\/[^)]+\.txt)\)/g)].map((m) => m[1]);
+const absent = linked.filter((f) => {
+  try {
+    return !statSync(path.join(DIST, f)).isFile();
+  } catch {
+    return true;
+  }
+});
+if (linked.length === 0 || absent.length) {
+  console.error(`check-dist: llms.txt links ${linked.length} page files; missing:\n  ${absent.join("\n  ")}`);
+  process.exit(1);
+}
+console.log(`check-dist: llms.txt links ${linked.length} page files, all present`);
