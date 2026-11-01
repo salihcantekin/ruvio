@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "sync-docs": "node scripts/sync-docs.mjs && node scripts/changelog.mjs",
+    "sync-docs": "node scripts/sync-docs.mjs && node scripts/changelog.mjs && node scripts/llms.mjs",
     "dev": "npm run sync-docs && astro dev",
     "build": "npm run sync-docs && astro build && node scripts/check-dist.mjs",
     "preview": "astro preview",
