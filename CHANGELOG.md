@@ -4,6 +4,7 @@ Notable changes to the Ruvio server (`ruvio`, `ruvio-ctl`, the Docker image and 
 
 ## Unreleased
 
+- Site: `/llms.txt` gives LLM tools a short guide to Ruvio and a list of every docs page as a plain-Markdown file (`/llms/<page>.txt`) with its size, so a tool fetches only the page it needs; `/llms-full.txt` holds all of them in one file. All are generated from the docs on every site build.
 - Site: a new link preview image (`og:image`) in the site's dark theme, with current facts; the old one still showed the light theme and an outdated command count.
 - Docs: the README opens with a short terminal recording of `LEASE`, `LIMIT`, `INCRBY ... MAX` and `ZMOVEDUE`, and `docs/COORDINATOR.md` shows a recorded failover with a client that keeps writing.
 
