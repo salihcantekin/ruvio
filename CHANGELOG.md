@@ -4,6 +4,7 @@ Notable changes to the Ruvio server (`ruvio`, `ruvio-ctl`, the Docker image and 
 
 ## Unreleased
 
+- Site: `/llms.txt` gives LLM tools a short guide to Ruvio and a list of every docs page as a plain-Markdown file (`/llms/<page>.txt`) with its size, so a tool fetches only the page it needs; `/llms-full.txt` holds all of them in one file. All are generated from the docs on every site build.
 - Site: the `site-azure` workflow builds the branch chosen in "Use workflow from" for either target; before, target `production` always built `main` and target `dev` always built `dev`, whichever branch was chosen.
 - Docs: Get Started has a "Replicas, failover and clusters" step (replica, three nodes with three coordinators, and a two-group cluster), and `deploy/compose.cluster.yml` with `deploy/cluster/` starts two groups of two nodes with three coordinators. `docs/COORDINATOR.md` now says the starting `cluster_topology` names groups as `coordinator.toml` does.
 - Server: `ruvio --check-config` runs every check a start runs (settings, TLS files, the data directory, the `cluster_topology` map) and exits without opening a port; `ruvio coordinator --config FILE --check` checks a coordinator file and prints the map a cluster's data nodes start with; `ruvio --print-config-schema` prints every setting (variable, file key, flag, `CONFIG SET` name, type, default) as JSON.
