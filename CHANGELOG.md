@@ -4,6 +4,7 @@ Notable changes to the Ruvio server (`ruvio`, `ruvio-ctl`, the Docker image and 
 
 ## Unreleased
 
+- Docs: pages that still called the cluster experimental, said membership, slot moves and failover were not implemented, or said the Azure long runs had not been made now describe automatic failover with `ruvio coordinator`, slot moves between groups and the recorded multi-node runs.
 - Release workflow: the cluster-test server build and the release binary build no longer restore a Rust build cache, so a published binary is built only from the checked-out source and locked dependencies (CodeQL "cache poisoning" alerts). Release builds are slower.
 - Site: `/llms.txt` gives LLM tools a short guide to Ruvio and a list of every docs page as a plain-Markdown file (`/llms/<page>.txt`) with its size, so a tool fetches only the page it needs; `/llms-full.txt` holds all of them in one file. All are generated from the docs on every site build.
 - Site: the `site-azure` workflow builds the branch chosen in "Use workflow from" for either target; before, target `production` always built `main` and target `dev` always built `dev`, whichever branch was chosen.
