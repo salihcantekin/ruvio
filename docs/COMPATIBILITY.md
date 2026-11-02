@@ -292,11 +292,16 @@ CI runs the first-party `ruvio-client` and `Ruvio.Client` tests. See
 - Redis hash tags such as `{account42}` are supported.
 - A request sent to the wrong shard is forwarded to the owner and answered on the same connection; only `SSUBSCRIBE`/`SPUBLISH` on the wrong shard receive `MOVED`.
 - A multi-key request spanning slots receives `CROSSSLOT`.
-- Topology is static. Membership, migration, and failover are not implemented.
-  Asynchronous WAL tail replication is a separate primary and its replicas, not
-  Redis Cluster replication.
-- The current cluster behavior is experimental and must not be presented as a
-  complete Redis Cluster implementation.
+- A multi-node cluster is several replication groups that share the slots.
+  `ruvio coordinator` keeps the slot map, runs automatic failover and moves slot
+  ranges between groups (`COORDINATOR MOVE`, `COORDINATOR REBALANCE`); a node
+  answers keys of another group with `MOVED` and a range being moved with
+  `TRYAGAIN`. See [CLUSTER](CLUSTER.md) and [COORDINATOR](COORDINATOR.md).
+- Cluster clients work unchanged, but the internals differ from Redis Cluster:
+  there is no gossip bus, so `CLUSTER MEET`, `CLUSTER FAILOVER` and the other
+  membership verbs are not supported; membership and failover go through the
+  coordinators. Replication is an asynchronous WAL tail from a primary to its
+  replicas, not the Redis replication stream.
 
 ## Replication
 

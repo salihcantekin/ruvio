@@ -13,7 +13,7 @@
 
 The Docker image and its environment variables are described in the [main README](../README.md#start-the-server) and in [docs/SETUP.md](../docs/SETUP.md). 
 > [!NOTE]
-> Review the files before use; they are starting points, not a hardened production setup.
+> These files are starting points. Before you go live, set your own passwords, TLS certificates, data volumes and resource limits.
 
 ## Local Ruvio, Redis, and UI in Docker
 

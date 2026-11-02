@@ -309,9 +309,9 @@ Docker RSS is not the bare-metal result; the memory detail is in [the string mem
 | [Replication](https://ruviodb.com/docs/recovery/) | WAL tail, reads from replicas, `REPLICAOF` |
 | [Automatic failover](https://ruviodb.com/docs/coordinator/) | `ruvio coordinator`: Raft-agreed failover, Sentinel-compatible discovery |
 | [Operations](https://ruviodb.com/docs/observability/) | Limits, metrics, shutdown |
-| [Testing and evidence](https://ruviodb.com/docs/testing/) | Test coverage, recorded results, open production evidence gates |
+| [Testing and evidence](https://ruviodb.com/docs/testing/) | Test coverage, recorded results, long runs on a multi-node cluster |
 | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) | What the process does and does not defend |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | Open gates, including a 24-hour soak and published bare-metal latency |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | Planned work, including a 24-hour soak and published bare-metal latency |
 | [docs/RECOVERY.md](docs/RECOVERY.md#promote-a-replica-by-hand) | Promote a caught-up replica by hand |
 | [docs/RESILIENCE.md](docs/RESILIENCE.md) | Crash, power-loss and disk-fault testing and what it found |
 | [docs/TESTING.md](docs/TESTING.md) | Contributor test guide |

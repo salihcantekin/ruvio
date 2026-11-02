@@ -1,7 +1,7 @@
 # Testing and Evidence
 
 This page summarizes what has been exercised, how the checks are run, and
-which production claims still need evidence. A test surface being present in
+what the next long runs will add. A test surface being present in
 CI is not the same as a recent successful run. Each result below is labeled by
 where and how it was obtained. Runs of hours on a multi-node cluster under load and
 injected faults, made with [tests/soak](../tests/soak), are summarized on the
@@ -168,7 +168,9 @@ A run writes `status.json` (and uploads it to Azure Blob when a SAS URL is confi
 checker's unit tests run in the PR gate (`python3 tests/soak/test_soak.py`); the runs themselves
 are started by hand. Local, debug build: `plans/local-smoke.json` (60 s, every local fault kind) ends with
 no durable write lost (lost `default` writes around a killed primary are counted as warnings); `plans/local-restart-as-configured.json` reproduces
-[#142](https://github.com/salihcantekin/ruvio/issues/142). The Azure path is not measured yet.
+[#142](https://github.com/salihcantekin/ruvio/issues/142). On four Azure VMs, a 3-hour run with
+faults and a 2-hour fixed-load run lost no acknowledged `CLIENT DURABILITY` write; the results
+are on the [long-run tests](https://ruviodb.com/testing/) page.
 
 ## Long model-check sessions
 
@@ -340,15 +342,15 @@ Laptop and Docker Desktop measurements are useful for repeatable functional
 checks and same-machine regression detection. They are not substitutes for
 published production-hardware latency or durability evidence.
 
-## Evidence still needed
+## Next evidence
 
 | Evidence gap | What remains |
 | --- | --- |
 | Host and device failure | Power-loss testing and validation of flush behavior on production-like Linux filesystems and storage |
-| Long-duration stability | A 24-hour mixed-workload soak with resource and recovery evidence; the tooling is in `tests/soak/`, no long run yet |
+| Long-duration stability | A 24-hour mixed-workload soak with resource and recovery evidence; 3-hour and 2-hour multi-node runs are on the [long-run tests](https://ruviodb.com/testing/) page |
 | Native macOS faults | Process/filesystem fault scenarios against a Ruvio process running directly on macOS, rather than inside Docker's Linux VM |
 | Production performance | Published Linux bare-metal p50/p95/p99 latency and repeatable throughput measurements |
-| Failure operations | Repeated failover/promotion drills with measured recovery time and client behavior; promotion is currently manual |
+| Failure operations | Measured recovery time across repeated automatic failovers; failovers by `ruvio coordinator` and client following already run in `scripts/coordinator_faults.py`, the client suites and the long runs |
 | Release provenance | Signed build provenance in addition to checksums and the generated SBOM |
 
 Use [`RELEASE_EVIDENCE.md`](RELEASE_EVIDENCE.md) and the

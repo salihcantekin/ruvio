@@ -151,7 +151,8 @@ identity.
 | `CLUSTER MEET`, migrate, failover | Not parsed |
 
 A client that can run `CLUSTER` (`@admin`) learns the advertised host and
-shard ports. That is experimental discovery, not a membership protocol. Do
+shard ports. That is discovery only, not a membership protocol: membership
+and failover go through `ruvio coordinator`, which has its own `secret`. Do
 not expose those ports beyond the same trust domain as the RESP listener.
 
 Tests: `protocol::parses_cluster_discovery_commands`,
@@ -170,7 +171,7 @@ bytes. With `replication.tls = false` (default) the stream is not encrypted and
 written value cross the network in the clear, so the port belongs on a private
 network or a tunnel. With `replication.tls = true` the link is TLS: the replica
 verifies the primary against `replication.tls_ca` and may present a client
-certificate. Failover is not implemented,
+certificate. Failover is run by `ruvio coordinator`, not over this port,
 and this port is not a cluster bus.
 
 A replica's handshake carries the client address it announces, and the primary
@@ -255,7 +256,7 @@ the default quota).
 2. No encryption at rest; no signed provenance on restore sources.
 3. No signed SLSA provenance on release artifacts yet. Checksums and a
    CycloneDX SBOM are produced; see `docs/SUPPLY_CHAIN.md`.
-4. Experimental static cluster discovery is not an authenticated cluster.
+4. `CLUSTER` discovery replies are not authenticated beyond the client's own ACL; cluster membership is the coordinators' job.
 5. (Removed: there is no HTTP metrics endpoint.)
 6. `CONFIG GET` path disclosure to anyone allowed `config` (`@admin`). Anyone
    allowed `config` can also raise memory and connection limits or change the

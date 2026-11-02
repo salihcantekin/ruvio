@@ -20,7 +20,7 @@ The storage, protocol, and routing layers remain independent of asynchronous run
 
 The tradeoff is that ownership matters. Data must be routed to the right shard up front, but the gain is that once the request arrives, the shard can operate without locks in its hot path.
 
-Redis-compatible key hashing selects a slot and its static shard owner. Online rebalancing and cross-slot transactions are not implemented. A slow shard can delay other requests on that shard; a fast shard is not guaranteed to retain its unloaded throughput under skew.
+Redis-compatible key hashing selects a slot and its shard owner. Slots move between the shards of one process with `RUVIO MOVESLOTS`, and between machines with `COORDINATOR MOVE` and `COORDINATOR REBALANCE` while both groups keep serving; a transaction still needs its keys in one slot. A slow shard can delay other requests on that shard; a fast shard is not guaranteed to retain its unloaded throughput under skew.
 
 Linux, macOS, and Windows run the same evented runtime. The command engine does not depend on epoll, kqueue, or IOCP. See [PORTABILITY](PORTABILITY.md).
 
@@ -97,16 +97,13 @@ WAL-backed `primary` and `replica` roles provide asynchronous per-shard WAL tail
 
 One structure is shared between shards on purpose: string keys matching a configured `hot_keys` glob live in one process-wide striped map (`src/hot_store/`), so every shard serves them without `MOVED`; only `GET`, `SET` and `DEL` are allowed on them ([CONFIGURATION](CONFIGURATION.md)). Everything else is owned by exactly one shard.
 
-## Production Gaps
+## Availability and evidence
 
-This is not a certified production cluster. Before making stronger availability or performance claims it needs:
+High availability is built in: replicas on other machines, automatic failover agreed by a Raft majority of `ruvio coordinator` processes, `CLIENT DURABILITY REPLICAS n` for writes that must survive a failover, and slot moves between replication groups while they serve. Election, failover, slot moves and split-brain behavior are defined in [COORDINATOR](COORDINATOR.md) and summarized in [CLUSTER](CLUSTER.md). All six first-party clients follow a failover on their own.
 
-- measured overload isolation and tail-latency budgets under saturation,
-- production-like fault, disk and recovery drills,
-- membership changes beyond what `ruvio coordinator` does today (election, failover, slot moves and split-brain behavior are defined in [COORDINATOR](COORDINATOR.md) and summarized in [CLUSTER](CLUSTER.md)),
-- hardware durability evidence and longer runs than the hours-long cluster runs on the [long-run tests](https://ruviodb.com/testing/) page.
+Each claim is backed by a recorded run: crash, disk-fault and recovery runs in [RESILIENCE](RESILIENCE.md), coordinator fault runs (partitions, a killed leader, no majority), and hours of load with injected faults on a multi-node cluster on the [long-run tests](https://ruviodb.com/testing/) page. Work that extends this evidence (longer runs, tail latency under saturation, more hardware) is tracked in the [roadmap](ROADMAP.md).
 
-Report at least p50, p95, p99, and p99.9 latency together with throughput, CPU utilization, allocation rate, key/value distribution, connection count, compiler version, kernel version, and CPU model. Compare against a scalar or conventional threaded baseline.
+When you publish a performance result, report at least p50, p95, p99, and p99.9 latency together with throughput, CPU utilization, allocation rate, key/value distribution, connection count, compiler version, kernel version, and CPU model. Compare against a scalar or conventional threaded baseline.
 
 ## Invariants
 
