@@ -1011,9 +1011,10 @@ impl ReplicaGroup {
     /// past the last good sync (`checkpoint_may_cover`): a restart replays the log and
     /// resumes from the primary, which holds these records on disk. A failed write keeps
     /// them staged until the log recovers, as for a primary.
-    fn close(&mut self, state: &ShardState) {
+    /// Returns false when the group's records did not reach the disk.
+    fn close(&mut self, state: &ShardState) -> bool {
         let Some(start) = self.start.take() else {
-            return;
+            return true;
         };
         let (result, totals) = {
             let mut wal = state
@@ -1032,7 +1033,10 @@ impl ReplicaGroup {
         }
         if let Err(error) = result {
             warn!(%error, "replica could not log the primary's frames");
+            return false;
         }
+
+        true
     }
 }
 
@@ -1074,7 +1078,7 @@ fn drain_replicated_into(state: &ShardState, budget: usize, group: &mut ReplicaG
                 catchup_through,
                 history,
             } => {
-                group.close(state);
+                let _ = group.close(state);
                 if !install_replica_snapshot(
                     state,
                     &shard,
@@ -1101,7 +1105,7 @@ fn drain_replicated_into(state: &ShardState, budget: usize, group: &mut ReplicaG
             }
 
             crate::replication::ReplicaDelivery::CaughtUp(sequence) => {
-                group.close(state);
+                let _ = group.close(state);
                 let target = state.replica_catchup_through.get();
                 let applied = state
                     .persistence
@@ -1158,14 +1162,20 @@ fn drain_replicated_into(state: &ShardState, budget: usize, group: &mut ReplicaG
                 .unwrap_or_else(|error| error.into_inner());
 
             group.open(&mut wal);
-            crate::replication::accept_replica_frame(
+            let applied = crate::replication::accept_replica_frame(
                 &mut state.store.borrow_mut(),
                 &mut wal,
                 &state.checkpoints,
                 &state.published_config.persistence,
                 &frame,
                 limits,
-            )
+            );
+            // The record may reach the shared hot store below before its group syncs: a
+            // cluster round's hot partition then syncs it first (`sync_hot_records`).
+            if matches!(applied, Ok((0, _, _))) && state.hot_store.is_some() {
+                wal.note_hot_record();
+            }
+            applied
         };
 
         match applied {
@@ -1176,8 +1186,11 @@ fn drain_replicated_into(state: &ShardState, budget: usize, group: &mut ReplicaG
                         | crate::OwnedMutation::SlotsGiven { .. }
                 ) =>
             {
-                // Slot ownership moves only once its record is on disk.
-                group.close(state);
+                // Slot ownership moves only once its record is on disk: a record whose sync
+                // failed was cut from the log, and the primary sends it again after a restart.
+                if !group.close(state) {
+                    continue;
+                }
                 let sequence = state
                     .persistence
                     .lock()
