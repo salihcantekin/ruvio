@@ -986,8 +986,66 @@ fn drain_replicated_frames(state: &ShardState) {
     }
 }
 
+/// The frames of one drain under `always`, logged as one WAL group with one sync, as the
+/// primary logs a client batch. Without it every frame paid its own fsync on the shard's
+/// thread: a replica then fell behind a primary that group-commits, and its clients waited
+/// behind the syncs. The replica acknowledges its durable cursor, which only the sync
+/// advances, so no acknowledgement covers a record before it is on disk.
+struct ReplicaGroup {
+    /// The log's last sequence when the group opened; `None` while no group is open.
+    start: Option<u64>,
+}
+
+impl ReplicaGroup {
+    /// Opens the group before a frame is logged, if the profile syncs every write.
+    fn open(&mut self, wal: &mut crate::persistence::WalSink) {
+        if self.start.is_none() && wal.profile() == crate::DurabilityProfile::Always {
+            wal.begin_group();
+            self.start = Some(wal.last_sequence());
+        }
+    }
+
+    /// Writes and syncs the group. Its frames are already in memory, as a primary's batch
+    /// is before its sync. When the sync fails the log cuts them and refuses every later
+    /// frame until restart (the link reports down), and no checkpoint covers a sequence
+    /// past the last good sync (`checkpoint_may_cover`): a restart replays the log and
+    /// resumes from the primary, which holds these records on disk. A failed write keeps
+    /// them staged until the log recovers, as for a primary.
+    fn close(&mut self, state: &ShardState) {
+        let Some(start) = self.start.take() else {
+            return;
+        };
+        let (result, totals) = {
+            let mut wal = state
+                .persistence
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let result = wal.end_group().and_then(|()| wal.sync_batch(start));
+
+            (result, wal.sync_totals())
+        };
+        {
+            let mut metrics = state.command_metrics.borrow_mut();
+
+            metrics.wal_sync_count = totals.0;
+            metrics.wal_sync_duration_nanos = u128::from(totals.1);
+        }
+        if let Err(error) = result {
+            warn!(%error, "replica could not log the primary's frames");
+        }
+    }
+}
+
 /// Takes at most `budget` deliveries and returns how many it took.
 fn drain_replicated_budget(state: &ShardState, budget: usize) -> usize {
+    let mut group = ReplicaGroup { start: None };
+    let taken = drain_replicated_into(state, budget, &mut group);
+
+    group.close(state);
+    taken
+}
+
+fn drain_replicated_into(state: &ShardState, budget: usize, group: &mut ReplicaGroup) -> usize {
     let mut taken = 0;
 
     while taken < budget {
@@ -1016,6 +1074,7 @@ fn drain_replicated_budget(state: &ShardState, budget: usize) -> usize {
                 catchup_through,
                 history,
             } => {
+                group.close(state);
                 if !install_replica_snapshot(
                     state,
                     &shard,
@@ -1042,6 +1101,7 @@ fn drain_replicated_budget(state: &ShardState, budget: usize) -> usize {
             }
 
             crate::replication::ReplicaDelivery::CaughtUp(sequence) => {
+                group.close(state);
                 let target = state.replica_catchup_through.get();
                 let applied = state
                     .persistence
@@ -1097,6 +1157,7 @@ fn drain_replicated_budget(state: &ShardState, budget: usize) -> usize {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
 
+            group.open(&mut wal);
             crate::replication::accept_replica_frame(
                 &mut state.store.borrow_mut(),
                 &mut wal,
@@ -1115,6 +1176,8 @@ fn drain_replicated_budget(state: &ShardState, budget: usize) -> usize {
                         | crate::OwnedMutation::SlotsGiven { .. }
                 ) =>
             {
+                // Slot ownership moves only once its record is on disk.
+                group.close(state);
                 let sequence = state
                     .persistence
                     .lock()

@@ -810,6 +810,88 @@ fn an_idle_replica_applies_a_burst_without_waiting_for_its_timers() {
     join_within(replica, PATIENCE).unwrap();
 }
 
+/// Under `always` a replica logs the frames of one drain as one group with one sync, as its
+/// primary does for a client batch. One sync per frame let a busy primary outrun its
+/// replicas: they fell behind, durable replies timed out and the replicas' own clients
+/// waited behind the syncs.
+#[test]
+fn an_always_replica_syncs_once_per_drained_batch_not_per_frame() {
+    let primary_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let ports = crate::test_ports::reserve();
+    let replication = ports.address_at(0);
+    let persistence = |directory: &std::path::Path, profile| PersistenceConfig {
+        profile,
+        data_dir: directory.to_path_buf(),
+        ..PersistenceConfig::default()
+    };
+    let (primary_address, primary_stop, primary) = serve_with(|config| {
+        config.persistence = persistence(primary_dir.path(), crate::DurabilityProfile::Everysec);
+        config.replication = crate::config::ReplicationConfig {
+            role: crate::config::ReplicationRole::Primary,
+            listen: Some(replication),
+            primary: None,
+            primary_name: None,
+            ..Default::default()
+        };
+    });
+    let (replica_address, replica_stop, replica) = serve_with(|config| {
+        config.persistence = persistence(replica_dir.path(), crate::DurabilityProfile::Always);
+        config.replication = crate::config::ReplicationConfig {
+            role: crate::config::ReplicationRole::Replica,
+            listen: None,
+            primary: Some(replication),
+            primary_name: None,
+            ..Default::default()
+        };
+    });
+
+    let records = 20_000u64;
+    let mut burst = Vec::new();
+    for index in 0..records {
+        burst.extend_from_slice(&resp(&[&[b"SET", format!("k{index}").as_bytes(), b"v"]]));
+    }
+    let replies = request_within(primary_address, &burst, Duration::from_secs(20));
+    assert_eq!(replies.len(), records as usize * b"+OK\r\n".len());
+    let applied = wait_for_info(replica_address, "wal_last_sequence", |sequence| {
+        sequence >= records
+    });
+    let syncs = replica_wal_syncs(replica_address);
+    eprintln!("always replica: {applied} records, {syncs} syncs");
+
+    // Every record is on the replica's disk: a restart replays all of them.
+    let limits = ProtocolLimits::default();
+    assert!(matches!(
+        crate::persistence::read_frames(replica_dir.path(), 0, records - 1, records, limits),
+        Ok(crate::persistence::FrameRead::Frames(frames)) if frames.len() == 1
+    ));
+    primary_stop.request();
+    replica_stop.request();
+    join_within(primary, PATIENCE).unwrap();
+    join_within(replica, PATIENCE).unwrap();
+
+    // One sync per frame would be `records`; a drain takes up to 256 frames. The bound is
+    // loose so that a slow runner whose drains catch the queue nearly empty still passes.
+    assert!(syncs >= 1, "the replica's syncs are counted");
+    assert!(
+        syncs <= records / 8,
+        "{syncs} syncs for {records} replicated records: the replica syncs per frame"
+    );
+}
+
+fn replica_wal_syncs(address: SocketAddr) -> u64 {
+    let metrics = request(address, &resp(&[&[b"INFO", b"prometheus"]]));
+    let metrics = String::from_utf8(metrics).unwrap();
+
+    metrics
+        .lines()
+        .find_map(|line| {
+            line.starts_with("ruvio_wal_syncs_total{")
+                .then(|| line.rsplit(' ').next().unwrap().parse().unwrap())
+        })
+        .unwrap_or_else(|| panic!("{metrics}"))
+}
+
 #[test]
 fn a_replica_keeps_applying_writes_after_a_copied_publish() {
     let primary_dir = tempfile::tempdir().unwrap();
@@ -1018,14 +1100,44 @@ fn replica_whose_log_sync_failed_reports_the_link_down() {
         .lock()
         .unwrap()
         .retain(|dir| dir != replica_dir.path());
-    primary_stop.request();
     replica_stop.request();
+    // The frame was applied in its group before the sync failed, as a primary's batch is:
+    // no checkpoint may cover it (`checkpoint_may_cover`), so the replica ends with the
+    // log's error, as an `always` primary does.
+    let ended = join_within(replica, PATIENCE);
+
+    // Its log holds every synced frame: a restart replays it and takes the cut frame from
+    // the primary again.
+    let (restarted_address, restarted_stop, restarted) = serve_with(|config| {
+        config.persistence = persistence(replica_dir.path(), crate::DurabilityProfile::Always);
+        config.replication = crate::config::ReplicationConfig {
+            role: crate::config::ReplicationRole::Replica,
+            listen: None,
+            primary: Some(replication),
+            primary_name: None,
+            ..Default::default()
+        };
+    });
+    wait_for_info(restarted_address, "wal_last_sequence", |sequence| {
+        sequence >= 2
+    });
+    let values = request(
+        restarted_address,
+        &resp(&[&[b"GET", b"first"], &[b"GET", b"second"]]),
+    );
+    restarted_stop.request();
+    primary_stop.request();
+    join_within(restarted, PATIENCE).unwrap();
     join_within(primary, PATIENCE).unwrap();
-    join_within(replica, PATIENCE).unwrap();
+    assert!(
+        ended.is_err(),
+        "a replica whose log failed must not end as a clean save"
+    );
     assert!(
         reported,
         "a replica that cannot log frames must not report its link up"
     );
+    assert_eq!(values, b"$1\r\n1\r\n$1\r\n2\r\n");
 }
 
 /// A primary restart breaks the link while frames of the old link still wait in the
