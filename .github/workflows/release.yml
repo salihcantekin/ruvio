@@ -441,10 +441,6 @@ jobs:
         with:
           ref: ${{ needs.versions.outputs.sha }}
       - uses: dtolnay/rust-toolchain@f08ac54821369508305fcb9e0121ec6e30ae9ada # 1.97.0
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          save-if: false
-          key: cluster-server
       - run: cargo build --locked --bin ruvio
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -597,10 +593,6 @@ jobs:
         with:
           ref: ${{ needs.versions.outputs.sha }}
       - uses: dtolnay/rust-toolchain@f08ac54821369508305fcb9e0121ec6e30ae9ada # 1.97.0
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          save-if: false
-          key: server-binaries-${{ matrix.platform }}
       - name: Stamp the preview version
         if: needs.versions.outputs.preview == 'true'
         # Windows runners name the interpreter python.
