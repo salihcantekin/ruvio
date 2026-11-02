@@ -66,6 +66,11 @@ def cli(port, *a, t=3):
     try: return subprocess.run(["redis-cli", "-p", str(port), *a], capture_output=True, text=True, timeout=t).stdout.strip()
     except subprocess.TimeoutExpired: return ""
 
+def set_after(port, seen):
+    # SET with the last reply kept, so a failed wait says what the node answered.
+    r = cli(port, "SET", "after", "1"); seen[:] = [r]
+    return r == "OK"
+
 def wait(c, t=20, step=0.05):
     end = time.time() + t
     while time.time() < end:
@@ -141,7 +146,9 @@ def run(SCEN):
             moved = wait(lambda: primary_index(COORDS[0][1]) not in (None, 0), 20)
             check(f"coordinators fail over a primary they cannot reach ({time.time()-t0:.2f}s)", moved)
             new = primary_index(COORDS[0][1])
-            check("the new primary takes writes", wait(lambda: cli(NODES[new][0], "SET", "after", "1") == "OK", 10))
+            seen = []
+            check("the new primary takes writes", wait(lambda: set_after(NODES[new][0], seen), 10))
+            if seen and seen[0] != "OK": print(f"  last reply from the new primary: {seen[0]!r}")
             # The old primary is still reachable by clients; its replicas were repointed, so
             # min-replicas-to-write 1 stops it within the lag (2 s) plus the 100 ms check.
             t1 = time.time()
@@ -221,7 +228,8 @@ def run(SCEN):
             moved = wait(lambda: primary_index(others[0][1]) not in (None, 0), 20)
             check(f"the majority fails over the killed primary ({time.time()-t1:.2f}s)", moved)
             new = primary_index(others[0][1]); rest = 3 - new
-            assert wait(lambda: cli(NODES[new][0], "SET", "after", "1") == "OK", 10), "the new primary takes no writes"
+            seen = []
+            assert wait(lambda: set_after(NODES[new][0], seen), 10), f"the new primary takes no writes (last reply: {seen[0] if seen else None!r})"
             e1 = epoch(NODES[new][0])
             check(f"the epoch went up exactly once ({e0} -> {e1})", e0 is not None and e1 == e0 + 1)
             # While the cut-off leader is still alive and reaching the data nodes, nothing may
