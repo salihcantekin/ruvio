@@ -8,6 +8,7 @@ points at the allocator or a leak; both climbing together is the data growing.""
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -24,8 +25,51 @@ NODE_FIELDS = (
     "keys",
     "total_commands_processed",
     "wal_unsynced_bytes",
+    "wal_last_sequence",
+    "wal_durable_sequence",
+    "replication_committed_sequence",
+    "replication_replica_sequence",
+    "replication_fenced",
+    "slave_repl_offset",
+    "master_link_status",
+    "master_last_io_seconds_ago",
+    "primary_lease",
+    "primary_lease_remaining_ms",
+    "rejected_connections",
+    "total_connections_received",
+    "expired_keys",
+    "evicted_keys",
+    "snapshot_in_progress",
+    "snapshot_aborts_total",
+    "snapshot_overload_skips_total",
+    "recovered_wal_records",
+    "ruvio_health",
 )
-COORDINATOR_FIELDS = ("leader_id", "is_leader", "failovers_total")
+COORDINATOR_FIELDS = ("coordinator_id", "leader_id", "is_leader", "failovers_total", "last_failover_unix_ms")
+
+
+_last_cpu: list[int] = []
+
+
+def controller_stats() -> dict:
+    """This machine's busy CPU share since the last call (all processes: the load, the
+    background workers, the checker), load and free memory: a busy controller would make the
+    cluster look slow."""
+    stats: dict = {}
+    try:
+        fields = [int(x) for x in open("/proc/stat").readline().split()[1:]]
+        idle, total = fields[3] + fields[4], sum(fields)
+        if _last_cpu:
+            busy = 1 - (idle - _last_cpu[0]) / max(1, total - _last_cpu[1])
+            stats["cpu_busy"] = round(busy, 4)
+        _last_cpu[:] = [idle, total]
+        stats["load1"] = os.getloadavg()[0]
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemAvailable:"):
+                stats["mem_available_kib"] = int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return stats
 
 
 def node_info(cluster: Cluster, host: int, role: str) -> dict[str, str] | None:
@@ -47,44 +91,104 @@ def pick(role: str, info: dict[str, str]) -> dict:
 
 
 class Collector(threading.Thread):
-    def __init__(self, cluster: Cluster, backend, path: Path, interval: float, stop: threading.Event):
+    """Besides the memory and the picked INFO fields every `interval`, each sample carries the
+    backend's process stats (CPU ticks, open descriptors, data directory, WAL and checkpoint
+    bytes), and `hosts.jsonl` gets each host's load, free memory and disk, network bytes and
+    clock offset. Every `full_info_every`-th sample writes the whole `INFO` of every process to
+    `info.jsonl`. `down()` names the processes stopped on purpose, so a sample that cannot reach
+    any other process counts as a gap."""
+
+    def __init__(self, cluster: Cluster, backend, path: Path, interval: float, stop: threading.Event,
+                 full_info_every: int = 6, down=lambda: set()):
         super().__init__(name="metrics", daemon=True)
         self.cluster, self.backend, self.interval, self.stop = cluster, backend, interval, stop
         self.file = open(path, "a", buffering=1)
+        self.hosts_file = open(path.with_name("hosts.jsonl"), "a", buffering=1)
+        self.info_file = open(path.with_name("info.jsonl"), "a", buffering=1)
+        self.full_info_every, self.down = max(1, full_info_every), down
+        self.samples = 0
+        self.gaps = 0  # process samples that got no INFO from a process not stopped on purpose
+        self.expected = 0
         self.rss: dict[str, list[tuple[float, int]]] = {}
+        self.anon: dict[str, list[tuple[float, int]]] = {}
         self.charged: dict[str, list[tuple[float, int]]] = {}
         self.lock = threading.Lock()
 
     def restarted(self, host: int, role: str) -> None:
         """Starts a new RSS series for a process that was started again."""
         with self.lock:
-            self.rss.pop(f"host{host}-{role}", None)
-            self.charged.pop(f"host{host}-{role}", None)
+            for series in (self.rss, self.anon, self.charged):
+                series.pop(f"host{host}-{role}", None)
 
     def sample(self) -> None:
         now = time.time()
-        for host, role in self.cluster.processes():
-            name = f"host{host}-{role}"
-            memory = self.backend.memory(host, role) or {}
-            rss = memory.get("rss_kib")
-            info = node_info(self.cluster, host, role)
-            entry = {"t": round(now, 1), "process": name, "rss_kib": rss, "up": info is not None}
-            entry.update(memory)
-            if info is not None:
-                entry.update(pick(role, info))
-            self.file.write(json.dumps(entry, separators=(",", ":")) + "\n")
-            charged = info.get("charged_memory_bytes") if info else None
-            with self.lock:
-                if rss is not None:
-                    self.rss.setdefault(name, []).append((now, rss))
-                if charged is not None and charged.isdigit():
-                    self.charged.setdefault(name, []).append((now, int(charged)))
+        full = self.samples % self.full_info_every == 0
+        self.samples += 1
+        down = set(self.down())
+        self.hosts_file.write(json.dumps({"t": round(now, 1), "host": "controller", **controller_stats()},
+                                         separators=(",", ":")) + "\n")
+        for host in range(len(self.cluster.hosts)):
+            try:
+                stats, machine = self.backend.stats(host)
+            except Exception as error:  # a sample must never stop the collector
+                stats, machine = {}, {"error": repr(error)[:200]}
+            self.hosts_file.write(json.dumps({"t": round(now, 1), "host": host, **machine}, separators=(",", ":")) + "\n")
+            for role in self.cluster.roles():
+                name = f"host{host}-{role}"
+                process = dict(stats.get(role, {}))
+                if "rss_kib" not in process:
+                    process.update(self.backend.memory(host, role) or {})
+                rss = process.get("rss_kib")
+                info = node_info(self.cluster, host, role)
+                entry = {"t": round(now, 1), "process": name, "rss_kib": rss, "up": info is not None}
+                entry.update(process)
+                if info is not None:
+                    entry.update(pick(role, info))
+                    if full:
+                        self.info_file.write(json.dumps({"t": round(now, 1), "process": name, "info": info},
+                                                        separators=(",", ":")) + "\n")
+                if (host, role) not in down:
+                    self.expected += 1
+                    if info is None:
+                        self.gaps += 1
+                        entry["gap"] = True
+                self.file.write(json.dumps(entry, separators=(",", ":")) + "\n")
+                charged = info.get("charged_memory_bytes") if info else None
+                anon = process.get("rss_anon_kib")
+                with self.lock:
+                    if rss is not None:
+                        self.rss.setdefault(name, []).append((now, rss))
+                    if anon is not None:
+                        self.anon.setdefault(name, []).append((now, anon))
+                    if charged is not None and charged.isdigit():
+                        self.charged.setdefault(name, []).append((now, int(charged)))
 
     def run(self) -> None:
         while not self.stop.is_set():
+            started = time.monotonic()
             self.sample()
-            self.stop.wait(self.interval)
-        self.file.close()
+            self.stop.wait(max(0.0, self.interval - (time.monotonic() - started)))
+        for file in (self.file, self.hosts_file, self.info_file):
+            file.close()
+
+    def anon_slopes_kib(self, min_window_s: float, skip_s: float = 900) -> dict[str, float]:
+        """Anonymous memory slope in KiB per hour since each process's last start, leaving out
+        its first `skip_s` (allocator warm-up). Absolute, because a percentage of a 6 MiB
+        process makes warm-up look like a leak."""
+        with self.lock:
+            series = {name: list(points) for name, points in self.anon.items()}
+        slopes = {}
+        for name, points in series.items():
+            if not points:
+                continue
+            points = [p for p in points if p[0] - points[0][0] >= skip_s]
+            if len(points) < 3 or points[-1][0] - points[0][0] < min_window_s:
+                continue
+            slopes[name] = round(slope_per_hour(points), 1)
+        return slopes
+
+    def gap_fraction(self) -> float:
+        return round(self.gaps / self.expected, 5) if self.expected else 0.0
 
     def rss_slopes(self, min_window_s: float) -> dict[str, float]:
         """Least-squares RSS slope in percent of the series' mean per hour, for each process
@@ -104,6 +208,16 @@ class Collector(threading.Thread):
                 continue
             slopes[name] = round(slope_percent_per_hour(points), 3)
         return slopes
+
+
+def slope_per_hour(points: list[tuple[float, float]]) -> float:
+    """Least-squares slope in units per hour."""
+    n = len(points)
+    mean_t = sum(t for t, _ in points) / n
+    mean_v = sum(v for _, v in points) / n
+    covariance = sum((t - mean_t) * (v - mean_v) for t, v in points)
+    variance = sum((t - mean_t) ** 2 for t, _ in points)
+    return covariance / variance * 3600 if variance else 0.0
 
 
 def slope_percent_per_hour(points: list[tuple[float, int]]) -> float:
