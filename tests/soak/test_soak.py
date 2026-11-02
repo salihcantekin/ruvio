@@ -411,5 +411,17 @@ class LongRunPieces(unittest.TestCase):
         self.assertTrue(any("--on-active=60" in c for _, c, _ in commands))
 
 
+    def test_a_report_without_data_is_never_a_pass(self):
+        from ruvio_soak import report
+
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "plan.json").write_text("{}")
+            result = report.write(Path(directory))
+            self.assertTrue((Path(directory) / "report.md").exists())
+        self.assertEqual(result["verdict"], "incomplete")
+        self.assertEqual({r["status"] for r in result["criteria"]}, {"not_measured"})
+        self.assertEqual(len(result["criteria"]), 17)
+
+
 if __name__ == "__main__":
     unittest.main()

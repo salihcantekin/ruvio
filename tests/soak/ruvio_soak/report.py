@@ -187,7 +187,8 @@ def evaluate(run: Run) -> dict:
     outside = defaultdict(int)
     minutes = 0
     for e in run.latency + run.background:
-        if run.load[0] and Run.inside(e["t"], (run.load[0] + 120, run.load[1] or float("inf"))) and not run.in_fault(e["t"] - 60, e["t"] + 120):
+        # The minute [t, t + 60) overlaps no fault window (each already ends 30 s after its heal).
+        if run.load[0] and Run.inside(e["t"], (run.load[0] + 60, run.load[1] or float("inf"))) and not run.in_fault(e["t"], e["t"] + 60):
             minutes += 1
             for outcome, n in e.get("counts", {}).items():
                 if outcome != "ok":
@@ -254,11 +255,12 @@ def evaluate(run: Run) -> dict:
     criterion(results, 13, "no memory growth: data nodes and coordinators", memory["status"], memory.get("value"),
               "anon B <= 1.1 x A (+2 MiB) or overhead ratio B <= 1.1 x A; slope in B < 1024 KiB/h (data), < 512 KiB/h (coordinator)",
               memory.get("details"))
-    fds = _flat(run, "fds", 5)
+    fds = _flat(run, "fds_internal", 5)
+    clients = _flat(run, "connected_clients_n", 50)
     threads = _flat(run, "threads", 2)
     status = "not_measured" if fds is None or threads is None else ("pass" if not fds["grew"] and not threads["grew"] else "fail")
-    criterion(results, 14, "open descriptors and threads do not grow", status, {"fds": fds, "threads": threads},
-              "B mean <= A mean + 5 fds, + 2 threads")
+    criterion(results, 14, "open descriptors (without client connections) and threads do not grow", status,
+              {"fds": fds, "threads": threads}, "B mean <= A mean + 5 fds, + 2 threads", {"client_connections": clients})
     disk = _disk(run)
     criterion(results, 15, "WAL + checkpoint size bounded, free disk >= 20 %", disk["status"], disk.get("value"),
               "B max <= 1.5 x A max + 64 MiB; free >= 20 %", disk.get("details"))
@@ -398,10 +400,31 @@ def _memory(run: Run) -> dict:
     return {"status": "fail" if failed else "pass", "value": {p: d["status"] for p, d in details.items()}, "details": details}
 
 
+def _by_role(metrics, field, window) -> dict[str, list[float]]:
+    """Values keyed by group and role (`g1:primary`, `g1:replica`) for data nodes and by process
+    for coordinators: a primary holds more connections than a replica, and failovers move the
+    roles between processes."""
+    values = defaultdict(list)
+    for m in metrics:
+        if field == "connected_clients_n" and str(m.get("connected_clients", "")).isdigit():
+            m = dict(m, connected_clients_n=int(m["connected_clients"]))
+        if field == "fds_internal" and isinstance(m.get("fds"), int):
+            # Descriptors besides client connections: clients keep pooled connections to a
+            # node that stopped being the primary, which is the clients' choice, not a leak.
+            clients = int(m["connected_clients"]) if str(m.get("connected_clients", "")).isdigit() else 0
+            m = dict(m, fds_internal=m["fds"] - clients)
+        if Run.inside(m["t"], window) and isinstance(m.get(field), (int, float)):
+            if m["process"].endswith("coordinator"):
+                values[m["process"]].append(m[field])
+            elif m.get("replication_role") in ("primary", "replica"):
+                values[f"{m['process'].split('-', 1)[1]}:{m['replication_role']}"].append(m[field])
+    return values
+
+
 def _flat(run: Run, field: str, allowance: float):
     if run.quiet_a is None or run.quiet_b is None:
         return None
-    a, b = per_process(run.metrics, field, run.quiet_a), per_process(run.metrics, field, run.quiet_b)
+    a, b = _by_role(run.metrics, field, run.quiet_a), _by_role(run.metrics, field, run.quiet_b)
     if not a or not b:
         return None
     grew = {p: (round(statistics.mean(a[p]), 1), round(statistics.mean(b[p]), 1)) for p in set(a) & set(b)
