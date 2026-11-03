@@ -20,6 +20,7 @@ on:
           - Ruvio.AspNetCore.DataProtection
           - Ruvio.AspNetCore.DistributedLock
           - Ruvio.Extensions.Idempotency
+          - Ruvio.Extensions.FusionCache
       publish:
         description: Publish to NuGet (required client version must already be published)
         type: boolean
@@ -64,7 +65,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$PACKAGE" = "all" ]; then
-            packages=(Ruvio.Extensions.Caching Ruvio.AspNetCore.RateLimiting Ruvio.AspNetCore.Idempotency Ruvio.AspNetCore.OutputCaching Ruvio.AspNetCore.DataProtection Ruvio.AspNetCore.DistributedLock Ruvio.Extensions.Idempotency)
+            packages=(Ruvio.Extensions.Caching Ruvio.AspNetCore.RateLimiting Ruvio.AspNetCore.Idempotency Ruvio.AspNetCore.OutputCaching Ruvio.AspNetCore.DataProtection Ruvio.AspNetCore.DistributedLock Ruvio.Extensions.Idempotency Ruvio.Extensions.FusionCache)
           else
             packages=("$PACKAGE")
           fi
@@ -99,7 +100,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$PACKAGE" = "all" ]; then
-            packages=(Ruvio.Extensions.Caching Ruvio.AspNetCore.RateLimiting Ruvio.AspNetCore.Idempotency Ruvio.AspNetCore.OutputCaching Ruvio.AspNetCore.DataProtection Ruvio.AspNetCore.DistributedLock Ruvio.Extensions.Idempotency)
+            packages=(Ruvio.Extensions.Caching Ruvio.AspNetCore.RateLimiting Ruvio.AspNetCore.Idempotency Ruvio.AspNetCore.OutputCaching Ruvio.AspNetCore.DataProtection Ruvio.AspNetCore.DistributedLock Ruvio.Extensions.Idempotency Ruvio.Extensions.FusionCache)
           else
             packages=("$PACKAGE")
           fi
@@ -137,6 +138,7 @@ jobs:
               Ruvio.AspNetCore.DataProtection
               Ruvio.AspNetCore.DistributedLock
               Ruvio.Extensions.Idempotency
+              Ruvio.Extensions.FusionCache
             )
           else
             packages=("$PACKAGE")

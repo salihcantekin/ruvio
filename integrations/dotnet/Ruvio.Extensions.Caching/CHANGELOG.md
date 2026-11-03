@@ -4,6 +4,7 @@ Notable changes to the NuGet package `Ruvio.Extensions.Caching`. New entries go 
 
 ## Unreleased
 
+- Docs: the README points to `Ruvio.Extensions.FusionCache` for the FusionCache backplane.
 - Docs: the README shows how to use the cache as FusionCache's second level; a live-server test project covers it.
 - Docs: the README says the cache polls plain `FILLGET`.
 - Needs Ruvio.Client 0.4.0.

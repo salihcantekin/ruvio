@@ -4,6 +4,7 @@ Notable changes to the Ruvio server (`ruvio`, `ruvio-ctl`, the Docker image and 
 
 ## Unreleased
 
+- New .NET package `Ruvio.Extensions.FusionCache`: a FusionCache backplane over sharded Pub/Sub, so other app nodes drop their in-memory copy when an entry changes. It is listed in the README package table, the .NET integrations README and the site integrations page; not published yet.
 - Server: a replica with `durability = always` logs the frames it takes from its primary in one batch as one WAL group with one fsync, as the primary does for a client batch; before, it synced every frame on the shard's thread, fell behind a busy primary, answered its own clients late and let durable replies (`CLIENT DURABILITY REPLICAS`) time out. Such a replica now also reports its fsyncs in `ruvio_wal_syncs_total`. A replica whose WAL fsync fails ends with an error at shutdown, as an `always` primary does, instead of writing a final checkpoint; a restart replays its log and takes the rest from the primary.
 - Docs: pages that still called the cluster experimental, said membership, slot moves and failover were not implemented, or said the Azure long runs had not been made now describe automatic failover with `ruvio coordinator`, slot moves between groups and the recorded multi-node runs.
 - Release workflow: the cluster-test server build and the release binary build no longer restore a Rust build cache, so a published binary is built only from the checked-out source and locked dependencies (CodeQL "cache poisoning" alerts). Release builds are slower.

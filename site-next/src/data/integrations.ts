@@ -182,6 +182,17 @@ app.MapPost("/orders", HandleOrder)
     .RequireAuthorization()
     .WithRuvioIdempotency();`),
   },
+  "Ruvio.Extensions.FusionCache": {
+    summary:
+      "A FusionCache backplane over sharded Pub/Sub. When one app node sets or removes an entry, the others drop their in-memory copy and read the new value from the shared level. With Ruvio.Extensions.Caching as the shared level, Ruvio covers both parts.",
+    useCases: ["cache"],
+    example: cs(`builder.Services.AddRuvioDistributedCache();
+
+builder.Services.AddFusionCache()
+    .WithSystemTextJsonSerializer()
+    .WithRegisteredDistributedCache()
+    .WithRuvioBackplane();`),
+  },
   "Ruvio.Extensions.Idempotency": {
     summary:
       "Run work once per key outside HTTP: message consumers, background jobs, gRPC handlers. A redelivered message gets the stored result instead of running the work again; a running or failed attempt and other content under the same key are reported, and a failed attempt can optionally free its key at once.",
