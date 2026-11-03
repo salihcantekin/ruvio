@@ -25,7 +25,7 @@ A connection that must not lose an acknowledged write to a failover asks for it 
 
 Without coordinators, promotion is a person running `REPLICAOF NO ONE` on a replica ([Recovery](RECOVERY.md#promote-a-replica-by-hand)). With coordinators, a majority of them agrees (through Raft) that a primary is down, checks that the chosen replica answers, promotes it and points the other members at it. The coordinators hold no data and serve no data commands. An optional primary lease (`primary_lease`, off by default) stops an old, cut-off primary from taking writes once the coordinators stop renewing it.
 
-Clients follow a failover on their own: with several seed addresses, or with the coordinators' address and a group name, all six first-party clients find the new primary after a dropped connection or a `READONLY` reply ([Client behavior: following a failover](CLIENT_BEHAVIOR.md#following-a-failover)).
+Clients follow a failover on their own: with several seed addresses, or with the coordinators' address and a group name, all six first-party clients find the new primary after a dropped connection or a `READONLY` reply ([Client behavior: following a failover](CLIENT_BEHAVIOR.md#following-a-failover)). A cluster client that writes to a demoted primary gets `MOVED` to the new primary from a node of a multi-node cluster, and reloads its slot map after a `READONLY` reply, so it reaches the new primary on its own.
 
 ## Multi-node cluster
 
