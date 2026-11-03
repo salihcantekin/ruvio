@@ -4,6 +4,8 @@ Notable changes to the Python client `ruvio-client` on PyPI. New entries go unde
 
 ## Unreleased
 
+- Cluster mode, sync and asyncio: a `READONLY` reply (the node that owned the slot was demoted by a failover) now reloads the slot table, and when the table names another node the command is sent there once. `READONLY` comes before a command runs, so the retry cannot apply it twice. Before, the client kept writing to the demoted node and got `READONLY` until something else reloaded the table, which could take hours. A command inside an open `WATCH`, a pipeline and a command split over several nodes still return the error. Nothing changes on the success path (issue #406).
+
 ## 0.2.0 - 2026-10-29
 
 - A pipeline command that is redirected with `-MOVED` or `-ASK` and then refused with `-TRYAGAIN` now shares one `TRYAGAIN` budget (the 635 ms schedule, cut to `socket_timeout` when that is shorter) with the other commands of its pipeline, in the sync and the asyncio client, instead of waiting up to 635 ms for each in turn. A command not yet re-sent when the budget has run out still gets one more try. A single command waits as before; a pipeline reply that is `TRYAGAIN` from the start is still returned as that command's error (issue #312).
