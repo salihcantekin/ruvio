@@ -312,7 +312,7 @@ const TRYAGAIN_WAIT_MS = 5;
 const ASKING_FRAME = Buffer.from('*1\r\n$6\r\nASKING\r\n');
 
 /** Error codes the router handles by sending the command again. */
-const isRedirect = (code: string): boolean => code === 'MOVED' || code === 'ASK' || code === 'TRYAGAIN';
+const isRedirect = (code: string): boolean => code === 'MOVED' || code === 'ASK' || code === 'TRYAGAIN' || code === 'READONLY';
 
 // ---- nodes ----------------------------------------------------------------------------------
 
@@ -856,13 +856,29 @@ class Router {
    * `ASK slot host:port` sends `ASKING` and the command to the named node in one write and leaves
    * the table alone. MOVED and ASK share `MAX_REDIRECTS`; the redirect after that is returned as
    * the error. `TRYAGAIN` waits 5, 10, 20, ... 320 ms and routes the command again by the current
-   * table, at most `MAX_TRYAGAIN` times; the TRYAGAIN after that is returned.
+   * table, at most `MAX_TRYAGAIN` times; the TRYAGAIN after that is returned. `READONLY` (the node
+   * that owned the slot was demoted by a failover; nothing ran) reloads the table and sends the
+   * command once to the node it names, when that is another node; otherwise the error is returned.
    */
   async moved(e: RuvioError, frame: Buffer, tf: Tf | null, fl: number, hop = 1, tries = 0, movedBefore = false): Promise<any> {
+    let readonly = false;
     for (;;) {
       let conn: Connection;
       let asking = false;
-      if (e.code === 'TRYAGAIN') {
+      if (e.code === 'READONLY') {
+        if (readonly) throw e;
+        readonly = true;
+        const refused = this.target(frame, 0);
+        if (typeof refused === 'number' || LAST_SLOT < 0) throw e;
+        try {
+          await this.refresh();
+        } catch {
+          throw e;
+        }
+        const t = this.target(frame, 0);
+        if (typeof t === 'number' || t.addr === refused.addr) throw e;
+        conn = t.conn;
+      } else if (e.code === 'TRYAGAIN') {
         if (tries >= MAX_TRYAGAIN) throw e;
         await new Promise((r) => setTimeout(r, TRYAGAIN_WAIT_MS << tries));
         tries++;
