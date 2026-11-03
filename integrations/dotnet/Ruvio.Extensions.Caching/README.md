@@ -150,6 +150,19 @@ Costs, paid only by entries that use these options:
 > cannot read: they throw on it. Upgrade every instance that shares an `InstanceName` before using these options.
 > Entries written without them keep the old format, so upgrading alone changes nothing.
 
+## Use it as FusionCache's second level
+
+[FusionCache](https://github.com/ZiggyCreatures/FusionCache) takes any `IDistributedCache` as its shared (L2) level, so this cache works there without extra code:
+
+```csharp
+services.AddRuvioDistributedCache();          // after AddRuvioClient
+services.AddFusionCache()
+    .WithSystemTextJsonSerializer()           // ZiggyCreatures.FusionCache.Serialization.SystemTextJson
+    .WithRegisteredDistributedCache();
+```
+
+FusionCache stores its own envelope as plain bytes, so use FusionCache's own fail-safe and tags there; `StaleFor` and `Tags` of this package are for direct use. Without a backplane, another node's in-memory (L1) copy stays until it expires; [`Ruvio.Extensions.FusionCache`](../Ruvio.Extensions.FusionCache/README.md) adds one, so Ruvio covers both parts. The test project `Ruvio.Extensions.Caching.FusionCache.Tests` runs two FusionCache nodes against a live server (set, read on the other node, remove, `GetOrSet` once, expiry).
+
 ## Contract and expiration
 
 * Empty keys and zero-byte values are valid; null keys, values, and entry options are

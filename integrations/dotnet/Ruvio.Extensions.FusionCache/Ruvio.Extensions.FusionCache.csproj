@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Version>0.1.0</Version>
+    <Description>FusionCache backplane for Ruvio: tells every app node to drop its in-memory copy when an entry changes, over sharded Pub/Sub.</Description>
+    <PackageId>Ruvio.Extensions.FusionCache</PackageId>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>ruvio;fusioncache;backplane;cache;pubsub</PackageTags>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="ZiggyCreatures.FusionCache" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" VersionOverride="9.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Options" VersionOverride="9.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" VersionOverride="9.0.0" />
+    <Compile Include="../Common/RuvioStartupChecks.cs" Link="Common/RuvioStartupChecks.cs" />
+    <ProjectReference Include="../../../clients/csharp/Ruvio.Client/Ruvio.Client.csproj" />
+    <None Include="README.md" Pack="true" PackagePath="/" />
+    <None Include="../../../brand/ruvio-icon-square.png" Pack="true" PackagePath="ruvio-icon.png" />
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>Ruvio.Extensions.FusionCache.Tests</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
+</Project>
