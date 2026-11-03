@@ -1528,6 +1528,7 @@ internal sealed class ClusterRouter : IDisposable
     {
         int moves = redirects;
         int retries = 0;
+        bool readonlyRetried = false;
 
         while (true)
         {
@@ -1570,6 +1571,28 @@ internal sealed class ClusterRouter : IDisposable
 
                 reply = await send(owner, false, cancellationToken).ConfigureAwait(false);
             }
+            else if (!readonlyRetried && IsReadonly(reply))
+            {
+                // The node that owned the slot was demoted by a failover. READONLY is sent before a
+                // command runs, so the command goes once to the owner a reloaded map names.
+                readonlyRetried = true;
+
+                RuvioSocket refused = await route(cancellationToken).ConfigureAwait(false);
+
+                if (!await RefreshAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    return reply;
+                }
+
+                RuvioSocket owner = await route(cancellationToken).ConfigureAwait(false);
+
+                if (ReferenceEquals(owner, refused))
+                {
+                    return reply;
+                }
+
+                reply = await send(owner, false, cancellationToken).ConfigureAwait(false);
+            }
             else
             {
                 return reply;
@@ -1604,12 +1627,20 @@ internal sealed class ClusterRouter : IDisposable
         return replies[1];
     }
 
-    /// <summary>True for an error reply that starts <c>MOVED</c>, <c>ASK</c> or <c>TRYAGAIN</c>; checked by prefix, only on errors.</summary>
+    /// <summary>True for an error reply that starts <c>MOVED</c>, <c>ASK</c>, <c>TRYAGAIN</c> or <c>READONLY</c>; checked by prefix, only on errors.</summary>
     private static bool NeedsFollowUp(RespValue reply) =>
         reply is { Kind: RespKind.Error, Text: { } text }
         && (text.StartsWith("MOVED ", StringComparison.Ordinal)
             || text.StartsWith("ASK ", StringComparison.Ordinal)
-            || text.StartsWith("TRYAGAIN", StringComparison.Ordinal));
+            || text.StartsWith("TRYAGAIN", StringComparison.Ordinal)
+            || IsReadonlyText(text));
+
+    /// <summary>A refused write: <c>READONLY</c> alone or followed by a space.</summary>
+    private static bool IsReadonly(RespValue reply) =>
+        reply is { Kind: RespKind.Error, Text: { } text } && IsReadonlyText(text);
+
+    private static bool IsReadonlyText(string text) =>
+        text.StartsWith("READONLY", StringComparison.Ordinal) && (text.Length == 8 || text[8] == ' ');
 
     private static bool IsTryAgain(RespValue reply) =>
         reply is { Kind: RespKind.Error, Text: { } text } && text.StartsWith("TRYAGAIN", StringComparison.Ordinal);
