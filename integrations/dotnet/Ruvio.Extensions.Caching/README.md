@@ -161,7 +161,7 @@ services.AddFusionCache()
     .WithRegisteredDistributedCache();
 ```
 
-FusionCache stores its own envelope as plain bytes, so use FusionCache's own fail-safe and tags there; `StaleFor` and `Tags` of this package are for direct use. Without a backplane, another node's in-memory (L1) copy stays until it expires. The test project `Ruvio.Extensions.Caching.FusionCache.Tests` runs two FusionCache nodes against a live server (set, read on the other node, remove, `GetOrSet` once, expiry).
+FusionCache stores its own envelope as plain bytes, so use FusionCache's own fail-safe and tags there; `StaleFor` and `Tags` of this package are for direct use. Without a backplane, another node's in-memory (L1) copy stays until it expires; [`Ruvio.Extensions.FusionCache`](../Ruvio.Extensions.FusionCache/README.md) adds one, so Ruvio covers both parts. The test project `Ruvio.Extensions.Caching.FusionCache.Tests` runs two FusionCache nodes against a live server (set, read on the other node, remove, `GetOrSet` once, expiry).
 
 ## Contract and expiration
 
