@@ -725,7 +725,9 @@ pub(super) async fn handle_client(
                     if let Some(refusal) = state.write_gate.get().refusal()
                         && mutates
                     {
-                        write_response(&mut output, Response::Error(refusal))?;
+                        if !redirect_refused(&state, &mut output, hot_command_slot(&command))? {
+                            write_response(&mut output, Response::Error(refusal))?;
+                        }
                         continue;
                     }
 
@@ -1740,6 +1742,38 @@ pub(super) async fn dispatch_command<'s>(
     result
 }
 
+/// A write this replica refused, sent to the primary that takes it with `-MOVED` when the node
+/// is part of a multi-node cluster (see [`crate::runtime::cluster::redirect_refused_write`]); `false`
+/// leaves the refusal to the caller. Called only after a write was refused, so a node that
+/// takes writes never gets here.
+fn redirect_refused(
+    state: &ShardState,
+    output: &mut impl Write,
+    slot: Option<u16>,
+) -> io::Result<bool> {
+    let Some(slot) = slot else {
+        return Ok(false);
+    };
+    if state.write_gate.get() != crate::replication::WriteGate::Replica {
+        return Ok(false);
+    }
+    let Some(topology) = state
+        .forwarding
+        .as_ref()
+        .and_then(|forwarding| forwarding.fabric.topology())
+    else {
+        return Ok(false);
+    };
+
+    crate::runtime::cluster::redirect_refused_write(
+        output,
+        state.cluster_view(),
+        Some(topology),
+        &state.shard_peers(),
+        slot,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_inner<'s>(
     state: &'s Rc<ShardState>,
@@ -1771,6 +1805,13 @@ async fn dispatch_inner<'s>(
         &command,
     ) {
         SessionAction::Reply(response) => {
+            if matches!(response, Response::Error(line) if line == crate::replication::READONLY_LINE)
+                && !session.is_multi()
+                && redirect_refused(state, output, command_slot(&command).ok().flatten())?
+            {
+                return Ok(());
+            }
+
             if matches!(command, Command::ClientTracking(false))
                 && matches!(response, Response::Simple(b"OK"))
             {
