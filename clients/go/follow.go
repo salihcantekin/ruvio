@@ -294,6 +294,11 @@ func isReadonly(err error) bool {
 	return strings.HasPrefix(m, "READONLY") && (len(m) == 8 || m[8] == ' ')
 }
 
+// isReadonlyMsg is isReadonly for the bytes of an error reply.
+func isReadonlyMsg(m []byte) bool {
+	return len(m) >= 8 && string(m[:8]) == "READONLY" && (len(m) == 8 || m[8] == ' ')
+}
+
 // execFollow runs one command on the shared connection with the failover rules: a READONLY
 // reply moves the client to the primary and sends the command once more.
 func (c *Client) execFollow(ctx context.Context, cn *conn, r *request) (Value, error) {

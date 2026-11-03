@@ -161,7 +161,7 @@ func (cl *cluster) send(ctx context.Context, node *Client, r *request, blocking 
 // drive is the loop behind send; asking says the first send goes out behind ASKING, and
 // retries is how many -TRYAGAIN retries the command has used.
 func (cl *cluster) drive(ctx context.Context, node *Client, asking bool, r *request, blocking bool, redirects, retries int, clk *tryAgainClock) (Value, error) {
-	reloaded := false
+	reloaded, readonly := false, false
 	for {
 		var ok bool
 		var err error
@@ -203,6 +203,12 @@ func (cl *cluster) drive(ctx context.Context, node *Client, asking bool, r *requ
 			if err != nil {
 				putReq(r)
 				return Value{}, err
+			}
+			if nn == nil && !readonly && isReadonlyMsg(v.Bytes) {
+				// The node was demoted by a failover: send the command once to the node a
+				// reloaded table names, when that is another node.
+				readonly = true
+				nn = cl.readonlyNode(ctx, node, r)
 			}
 			if nn != nil {
 				node, asking = nn, ask
@@ -329,6 +335,28 @@ func (cl *cluster) reloadNode(ctx context.Context, r *request) *Client {
 		if _, err := n.shared(ctx); err == nil {
 			return n
 		}
+	}
+	return nil
+}
+
+// readonlyNode reloads the slot table after refused answered -READONLY to r (refused was
+// demoted by a failover) and returns the node the new table names for r's slot, or nil when
+// r is keyless, the table cannot be reloaded or it still names refused. READONLY is sent
+// before a command runs, so sending r once more cannot apply it twice.
+func (cl *cluster) readonlyNode(ctx context.Context, refused *Client, r *request) *Client {
+	_, slot, _, err := routeFrame(r.buf)
+	if err != nil || slot < 0 {
+		return nil
+	}
+	if _, err := cl.refresh(ctx, false); err != nil {
+		return nil
+	}
+	t := cl.t.Load()
+	if t == nil {
+		return nil
+	}
+	if n := t.nodeAt(slot, cl.seed); n != refused {
+		return n
 	}
 	return nil
 }
