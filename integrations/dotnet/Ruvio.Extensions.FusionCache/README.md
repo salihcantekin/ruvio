@@ -26,6 +26,7 @@ The package does not create a connection. It uses the registered `IRuvioClient`,
 
 - Messages are not stored. A node whose connection dropped misses what was published meanwhile; its in-memory copies then live until they expire. Give entries a modest `Duration` (and use FusionCache's own auto-recovery where it applies).
 - This package does not detect a reconnect of the Pub/Sub socket. The client subscribes again by itself when `RuvioClientOptions.Reconnect` is on, but FusionCache is not told (`IsReconnection` is always false).
+- After a failover, give the client every node of the group (`Seeds`) or the coordinators (`SentinelMaster`). A client that knows only the old primary cannot reach the new one, and neither can its Pub/Sub subscription. In one local run (a primary killed, the replica promoted by the coordinators) the commands worked again within a second and the subscription about 30 seconds later; messages sent in between were lost.
 - Needs a Ruvio server with sharded Pub/Sub (`SPUBLISH`) and `Ruvio.Client` 0.4.0.
 - Needs FusionCache 2.1.0 or newer.
 
@@ -35,4 +36,4 @@ The package does not create a connection. It uses the registered `IRuvioClient`,
 RUVIO_TEST_ADDR=127.0.0.1:6379 dotnet test integrations/dotnet/Ruvio.Extensions.FusionCache.Tests
 ```
 
-The live tests run two FusionCache nodes (own connections, shared Ruvio level) and check that a set or remove on one node reaches the other node's in-memory copy, and that a message that is not from FusionCache is ignored.
+The live tests run two FusionCache nodes (each on its own connection, so they also pass when the two nodes talk to two different Ruvio servers of a cluster) (own connections, shared Ruvio level) and check that a set or remove on one node reaches the other node's in-memory copy, and that a message that is not from FusionCache is ignored.
