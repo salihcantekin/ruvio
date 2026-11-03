@@ -912,6 +912,56 @@ public final class ClusterRouter implements AutoCloseable {
         }
     }
 
+    /**
+     * Tells whether an error is a refused write: {@code READONLY} alone or followed by a space. The node that
+     * owned the slot was demoted by a failover; nothing ran.
+     *
+     * @param error the failure
+     * @return {@code true} for a server error that is {@code READONLY}
+     */
+    public static boolean isReadonly(Throwable error) {
+        if (!(error instanceof RuvioServerException)) {
+            return false;
+        }
+        String m = error.getMessage();
+        return m != null && m.startsWith("READONLY") && (m.length() == 8 || m.charAt(8) == ' ');
+    }
+
+    /**
+     * After a {@code READONLY} reply: reloads the slot table off the reader threads and sends the command once
+     * to the owner the new table names, when that is another node. {@code READONLY} is sent before a command
+     * runs, so it cannot be applied twice. A keyless command, a table that cannot be reloaded or one that still
+     * names the same node completes with the error.
+     *
+     * @param r the refused request
+     * @param readonly the {@code READONLY} error
+     */
+    public void afterReadonly(RoutedRequest<?> r, Throwable readonly) {
+        try {
+            BACKGROUND.execute(() -> {
+                try {
+                    int slot = slotOf(r.frame, r.frameOff, r.frameLen);
+                    if (slot < 0 || closed) {
+                        r.failFinal(readonly);
+                        return;
+                    }
+                    ClusterNode refused = owner(slot);
+                    refresh();
+                    if (owner(slot) == refused) {
+                        r.failFinal(readonly);
+                        return;
+                    }
+                    r.replica = null;
+                    route(DIRECT, slot, r.frame, r.frameOff, r.frameLen, r, false);
+                } catch (RuntimeException e) {
+                    r.failFinal(readonly);
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            r.failFinal(readonly);
+        }
+    }
+
     /** The slot of an encoded single-slot command, or -1 when it has no key. */
     private static int slotOf(byte[] buf, int off, int len) {
         Frame f = new Frame();

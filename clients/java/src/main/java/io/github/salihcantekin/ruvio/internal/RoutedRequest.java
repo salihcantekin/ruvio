@@ -6,7 +6,8 @@ import io.github.salihcantekin.ruvio.RuvioCodec;
 /**
  * A request sent by the cluster router. It keeps a copy of the encoded command so that a
  * {@code -MOVED} or {@code -ASK} reply can be followed (together at most {@link ClusterRouter#MAX_REDIRECTS} times) and a
- * {@code -TRYAGAIN} reply retried (at most {@link ClusterRouter#MAX_TRYAGAIN} times); any other failure
+ * {@code -TRYAGAIN} reply retried (at most {@link ClusterRouter#MAX_TRYAGAIN} times), and a {@code -READONLY} reply
+ * (a primary demoted by a failover) sent once to the owner a reloaded slot table names; any other failure
  * (including a lost connection) completes it as is: nothing is ever replayed after a transport failure.
  *
  * @param <T> the result type
@@ -26,6 +27,8 @@ public class RoutedRequest<T> extends Request<T> {
     public byte redirects;
     /** How many times this command was sent again after a {@code TRYAGAIN} reply. */
     public byte retries;
+    /** Set once the command was sent again after a {@code READONLY} reply; there is never a second time. */
+    public boolean readonlyRetried;
     /** Set under a replica read policy: the command is a read (flagged readonly, not blocking). */
     public boolean read;
     /** Set while a pipeline holds the command: a keyed read, which may go to a replica when the whole pipeline reads. */
@@ -79,6 +82,11 @@ public class RoutedRequest<T> extends Request<T> {
             if (retries < ClusterRouter.MAX_TRYAGAIN && ClusterRouter.isTryAgain(error)) {
                 retries++;
                 r.retryLater(this, error);
+                return;
+            }
+            if (!readonlyRetried && ClusterRouter.isReadonly(error)) {
+                readonlyRetried = true;
+                r.afterReadonly(this, error);
                 return;
             }
         }
