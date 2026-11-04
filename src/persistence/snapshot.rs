@@ -37,6 +37,12 @@ pub(crate) use writer::SnapshotWriter;
 pub(crate) static CARRY_DELAYS: std::sync::Mutex<Vec<(PathBuf, std::time::Duration)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// Data directories whose round commits take this much longer (a slow disk's syncs), with
+/// the number of commits delayed so far.
+#[cfg(test)]
+pub(crate) static COMMIT_DELAYS: std::sync::Mutex<Vec<(PathBuf, std::time::Duration, u32)>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// Data directories whose next round commits fail before `CURRENT` changes, as many as the
 /// count says (the round is not published).
 #[cfg(test)]

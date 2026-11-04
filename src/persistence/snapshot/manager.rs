@@ -501,6 +501,22 @@ impl CheckpointManager {
         files: &[ShardFile],
     ) -> Result<(), PersistenceError> {
         #[cfg(test)]
+        {
+            let delay = COMMIT_DELAYS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .iter_mut()
+                .find(|(dir, _, _)| *dir == self.config.data_dir)
+                .map(|(_, delay, delayed)| {
+                    *delayed += 1;
+                    *delay
+                });
+
+            if let Some(delay) = delay {
+                std::thread::sleep(delay);
+            }
+        }
+        #[cfg(test)]
         if let Some((_, left)) = FAILING_COMMITS
             .lock()
             .unwrap_or_else(|error| error.into_inner())

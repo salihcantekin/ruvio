@@ -140,7 +140,7 @@ struct ShardState {
     last_requested_checkpoint_at: Cell<Instant>,
     recovery: RecoveryReport,
     security: SecurityConfig,
-    checkpoints: CheckpointManager,
+    checkpoints: Arc<CheckpointManager>,
     checkpoint_generation: Cell<u64>,
     last_checkpoint_at: Cell<Instant>,
     mutations_since_checkpoint: Cell<u64>,
@@ -159,6 +159,9 @@ struct ShardState {
     /// A copy of this shard's last published checkpoint file being made for the open
     /// round on a helper thread (see `checkpoint::carry_published_file`).
     carry: RefCell<Option<checkpoint::Carry>>,
+    /// A finished checkpoint file being committed (clock, round, manifest) on a helper
+    /// thread, so the shard keeps serving while the disk syncs (see `checkpoint::Commit`).
+    commit: RefCell<Option<checkpoint::Commit>>,
     /// Like `checkpoint_failure_warned`, for a copy that failed.
     carry_failure_warned: RefCell<Option<(String, Instant, u64)>>,
     /// A `BGSAVE` was accepted and no checkpoint has completed since: restarted when aborted.
@@ -994,7 +997,10 @@ async fn serve_async(
             "sync worker does not yet support hot_keys",
         ));
     }
-    let checkpoints = CheckpointManager::new(config.persistence.clone(), config.protocol);
+    let checkpoints = Arc::new(CheckpointManager::new(
+        config.persistence.clone(),
+        config.protocol,
+    ));
     let plan = checkpoints
         .plan()
         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -1289,6 +1295,7 @@ async fn serve_async(
         checkpoint_retry_at: Cell::new(Instant::now()),
         checkpoint_failure_warned: RefCell::new(None),
         carry: RefCell::new(None),
+        commit: RefCell::new(None),
         carry_failure_warned: RefCell::new(None),
         bgsave_pending: Cell::new(false),
         waiters: RefCell::new(ListWaiters::new(DEFAULT_MAX_LIST_WAITERS)),

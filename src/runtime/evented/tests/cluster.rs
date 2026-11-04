@@ -2680,3 +2680,176 @@ fn evented_scan_with_a_slot_runs_on_the_owner_from_either_shard() {
     join_within(left_server, PATIENCE).unwrap();
     join_within(right_server, PATIENCE).unwrap();
 }
+
+/// A round commit that waits for a slow disk runs beside the shard: clients are answered
+/// meanwhile, and the round still publishes. On the shard thread every client of the
+/// shard (and a primary's lease grants) waited for the whole commit.
+#[test]
+fn a_slow_checkpoint_commit_does_not_hold_the_shard() {
+    let directory = tempfile::tempdir().unwrap();
+    let persistence = slow_commit_persistence(directory.path());
+    let configured = persistence.clone();
+    let (address, stop, server) = serve_with(move |config| config.persistence = configured);
+
+    wait_until_listening(address, &server);
+    let before = published_generation(&persistence);
+    let delayed = slow_commits(&persistence.data_dir, || {
+        vec![writes_for_three_seconds(address, "key")]
+    });
+
+    // The commits that were delayed still publish their rounds.
+    wait_for_round_after(&persistence, before, address, "key");
+    stop.request();
+    join_within(server, PATIENCE).unwrap();
+    assert_writes_kept_moving(&delayed);
+}
+
+/// The same with two shards, whose files go to one round that commits once both are in.
+#[test]
+fn a_slow_round_commit_does_not_hold_either_shard() {
+    let directory = tempfile::tempdir().unwrap();
+    let persistence = slow_commit_persistence(directory.path());
+    let configured = persistence.clone();
+    let (left_addr, right_addr, stop, left_server, right_server) =
+        serve_two_shards_with(move |config| config.persistence = configured);
+    let (left, right) = (key_on_shard(0, "left"), key_on_shard(1, "right"));
+    let before = published_generation(&persistence);
+    let delayed = slow_commits(&persistence.data_dir, || {
+        let watcher = {
+            let right = right.clone();
+
+            thread::spawn(move || writes_for_three_seconds(right_addr, &right))
+        };
+        let slowest_left = writes_for_three_seconds(left_addr, &left);
+
+        vec![slowest_left, watcher.join().unwrap()]
+    });
+
+    wait_for_round_after(&persistence, before, left_addr, &left);
+    stop.request();
+    join_within(left_server, PATIENCE).unwrap();
+    join_within(right_server, PATIENCE).unwrap();
+    assert_writes_kept_moving(&delayed);
+}
+
+/// A `BGSAVE` that arrives while a finished file is still being committed is not refused:
+/// its checkpoint starts once the commit is collected, and a later round publishes it.
+#[test]
+fn a_bgsave_during_a_slow_commit_starts_after_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let persistence = slow_commit_persistence(directory.path());
+    let configured = persistence.clone();
+    let (address, stop, server) = serve_with(move |config| config.persistence = configured);
+
+    wait_until_listening(address, &server);
+    let ((reply, during), delayed) = slow_commits(&persistence.data_dir, || {
+        assert_eq!(
+            request(address, &resp(&[&[b"SET", b"key", b"v"]])),
+            b"+OK\r\n"
+        );
+        // Once a commit is held in the delay, the shard has no job and one commit in flight
+        // for most of `SLOW_COMMIT`.
+        let deadline = Instant::now() + PATIENCE;
+
+        while delayed_commits(&persistence.data_dir) == 0 {
+            assert!(Instant::now() < deadline, "no checkpoint was committed");
+            thread::sleep(Duration::from_millis(5));
+        }
+        (
+            request_within(address, &resp(&[&[b"BGSAVE"]]), Duration::from_secs(1)),
+            published_generation(&persistence),
+        )
+    });
+
+    assert!(delayed > 0);
+    assert_eq!(
+        String::from_utf8_lossy(&reply),
+        "+Background saving started\r\n"
+    );
+    // The saves end, and a round newer than any published while they were sent follows.
+    let deadline = Instant::now() + PATIENCE;
+
+    while info_field(address, "rdb_bgsave_in_progress") != Some(0)
+        || published_generation(&persistence) <= during
+    {
+        assert!(Instant::now() < deadline, "the background save never ended");
+        thread::sleep(Duration::from_millis(20));
+    }
+    stop.request();
+    join_within(server, PATIENCE).unwrap();
+}
+
+fn slow_commit_persistence(directory: &std::path::Path) -> PersistenceConfig {
+    PersistenceConfig {
+        profile: crate::DurabilityProfile::Always,
+        data_dir: directory.to_path_buf(),
+        snapshot_interval: Duration::from_millis(100),
+        ..PersistenceConfig::default()
+    }
+}
+
+/// How long a commit of the slow tests takes longer than it would.
+const SLOW_COMMIT: Duration = Duration::from_millis(1500);
+
+/// Runs `writes` while every round commit in `directory` takes [`SLOW_COMMIT`] longer.
+/// What `writes` returned, and how many commits were delayed meanwhile.
+fn slow_commits<T>(directory: &std::path::Path, writes: impl FnOnce() -> T) -> (T, u32) {
+    crate::persistence::COMMIT_DELAYS.lock().unwrap().push((
+        directory.to_path_buf(),
+        SLOW_COMMIT,
+        0,
+    ));
+    let result = writes();
+    let delayed = delayed_commits(directory);
+
+    crate::persistence::COMMIT_DELAYS
+        .lock()
+        .unwrap()
+        .retain(|(dir, _, _)| dir != directory);
+    (result, delayed)
+}
+
+/// How many commits in `directory` were delayed so far.
+fn delayed_commits(directory: &std::path::Path) -> u32 {
+    crate::persistence::COMMIT_DELAYS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(dir, _, _)| dir == directory)
+        .map_or(0, |(_, _, delayed)| *delayed)
+}
+
+/// A slow commit overlapped the writes, and no write waited for one.
+fn assert_writes_kept_moving((slowest, delayed): &(Vec<Duration>, u32)) {
+    assert!(*delayed > 0, "no commit was delayed while the writes ran");
+    for slowest in slowest {
+        assert!(
+            *slowest < SLOW_COMMIT * 2 / 3,
+            "a write waited {slowest:?} while a checkpoint was committed"
+        );
+    }
+}
+
+/// Writes `key` for 3 s, long enough for a checkpoint to start committing and be waited
+/// for. The slowest write.
+fn writes_for_three_seconds(address: SocketAddr, key: &str) -> Duration {
+    let started = Instant::now();
+    let mut slowest = Duration::ZERO;
+    let mut written = 0u32;
+
+    while started.elapsed() < Duration::from_secs(3) {
+        let asked = Instant::now();
+        let reply = request_within(
+            address,
+            &resp(&[&[b"SET", key.as_bytes(), written.to_string().as_bytes()]]),
+            Duration::from_secs(10),
+        );
+
+        slowest = slowest.max(asked.elapsed());
+        assert_eq!(reply, b"+OK\r\n");
+        written += 1;
+        // Paces the writes; nothing is asserted after it.
+        thread::sleep(Duration::from_millis(20));
+    }
+    slowest
+}

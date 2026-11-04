@@ -8,7 +8,7 @@ pub(crate) use sync_worker::SyncBarrier;
 mod tooling;
 mod wal;
 #[cfg(test)]
-pub(crate) use snapshot::{CARRY_DELAYS, FAILING_COMMITS, SHARD_FILE_DELAYS};
+pub(crate) use snapshot::{CARRY_DELAYS, COMMIT_DELAYS, FAILING_COMMITS, SHARD_FILE_DELAYS};
 #[cfg(test)]
 pub(crate) use wal::{
     COUNTED_WRITE_DIRS, FAILING_NEXT_SYNC_SHARDS, FAILING_SYNC_DIRS, FAILING_SYNC_SHARDS,

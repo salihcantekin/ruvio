@@ -255,7 +255,7 @@ fn start_job(state: &ShardState, requested: u64) -> Result<CheckpointJob, crate:
                 .allocate_generation(state.checkpoint_generation.get())?;
 
             state.checkpoints.begin_round(generation)?;
-            (&state.checkpoints, generation, 1)
+            (&*state.checkpoints, generation, 1)
         };
         let writer = manager.shard_writer(generation, shard_id, shard_count, covered)?;
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -435,14 +435,19 @@ fn complete_job(
             .persist_clock(state.store.borrow().now_unix_millis())?;
     }
 
+    checkpoint_completed(state, job.requested);
+    Ok(())
+}
+
+/// The bookkeeping of a completed checkpoint taken for snapshot request `requested`.
+fn checkpoint_completed(state: &ShardState, requested: u64) {
     state.last_checkpoint_at.set(Instant::now());
     state.checkpoint_failure_warned.replace(None);
-    state.snapshot_request_seen.set(job.requested);
+    state.snapshot_request_seen.set(requested);
     state
         .checkpoint_ladder
         .set(state.checkpoint_ladder.get().after_job());
     state.bgsave_pending.set(false);
-    Ok(())
 }
 
 /// Notes a file this shard submitted to cluster round `generation`, and compacts the WAL
@@ -484,6 +489,159 @@ fn record_submission(
 
         state.compacted_generation.set(published);
     }
+}
+
+/// A finished checkpoint file being committed on a helper thread: the WAL batches it covers
+/// synced, the clock persisted, the file submitted to its round (which commits the manifest
+/// once every shard's file is in), the clock persisted again. Each of these waits for the
+/// disk; on the shard thread a slow disk held every client of the shard, and a primary
+/// whose lease grants waited behind it lost its lease.
+pub(super) struct Commit {
+    thread: JoinHandle<CommitResult>,
+    generation: u64,
+    covered: u64,
+    requested: u64,
+    /// A `BGSAVE` arrived while this commit ran: once it is collected, a checkpoint of its
+    /// own starts (see [`start_background_checkpoint`]).
+    background_save_after: bool,
+}
+
+/// Whether the file reached its round (or generation), and how the commit ended. A clock
+/// write that fails after the file was submitted fails the request, but the submission is
+/// still recorded, since its round may publish.
+struct CommitResult {
+    submitted: bool,
+    result: Result<(), crate::PersistenceError>,
+}
+
+/// Where a commit thread puts a finished file.
+enum CommitTarget {
+    /// The open round of the shards' coordinator (every server with persistence).
+    Round(Arc<crate::runtime::cluster::ClusterCheckpointCoordinator>),
+    /// A generation of its own, published at once (a server without a round coordinator).
+    Generation(Arc<CheckpointManager>),
+}
+
+/// Hands a finished file to a commit thread. The clock value is read here, after the
+/// snapshot point, so the floor written before the round is still above every token granted
+/// before the checkpoint; the value written after it is at least the wall clock then.
+fn spawn_commit(
+    state: &ShardState,
+    job: &CheckpointJob,
+    file: ShardFile,
+    covers: u64,
+) -> Result<(), crate::PersistenceError> {
+    let (generation, covered) = (job.generation, job.covered);
+    let now = state.store.borrow().now_unix_millis();
+    let wal = Arc::clone(&state.persistence);
+    let target = match &state.cluster {
+        Some(coordinator) => CommitTarget::Round(Arc::clone(coordinator)),
+        None => CommitTarget::Generation(Arc::clone(&state.checkpoints)),
+    };
+    let thread = std::thread::Builder::new()
+        .name("ruvio-checkpoint-commit".into())
+        .spawn(move || {
+            let submit = || -> Result<(), crate::PersistenceError> {
+                // The batches the file covers may not be synced yet (a sync in flight on the
+                // worker, or a batch whose group ended but whose sync has not run): sync them
+                // first, and refuse the file if that fails, since their clients are then
+                // refused.
+                wal.lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .sync_for_checkpoint(covered)?;
+
+                // The clock goes to disk before the round, so a crash between the two cannot
+                // leave a checkpoint whose restart floor is below a token granted before it.
+                match &target {
+                    CommitTarget::Round(coordinator) => {
+                        coordinator.persist_clock(now)?;
+                        coordinator.submit_file_covering(generation, file, now, covers)
+                    }
+                    CommitTarget::Generation(checkpoints) => {
+                        checkpoints.persist_clock(now)?;
+                        checkpoints.commit_round(generation, &[file])
+                    }
+                }
+            };
+            if let Err(error) = submit() {
+                return CommitResult {
+                    submitted: false,
+                    result: Err(error),
+                };
+            }
+            let later = UnixMillis::new(now.get().max(wall_clock_millis()));
+            let result = match &target {
+                CommitTarget::Round(coordinator) => coordinator.persist_clock(later),
+                CommitTarget::Generation(checkpoints) => checkpoints.persist_clock(later),
+            };
+
+            CommitResult {
+                submitted: true,
+                result,
+            }
+        })?;
+
+    *state.commit.borrow_mut() = Some(Commit {
+        thread,
+        generation,
+        covered,
+        requested: covers,
+        background_save_after: false,
+    });
+    Ok(())
+}
+
+/// Milliseconds since the Unix epoch on the host clock; 0 before the epoch.
+fn wall_clock_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+/// Collects a finished commit (waiting for it when `block`) and records it as a completed
+/// checkpoint, or a failed one. True while one still runs.
+fn collect_commit(state: &ShardState, block: bool) -> bool {
+    let Some(commit) = state.commit.borrow_mut().take() else {
+        return false;
+    };
+
+    if !block && !commit.thread.is_finished() {
+        *state.commit.borrow_mut() = Some(commit);
+        return true;
+    }
+
+    let Commit {
+        thread,
+        generation,
+        covered,
+        requested,
+        background_save_after,
+    } = commit;
+    let CommitResult { submitted, result } = thread.join().unwrap_or_else(|_| CommitResult {
+        submitted: false,
+        result: Err(crate::PersistenceError::Failed(
+            "checkpoint commit thread panicked".into(),
+        )),
+    });
+
+    if submitted {
+        match &state.cluster {
+            Some(coordinator) => record_submission(state, coordinator, generation, covered),
+            None => {
+                state.checkpoint_generation.set(generation);
+                compact_after_checkpoint(state, covered);
+            }
+        }
+    }
+    match result {
+        Ok(()) => checkpoint_completed(state, requested),
+        Err(error) => fail_job(state, &error, requested),
+    }
+    // The `BGSAVE` that came in meanwhile is owed a checkpoint taken after it.
+    if background_save_after {
+        state.bgsave_pending.set(true);
+    }
+    false
 }
 
 /// A copy of the last published file being made on a helper thread.
@@ -536,7 +694,13 @@ fn carry_published_file(state: &ShardState) {
 }
 
 /// Collects a finished copy (waiting for it when `block`). True while one still runs.
+///
+/// A checkpoint file still being committed is collected first, the same way: it is this
+/// shard's file of the open round, and a carried copy or a newer file may only follow it.
 pub(super) fn collect_carry(state: &ShardState, block: bool) -> bool {
+    if collect_commit(state, block) {
+        return true;
+    }
     let Some(carry) = state.carry.borrow_mut().take() else {
         return false;
     };
@@ -806,6 +970,10 @@ fn requested_start(unanswered: bool, saving: bool, since_attempt: Duration) -> R
 /// A job whose walk is done is dropped too: completing it would publish a file of the old
 /// data, with an older snapshot point, over the installed copy.
 pub(super) fn abandon_checkpoint_for_install(state: &ShardState) {
+    // A file of the old data still being committed is waited for: committed after the
+    // install, it would point `CURRENT` back at the old data and compact the new log to the
+    // old file's coverage.
+    collect_commit(state, true);
     let Some(job) = state.checkpoint_job.borrow_mut().take() else {
         return;
     };
@@ -818,11 +986,14 @@ pub(super) fn abandon_checkpoint_for_install(state: &ShardState) {
 }
 
 pub(super) fn checkpoint_running(state: &ShardState) -> bool {
-    state.checkpoint_job.borrow().is_some()
+    state.checkpoint_job.borrow().is_some() || state.commit.borrow().is_some()
 }
 
 /// One bounded slice of the running checkpoint.
 pub(super) fn checkpoint_slice(state: &ShardState) {
+    if collect_commit(state, false) {
+        return;
+    }
     let Some(mut job) = state.checkpoint_job.borrow_mut().take() else {
         return;
     };
@@ -880,9 +1051,13 @@ pub(super) fn checkpoint_slice(state: &ShardState) {
             }
         }
         Progress::Finished(result) => {
-            match result.and_then(|file| complete_job(state, &job, file, job.requested)) {
-                Ok(()) => {}
-                Err(error) => fail_job(state, &error, job.requested),
+            let requested = job.requested;
+            // The round's disk work runs on a helper thread; the shard records it once that
+            // thread is done (see `collect_commit`).
+            let completed = result.and_then(|file| spawn_commit(state, &job, file, requested));
+
+            if let Err(error) = completed {
+                fail_job(state, &error, requested);
             }
         }
     }
@@ -1238,6 +1413,18 @@ pub(super) fn start_background_checkpoint(
         return Ok(BackgroundSave::Started);
     }
 
+    // A file being committed is a checkpoint taken before this request, and its commit
+    // may wait on the disk: the request is noted and its checkpoint starts once the commit
+    // is collected (`checkpoint_start_if_due`), as for a save the journal bound aborted.
+    if collect_commit(state, false) {
+        request_every_shard(state);
+        if let Some(commit) = state.commit.borrow_mut().as_mut() {
+            commit.background_save_after = true;
+        }
+        state.bgsave_pending.set(true);
+        return Ok(BackgroundSave::Started);
+    }
+
     // A carried copy being written is this shard's part of the round under way.
     if state.checkpoint_job.borrow().is_some() || joined_open_round(state) || carry_running(state) {
         return Ok(BackgroundSave::AlreadyRunning);
@@ -1276,9 +1463,20 @@ fn request_every_shard(state: &ShardState) -> u64 {
 
 /// `rdb_bgsave_in_progress`: this shard is writing or owes a requested checkpoint, or the
 /// cluster round it belongs to is not published yet.
+///
+/// A commit whose round is already published only has the clock left to write: the save
+/// is answered, so it no longer counts.
 pub(super) fn background_save_in_progress(state: &ShardState) -> bool {
+    let committing = state.commit.borrow().as_ref().is_some_and(|commit| {
+        state
+            .cluster
+            .as_ref()
+            .is_none_or(|coordinator| coordinator.published_generation() < commit.generation)
+    });
+
     state.bgsave_pending.get()
-        || checkpoint_running(state)
+        || state.checkpoint_job.borrow().is_some()
+        || committing
         || state
             .cluster
             .as_ref()
