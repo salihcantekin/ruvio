@@ -1528,3 +1528,48 @@ fn a_failed_carry_leaves_no_temporary_file() {
         .collect();
     assert!(left.is_empty(), "{left:?}");
 }
+
+/// A carried copy of a large file is synced in steps too, and still loads.
+#[test]
+fn a_large_carried_copy_is_synced_in_steps() {
+    let directory = tempdir().unwrap();
+    let mut config = config(directory.path());
+
+    config.snapshot_max_bytes = 64 << 20;
+    let manager = CheckpointManager::new(config, ProtocolLimits::default());
+    let value = vec![9u8; 64 << 10];
+    let count = (3 * SNAPSHOT_SYNC_STEP_BYTES as usize) / value.len() + 8;
+    let entries: Vec<_> = (0..count)
+        .map(|index| SnapshotEntry {
+            database: 0,
+            key: format!("key:{index}").into_bytes(),
+            expires_at: None,
+            value: SnapshotValue::Bytes(value.clone()),
+        })
+        .collect();
+
+    manager.begin_round(1).unwrap();
+    let file = manager
+        .write_shard_file(
+            1,
+            1,
+            &ShardCheckpoint {
+                shard_id: 0,
+                last_sequence: 7,
+                entries,
+            },
+        )
+        .unwrap();
+    manager.commit_round(1, &[file]).unwrap();
+    let before = step_syncs(directory.path());
+
+    manager.begin_round(2).unwrap();
+    let carried = manager.carry_shard_file(1, 2, 0).unwrap();
+    manager.commit_round(2, &[carried]).unwrap();
+
+    assert!(step_syncs(directory.path()) - before >= 3);
+    let loaded = manager.load().unwrap().expect("checkpoint");
+
+    assert_eq!(loaded.generation, 2);
+    assert_eq!(loaded.shards[0].entries.len(), count);
+}
