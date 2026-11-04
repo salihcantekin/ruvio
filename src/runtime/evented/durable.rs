@@ -77,7 +77,8 @@ pub(super) async fn hold_until_durable(
                 if acks.reached(*target) < durability.replicas {
                     let mut wal = shard.wal.lock().unwrap_or_else(|error| error.into_inner());
 
-                    // Any other profile synced these records in the flush above.
+                    // Any other profile needs no second request: the one above synced
+                    // these records, or handed all of them to the sync worker.
                     if wal.profile() == crate::DurabilityProfile::Everysec {
                         let _ = wal.request_sync();
                     }

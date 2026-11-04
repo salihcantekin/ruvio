@@ -1387,12 +1387,54 @@ fn a_durable_connection_waits_for_its_replica_and_is_refused_without_one() {
 /// other clients of the shard, and the coordinators' lease renewals, are answered meanwhile.
 #[test]
 fn a_durable_reply_does_not_hold_the_shard_behind_a_slow_sync() {
+    shard_answers_while_durable_writes_sync(
+        crate::DurabilityProfile::Everysec,
+        false,
+        Slow::Primary,
+    );
+}
+
+#[test]
+fn a_replica_syncs_for_a_durable_reply_off_the_shard_thread() {
+    shard_answers_while_durable_writes_sync(
+        crate::DurabilityProfile::Everysec,
+        false,
+        Slow::Replica,
+    );
+}
+
+#[test]
+fn a_durable_reply_leaves_its_sync_to_the_sync_worker() {
+    shard_answers_while_durable_writes_sync(crate::DurabilityProfile::Always, true, Slow::Primary);
+}
+
+#[test]
+fn a_replica_with_the_sync_worker_syncs_its_batches_off_the_shard_thread() {
+    shard_answers_while_durable_writes_sync(crate::DurabilityProfile::Always, true, Slow::Replica);
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Slow {
+    Primary,
+    Replica,
+}
+
+/// Durable writes go to a primary whose replica follows, with every sync of the `slow`
+/// node delayed: none of them may run on that node's shard thread. Under `everysec` its
+/// replies do not wait for the disk either, so PINGs meanwhile must answer at once; under
+/// `always` every reply waits for the sync of the records before it, by design.
+fn shard_answers_while_durable_writes_sync(
+    profile: crate::DurabilityProfile,
+    worker: bool,
+    slow: Slow,
+) {
     let primary_dir = tempfile::tempdir().unwrap();
     let replica_dir = tempfile::tempdir().unwrap();
     let ports = crate::test_ports::reserve();
     let replication = ports.address_at(0);
     let persistence = |directory: &std::path::Path| PersistenceConfig {
-        profile: crate::DurabilityProfile::Everysec,
+        profile,
+        sync_worker_active: worker,
         data_dir: directory.to_path_buf(),
         ..PersistenceConfig::default()
     };
@@ -1404,7 +1446,7 @@ fn a_durable_reply_does_not_hold_the_shard_behind_a_slow_sync() {
             ..Default::default()
         };
     });
-    let (_replica_address, replica_stop, replica) = serve_with(|config| {
+    let (replica_address, replica_stop, replica) = serve_with(|config| {
         config.persistence = persistence(replica_dir.path());
         config.replication = crate::config::ReplicationConfig {
             role: crate::config::ReplicationRole::Replica,
@@ -1414,14 +1456,40 @@ fn a_durable_reply_does_not_hold_the_shard_behind_a_slow_sync() {
     });
 
     wait_for_info(primary_address, "replication_replicas", |count| count == 1);
-    // Only the primary's disk is slow.
-    let slow = Duration::from_millis(1500);
-    crate::persistence::SLOW_SYNC_DIRS.lock().unwrap().push((
-        primary_dir.path().to_path_buf(),
-        slow,
-        0,
-    ));
+    let (slow_dir, pinged) = match slow {
+        Slow::Primary => (primary_dir.path().to_path_buf(), primary_address),
+        Slow::Replica => (replica_dir.path().to_path_buf(), replica_address),
+    };
+    let delay = Duration::from_millis(1500);
+    crate::persistence::SLOW_SYNC_DIRS
+        .lock()
+        .unwrap()
+        .push(crate::persistence::SlowSyncDir::new(&slow_dir, delay));
 
+    // Other clients keep the disk busy, as in production: a sync is often running when a
+    // durable reply asks for its own.
+    let writes_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let writes_done = Arc::clone(&writes_done);
+
+        thread::spawn(move || {
+            let mut n = 0u32;
+
+            while !writes_done.load(std::sync::atomic::Ordering::Acquire) {
+                let key = format!("plain{n}");
+
+                assert_eq!(
+                    request_within(
+                        primary_address,
+                        &resp(&[&[b"SET", key.as_bytes(), b"1"]]),
+                        Duration::from_secs(10),
+                    ),
+                    b"+OK\r\n"
+                );
+                n += 1;
+            }
+        })
+    };
     let durable = thread::spawn(move || {
         let mut replies = Vec::new();
 
@@ -1457,21 +1525,21 @@ fn a_durable_reply_does_not_hold_the_shard_behind_a_slow_sync() {
         let asked = Instant::now();
 
         assert_eq!(
-            request_within(
-                primary_address,
-                &resp(&[&[b"PING"]]),
-                Duration::from_secs(10)
-            ),
+            request_within(pinged, &resp(&[&[b"PING"]]), Duration::from_secs(10)),
             b"+PONG\r\n"
         );
         slowest = slowest.max(asked.elapsed());
         // Paces the pings; nothing is asserted after it.
         thread::sleep(Duration::from_millis(20));
     }
-    crate::persistence::SLOW_SYNC_DIRS
-        .lock()
-        .unwrap()
-        .retain(|(dir, _, _)| dir != primary_dir.path());
+    writes_done.store(true, std::sync::atomic::Ordering::Release);
+    writer.join().unwrap();
+    let slow_syncs = {
+        let mut dirs = crate::persistence::SLOW_SYNC_DIRS.lock().unwrap();
+        let at = dirs.iter().position(|slow| slow.dir == slow_dir).unwrap();
+
+        dirs.swap_remove(at)
+    };
 
     for reply in durable.join().unwrap() {
         assert_eq!(reply, b"+OK\r\n+OK\r\n");
@@ -1481,9 +1549,19 @@ fn a_durable_reply_does_not_hold_the_shard_behind_a_slow_sync() {
     primary_stop.request();
     join_within(primary, PATIENCE).unwrap();
     assert!(
-        slowest < slow * 2 / 3,
-        "a PING waited {slowest:?} behind a durable reply's sync"
+        slow_syncs.started > 0,
+        "no sync was delayed: {slow_syncs:?}"
     );
+    assert_eq!(
+        slow_syncs.on_shard_thread, 0,
+        "the shard thread waited for the disk: {slow_syncs:?}"
+    );
+    if profile == crate::DurabilityProfile::Everysec {
+        assert!(
+            slowest < delay * 2 / 3,
+            "a PING waited {slowest:?} behind a sync"
+        );
+    }
 }
 
 #[test]
@@ -1518,11 +1596,13 @@ fn a_durable_reply_behind_a_running_sync_gets_its_own_sync() {
 
     wait_for_info(primary_address, "replication_replicas", |count| count == 1);
     let slow = Duration::from_millis(500);
-    crate::persistence::SLOW_SYNC_DIRS.lock().unwrap().push((
-        primary_dir.path().to_path_buf(),
-        slow,
-        0,
-    ));
+    crate::persistence::SLOW_SYNC_DIRS
+        .lock()
+        .unwrap()
+        .push(crate::persistence::SlowSyncDir::new(
+            primary_dir.path(),
+            slow,
+        ));
     let durable_set = move |key: &'static [u8]| {
         let asked = Instant::now();
         let reply = request_within(
@@ -1550,8 +1630,8 @@ fn a_durable_reply_behind_a_running_sync_gets_its_own_sync() {
             .lock()
             .unwrap()
             .iter()
-            .find(|(dir, _, _)| dir == primary_dir.path())
-            .map_or(0, |(_, _, started)| *started)
+            .find(|slow| slow.dir == primary_dir.path())
+            .map_or(0, |slow| slow.started)
     };
     let deadline = Instant::now() + PATIENCE;
 
@@ -1569,7 +1649,7 @@ fn a_durable_reply_behind_a_running_sync_gets_its_own_sync() {
     crate::persistence::SLOW_SYNC_DIRS
         .lock()
         .unwrap()
-        .retain(|(dir, _, _)| dir != primary_dir.path());
+        .retain(|slow| slow.dir != primary_dir.path());
     replica_stop.request();
     join_within(replica, PATIENCE).unwrap();
     primary_stop.request();

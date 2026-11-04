@@ -106,20 +106,20 @@ quiet windows are the fault-free stretches before the first and after the last f
 | # | Criterion |
 | --- | --- |
 | 1 | `durable`: no lost, excess, phantom, duplicate, out-of-order, unread, stale or backwards read |
-| 2 | `default`, `client`: none of excess, phantom, duplicate, order, unread; losses and stale reads only inside a fault window |
+| 2 | `default`, `client`: none of excess, phantom, duplicate, order, unread; losses and stale reads only inside a fault window, or from 10 s before a failover no fault caused to 30 s after it (criterion 8 fails that failover) |
 | 3 | After `restart-all-data`: no acknowledged write lost on the `always` group |
 | 4 | No anomaly inside a `migrate-slots` window |
 | 5 | Every fault healed; recovery max <= 60 s, median <= 15 s |
 | 6 | No unexpected process exit, no panic in the logs |
 | 7 | No failed or unknown operation outside fault windows |
-| 8 | Failovers (`failovers_total`) at most two per fault that hits a primary |
+| 8 | Failovers (`failovers_total`) at most two per fault that hits a primary, and none (`last_failover_unix_ms`) outside a fault window |
 | 9 | p99 and p99.9 in the last quiet window within 20 % (+0.2 ms) of the first |
 | 10 | p99 back within 1.5 x the quiet baseline 60 s after each fault |
 | 11 | Background throughput within +-5 % in the quiet windows |
 | 12 | Replica lag p99 below 1 s in the quiet windows |
-| 13 | Anonymous memory: last quiet window <= 1.1 x the first (or the same overhead per charged byte), slope there < 1 MiB/h (coordinators 0.5) |
+| 13 | Anonymous memory: last quiet window <= 1.1 x the first (or the same anonymous memory per charged byte); there, anonymous memory per charged byte rising < 2 %/h on data nodes, anonymous memory < 0.5 MiB/h on coordinators |
 | 14 | Open descriptors and threads do not grow |
-| 15 | WAL + checkpoints bounded, free disk >= 20 % |
+| 15 | WAL bounded (last <= 1.5 x first + 64 MiB), checkpoints in step with the data (bytes per charged byte <= 1.5 x first + 0.1), free disk >= 20 % |
 | 16 | Coordinator data grows less than 64 MiB |
 | 17 | Metric gaps < 1 %, clock offset < 10 ms, controller CPU p95 < 70 %, check finished |
 
@@ -140,6 +140,12 @@ quiet windows are the fault-free stretches before the first and after the last f
 
 Lost writes in `default` and stale reads are expected around a primary failure without the
 primary lease (see [COORDINATOR.md](../../docs/COORDINATOR.md)); they are counted, not failed.
+
+Each finding keeps the time it happened, so the report can tie it to a fault or a failover. A
+lost list value or register version has the time its write was acknowledged. A lost counter
+increment is timed from the `INCR` replies the history records: a reply at or below one that
+came back before it was sent shows where the counter went back. A history without those replies
+falls back to its newest acknowledged increments, which put the loss at the end of the run.
 
 ## Run it locally
 
@@ -217,6 +223,10 @@ to delete its own VMs at the end, `selfDelete=true` and
 `run.py run ... --delete-resource-group rg-ruvio-soak` (the group is deleted only once every
 file is in Blob; the auto-shutdown stays as the backstop). `plans/local-rehearsal.json` runs
 the same machinery locally in about 12 minutes.
+
+`plans/azure-1h.json` is the same in one hour: 18 quiet minutes, a fault every 150-170 s for
+24 minutes (each kind about once), 18 quiet minutes. Its quiet windows are under the 10 minutes
+a memory slope needs, so criterion 13 judges only the first and last window there.
 
 `plans/azure-short.json` is the same in 30 minutes (faults every 2-4 minutes), to try the tool.
 `plans/azure-mini.json` is a 3-hour run: every fault kind every 5-10 minutes, faults lasting

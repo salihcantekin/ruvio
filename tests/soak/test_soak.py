@@ -112,6 +112,30 @@ class HistoryChecks(unittest.TestCase):
         r.final("c", 1)
         self.assertEqual(history.check(r.entries)["profiles"]["durable"]["lost"], 1)
 
+    def test_a_counter_loss_is_timed_where_the_replies_went_back(self):
+        r = Recorder()
+        for reply in (1, 2, 3):
+            r.op_("c", "incr", "c", 1, "ok", "default", result=1)
+            r.entries[-1]["r"] = reply
+        lost_at = r.t + 10  # the invoke time of the next increment
+        for reply in (3, 4, 5):  # the increment that returned 3 was lost with a primary
+            r.op_("c", "incr", "c", 1, "ok", "default", result=1)
+            r.entries[-1]["r"] = reply
+        r.final("c", 5, "default")
+        result = history.check(r.entries)
+        self.assertEqual(result["profiles"]["default"]["lost"], 1)
+        (_, count, t, _), = result["findings"]
+        self.assertEqual((count, t), ("lost", lost_at))
+
+    def test_a_counter_loss_without_replies_falls_back_to_the_newest_increments(self):
+        r = Recorder()
+        for _ in range(3):
+            r.op_("c", "incr", "c", 1, "ok", "default")
+        last_end = r.t
+        r.final("c", 2, "default")
+        (_, _, t, _), = history.check(r.entries)["findings"]
+        self.assertEqual(t, last_end)
+
     def test_stale_and_backwards_reads(self):
         r = Recorder()
         r.op_("rw", "write", "r", 1, "ok", "default")
@@ -410,6 +434,61 @@ class LongRunPieces(unittest.TestCase):
         self.assertIn("{ 10.0.0.2, 10.0.0.3 }", rules)
         self.assertTrue(any("--on-active=60" in c for _, c, _ in commands))
 
+
+    def report_run(self, directory, metrics, findings=(), events=None):
+        """A run directory: load 1-10000 s, one kill-primary fault at 5000-5060 s healed, and
+        the given metrics and findings (finding times are wall seconds, written as monotonic
+        nanoseconds with the events' clock offset of zero)."""
+        events = events or [
+            {"event": "load-start", "t": 1, "mono": 10**9},
+            {"event": "fault", "kind": "kill-primary", "t": 5000, "mono": 5000 * 10**9},
+            {"event": "healed", "kind": "kill-primary", "t": 5060, "recovery_s": 4, "mono": 5060 * 10**9},
+            {"event": "load-stop", "t": 10000, "mono": 10000 * 10**9},
+        ]
+        (directory / "plan.json").write_text("{}")
+        (directory / "events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+        (directory / "metrics.jsonl").write_text("".join(json.dumps(m) + "\n" for m in metrics))
+        (directory / "findings.jsonl").write_text(
+            "".join(json.dumps([p, c, int(t * 10**9), k]) + "\n" for p, c, t, k in findings))
+        (directory / "check.json").write_text(json.dumps({"profiles": {
+            "durable": {}, "default": {"lost": len(findings)}}, "attribution": {}}))
+
+    def test_a_failover_outside_every_fault_fails_and_explains_its_losses(self):
+        from ruvio_soak import report
+
+        metrics = [{"t": t, "process": "host0-coordinator", "failovers_total": str(n),
+                    "last_failover_unix_ms": str(ms)}
+                   for t, n, ms in ((100, 0, 0), (2000, 1, 1_995_000), (5100, 2, 5_003_000))]
+        with tempfile.TemporaryDirectory() as directory:
+            self.report_run(Path(directory), metrics, [
+                ("default", "lost", 1990, "k1"),  # just before the failover at 1995 s
+                ("default", "lost", 5010, "k2"),  # inside the fault
+                ("default", "lost", 8000, "k3"),  # neither
+            ])
+            criteria = {c["id"]: c for c in report.write(Path(directory))["criteria"]}
+        self.assertEqual(criteria[8]["status"], "fail")
+        self.assertEqual(len(criteria[8]["value"]["outside_faults"]), 1)
+        default = criteria[2]["details"]["default"]
+        self.assertEqual(default["by_uninjected_failover"], {"lost": 1})
+        self.assertEqual(default["unexplained"], {"lost": 1})
+
+    def test_memory_and_checkpoints_are_judged_against_the_data(self):
+        from ruvio_soak import report
+
+        # The data doubles between the quiet windows; anonymous memory and the checkpoint
+        # double with it, the WAL stays flat: no leak, no growth beyond the data.
+        def sample(t, scale):
+            return {"t": t, "process": "host0-g1", "rss_anon_kib": 200_000 * scale,
+                    "charged_memory_bytes": str(100_000 * 1024 * scale), "wal_bytes": 300 << 20,
+                    "checkpoint_bytes": (200 << 20) * scale}
+        metrics = [sample(t, 1) for t in range(3700, 5000, 60)] + [sample(t, 2) for t in range(8700, 10000, 60)]
+        with tempfile.TemporaryDirectory() as directory:
+            self.report_run(Path(directory), metrics)
+            run = report.Run(Path(directory), settle_s=3600)
+            run.hosts = [{"disk_avail_bytes": 90, "disk_size_bytes": 100}]
+            memory, disk = report._memory(run), report._disk(run)
+        self.assertEqual(memory["status"], "pass", memory)
+        self.assertEqual(disk["status"], "pass", disk)
 
     def test_a_report_without_data_is_never_a_pass(self):
         from ruvio_soak import report
