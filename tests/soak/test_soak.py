@@ -490,6 +490,53 @@ class LongRunPieces(unittest.TestCase):
         self.assertEqual(memory["status"], "pass", memory)
         self.assertEqual(disk["status"], "pass", disk)
 
+    def test_recovery_is_counted_from_the_end_of_the_fault(self):
+        from ruvio_soak import report
+
+        # A 30 s fault healed 33 s after it began recovered in 3 s; a slot move counts whole.
+        events = [
+            {"event": "load-start", "t": 1, "mono": 10**9},
+            {"event": "fault", "kind": "kill-host", "t": 3000, "down_s": 30, "mono": 3000 * 10**9},
+            {"event": "healed", "kind": "kill-host", "t": 3033, "recovery_s": 33, "mono": 3033 * 10**9},
+            {"event": "fault", "kind": "migrate-slots", "t": 5000, "down_s": 0, "mono": 5000 * 10**9},
+            {"event": "healed", "kind": "migrate-slots", "t": 5013, "recovery_s": 13, "mono": 5013 * 10**9},
+            {"event": "fault", "kind": "kill-primary", "t": 7000, "down_s": 10, "mono": 7000 * 10**9},
+            {"event": "healed", "kind": "kill-primary", "t": 7026, "recovery_s": 26, "mono": 7026 * 10**9},
+            {"event": "load-stop", "t": 10000, "mono": 10000 * 10**9},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            self.report_run(Path(directory), [], events=events)
+            criteria = {c["id"]: c for c in report.write(Path(directory))["criteria"]}
+        self.assertEqual(criteria[5]["status"], "fail")  # kill-primary took 16 s after its fault
+        self.assertEqual(criteria[5]["value"]["max_s"], 16)
+        self.assertEqual(criteria[5]["value"]["move_max_s"], 13)
+        self.assertEqual(criteria[5]["details"]["kill-host"]["max_s"], 3)
+
+    def test_throughput_is_compared_only_within_one_primary_placement(self):
+        from ruvio_soak import report
+
+        # Quiet minutes 2-49 with g2 on host1 at 300 ops, 51-99 on host0 at 360 ops: each
+        # placement is steady, so the 18 % step between them is not a failure.
+        def roles(t, g2):
+            return [{"t": t, "process": "host0-g1", "replication_role": "primary"},
+                    {"t": t, "process": g2, "replication_role": "primary"}]
+        metrics = [m for t in range(0, 10000, 60) for m in roles(t, "host1-g2" if t < 5000 else "host0-g2")]
+        with tempfile.TemporaryDirectory() as directory:
+            self.report_run(Path(directory), metrics, events=[
+                {"event": "load-start", "t": 1, "mono": 10**9},
+                {"event": "load-stop", "t": 10000, "mono": 10000 * 10**9},
+            ])
+            (Path(directory) / "background-latency-0.jsonl").write_text("".join(
+                json.dumps({"t": t, "series": "bg:get", "counts": {"ok": 300 if t < 5000 else 360}}) + "\n"
+                for t in range(0, 10000, 60)))
+            run = report.Run(Path(directory), settle_s=100)
+            criteria = {c["id"]: c for c in report.write(Path(directory))["criteria"]}
+        # No fault: the first and the last third of the load after the settle time.
+        self.assertEqual(run.quiet_a, (101, 101 + (10000 - 101) / 3))
+        self.assertEqual(run.quiet_b, (10000 - (10000 - 101) / 3, 10000))
+        self.assertEqual(criteria[11]["status"], "pass", criteria[11])
+        self.assertEqual(criteria[11]["value"]["placements"], 2)
+
     def test_a_report_without_data_is_never_a_pass(self):
         from ruvio_soak import report
 

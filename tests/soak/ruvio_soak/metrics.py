@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 from .cluster import COORDINATOR, Cluster
-from .resp import ReplyError, Unknown, call_once, parse_info
+from .resp import Connection, ReplyError, Unknown, call_once, parse_info
 
 NODE_FIELDS = (
     "replication_role",
@@ -78,6 +78,31 @@ def node_info(cluster: Cluster, host: int, role: str) -> dict[str, str] | None:
         return parse_info(call_once(cluster.address(host, role), "INFO", password=password))
     except (OSError, ReplyError, Unknown):
         return None
+
+
+def ping_ms(cluster: Cluster, host: int, role: str, count: int = 5) -> float | None:
+    """The fastest of `count` PINGs from this machine to the process, on one connection opened
+    first: the network round trip plus the least the process takes to answer. A primary that
+    answers slower than another (a farther host, a busy node) shows here."""
+    password = cluster.secret if role == COORDINATOR else cluster.password
+    host_name, port = cluster.address(host, role).rsplit(":", 1)
+    try:
+        connection = Connection(host_name, int(port), password, 2.0)
+    except OSError:
+        return None
+    try:
+        connection.call("PING")
+        best = None
+        for _ in range(count):
+            started = time.perf_counter()
+            connection.call("PING")
+            elapsed = (time.perf_counter() - started) * 1000
+            best = elapsed if best is None else min(best, elapsed)
+        return round(best, 3)
+    except (OSError, ReplyError, Unknown):
+        return None
+    finally:
+        connection.close()
 
 
 def pick(role: str, info: dict[str, str]) -> dict:
@@ -144,6 +169,7 @@ class Collector(threading.Thread):
                 entry.update(process)
                 if info is not None:
                     entry.update(pick(role, info))
+                    entry["ping_ms"] = ping_ms(self.cluster, host, role)
                     if full:
                         self.info_file.write(json.dumps({"t": round(now, 1), "process": name, "info": info},
                                                         separators=(",", ":")) + "\n")

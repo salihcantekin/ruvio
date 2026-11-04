@@ -87,7 +87,7 @@ today.
 | `history-NNNN.jsonl` | `history_segment_s` (3600) | The checked operations, one segment per hour, each uploaded when it closes |
 | `latency.jsonl` | minute | Per profile and command: counts by outcome, p50/p90/p99/p99.9/max and the sparse histogram (16 buckets per power of two), so hours merge exactly |
 | `background-latency-N.jsonl` | minute | The same for the background load (`load.background`, see `ruvio_soak/background.py`): about a million keys of seven types, bounded in size |
-| `metrics.jsonl` | `metrics_interval_s` | Per process: memory, CPU ticks, open descriptors, threads, context switches, data directory, WAL and checkpoint bytes, and the INFO fields of `metrics.py` |
+| `metrics.jsonl` | `metrics_interval_s` | Per process: memory, CPU ticks, open descriptors, threads, context switches, data directory, WAL and checkpoint bytes, and the INFO fields of `metrics.py`; `ping_ms`, the fastest of five PINGs from the controller |
 | `info.jsonl` | `full_info_every` samples | The whole `INFO` of every process |
 | `hosts.jsonl` | `metrics_interval_s` | Per VM: load, free memory and disk, network bytes, chrony offset; the controller's own CPU |
 | `logs/hostN-role.log` | `log_interval_s` (3600) | Each process's journal, with panic, ERROR and WARN counts in `status.json` |
@@ -101,7 +101,8 @@ Python client (`clients/python`, cluster mode); its operations are checked like 
 
 `python3 tests/soak/run.py report <run directory>` (also run at the end of every run). The
 quiet windows are the fault-free stretches before the first and after the last fault, minus
-`report_settle_s` at their start.
+`report_settle_s` at their start; a run without faults compares the first and the last third of
+its load instead.
 
 | # | Criterion |
 | --- | --- |
@@ -109,13 +110,13 @@ quiet windows are the fault-free stretches before the first and after the last f
 | 2 | `default`, `client`: none of excess, phantom, duplicate, order, unread; losses and stale reads only inside a fault window, or from 10 s before a failover no fault caused to 30 s after it (criterion 8 fails that failover) |
 | 3 | After `restart-all-data`: no acknowledged write lost on the `always` group |
 | 4 | No anomaly inside a `migrate-slots` window |
-| 5 | Every fault healed; recovery max <= 60 s, median <= 15 s |
+| 5 | Every fault healed; counted from the end of the fault (the plan draws its length at random), recovery max <= 15 s, median <= 5 s; a `migrate-slots` move <= 60 s in all |
 | 6 | No unexpected process exit, no panic in the logs |
 | 7 | No failed or unknown operation outside fault windows |
 | 8 | Failovers (`failovers_total`) at most two per fault that hits a primary, and none (`last_failover_unix_ms`) outside a fault window |
 | 9 | p99 and p99.9 in the last quiet window within 20 % (+0.2 ms) of the first |
 | 10 | p99 back within 1.5 x the quiet baseline 60 s after each fault |
-| 11 | Background throughput within +-5 % in the quiet windows |
+| 11 | Background throughput within +-5 % in the quiet windows, among minutes with the same primaries (the background load is closed loop, so its rate follows the latency of the nodes that hold them) |
 | 12 | Replica lag p99 below 1 s in the quiet windows |
 | 13 | Anonymous memory: last quiet window <= 1.1 x the first (or the same anonymous memory per charged byte); there, anonymous memory per charged byte rising < 2 %/h on data nodes, anonymous memory < 0.5 MiB/h on coordinators |
 | 14 | Open descriptors and threads do not grow |
@@ -227,6 +228,13 @@ the same machinery locally in about 12 minutes.
 `plans/azure-1h.json` is the same in one hour: 18 quiet minutes, a fault every 150-170 s for
 24 minutes (each kind about once), 18 quiet minutes. Its quiet windows are under the 10 minutes
 a memory slope needs, so criterion 13 judges only the first and last window there.
+
+`plans/azure-30m-disk.json` and `plans/azure-30m-faults.json` split a readiness check into two
+30-minute runs. The disk run has no faults and a background data set that grows to about 2
+million keys, so checkpoints grow through the run: it judges what grows with the data
+(criteria 7, 9, 11, 13, 15) between the first and the last third of its load. The fault run
+injects each of the ten fault kinds once, every 90-100 s with faults of 5-15 s, between minutes 5
+and 25: it judges criteria 2-5, 8 and 10; its quiet windows are too short for 11 and 13.
 
 `plans/azure-short.json` is the same in 30 minutes (faults every 2-4 minutes), to try the tool.
 `plans/azure-mini.json` is a 3-hour run: every fault kind every 5-10 minutes, faults lasting
