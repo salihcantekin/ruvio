@@ -69,6 +69,31 @@ fn delay_shard_file(path: &Path, shard_id: u32) {
     }
 }
 
+/// Step syncs (see [`SNAPSHOT_SYNC_STEP_BYTES`]) made by files written under each directory.
+#[cfg(test)]
+static STEP_SYNCS: std::sync::Mutex<Vec<(PathBuf, u64)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn note_step_sync(path: &Path) {
+    let mut counts = STEP_SYNCS.lock().unwrap_or_else(|error| error.into_inner());
+
+    match counts.iter_mut().find(|(dir, _)| path.starts_with(dir)) {
+        Some((_, count)) => *count += 1,
+        None => counts.push((path.to_path_buf(), 1)),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn step_syncs(path: &Path) -> u64 {
+    STEP_SYNCS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .filter(|(dir, _)| dir.starts_with(path))
+        .map(|(_, count)| count)
+        .sum()
+}
+
 const SNAPSHOT_MAGIC: &[u8; 8] = b"RUVSNP01";
 const SNAPSHOT_FOOTER_MAGIC: &[u8; 8] = b"RUVEND01";
 const SNAPSHOT_HEADER_LEN: usize = 64;
@@ -77,6 +102,11 @@ const SNAPSHOT_HEADER_LEN: usize = 64;
 const SNAPSHOT_MINOR_STREAMED: u16 = 1;
 const COUNT_IN_FOOTER: u64 = u64::MAX;
 const SNAPSHOT_FOOTER_LEN: usize = 60;
+/// A file being written is synced every this many bytes, so its final sync never has a
+/// whole shard's data to flush at once. A single large flush fills the disk's queue, and
+/// a WAL sync on the same disk then waits behind it: on a replica that holds back the
+/// acknowledgement a durable reply waits for, on a primary the reply itself.
+const SNAPSHOT_SYNC_STEP_BYTES: u64 = 4 << 20;
 const MANIFEST_MAGIC: &[u8; 8] = b"RUVMAN01";
 const CURRENT_MAGIC: &[u8; 8] = b"RUVCUR01";
 const CLOCK_MAGIC: &[u8; 8] = b"RUVCLK01";

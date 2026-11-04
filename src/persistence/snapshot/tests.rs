@@ -1307,6 +1307,44 @@ fn streamed_writer_enforces_the_size_limit_and_abort_removes_the_file() {
 }
 
 #[test]
+fn a_large_snapshot_is_synced_in_steps_while_it_is_written() {
+    // A file synced only at the end leaves the whole shard to one flush, and a WAL sync on
+    // the same disk waits behind it. Each step's bytes must be on disk before the next.
+    let directory = tempdir().unwrap();
+    let value = vec![7u8; 64 << 10];
+    let entry = |index: usize| SnapshotEntry {
+        database: 0,
+        key: format!("key:{index}").into_bytes(),
+        expires_at: None,
+        value: SnapshotValue::Bytes(value.clone()),
+    };
+    let count = (3 * SNAPSHOT_SYNC_STEP_BYTES as usize) / value.len() + 8;
+    let mut writer =
+        SnapshotWriter::create_at(directory.path(), 1, 0, 1, 7, u64::MAX, 1_000).unwrap();
+
+    for index in 0..count {
+        let mut bytes = Vec::new();
+
+        encode_entry(&mut bytes, &entry(index)).unwrap();
+        writer.write_chunk(&bytes, 1).unwrap();
+        assert!(
+            writer.unsynced() < SNAPSHOT_SYNC_STEP_BYTES,
+            "{} bytes written since the last sync",
+            writer.unsynced()
+        );
+    }
+
+    let file = writer.finish().unwrap();
+    let bytes = std::fs::read(directory.path().join(&file.file_name)).unwrap();
+    let limits = ProtocolLimits::default();
+    let (decoded, _) = decode_snapshot(&bytes, 1, 0, limits, u64::MAX).unwrap();
+
+    assert!(step_syncs(directory.path()) >= 3);
+    assert_eq!(decoded.entries.len(), count);
+    assert_eq!(decoded.entries[count - 1], entry(count - 1));
+}
+
+#[test]
 fn concurrent_clock_writes_never_fail_and_keep_the_highest_floor() {
     let directory = tempdir().unwrap();
     let mut config = config(directory.path());
@@ -1489,4 +1527,49 @@ fn a_failed_carry_leaves_no_temporary_file() {
         .map(|entry| entry.unwrap().file_name())
         .collect();
     assert!(left.is_empty(), "{left:?}");
+}
+
+/// A carried copy of a large file is synced in steps too, and still loads.
+#[test]
+fn a_large_carried_copy_is_synced_in_steps() {
+    let directory = tempdir().unwrap();
+    let mut config = config(directory.path());
+
+    config.snapshot_max_bytes = 64 << 20;
+    let manager = CheckpointManager::new(config, ProtocolLimits::default());
+    let value = vec![9u8; 64 << 10];
+    let count = (3 * SNAPSHOT_SYNC_STEP_BYTES as usize) / value.len() + 8;
+    let entries: Vec<_> = (0..count)
+        .map(|index| SnapshotEntry {
+            database: 0,
+            key: format!("key:{index}").into_bytes(),
+            expires_at: None,
+            value: SnapshotValue::Bytes(value.clone()),
+        })
+        .collect();
+
+    manager.begin_round(1).unwrap();
+    let file = manager
+        .write_shard_file(
+            1,
+            1,
+            &ShardCheckpoint {
+                shard_id: 0,
+                last_sequence: 7,
+                entries,
+            },
+        )
+        .unwrap();
+    manager.commit_round(1, &[file]).unwrap();
+    let before = step_syncs(directory.path());
+
+    manager.begin_round(2).unwrap();
+    let carried = manager.carry_shard_file(1, 2, 0).unwrap();
+    manager.commit_round(2, &[carried]).unwrap();
+
+    assert!(step_syncs(directory.path()) - before >= 3);
+    let loaded = manager.load().unwrap().expect("checkpoint");
+
+    assert_eq!(loaded.generation, 2);
+    assert_eq!(loaded.shards[0].entries.len(), count);
 }

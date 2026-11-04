@@ -411,6 +411,7 @@ impl CheckpointManager {
 
             let mut buffer = vec![0u8; SNAPSHOT_READ_BUFFER];
             let mut left = body_length;
+            let mut unsynced = 0u64;
 
             while left > 0 {
                 let take = left.min(buffer.len() as u64) as usize;
@@ -420,6 +421,15 @@ impl CheckpointManager {
                 new_hash.update(&buffer[..take]);
                 output.write_all(&buffer[..take])?;
                 left -= take as u64;
+                // Synced in steps like a new file, so the final sync does not hold the
+                // disk for the whole copy (see `SNAPSHOT_SYNC_STEP_BYTES`).
+                unsynced += take as u64;
+                if unsynced >= SNAPSHOT_SYNC_STEP_BYTES {
+                    output.sync_data()?;
+                    unsynced = 0;
+                    #[cfg(test)]
+                    note_step_sync(&directory);
+                }
             }
 
             let mut footer = [0u8; SNAPSHOT_FOOTER_LEN];
