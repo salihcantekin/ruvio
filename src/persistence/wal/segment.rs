@@ -25,8 +25,12 @@ impl WalSink {
             return Ok(());
         }
 
-        if self.last_sequence() <= covered_sequence
-            && self.segment_first_sequence <= covered_sequence
+        // Close the open segment when the checkpoint covers all of it, or when it holds covered
+        // records and is large: the next checkpoint can then delete it whole.
+        if self.segment_first_sequence <= covered_sequence
+            && (self.last_sequence() <= covered_sequence
+                || self.file_length
+                    >= self.config.wal_segment_bytes / WAL_CHECKPOINT_ROTATE_DIVISOR)
         {
             self.rotate()?;
         }
@@ -35,7 +39,9 @@ impl WalSink {
         let current = segment_path(&directory, self.segment_first_sequence);
         let segments = discover_segments(&directory)?;
 
-        let retained_from = self.cdc_retained_from(&segments)?;
+        let retained_from = self
+            .cdc_retained_from(&segments)?
+            .min(self.history_retained_from(&segments)?);
 
         for (index, path) in segments.iter().enumerate() {
             if path == &current || index >= retained_from {
@@ -87,6 +93,33 @@ impl WalSink {
         }
 
         Ok(held > budget)
+    }
+
+    /// Index of the oldest segment of the newest log kept as resume history: segments are
+    /// kept from the newest back until they hold an eighth of `wal_segment_bytes`. Before a
+    /// checkpoint closed large open segments, the open segment kept up to `wal_segment_bytes`
+    /// of history by accident; this keeps a bounded part of it on purpose.
+    fn history_retained_from(&self, segments: &[PathBuf]) -> Result<usize, PersistenceError> {
+        let budget = self.config.wal_segment_bytes / WAL_CHECKPOINT_ROTATE_DIVISOR;
+        let directory = shard_wal_directory(&self.config.data_dir, self.shard_id);
+        let current = segment_path(&directory, self.segment_first_sequence);
+        let mut kept = 0u64;
+
+        for (index, path) in segments.iter().enumerate().rev() {
+            // The open segment's file is preallocated ahead of what was written.
+            let length = if path == &current {
+                self.write_pos
+            } else {
+                fs::metadata(path)?.len()
+            };
+            kept = kept.saturating_add(length);
+
+            if kept >= budget {
+                return Ok(index);
+            }
+        }
+
+        Ok(0)
     }
 
     /// Index of the oldest segment the change-stream window keeps; `usize::MAX` (nothing

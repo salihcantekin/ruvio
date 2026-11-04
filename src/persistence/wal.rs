@@ -101,6 +101,14 @@ impl SyncError {
         slot.take()
     }
 }
+/// A checkpoint closes the open segment once it reaches this fraction of
+/// `wal_segment_bytes` (32 MiB of the default 256 MiB). Under steady writes the open segment
+/// always holds records newer than the checkpoint, so without this it only closed at full size
+/// and the records a checkpoint made redundant stayed on disk until then. Compaction also keeps
+/// at least this much of the newest log, so a replica that was away for a moment, or a
+/// change-stream reader a little behind, can still resume from it.
+const WAL_CHECKPOINT_ROTATE_DIVISOR: u64 = 8;
+
 /// How far ahead of the write cursor a segment is extended with `fallocate`.
 const WAL_PREALLOC_CHUNK: u64 = 4 * 1024 * 1024;
 /// A new chunk is requested when less than this much written-zero space is left ahead of the cursor.
