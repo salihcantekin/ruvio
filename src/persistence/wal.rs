@@ -111,9 +111,9 @@ const WAL_PREALLOC_AHEAD: u64 = 3 * 1024 * 1024;
 pub(crate) static FAILING_SYNC_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// Data directories whose WAL syncs take this much longer (a slow disk), on the shard thread
-/// and on the background sync thread alike.
+/// and on the background sync thread alike; the count is how many syncs were delayed.
 #[cfg(test)]
-pub(crate) static SLOW_SYNC_DIRS: Mutex<Vec<(PathBuf, std::time::Duration)>> =
+pub(crate) static SLOW_SYNC_DIRS: Mutex<Vec<(PathBuf, std::time::Duration, u32)>> =
     Mutex::new(Vec::new());
 
 #[cfg(test)]
@@ -121,9 +121,12 @@ fn delay_sync(data_dir: &Path) {
     let delay = SLOW_SYNC_DIRS
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .iter()
-        .find(|(dir, _)| dir == data_dir)
-        .map(|(_, delay)| *delay);
+        .iter_mut()
+        .find(|(dir, _, _)| dir == data_dir)
+        .map(|(_, delay, started)| {
+            *started += 1;
+            *delay
+        });
 
     if let Some(delay) = delay {
         std::thread::sleep(delay);

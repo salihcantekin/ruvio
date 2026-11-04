@@ -1383,7 +1383,7 @@ pub(super) fn durable_shards(state: &ShardState, forwarded_shards: u64) -> Vec<S
 }
 
 /// Waits until `replicas` replicas reached every target, or the timeout; returns how many
-/// replicas reached all of them. `between_polls` runs after each wake that did not reach them.
+/// replicas reached all of them. `between_polls` runs after each wake, before the next check.
 pub(super) async fn wait_for_targets(
     state: &ShardState,
     targets: &[(Arc<crate::replication::DurableAcks>, u64)],

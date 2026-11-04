@@ -1416,10 +1416,11 @@ fn a_durable_reply_does_not_hold_the_shard_behind_a_slow_sync() {
     wait_for_info(primary_address, "replication_replicas", |count| count == 1);
     // Only the primary's disk is slow.
     let slow = Duration::from_millis(1500);
-    crate::persistence::SLOW_SYNC_DIRS
-        .lock()
-        .unwrap()
-        .push((primary_dir.path().to_path_buf(), slow));
+    crate::persistence::SLOW_SYNC_DIRS.lock().unwrap().push((
+        primary_dir.path().to_path_buf(),
+        slow,
+        0,
+    ));
 
     let durable = thread::spawn(move || {
         let mut replies = Vec::new();
@@ -1470,7 +1471,7 @@ fn a_durable_reply_does_not_hold_the_shard_behind_a_slow_sync() {
     crate::persistence::SLOW_SYNC_DIRS
         .lock()
         .unwrap()
-        .retain(|(dir, _)| dir != primary_dir.path());
+        .retain(|(dir, _, _)| dir != primary_dir.path());
 
     for reply in durable.join().unwrap() {
         assert_eq!(reply, b"+OK\r\n+OK\r\n");
@@ -1517,10 +1518,11 @@ fn a_durable_reply_behind_a_running_sync_gets_its_own_sync() {
 
     wait_for_info(primary_address, "replication_replicas", |count| count == 1);
     let slow = Duration::from_millis(500);
-    crate::persistence::SLOW_SYNC_DIRS
-        .lock()
-        .unwrap()
-        .push((primary_dir.path().to_path_buf(), slow));
+    crate::persistence::SLOW_SYNC_DIRS.lock().unwrap().push((
+        primary_dir.path().to_path_buf(),
+        slow,
+        0,
+    ));
     let durable_set = move |key: &'static [u8]| {
         let asked = Instant::now();
         let reply = request_within(
@@ -1543,16 +1545,31 @@ fn a_durable_reply_behind_a_running_sync_gets_its_own_sync() {
     };
 
     let first = thread::spawn(move || durable_set(b"first"));
-    // Lands the second write while the first one's sync runs; if it lands later, it starts
-    // its own sync and the test proves nothing but still passes.
-    thread::sleep(slow / 5);
+    let syncs_started = || {
+        crate::persistence::SLOW_SYNC_DIRS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(dir, _, _)| dir == primary_dir.path())
+            .map_or(0, |(_, _, started)| *started)
+    };
+    let deadline = Instant::now() + PATIENCE;
+
+    // The second write lands while the first one's sync runs.
+    while syncs_started() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the first durable write never started a sync"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
     let (second, waited) = durable_set(b"second");
     let (first, _) = first.join().unwrap();
 
     crate::persistence::SLOW_SYNC_DIRS
         .lock()
         .unwrap()
-        .retain(|(dir, _)| dir != primary_dir.path());
+        .retain(|(dir, _, _)| dir != primary_dir.path());
     replica_stop.request();
     join_within(replica, PATIENCE).unwrap();
     primary_stop.request();
