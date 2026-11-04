@@ -5,13 +5,15 @@ never `pass`.
 
 Windows (from `events.jsonl`): `quiet_a` is the fault-free stretch before the first fault,
 without its first `settle_s` (data still filling, allocator warming up); `quiet_b` is the
-fault-free stretch after the last fault, without its first `settle_s`. A fault window runs from
-its `fault` event to its `healed` event plus `grace_s`.
+fault-free stretch after the last fault, without its first `settle_s`. A run without faults
+compares the first and the last third of the load after `settle_s` instead. A fault window runs
+from its `fault` event to its `healed` event plus `grace_s`.
 
     python3 tests/soak/run.py report <run directory>"""
 
 from __future__ import annotations
 
+import bisect
 import json
 import statistics
 import time
@@ -57,6 +59,13 @@ class Run:
         self.quiet_a = (start + settle, first) if start and first and first - start > settle else None
         settle_b = min(settle_s, 0.5 * ((stop or 0) - (last or 0))) if stop and last else settle_s
         self.quiet_b = (last + settle_b, stop) if stop and last and stop - last > settle_b else None
+        if not self.windows and start and stop:
+            # No fault ran: the first and the last third of the load after the settle time, so
+            # what grows with the data (checkpoints, the log) shows between them.
+            begin = start + min(settle_s, 0.5 * (stop - start))
+            third = (stop - begin) / 3
+            self.quiet_a = (begin, begin + third)
+            self.quiet_b = (stop - third, stop)
 
     def _fault_windows(self) -> list[tuple[float, float, str]]:
         """(start, end, kind) in epoch seconds."""
@@ -203,18 +212,24 @@ def evaluate(run: Run) -> dict:
     # 5-8: availability
     healed = [e for e in run.events if e["event"] == "healed"]
     not_healed = [e for e in run.events if e["event"] == "not-healed"]
-    recoveries = [e["recovery_s"] for e in healed]
-    if not recoveries and not not_healed:
-        criterion(results, 5, "every fault recovers: max <= 60 s, median <= 15 s", "not_measured")
+    after = _recovery_after_fault(run)
+    if not after and not not_healed:
+        criterion(results, 5, RECOVERY_NAME, "not_measured")
     else:
-        worst = max(recoveries, default=0)
-        median = statistics.median(recoveries) if recoveries else None
         by_kind = defaultdict(list)
-        for e in healed:
-            by_kind[e["kind"]].append(e["recovery_s"])
-        ok = not not_healed and worst <= 60 and (median or 0) <= 15
-        criterion(results, 5, "every fault recovers: max <= 60 s, median <= 15 s", "pass" if ok else "fail",
-                  {"max_s": worst, "median_s": median, "not_healed": len(not_healed)}, {"max_s": 60, "median_s": 15},
+        for kind, seconds in after:
+            by_kind[kind].append(seconds)
+        # A slot move is not a down time: the whole move counts, and it has its own ceiling.
+        moves = by_kind.get("migrate-slots", [])
+        rest = [seconds for kind, seconds in after if kind != "migrate-slots"]
+        worst = max(rest, default=0)
+        median = statistics.median(rest) if rest else None
+        ok = (not not_healed and worst <= RECOVERY_MAX_S and (median or 0) <= RECOVERY_MEDIAN_S
+              and max(moves, default=0) <= MOVE_MAX_S)
+        criterion(results, 5, RECOVERY_NAME, "pass" if ok else "fail",
+                  {"max_s": worst, "median_s": median, "move_max_s": max(moves, default=None),
+                   "not_healed": len(not_healed)},
+                  {"max_s": RECOVERY_MAX_S, "median_s": RECOVERY_MEDIAN_S, "move_max_s": MOVE_MAX_S},
                   {k: {"n": len(v), "max_s": max(v), "median_s": statistics.median(v)} for k, v in sorted(by_kind.items())})
     exits = [e for e in run.events if e["event"] == "unexpected-exit"]
     logs = run.status.get("log_counts")
@@ -277,17 +292,30 @@ def evaluate(run: Run) -> dict:
                 slow.append({"kind": e["kind"], "t": e["t"], "p99_ms": p99})
         criterion(results, 10, "p99 back to the quiet baseline within 60 s after each fault", "fail" if slow else "pass",
                   len(slow), f"p99 <= {limit:.2f} ms", slow[:20] or None)
-    rates = [sum(e["counts"].get("ok", 0) for e in run.background if int(e["t"]) == minute)
-             for minute in sorted({int(e["t"]) for e in run.background
-                                   if (Run.inside(e["t"], run.quiet_a) or Run.inside(e["t"], run.quiet_b))})]
-    if len(rates) < 10:
-        criterion(results, 11, "background throughput steady (+-5 %) in quiet windows", "not_measured")
+    # The background load runs closed loop, so its rate follows the latency of the nodes that
+    # hold the primaries: minutes are compared only with minutes of the same primary placement.
+    placement = _placements(run)
+    groups: dict[tuple, list[int]] = defaultdict(list)
+    for minute in sorted({int(e["t"]) for e in run.background
+                          if (Run.inside(e["t"], run.quiet_a) or Run.inside(e["t"], run.quiet_b))}):
+        groups[placement(minute)].append(minute)
+    totals = defaultdict(int)
+    for e in run.background:
+        totals[int(e["t"])] += e["counts"].get("ok", 0)
+    judged = []
+    for key, minutes in groups.items():
+        rates = [totals[m] for m in minutes][1:-1]  # a run of minutes starts and ends partial
+        if len(rates) >= 5:
+            mean = statistics.mean(rates)
+            spread = (max(rates) - min(rates)) / 2 / mean if mean else 1
+            judged.append({"primaries": list(key), "minutes": len(rates), "ops_per_min_mean": round(mean),
+                           "half_spread": round(spread, 4)})
+    if not judged:
+        criterion(results, 11, THROUGHPUT_NAME, "not_measured")
     else:
-        rates = rates[1:-1]  # a window's edge minutes are partial
-        mean = statistics.mean(rates)
-        spread = (max(rates) - min(rates)) / 2 / mean if mean else 1
-        criterion(results, 11, "background throughput steady (+-5 %) in quiet windows", "pass" if spread <= 0.05 else "fail",
-                  {"ops_per_min_mean": round(mean), "half_spread": round(spread, 4)}, 0.05)
+        worst = max(j["half_spread"] for j in judged)
+        criterion(results, 11, THROUGHPUT_NAME, "pass" if worst <= 0.05 else "fail",
+                  {"half_spread": worst, "placements": len(judged)}, 0.05, judged)
     lag = _replica_lag_s(run)
     if lag is None:
         criterion(results, 12, "replica lag p99 < 1 s in quiet windows", "not_measured")
@@ -335,6 +363,48 @@ def evaluate(run: Run) -> dict:
     return {"run_id": run.status.get("run_id"), "verdict": verdict, "windows": {
         "load": run.load, "quiet_a": run.quiet_a, "quiet_b": run.quiet_b, "faults": len(run.windows)},
         "criteria": results, "hourly": _hourly(run)}
+
+
+RECOVERY_NAME = "every fault recovers: after the fault ends, max <= 15 s, median <= 5 s; a slot move <= 60 s"
+RECOVERY_MAX_S = 15
+RECOVERY_MEDIAN_S = 5
+MOVE_MAX_S = 60
+
+
+def _recovery_after_fault(run: Run) -> list[tuple[str, float]]:
+    """Each healed fault's recovery time counted from the end of the fault: `recovery_s` runs
+    from the injection, so it holds the fault's own down time, which the plan draws at random."""
+    out = []
+    down = 0.0
+    for e in run.events:
+        if e["event"] == "fault":
+            down = float(e.get("down_s") or 0)
+        elif e["event"] == "healed":
+            out.append((e["kind"], round(max(0.0, float(e["recovery_s"]) - down), 2)))
+            down = 0.0
+    return out
+
+
+THROUGHPUT_NAME = "background throughput steady (+-5 %) in quiet windows, per primary placement"
+
+
+def _placements(run: Run):
+    """A function from an epoch second to the primaries named by the latest metrics sample at
+    or before it (a sorted tuple of process names; empty before the first sample)."""
+    samples: dict[float, set[str]] = defaultdict(set)
+    for m in run.metrics:
+        if "replication_role" in m:
+            samples[m["t"]]
+            if m.get("replication_role") == "primary":
+                samples[m["t"]].add(m["process"])
+    times = sorted(samples)
+    keys = [tuple(sorted(samples[t])) for t in times]
+
+    def at(t: float) -> tuple:
+        index = bisect.bisect_right(times, t) - 1
+        return keys[index] if index >= 0 else ()
+
+    return at
 
 
 def _wall(run: Run, mono: int) -> float | None:

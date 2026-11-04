@@ -1,0 +1,109 @@
+{
+ "name": "azure-30m-faults",
+ "seed": 1,
+ "duration_s": 1800,
+ "warmup_s": 120,
+ "restart_as": "mixed",
+ "cluster": {
+  "ping_interval_ms": 500,
+  "down_after_ms": 3000,
+  "primary_lease_ms": 2000,
+  "snapshot_interval_ms": 60000
+ },
+ "load": {
+  "rate_per_worker": 25,
+  "keys_per_worker": 8,
+  "counters": 2,
+  "appenders": 2,
+  "registers": 2,
+  "readers_per_register": 2,
+  "max_list_len": 20000,
+  "profiles": {
+   "default": {},
+   "durable": {
+    "replicas": 2
+   }
+  },
+  "official": {
+   "path": "clients/python",
+   "counters": 1,
+   "registers": 1,
+   "readers_per_register": 2
+  },
+  "background": {
+   "processes": 6,
+   "rate": 1000,
+   "keys": 1000000,
+   "value_bytes": 100
+  }
+ },
+ "faults": {
+  "start_s": 300,
+  "stop_s": 1500,
+  "interval_s": [
+   90,
+   100
+  ],
+  "down_s": [
+   5,
+   15
+  ],
+  "recovery_timeout_s": 120,
+  "netem": "delay 50ms 20ms loss 2%",
+  "migrate_range": "4096-4607",
+  "sequence": [
+   {
+    "kind": "kill-primary"
+   },
+   {
+    "kind": "kill-replica"
+   },
+   {
+    "kind": "stall-replica"
+   },
+   {
+    "kind": "kill-coordinator-leader"
+   },
+   {
+    "kind": "kill-host"
+   },
+   {
+    "kind": "isolate-host"
+   },
+   {
+    "kind": "netem"
+   },
+   {
+    "kind": "partition-coordinator-leader"
+   },
+   {
+    "kind": "migrate-slots"
+   },
+   {
+    "kind": "restart-all-data"
+   }
+  ],
+  "kinds": [
+   "kill-primary",
+   "kill-replica",
+   "stall-replica",
+   "kill-coordinator-leader",
+   "kill-host",
+   "isolate-host",
+   "netem",
+   "partition-coordinator-leader",
+   "migrate-slots"
+  ]
+ },
+ "metrics_interval_s": 10,
+ "full_info_every": 6,
+ "status_interval_s": 60,
+ "artifact_interval_s": 300,
+ "history_segment_s": 600,
+ "log_interval_s": 900,
+ "check_buckets": 4,
+ "report_settle_s": 120,
+ "rss_min_window_s": 900,
+ "rss_warn_percent_per_hour": 1000.0,
+ "startup_timeout_s": 180
+}
