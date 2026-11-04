@@ -2186,7 +2186,8 @@ fn compact_keeps_the_change_stream_window_and_nothing_more() {
 
     let (before, off, _) = run(0);
     let (_, everything, _) = run(u64::MAX);
-    let (_, windowed, segment_bytes) = run(2048);
+    // Wider than the resume history every compaction keeps (an eighth of a segment).
+    let (_, windowed, segment_bytes) = run(3 * 4096);
 
     assert!(before.1 > 2, "test needs several segments");
     assert!(off.1 < before.1, "no window: covered segments go");
@@ -2196,7 +2197,7 @@ fn compact_keeps_the_change_stream_window_and_nothing_more() {
     );
     assert!(windowed.1 > off.1, "a window holds back some segments");
     assert!(windowed.1 < before.1, "but not all of them");
-    assert!(windowed.0 <= 2048 + segment_bytes);
+    assert!(windowed.0 <= 3 * 4096 + segment_bytes);
 }
 
 #[test]
@@ -2874,4 +2875,125 @@ fn a_record_over_the_command_limit_leaves_the_staged_batch_intact() {
 
     assert_eq!(keys, [b"a".to_vec(), b"b".to_vec()]);
     assert_eq!(report.last_sequence, 2);
+}
+
+/// Under steady writes the open segment always holds records newer than the checkpoint. A
+/// large one is closed by the checkpoint, so the next checkpoint deletes it instead of the WAL
+/// growing to `wal_segment_bytes` first.
+#[test]
+fn a_checkpoint_closes_a_large_open_segment_so_the_next_one_can_delete_it() {
+    let directory = tempdir().unwrap();
+    let config = PersistenceConfig {
+        wal_segment_bytes: 64 * 1024,
+        ..bulk_config(directory.path())
+    };
+    let limits = ProtocolLimits::default();
+    let (mut sink, _, _) = WalSink::open(config.clone(), 0, limits).unwrap();
+    let wal_dir = shard_wal_directory(directory.path(), 0);
+    let first_sequences = || {
+        let mut firsts: Vec<u64> = fs::read_dir(&wal_dir)
+            .unwrap()
+            .map(|entry| segment_first_sequence(&entry.unwrap().path()).unwrap())
+            .collect();
+        firsts.sort_unstable();
+        firsts
+    };
+    let write = |sink: &mut WalSink, count: u64| {
+        for index in 0..count {
+            sink.record(Mutation::SetBytes {
+                key: b"key",
+                value: &[index as u8; 64],
+            })
+            .unwrap();
+        }
+        sink.flush().unwrap();
+    };
+
+    // 200 records (~20 KiB) stay in one segment: above an eighth of it, far below its size.
+    write(&mut sink, 200);
+    assert_eq!(first_sequences(), vec![1]);
+
+    // A checkpoint covering half of them closes the segment; it keeps the uncovered half.
+    sink.compact(100).unwrap();
+    assert_eq!(first_sequences(), vec![1, 201]);
+
+    write(&mut sink, 100);
+
+    // The next checkpoint covers the closed segment and deletes it.
+    sink.compact(250).unwrap();
+    assert_eq!(first_sequences(), vec![201, 301]);
+    drop(sink);
+
+    let (_sink, mutations, report) = WalSink::open_after(config, 0, limits, 250).unwrap();
+
+    assert_eq!(report.last_sequence, 300);
+    assert_eq!(mutations.len(), 50);
+}
+
+/// A small open segment is left alone, so a lightly written shard does not get a new file on
+/// every checkpoint.
+#[test]
+fn a_checkpoint_leaves_a_small_open_segment_open() {
+    let directory = tempdir().unwrap();
+    let config = PersistenceConfig {
+        wal_segment_bytes: 1024 * 1024,
+        ..bulk_config(directory.path())
+    };
+    let limits = ProtocolLimits::default();
+    let (mut sink, _, _) = WalSink::open(config, 0, limits).unwrap();
+
+    for index in 0..20u8 {
+        sink.record(Mutation::SetBytes {
+            key: b"key",
+            value: &[index; 64],
+        })
+        .unwrap();
+    }
+    sink.flush().unwrap();
+    sink.compact(10).unwrap();
+
+    let wal_dir = shard_wal_directory(directory.path(), 0);
+    assert_eq!(fs::read_dir(&wal_dir).unwrap().count(), 1);
+}
+
+/// Compaction keeps the newest eighth of a segment's worth of log even when a checkpoint
+/// covers it, so a replica that was away for a moment can still resume from the WAL.
+#[test]
+fn compaction_keeps_a_short_resume_history() {
+    let directory = tempdir().unwrap();
+    let config = PersistenceConfig {
+        wal_segment_bytes: 64 * 1024,
+        ..bulk_config(directory.path())
+    };
+    let limits = ProtocolLimits::default();
+    let (mut sink, _, _) = WalSink::open(config, 0, limits).unwrap();
+    let wal_dir = shard_wal_directory(directory.path(), 0);
+    let first_sequences = || {
+        let mut firsts: Vec<u64> = fs::read_dir(&wal_dir)
+            .unwrap()
+            .map(|entry| segment_first_sequence(&entry.unwrap().path()).unwrap())
+            .collect();
+        firsts.sort_unstable();
+        firsts
+    };
+    let write = |sink: &mut WalSink, count: u64| {
+        for index in 0..count {
+            sink.record(Mutation::SetBytes {
+                key: b"key",
+                value: &[index as u8; 64],
+            })
+            .unwrap();
+        }
+        sink.flush().unwrap();
+    };
+
+    write(&mut sink, 200);
+    sink.compact(100).unwrap();
+    assert_eq!(first_sequences(), vec![1, 201]);
+
+    // The checkpoint covers the closed segment, but the open one holds only ten records: less
+    // than an eighth of a segment, so the closed one stays as history.
+    write(&mut sink, 10);
+    sink.compact(205).unwrap();
+    assert_eq!(first_sequences(), vec![1, 201]);
 }

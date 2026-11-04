@@ -374,6 +374,15 @@ script's writes whose record is larger than `wal_segment_bytes` is refused with
 the shard stays healthy (this is not a `MISCONF` state), and the refusal is
 logged at most once a minute. Raise `wal_segment_bytes` or split the write.
 
+A checkpoint deletes the segments it covers. It also closes the open segment once that
+holds an eighth of `wal_segment_bytes` (32 MiB by default), so under steady writes each
+shard's WAL stays near what was written since the last checkpoint or two, and does not
+grow to `wal_segment_bytes` before anything is deleted. The newest eighth of a segment's
+worth of log is always kept, so a replica that reconnects after a moment, or a change-stream
+reader a little behind, resumes from the WAL instead of starting over. Segments a connected
+replica has not received yet, or that the change stream keeps (`cdc_retain_bytes`), stay
+longer.
+
 `wal_segment_bytes` can be lowered between restarts: older, longer segments are still
 read (with a warning) and new records go to segments of the new size. `ruvio-ctl` reads
 segments of any length.
