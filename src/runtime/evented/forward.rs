@@ -1335,6 +1335,8 @@ async fn execute_request_in(
     session.resp = request.resp;
     session.database = request.database;
     session.tracking = request.tracking;
+    // The node the client is connected to already decided where the command runs.
+    session.replica_reads = true;
     // The home shard already ran the NOAUTH, rate and ACL checks; the ACL is checked again
     // here (and inside scripts) with the caller's own rules.
     let mut auth = crate::acl::ConnectionAuth {

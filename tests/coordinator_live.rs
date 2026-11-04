@@ -293,6 +293,25 @@ fn call(address: &str, args: &[&str]) -> Option<String> {
     read_reply(&mut BufReader::new(stream))
 }
 
+/// `READONLY`, then `GET key`, on one connection: a replica of a multi-node cluster answers
+/// a read from a connection without `READONLY` with `MOVED` to its primary.
+fn read_replica(address: &str, key: &str) -> Option<String> {
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&address.parse().ok()?, Duration::from_millis(300))
+            .ok()?;
+    let frame = format!(
+        "*1\r\n$8\r\nREADONLY\r\n*2\r\n$3\r\nGET\r\n${}\r\n{key}\r\n",
+        key.len()
+    );
+
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    stream.write_all(frame.as_bytes()).ok()?;
+    let mut reader = BufReader::new(stream);
+
+    (read_reply(&mut reader)? == "OK").then_some(())?;
+    read_reply(&mut reader)
+}
+
 /// `AUTH` with the coordinators' secret, then `args`, on one connection.
 fn call_with_secret(address: &str, args: &[&str]) -> Option<String> {
     let mut stream =
@@ -1327,7 +1346,7 @@ fn a_slot_range_moves_between_groups_while_a_client_keeps_writing() {
     // The replicas follow: b's copies the range, a's drops it.
     wait_until("b's replica to hold the range", || {
         keys.iter()
-            .all(|key| call(&groups.node(3), &["GET", key]).as_deref() == Some(key.as_str()))
+            .all(|key| read_replica(&groups.node(3), key).as_deref() == Some(key.as_str()))
     });
     wait_until("group a to drop its copy", || {
         [0, 1]
@@ -1452,7 +1471,7 @@ fn a_rebalance_evens_out_the_slots_in_moves_while_a_client_keeps_writing() {
     // move began.
     wait_until("b's replica to hold both ranges", || {
         keys.iter()
-            .all(|key| call(&groups.node(3), &["GET", key]).as_deref() == Some(key.as_str()))
+            .all(|key| read_replica(&groups.node(3), key).as_deref() == Some(key.as_str()))
     });
 }
 
@@ -1550,7 +1569,7 @@ fn a_replica_down_during_two_moves_takes_them_from_the_log() {
     });
     wait_until("b's replica to hold both ranges", || {
         keys.iter()
-            .all(|key| call(&groups.node(3), &["GET", key]).as_deref() == Some(key.as_str()))
+            .all(|key| read_replica(&groups.node(3), key).as_deref() == Some(key.as_str()))
     });
 }
 
@@ -1577,7 +1596,7 @@ fn moves_to_both_shards_of_a_group_reach_its_replica() {
     for node in [2, 3] {
         wait_until("b's members to hold every moved key", || {
             keys.iter()
-                .all(|key| call(&groups.node(node), &["GET", key]).as_deref() == Some(key.as_str()))
+                .all(|key| read_replica(&groups.node(node), key).as_deref() == Some(key.as_str()))
         });
     }
     assert_eq!(coordinator(&["COORDINATOR", "REBALANCE", "DRYRUN"]), "");
@@ -1602,7 +1621,7 @@ fn a_failover_of_the_source_during_a_move_starts_it_again_with_the_new_primary()
     }
     wait_until("a's replica to copy the keys", || {
         keys.iter()
-            .all(|key| call(&groups.node(1), &["GET", key]).as_deref() == Some(key.as_str()))
+            .all(|key| read_replica(&groups.node(1), key).as_deref() == Some(key.as_str()))
     });
     let id = call_with_secret(
         &groups.coordinator,

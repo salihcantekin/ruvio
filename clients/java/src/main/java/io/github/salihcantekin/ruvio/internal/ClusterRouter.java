@@ -24,6 +24,7 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Routes encoded commands to the node that owns their key's slot.
@@ -113,6 +114,8 @@ public final class ClusterRouter implements AutoCloseable {
     private volatile ClusterNode[] table = new ClusterNode[SLOTS];
     private final AtomicInteger nextIndex = new AtomicInteger();
     private final Object refreshLock = new Object();
+    /** Counts the slot tables {@link #refresh()} installed; lets callers that queued behind a reload skip their own. */
+    private final AtomicLong reloads = new AtomicLong();
     private volatile boolean closed;
 
     private ClusterRouter(RuvioOptions options, ClusterNode seed) {
@@ -359,6 +362,7 @@ public final class ClusterRouter implements AutoCloseable {
             pickReaders(listed);
         }
         table = t;
+        reloads.incrementAndGet();
     }
 
     /** Adds the replicas listed after the primary in a range; an entry that cannot be read is skipped. */
@@ -909,6 +913,79 @@ public final class ClusterRouter implements AutoCloseable {
             route(DIRECT, slotOf(r.frame, r.frameOff, r.frameLen), r.frame, r.frameOff, r.frameLen, r, false);
         } catch (RuntimeException e) {
             r.failFinal(e);
+        }
+    }
+
+    /**
+     * Tells whether an error is a refused write: {@code READONLY} alone or followed by a space. The node that
+     * owned the slot was demoted by a failover; nothing ran.
+     *
+     * @param error the failure
+     * @return {@code true} for a server error that is {@code READONLY}
+     */
+    public static boolean isReadonly(Throwable error) {
+        if (!(error instanceof RuvioServerException)) {
+            return false;
+        }
+        String m = error.getMessage();
+        return m != null && m.startsWith("READONLY") && (m.length() == 8 || m.charAt(8) == ' ');
+    }
+
+    /**
+     * After a {@code READONLY} reply: reloads the slot table off the reader threads and sends the command once
+     * to the owner the new table names, when that is another node. {@code READONLY} is sent before a command
+     * runs, so it cannot be applied twice. A keyless command, a table that cannot be reloaded or one that still
+     * names the same node completes with the error.
+     *
+     * @param r the refused request
+     * @param readonly the {@code READONLY} error
+     */
+    public void afterReadonly(RoutedRequest<?> r, Throwable readonly) {
+        int slot = slotOrNone(r);
+        if (slot < 0 || closed) {
+            r.failFinal(readonly);
+            return;
+        }
+        // Taken on the reader thread, when the reply arrived: the node that refused and the table it came from.
+        ClusterNode refused = owner(slot);
+        long seen = reloads.get();
+        try {
+            BACKGROUND.execute(() -> {
+                try {
+                    reloadUnlessNewer(seen);
+                    if (owner(slot) == refused) {
+                        r.failFinal(readonly);
+                        return;
+                    }
+                    r.replica = null;
+                    route(DIRECT, slot, r.frame, r.frameOff, r.frameLen, r, false);
+                } catch (RuntimeException e) {
+                    r.failFinal(readonly);
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            r.failFinal(readonly);
+        }
+    }
+
+    /**
+     * Reloads the slot table unless one was installed after {@code seen} was read: the writers refused by the same
+     * demoted node share one {@code CLUSTER SLOTS} instead of queueing one each behind {@link #refreshLock}.
+     */
+    private void reloadUnlessNewer(long seen) {
+        synchronized (refreshLock) {
+            if (reloads.get() == seen) {
+                refresh();
+            }
+        }
+    }
+
+    /** The slot of a request's command, or -1 when it has no key or cannot be read. */
+    private static int slotOrNone(RoutedRequest<?> r) {
+        try {
+            return slotOf(r.frame, r.frameOff, r.frameLen);
+        } catch (RuntimeException e) {
+            return -1;
         }
     }
 

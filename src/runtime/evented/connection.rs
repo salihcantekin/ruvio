@@ -722,11 +722,20 @@ pub(super) async fn handle_client(
 
                     let mutates = hot_command_mutates_store(&command);
 
-                    if let Some(refusal) = state.write_gate.get().refusal()
-                        && mutates
-                    {
-                        write_response(&mut output, Response::Error(refusal))?;
-                        continue;
+                    if let Some(refusal) = state.write_gate.get().refusal() {
+                        if mutates {
+                            if !redirect_refused(&state, &mut output, hot_command_slot(&command))? {
+                                write_response(&mut output, Response::Error(refusal))?;
+                            }
+                            continue;
+                        }
+                        if !session.replica_reads
+                            && redirect_replica_read(&state, &mut output, || {
+                                hot_command_slot(&command)
+                            })?
+                        {
+                            continue;
+                        }
                     }
 
                     if state.hot_store.is_some()
@@ -1740,6 +1749,72 @@ pub(super) async fn dispatch_command<'s>(
     result
 }
 
+/// A write this replica refused, sent to the primary that takes it with `-MOVED` when the node
+/// is part of a multi-node cluster (see [`crate::runtime::cluster::redirect_refused_write`]); `false`
+/// leaves the refusal to the caller. Called only after a write was refused, so a node that
+/// takes writes never gets here.
+fn redirect_refused(
+    state: &ShardState,
+    output: &mut impl Write,
+    slot: Option<u16>,
+) -> io::Result<bool> {
+    let Some(slot) = slot else {
+        return Ok(false);
+    };
+    if state.write_gate.get() != crate::replication::WriteGate::Replica {
+        return Ok(false);
+    }
+    let Some(topology) = state
+        .forwarding
+        .as_ref()
+        .and_then(|forwarding| forwarding.fabric.topology())
+    else {
+        return Ok(false);
+    };
+
+    crate::runtime::cluster::redirect_refused_write(
+        output,
+        state.cluster_view(),
+        Some(topology),
+        &state.shard_peers(),
+        slot,
+    )
+}
+
+/// A keyed command on a replica of a multi-node cluster from a connection that did not send
+/// `READONLY`: answered with `-MOVED` to the primary of its slot, so a cluster client that
+/// only reads moves to the new primary after a failover instead of reading a demoted one.
+/// `false` (the command runs here) on a primary, a standalone or single-node replica, a
+/// command without a key, or when no primary can be named. `slot` is computed only on such
+/// a replica.
+fn redirect_replica_read(
+    state: &ShardState,
+    output: &mut impl Write,
+    slot: impl FnOnce() -> Option<u16>,
+) -> io::Result<bool> {
+    if state.write_gate.get() != crate::replication::WriteGate::Replica {
+        return Ok(false);
+    }
+    let Some(topology) = state
+        .forwarding
+        .as_ref()
+        .and_then(|forwarding| forwarding.fabric.topology())
+    else {
+        return Ok(false);
+    };
+    let Some(slot) = slot() else {
+        return Ok(false);
+    };
+
+    crate::runtime::cluster::redirect_refused_write(
+        output,
+        state.cluster_view(),
+        Some(topology),
+        &state.shard_peers(),
+        slot,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_inner<'s>(
     state: &'s Rc<ShardState>,
@@ -1771,6 +1846,13 @@ async fn dispatch_inner<'s>(
         &command,
     ) {
         SessionAction::Reply(response) => {
+            if matches!(response, Response::Error(line) if line == crate::replication::READONLY_LINE)
+                && !session.is_multi()
+                && redirect_refused(state, output, command_slot(&command).ok().flatten())?
+            {
+                return Ok(());
+            }
+
             if matches!(command, Command::ClientTracking(false))
                 && matches!(response, Response::Simple(b"OK"))
             {
@@ -1820,6 +1902,15 @@ async fn dispatch_inner<'s>(
                 return Ok(());
             }
         }
+    }
+
+    // A replica of a multi-node cluster sends a keyed command to its primary unless the
+    // connection asked for replica reads (`READONLY`), as Redis Cluster does.
+    if !session.replica_reads
+        && !session.is_multi()
+        && redirect_replica_read(state, output, || command_slot(&command).ok().flatten())?
+    {
+        return Ok(());
     }
 
     // A hot key lives in the shared hot store, outside the shard's transaction and its undo
@@ -1889,6 +1980,9 @@ async fn dispatch_inner<'s>(
             }
 
             Command::ReadOnly | Command::ReadWrite => {
+                if state.cluster_view().is_some() {
+                    session.replica_reads = matches!(command, Command::ReadOnly);
+                }
                 write_read_mode(output, state.cluster_view())?;
 
                 return Ok(());

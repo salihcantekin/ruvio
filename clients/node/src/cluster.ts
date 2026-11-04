@@ -312,7 +312,7 @@ const TRYAGAIN_WAIT_MS = 5;
 const ASKING_FRAME = Buffer.from('*1\r\n$6\r\nASKING\r\n');
 
 /** Error codes the router handles by sending the command again. */
-const isRedirect = (code: string): boolean => code === 'MOVED' || code === 'ASK' || code === 'TRYAGAIN';
+const isRedirect = (code: string): boolean => code === 'MOVED' || code === 'ASK' || code === 'TRYAGAIN' || code === 'READONLY';
 
 // ---- nodes ----------------------------------------------------------------------------------
 
@@ -856,13 +856,29 @@ class Router {
    * `ASK slot host:port` sends `ASKING` and the command to the named node in one write and leaves
    * the table alone. MOVED and ASK share `MAX_REDIRECTS`; the redirect after that is returned as
    * the error. `TRYAGAIN` waits 5, 10, 20, ... 320 ms and routes the command again by the current
-   * table, at most `MAX_TRYAGAIN` times; the TRYAGAIN after that is returned.
+   * table, at most `MAX_TRYAGAIN` times; the TRYAGAIN after that is returned. `READONLY` (the node
+   * that owned the slot was demoted by a failover; nothing ran) reloads the table and sends the
+   * command once to the node it names, when that is another node; otherwise the error is returned.
    */
   async moved(e: RuvioError, frame: Buffer, tf: Tf | null, fl: number, hop = 1, tries = 0, movedBefore = false): Promise<any> {
+    let readonly = false;
     for (;;) {
       let conn: Connection;
       let asking = false;
-      if (e.code === 'TRYAGAIN') {
+      if (e.code === 'READONLY') {
+        if (readonly) throw e;
+        readonly = true;
+        const refused = this.target(frame, 0);
+        if (typeof refused === 'number' || LAST_SLOT < 0) throw e;
+        try {
+          await this.refresh();
+        } catch {
+          throw e;
+        }
+        const t = this.target(frame, 0);
+        if (typeof t === 'number' || t.addr === refused.addr) throw e;
+        conn = t.conn;
+      } else if (e.code === 'TRYAGAIN') {
         if (tries >= MAX_TRYAGAIN) throw e;
         await new Promise((r) => setTimeout(r, TRYAGAIN_WAIT_MS << tries));
         tries++;
@@ -1109,6 +1125,16 @@ function replicaFault(v: unknown): boolean {
   return (v instanceof ConnectionError && v.unreachable) || (v instanceof RuvioError && (v.code === 'LOADING' || v.code === 'MASTERDOWN'));
 }
 
+/** The command name of one RESP frame (`*N\r\n$len\r\nNAME...`), upper-cased; empty when it cannot be read. */
+function frameName(frame: Buffer): string {
+  const dollar = frame.indexOf(36); // '$'
+  if (dollar < 0) return '';
+  const eol = frame.indexOf(13, dollar);
+  const len = Number(frame.toString('latin1', dollar + 1, eol));
+  if (eol < 0 || !Number.isInteger(len) || len < 0) return '';
+  return frame.toString('latin1', eol + 2, eol + 2 + len).toUpperCase();
+}
+
 /** Receives a pipeline's replies at the caller's indexes and follows MOVED per command. */
 class ClusterSink implements BatchSink {
   private offs: Int32Array | null = null;
@@ -1132,7 +1158,7 @@ class ClusterSink implements BatchSink {
         return;
       }
     }
-    if (v instanceof RuvioError && isRedirect(v.code)) {
+    if (v instanceof RuvioError && isRedirect(v.code) && !this.inMulti(i)) {
       this.r.moved(v, this.frame(i), null, this.fls[i]!).then(
         (x) => this.out.set(i, x),
         (e) => this.out.set(i, e),
@@ -1140,6 +1166,19 @@ class ClusterSink implements BatchSink {
       return;
     }
     this.out.set(i, v);
+  }
+  /**
+   * Whether command `i` was queued inside a `MULTI` the batch itself sent (rare path): sending it alone
+   * elsewhere would apply it outside the transaction, whose `EXEC` fails, so its redirect is returned.
+   */
+  private inMulti(i: number): boolean {
+    let open = false;
+    for (let k = 0; k < i; k++) {
+      const name = frameName(this.frame(k));
+      if (name === 'MULTI') open = true;
+      else if (name === 'EXEC' || name === 'DISCARD') open = false;
+    }
+    return open;
   }
   /** Frame `i` of the batch bytes (rare path: offsets are rebuilt here). */
   private frame(i: number): Buffer {

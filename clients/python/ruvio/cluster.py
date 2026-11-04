@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import _cluster as cl
 from ._blocking import FOREVER, blocking_wait, frames_wait, pipeline_wait
 from ._commands import Conv
+from ._follow import is_readonly
 from ._pipeline import _EXEC, _MULTI
 from .client import PubSub, Ruvio, _Conn, _Options, _ReplicaOptions
 from .errors import ConnectionError, CrossSlotError, MovedError, ResponseError, RuvioError, TimeoutError
@@ -420,9 +421,28 @@ class ClusterRuvio(Ruvio):
         if isinstance(reply, ResponseError):
             if cl.is_tryagain(reply):  # only an error reply gets here
                 reply = self._redirect(reply, data, dec)
+            elif is_readonly(reply):
+                reply = self._readonly(reply, data, dec)
             if isinstance(reply, ResponseError):
                 raise reply
         return reply if conv is None else conv(reply)
+
+    def _readonly(self, err: ResponseError, data: bytes, dec: bool) -> Any:
+        """After ``-READONLY``: the node that owned the slot was demoted by a failover. The slot table is
+        reloaded and, when it names another node for the command, the command is sent there once (``READONLY``
+        is sent before a command runs, so it was not applied). The retry's reply, an error included, is
+        returned; when the table names the same node, or a ``WATCH`` is open, ``err`` is returned."""
+        c = self._cl
+        before = self._route_node(data)
+        if before is None or not self._refresh():
+            return err
+        after = self._route_node(data)
+        if after is None or (after.host, after.port) == (before.host, before.port) or c.watch is not None:
+            return err
+        reply = self._rt(after.conn, data, dec)
+        if reply.__class__ is MovedError:
+            reply = self._redirect(reply, data, dec)
+        return reply
 
     def _open_target(self, ni: int, data: bytes) -> _Conn:
         """Opens the socket of target ``ni`` for an ordinary command. When the node cannot be

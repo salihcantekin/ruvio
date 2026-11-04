@@ -17,6 +17,7 @@ from typing import Any, Awaitable, Dict, List, Optional, Tuple
 from .. import _cluster as cl
 from .._blocking import pipeline_wait
 from .._commands import Conv
+from .._follow import is_readonly
 from .._pipeline import _EXEC, _MULTI
 from ..client import _Options, _ReplicaOptions
 from ..errors import ConnectionError, CrossSlotError, MovedError, ResponseError, RuvioError
@@ -42,7 +43,10 @@ class _Node:
 
 
 class _State:
-    __slots__ = ("mode", "slots", "nodes", "by_addr", "seed", "watch", "gate", "targets", "policy", "reps", "rnodes")
+    __slots__ = (
+        "mode", "slots", "nodes", "by_addr", "seed", "watch", "gate", "targets", "policy", "reps", "rnodes",
+        "reloads", "reloading",
+    )
 
     def __init__(self, seed: _Node) -> None:
         self.mode = 0
@@ -56,17 +60,19 @@ class _State:
         self.policy = cl.POLICY_PRIMARY  # where reads go; anything but primary adds the replica paths
         self.reps: List[Optional[_Node]] = []  # per node index: the replica its reads go to (None = none usable)
         self.rnodes: Dict[Tuple[str, int], _Node] = {}  # the replica nodes of the last load, by address
+        self.reloads = 0  # slot tables installed; a READONLY that saw an older count skips its own reload
+        self.reloading: Optional[asyncio.Future] = None  # type: ignore[type-arg]  # the reload READONLY replies share
 
 
 class _RoutedFuture(asyncio.Future):  # type: ignore[type-arg]
     """The future of a single-key command handed to the shared connection. It behaves like any
-    future; only a ``-MOVED`` / ``-ASK`` / ``-TRYAGAIN`` reply is intercepted (in ``set_exception``) and followed to the node
+    future; only a ``-MOVED`` / ``-ASK`` / ``-TRYAGAIN`` / ``-READONLY`` reply is intercepted (in ``set_exception``) and followed to the node
     the reply names. This keeps the warm path free of an extra coroutine."""
 
     __slots__ = ("owner", "data", "conv", "dec")
 
     def set_exception(self, exc: BaseException) -> None:
-        if (exc.__class__ is MovedError or (exc.__class__ is ResponseError and cl.is_tryagain(exc))) and not self.done():
+        if (exc.__class__ is MovedError or (exc.__class__ is ResponseError and (cl.is_tryagain(exc) or is_readonly(exc)))) and not self.done():
             asyncio.ensure_future(self.owner._retry_moved(self, exc), loop=self.get_loop())
         else:
             asyncio.Future.set_exception(self, exc)
@@ -302,6 +308,7 @@ class ClusterRuvio(Ruvio):
         c.nodes = nodes
         c.by_addr = by
         c.slots = topo.slots
+        c.reloads += 1
         c.targets = [*nodes, c.seed]
         if c.policy:
             self._pick_replicas(topo)
@@ -479,7 +486,7 @@ class ClusterRuvio(Ruvio):
         try:
             return await fut
         except ResponseError as err:
-            if err.__class__ is MovedError or cl.is_tryagain(err):
+            if err.__class__ is MovedError or cl.is_tryagain(err) or is_readonly(err):
                 return await self._redirect(err, data, conv, dec, False)
             raise
 
@@ -584,7 +591,10 @@ class ClusterRuvio(Ruvio):
     ) -> Any:
         """Follows ``-MOVED`` and ``-ASK`` (one budget of ``MAX_REDIRECTS`` per command) and re-sends after
         ``-TRYAGAIN`` (``TRYAGAIN_DELAYS``, one ``asyncio.sleep`` before each re-send); the last error is raised
-        when a budget runs out. ``ASK`` sends ``ASKING`` and the command to the named node and leaves the table alone."""
+        when a budget runs out. ``ASK`` sends ``ASKING`` and the command to the named node and leaves the table alone.
+        ``-READONLY`` goes to :meth:`_readonly`."""
+        if is_readonly(err):
+            return await self._readonly(err, data, conv, dec, blocking)
         hops = moved = tries = 0
         while True:
             ask = None
@@ -622,6 +632,46 @@ class ClusterRuvio(Ruvio):
                 if e.__class__ is not MovedError and not cl.is_tryagain(e):
                     raise
                 err = e
+
+    async def _readonly(self, err: ResponseError, data: bytes, conv: Conv, dec: bool, blocking: bool) -> Any:
+        """After ``-READONLY``: the node that owned the slot was demoted by a failover. The slot table is
+        reloaded and, when it names another node for the command, the command is sent there once (``READONLY``
+        is sent before a command runs, so it was not applied). The retry's reply, an error included, is
+        returned; when the table names the same node, or a ``WATCH`` is open, ``err`` is raised."""
+        c = self._cl
+        seen = c.reloads
+        before = self._route_node(data)
+        if before is None or not await self._reload_after(seen):
+            raise err
+        after = self._route_node(data)
+        if after is None or (after.host, after.port) == (before.host, before.port) or c.watch is not None:
+            raise err
+        try:
+            if blocking:
+                return await self._send_blocking(after, data, conv, dec)
+            return await self._send(after, data, conv, dec)
+        except ResponseError as e:
+            if e.__class__ is MovedError or cl.is_tryagain(e):
+                return await self._redirect(e, data, conv, dec, blocking)
+            raise
+
+    async def _reload_after(self, seen: int) -> bool:
+        """Reloads the slot table unless one was installed since the reload count was ``seen``. The commands a
+        demoted node refused at once share one ``CLUSTER SLOTS``: a reload already running is awaited."""
+        c = self._cl
+        if c.reloads != seen:
+            return True
+        task = c.reloading
+        if task is None:
+            task = c.reloading = asyncio.ensure_future(self._refresh())
+            task.add_done_callback(self._reloaded)
+        return bool(await asyncio.shield(task))
+
+    def _reloaded(self, task: "asyncio.Future[bool]") -> None:
+        if self._cl.reloading is task:
+            self._cl.reloading = None
+        if not task.cancelled():
+            task.exception()
 
     def _route_node(self, data: bytes) -> Optional[_Node]:
         """The node the current table names for a command's frame (the seed for a keyless one); None for a
@@ -702,7 +752,7 @@ class ClusterRuvio(Ruvio):
                 node = await self._open_owner(slot)
             return await self._send(node, data, conv, dec)
         except ResponseError as err:
-            if err.__class__ is MovedError or cl.is_tryagain(err):
+            if err.__class__ is MovedError or cl.is_tryagain(err) or is_readonly(err):
                 return await self._redirect(err, data, conv, dec, blocking)
             raise
 

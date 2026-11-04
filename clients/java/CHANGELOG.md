@@ -4,6 +4,8 @@ Notable changes to the Java client `io.github.salihcantekin:ruvio-client`. New e
 
 ## Unreleased
 
+- Cluster mode: a `READONLY` reply (the node that owned the slot was demoted by a failover) now reloads the slot table off the reader threads, and when the table names another node the command is sent there once. `READONLY` comes before a command runs, so the retry cannot apply it twice. Before, the client kept writing to the demoted node and got `READONLY` until something else reloaded the table. A keyless command still returns the error. Nothing changes on the success path (issue #406).
+
 ## 0.2.0 - 2026-10-29
 
 - Fixed: a storm of `MOVED` or `TRYAGAIN` replies over many commands in flight no longer starts a platform thread per retry; the cluster follow-ups run on 8 daemon threads with a queue of 65,536, and a follow-up beyond that fails with the redirect error. No API change (issue #322).

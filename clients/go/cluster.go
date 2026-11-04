@@ -74,8 +74,11 @@ type cluster struct {
 	standalone atomic.Bool // the seed answered "cluster mode is disabled"
 	policy     ReadPolicy  // Options.ReadPolicy
 
-	mu    sync.Mutex // guards nodes, refresh and slot patches
-	nodes map[string]*Client
+	mu sync.Mutex // guards nodes, refresh and slot patches
+	// reloads counts the tables refresh installed: callers that queued behind a reload
+	// skip their own (see reloadUnlessNewer).
+	reloads atomic.Uint64
+	nodes   map[string]*Client
 
 	// seeds are the configured Options.Seeds addresses, asked for the slot map when no
 	// known node answers. Empty without Options.Seeds.
@@ -202,6 +205,7 @@ func (cl *cluster) refresh(ctx context.Context, first bool) (*topology, error) {
 			return nil, true, err
 		}
 		cl.t.Store(t)
+		cl.reloads.Add(1)
 		return t, true, nil
 	}
 	for _, n := range known {

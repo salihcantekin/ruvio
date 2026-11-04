@@ -65,20 +65,7 @@ fn shard_nodes(route: &ClusterRoute, peers: &[ShardPeers], shard_id: usize) -> V
     };
     let peers = peers.get(shard_id);
 
-    let followed = peers.and_then(|peers| {
-        peers
-            .primary
-            .as_ref()
-            .map(|primary| (primary.host.clone(), primary.port))
-            .or_else(|| {
-                peers
-                    .following
-                    .then(|| mapped_primary(route, shard_id))
-                    .flatten()
-            })
-    });
-
-    if let Some((primary_host, primary_port)) = followed {
+    if let Some((primary_host, primary_port)) = followed_primary(route, peers, shard_id) {
         return vec![
             Node {
                 id: node_id(&primary_host, primary_port),
@@ -104,6 +91,57 @@ fn shard_nodes(route: &ClusterRoute, peers: &[ShardPeers], shard_id: usize) -> V
     }
 
     nodes
+}
+
+/// The primary shard `shard_id` follows, when it is a replica: the one that accepted it, or
+/// before that the one the cluster map names.
+fn followed_primary(
+    route: &ClusterRoute,
+    peers: Option<&ShardPeers>,
+    shard_id: usize,
+) -> Option<(String, u16)> {
+    peers.and_then(|peers| {
+        peers
+            .primary
+            .as_ref()
+            .map(|primary| (primary.host.clone(), primary.port))
+            .or_else(|| {
+                peers
+                    .following
+                    .then(|| mapped_primary(route, shard_id))
+                    .flatten()
+            })
+    })
+}
+
+/// A write a replica refused (`READONLY`), answered the way Redis Cluster answers it: `-MOVED
+/// slot host:port` naming the node that takes writes for `slot`, so a cluster client reloads
+/// its slot table instead of writing to a demoted primary again. Only on a node of a
+/// multi-node cluster (`topology` is the cluster map): a standalone or single-node replica
+/// keeps `READONLY`, which clients that follow a failover on a plain connection rely on.
+/// `false` when no node can be named; the caller then sends `READONLY`.
+pub(crate) fn redirect_refused_write(
+    output: &mut impl Write,
+    route: Option<&ClusterRoute>,
+    topology: Option<&crate::topology::SharedTopology>,
+    peers: &[ShardPeers],
+    slot: u16,
+) -> io::Result<bool> {
+    let (Some(route), Some(topology)) = (route, topology) else {
+        return Ok(false);
+    };
+    let owner = route.slots.owner(slot);
+
+    if owner >= route.shard_count {
+        write_moved(output, &topology.get(), slot, owner, route.shard_count)?;
+        return Ok(true);
+    }
+    let Some((host, port)) = followed_primary(route, peers.get(owner), owner) else {
+        return Ok(false);
+    };
+
+    write!(output, "-MOVED {slot} {host}:{port}\r\n")?;
+    Ok(true)
 }
 
 /// Shard `shard_id` of this node's group's primary as the cluster map names it, for a replica

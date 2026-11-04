@@ -8,7 +8,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 use crate::blocking::{Wait, blocking_wait, pipeline_wait};
-use crate::client::{ClientOptions, NoticeHook, ReadPolicy};
+use crate::client::{ClientOptions, NoticeHook, ReadPolicy, is_readonly};
 use crate::codec::read_value;
 use crate::command_keys::{COMMAND_KEY_RULES, KeyRule};
 use crate::tls::Stream;
@@ -1204,14 +1204,18 @@ impl ClusterRouter {
             _ => {}
         }
 
-        let target = match single_key(name, arguments) {
-            Some(key) => self.slot_target(name, hash_slot(key))?,
+        let (target, slot) = match single_key(name, arguments) {
+            Some(key) => {
+                let slot = hash_slot(key);
+
+                (self.slot_target(name, slot)?, Some(slot))
+            }
             None => {
                 let keys = command_keys(name, arguments);
 
                 match slots_of(&keys) {
-                    Slots::None => self.seed_target()?,
-                    Slots::One(slot) => self.slot_target(name, slot)?,
+                    Slots::None => (self.seed_target()?, None),
+                    Slots::One(slot) => (self.slot_target(name, slot)?, Some(slot)),
                     Slots::Many if listed(SPLIT, name) => {
                         return self.split(name, arguments, &keys);
                     }
@@ -1220,7 +1224,11 @@ impl ClusterRouter {
             }
         };
 
-        let reply = self.send_routed(target, arguments)?;
+        let mut reply = self.send_routed(target, arguments)?;
+
+        if let Some(owner) = self.owner_after_readonly(slot, &reply) {
+            reply = self.send_routed(owner, arguments)?;
+        }
 
         if self.options.read_policy != ReadPolicy::Primary
             && self.endpoints[target].replica
@@ -1232,6 +1240,25 @@ impl ClusterRouter {
         }
 
         Ok(reply)
+    }
+
+    /// After the owner of `slot` answered `READONLY` to a command (a failover demoted it): the
+    /// slot map is reloaded, and the endpoint the new map names is returned when it is another
+    /// node, for the command to be sent there once. `READONLY` is sent before a command runs,
+    /// so it cannot be applied twice. `None` for any other reply, a keyless command, a map that
+    /// cannot be reloaded or one that still names the node that refused.
+    fn owner_after_readonly(&mut self, slot: Option<u16>, reply: &RespValue) -> Option<usize> {
+        let RespValue::Error(text) = reply else {
+            return None;
+        };
+        let slot = slot.filter(|_| is_readonly(text))?;
+        // The node that answered: a MOVED followed on the way already pointed the slot at it.
+        let refused = self.for_slot(slot).ok()?;
+
+        self.refresh().ok()?;
+        let owner = self.for_slot(slot).ok()?;
+
+        (owner != refused).then_some(owner)
     }
 
     /// The endpoint for a command on `slot`: a replica for a read under a replica read policy,
@@ -1318,17 +1345,27 @@ impl ClusterRouter {
     /// keyless; multi-key splitting and transactions are not applied on this path.
     pub(crate) fn execute_binary(&mut self, arguments: &[&[u8]]) -> Result<RespValue, Error> {
         let name = CommandName::from_bytes(arguments.first().copied().unwrap_or_default());
-        let current = match arguments.get(1) {
+        let (current, slot) = match arguments.get(1) {
             Some(key) if !keyless(name.as_str()) => {
-                self.slot_target(name.as_str(), hash_slot_bytes(key))?
+                let slot = hash_slot_bytes(key);
+
+                (self.slot_target(name.as_str(), slot)?, Some(slot))
             }
-            _ => self.seed_target()?,
+            _ => (self.seed_target()?, None),
         };
 
         let reply = self.connection(current)?.send_bytes(arguments)?;
-        let reply = self.follow_moved(current, reply, |connection, asking| {
+        let mut reply = self.follow_moved(current, reply, |connection, asking| {
             connection.send_bytes_with(arguments, asking)
         })?;
+
+        if let Some(owner) = self.owner_after_readonly(slot, &reply) {
+            let again = self.connection(owner)?.send_bytes(arguments)?;
+
+            reply = self.follow_moved(owner, again, |connection, asking| {
+                connection.send_bytes_with(arguments, asking)
+            })?;
+        }
 
         if self.options.read_policy != ReadPolicy::Primary
             && self.endpoints[current].replica

@@ -22,6 +22,11 @@
 # replication ports +92, +93), node 1 the primary, watched by three `ruvio coordinator`
 # processes (+94, +95, +96, no secret) that fail it over. A test may kill a member: the group is
 # meant for one failover per run of this script.
+# A cluster failover pair: two 2-shard nodes (client ports <base-port>+110, +111 and +120, +121;
+# replication ports +114 and +124), node 1 the primary and node 2 its replica. Exports
+# RUVIO_CLUSTER_FAILOVER_ADDRS (shard 0 of each, primary first) and
+# RUVIO_CLUSTER_FAILOVER_REPLICATION (their replication addresses, same order); a test swaps the
+# roles once, to check that a cluster client leaves the demoted primary after READONLY.
 # TLS servers for the client TLS tests: a standalone server with TLS (<base-port>+100) and one that
 # also demands a client certificate (+101), certificates from scripts/make_test_tls.sh. Exports
 # RUVIO_TLS_ADDR / RUVIO_TLS_CLIENT_AUTH_ADDR and the PEM files RUVIO_TLS_CA / RUVIO_TLS_CLIENT_CERT /
@@ -192,6 +197,14 @@ CONFIG
   pids+=("$!")
 done
 
+# The cluster failover pair (see the header).
+RUVIO_REPLICATION_ROLE=primary RUVIO_REPLICATION_LISTEN="127.0.0.1:$((base + 114))" \
+  "$binary" --config "$work/replicated.toml" --address "127.0.0.1:$((base + 110))" --durability always --data-dir "$work/cluster-failover-1" >"$work/cluster-failover-1.log" 2>&1 &
+pids+=("$!")
+RUVIO_REPLICATION_ROLE=replica RUVIO_REPLICATION_LISTEN="127.0.0.1:$((base + 124))" RUVIO_REPLICATION_PRIMARY="127.0.0.1:$((base + 114))" \
+  "$binary" --config "$work/replicated.toml" --address "127.0.0.1:$((base + 120))" --durability always --data-dir "$work/cluster-failover-2" >"$work/cluster-failover-2.log" 2>&1 &
+pids+=("$!")
+
 # The TLS servers (see the header); the certificates live in the work directory.
 "$root/scripts/make_test_tls.sh" "$work/tls"
 RUVIO_TLS_CERT="$work/tls/server.pem" RUVIO_TLS_KEY="$work/tls/server.key" \
@@ -232,8 +245,15 @@ for index in 0 1 2; do
   python3 "$root/scripts/_ruvio.py" wait-primary --timeout 30 --port "$((base + 94 + index))" \
     --pid "${pids[$((11 + index))]}" --master main --primary "127.0.0.1:$((base + 90))"
 done
-ready "$((base + 100))" --pid "${pids[14]}" --data-dir "$work/tls-server" --tls-ca "$work/tls/ca.pem"
-ready "$((base + 101))" --pid "${pids[15]}" --data-dir "$work/tls-client-auth" --tls-ca "$work/tls/ca.pem" \
+for port in $((base + 110)) $((base + 111)); do
+  ready "$port" --pid "${pids[14]}" --data-dir "$work/cluster-failover-1"
+done
+for port in $((base + 120)) $((base + 121)); do
+  ready "$port" --pid "${pids[15]}" --data-dir "$work/cluster-failover-2"
+done
+python3 "$root/scripts/_ruvio.py" wait-replicas --timeout 30 --port "$((base + 110))" --replicas 1
+ready "$((base + 100))" --pid "${pids[16]}" --data-dir "$work/tls-server" --tls-ca "$work/tls/ca.pem"
+ready "$((base + 101))" --pid "${pids[17]}" --data-dir "$work/tls-client-auth" --tls-ca "$work/tls/ca.pem" \
   --tls-cert "$work/tls/client.pem" --tls-key "$work/tls/client.key"
 
 export RUVIO_ADDR="127.0.0.1:$base"
@@ -250,6 +270,8 @@ export RUVIO_COORDINATOR_ADDRS="127.0.0.1:$((base + 94)),127.0.0.1:$((base + 95)
 export RUVIO_COORDINATOR_MASTER=main
 export RUVIO_COORDINATOR_GROUP_ADDRS="127.0.0.1:$((base + 90)),127.0.0.1:$((base + 91))"
 export RUVIO_COORDINATOR_GROUP_PIDS="${group_nodes[0]},${group_nodes[1]}"
+export RUVIO_CLUSTER_FAILOVER_ADDRS="127.0.0.1:$((base + 110)),127.0.0.1:$((base + 120))"
+export RUVIO_CLUSTER_FAILOVER_REPLICATION="127.0.0.1:$((base + 114)),127.0.0.1:$((base + 124))"
 export RUVIO_TLS_ADDR="127.0.0.1:$((base + 100))"
 export RUVIO_TLS_CLIENT_AUTH_ADDR="127.0.0.1:$((base + 101))"
 export RUVIO_TLS_CA="$work/tls/ca.pem"

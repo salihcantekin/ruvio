@@ -42,6 +42,10 @@ pub struct TxSession {
     /// This shard's last record when the previous replies left under `durability`: a later
     /// flush with no record past it has nothing new to wait for.
     pub durable_mark: u64,
+    /// `READONLY` (cluster mode): this connection reads from a replica on purpose. Without it,
+    /// a replica of a multi-node cluster answers a keyed command with `-MOVED` to its primary,
+    /// as Redis Cluster does, so a client that only reads does not stay on a demoted primary.
+    pub replica_reads: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +84,7 @@ impl TxSession {
             forwarded_shards: 0,
             durability: None,
             durable_mark: 0,
+            replica_reads: false,
         }
     }
 

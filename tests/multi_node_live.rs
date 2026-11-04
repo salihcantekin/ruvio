@@ -620,3 +620,126 @@ fn a_promoted_replica_redirects_a_range_the_map_gave_away_from_its_first_command
         "{replies:?}"
     );
 }
+
+/// A replica of a multi-node cluster answers a write with `MOVED` to the node that takes it,
+/// as Redis Cluster does, so a cluster client reloads its slot table instead of writing to a
+/// demoted primary again: a key of its own group goes to its primary, a key of another group
+/// to that group. After the roles are swapped, the demoted primary sends writes to the
+/// promoted replica. A keyed read goes the same way unless the connection sent `READONLY`.
+#[test]
+fn a_replica_of_a_cluster_sends_writes_to_its_primary_with_moved() {
+    let env = [
+        ("RUVIO_SHARDS", "1"),
+        ("RUVIO_DURABILITY", "always"),
+        ("RUVIO_SNAPSHOT_INTERVAL_MS", "0"),
+    ];
+    let mut primary = Server::start_with(&env);
+    let mut replica = Server::start_with(&env);
+    let dir = tempfile::tempdir().unwrap();
+    let topology = dir.path().join("topology.toml");
+    let a_port = primary.ports().port_at(0);
+    let replica_port = replica.ports().port_at(0);
+    // Group b never runs: only its address is named in `MOVED`.
+    let b_port = primary.ports().port_at(9);
+    let (primary_repl, replica_repl) = (primary.ports().port_at(5), replica.ports().port_at(5));
+
+    std::fs::write(
+        &topology,
+        format!(
+            "version = 1\n[[groups]]\nname = \"a\"\naddress = \"127.0.0.1:{a_port}\"\nshards = 1\nslots = [\"0-8191\"]\n\
+             [[groups]]\nname = \"b\"\naddress = \"127.0.0.1:{b_port}\"\nshards = 1\nslots = [\"8192-16383\"]\n"
+        ),
+    )
+    .unwrap();
+    primary.set_env("RUVIO_REPLICATION_ROLE", "primary");
+    primary.set_env(
+        "RUVIO_REPLICATION_LISTEN",
+        &format!("127.0.0.1:{primary_repl}"),
+    );
+    replica.set_env("RUVIO_REPLICATION_ROLE", "replica");
+    replica.set_env(
+        "RUVIO_REPLICATION_LISTEN",
+        &format!("127.0.0.1:{replica_repl}"),
+    );
+    replica.set_env(
+        "RUVIO_REPLICATION_PRIMARY",
+        &format!("127.0.0.1:{primary_repl}"),
+    );
+    for server in [&mut primary, &mut replica] {
+        server.set_env("RUVIO_CLUSTER_TOPOLOGY", topology.to_str().unwrap());
+        server.set_env("RUVIO_CLUSTER_GROUP", "a");
+        server.restart();
+    }
+
+    let own = key_in(100..200, "own");
+    let other = key_in(9000..9100, "other");
+    let (own_slot, other_slot) = (hash_slot(own.as_bytes()), hash_slot(other.as_bytes()));
+    let mut on_primary = Client::connect(&primary.address);
+    let mut on_replica = Client::connect(&replica.address);
+    let mut reads_replica = Client::connect(&replica.address);
+
+    assert_eq!(reads_replica.call(&["READONLY"]), "OK");
+    assert_eq!(on_primary.call(&["SET", &own, "1"]), "OK");
+    wait_for(&mut reads_replica, &["GET", &own], "1");
+
+    assert_eq!(
+        on_replica.call(&["SET", &own, "2"]),
+        format!("ERR:MOVED {own_slot} 127.0.0.1:{a_port}")
+    );
+    assert_eq!(
+        on_replica.call(&["INCR", &own]),
+        format!("ERR:MOVED {own_slot} 127.0.0.1:{a_port}")
+    );
+    assert_eq!(
+        on_replica.call(&["SET", &other, "2"]),
+        format!("ERR:MOVED {other_slot} 127.0.0.1:{b_port}")
+    );
+    // A read goes to the primary too, unless the connection asked for replica reads.
+    assert_eq!(
+        on_replica.call(&["GET", &own]),
+        format!("ERR:MOVED {own_slot} 127.0.0.1:{a_port}")
+    );
+    assert_eq!(
+        on_replica.call(&["GET", &other]),
+        format!("ERR:MOVED {other_slot} 127.0.0.1:{b_port}")
+    );
+    assert_eq!(reads_replica.call(&["GET", &own]), "1");
+    assert_eq!(reads_replica.call(&["READWRITE"]), "OK");
+    assert_eq!(
+        reads_replica.call(&["GET", &own]),
+        format!("ERR:MOVED {own_slot} 127.0.0.1:{a_port}")
+    );
+    assert_eq!(reads_replica.call(&["READONLY"]), "OK");
+    // A command without a key is answered here, a keyless write is still refused.
+    assert_eq!(on_replica.call(&["DBSIZE"]), "1");
+    assert!(
+        on_replica.call(&["FLUSHALL"]).starts_with("ERR:READONLY"),
+        "a keyless write"
+    );
+
+    // The roles swap, as a coordinator swaps them.
+    assert_eq!(on_replica.call(&["REPLICAOF", "NO", "ONE"]), "OK");
+    assert_eq!(
+        on_primary.call(&["REPLICAOF", "127.0.0.1", &replica_repl.to_string()]),
+        "OK"
+    );
+    // Until the promoted replica accepts it, the demoted primary names no other primary for
+    // its group (the map names the demoted node itself) and refuses with READONLY.
+    let moved = format!("ERR:MOVED {own_slot} 127.0.0.1:{replica_port}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+
+    loop {
+        let reply = on_primary.call(&["SET", &own, "3"]);
+
+        if reply == moved {
+            break;
+        }
+        assert!(reply.starts_with("ERR:READONLY"), "{reply}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the demoted primary never sent the write on: {reply}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(on_replica.call(&["SET", &own, "3"]), "OK");
+}

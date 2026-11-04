@@ -4,6 +4,8 @@ Notable changes to the Node.js client `ruvio-client` on npm. New entries go unde
 
 ## Unreleased
 
+- Cluster mode: a `READONLY` reply (the node that owned the slot was demoted by a failover) now reloads the slot table, and when the table names another node the command is sent there once. `READONLY` comes before a command runs, so the retry cannot apply it twice. Before, the client kept writing to the demoted node and got `READONLY` until something else reloaded the table. A keyless command still returns the error. Nothing changes on the success path (issue #406).
+
 ## 0.3.0 - 2026-10-29
 
 - The blocking-command wait parser uses a regular expression that is linear in the argument length (the old one could backtrack on long runs of zeros; the argument was already bounded, so no behaviour changes).

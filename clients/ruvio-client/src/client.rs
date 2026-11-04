@@ -2251,7 +2251,7 @@ fn finish_standalone(
 }
 
 /// A refused write: `READONLY` followed by a space or nothing.
-fn is_readonly(message: &str) -> bool {
+pub(crate) fn is_readonly(message: &str) -> bool {
     message
         .strip_prefix("READONLY")
         .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))

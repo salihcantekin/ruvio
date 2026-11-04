@@ -75,6 +75,9 @@ internal sealed class ClusterRouter : IDisposable
     private readonly Dictionary<string, RuvioSocket> _connections = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _connectGate = new(1, 1);
     private readonly SemaphoreSlim _refreshGate = new(1, 1);
+
+    /// <summary>Counts the slot maps installed; lets callers that queued behind a reload skip their own.</summary>
+    private long _reloads;
     private readonly List<IReadOnlyList<string>> _queued = [];
     private readonly (string Host, int Port)[] _seeds;
     private ClusterTopology _topology;
@@ -108,6 +111,7 @@ internal sealed class ClusterRouter : IDisposable
     {
         PickReplicas(topology);
         _topology = topology;
+        Interlocked.Increment(ref _reloads);
     }
 
     private void PickReplicas(ClusterTopology topology)
@@ -1528,6 +1532,9 @@ internal sealed class ClusterRouter : IDisposable
     {
         int moves = redirects;
         int retries = 0;
+        bool readonlyRetried = false;
+        // The node the latest retry went to; null while the reply is the first one, whose node the map names.
+        RuvioSocket? last = null;
 
         while (true)
         {
@@ -1542,6 +1549,7 @@ internal sealed class ClusterRouter : IDisposable
 
                 RuvioSocket owner = await FollowMovedAsync(moved, moves++, cancellationToken).ConfigureAwait(false);
 
+                last = owner;
                 reply = await send(owner, false, cancellationToken).ConfigureAwait(false);
             }
             else if (AskTarget(reply) is { } ask)
@@ -1555,6 +1563,7 @@ internal sealed class ClusterRouter : IDisposable
 
                 RuvioSocket node = await ConnectionAsync(ask.Host, ask.Port, cancellationToken).ConfigureAwait(false);
 
+                last = node;
                 reply = await send(node, true, cancellationToken).ConfigureAwait(false);
             }
             else if (IsTryAgain(reply) && retries < MaxTryAgains && NextTryAgainPause(clock, retries) is { } pause)
@@ -1567,6 +1576,30 @@ internal sealed class ClusterRouter : IDisposable
                 }
 
                 RuvioSocket owner = await route(cancellationToken).ConfigureAwait(false);
+
+                last = owner;
+                reply = await send(owner, false, cancellationToken).ConfigureAwait(false);
+            }
+            else if (!readonlyRetried && IsReadonly(reply))
+            {
+                // The node that owned the slot was demoted by a failover. READONLY is sent before a
+                // command runs, so the command goes once to the owner a reloaded map names.
+                readonlyRetried = true;
+
+                long seen = Interlocked.Read(ref _reloads);
+                RuvioSocket refused = last ?? await route(cancellationToken).ConfigureAwait(false);
+
+                if (!await RefreshAsync(cancellationToken, seen).ConfigureAwait(false))
+                {
+                    return reply;
+                }
+
+                RuvioSocket owner = await route(cancellationToken).ConfigureAwait(false);
+
+                if (ReferenceEquals(owner, refused))
+                {
+                    return reply;
+                }
 
                 reply = await send(owner, false, cancellationToken).ConfigureAwait(false);
             }
@@ -1604,12 +1637,20 @@ internal sealed class ClusterRouter : IDisposable
         return replies[1];
     }
 
-    /// <summary>True for an error reply that starts <c>MOVED</c>, <c>ASK</c> or <c>TRYAGAIN</c>; checked by prefix, only on errors.</summary>
+    /// <summary>True for an error reply that starts <c>MOVED</c>, <c>ASK</c>, <c>TRYAGAIN</c> or <c>READONLY</c>; checked by prefix, only on errors.</summary>
     private static bool NeedsFollowUp(RespValue reply) =>
         reply is { Kind: RespKind.Error, Text: { } text }
         && (text.StartsWith("MOVED ", StringComparison.Ordinal)
             || text.StartsWith("ASK ", StringComparison.Ordinal)
-            || text.StartsWith("TRYAGAIN", StringComparison.Ordinal));
+            || text.StartsWith("TRYAGAIN", StringComparison.Ordinal)
+            || IsReadonlyText(text));
+
+    /// <summary>A refused write: <c>READONLY</c> alone or followed by a space.</summary>
+    private static bool IsReadonly(RespValue reply) =>
+        reply is { Kind: RespKind.Error, Text: { } text } && IsReadonlyText(text);
+
+    private static bool IsReadonlyText(string text) =>
+        text.StartsWith("READONLY", StringComparison.Ordinal) && (text.Length == 8 || text[8] == ' ');
 
     private static bool IsTryAgain(RespValue reply) =>
         reply is { Kind: RespKind.Error, Text: { } text } && text.StartsWith("TRYAGAIN", StringComparison.Ordinal);
@@ -1675,12 +1716,22 @@ internal sealed class ClusterRouter : IDisposable
     /// (the usual case after a node went away), every other known node and then every seed is opened
     /// in turn, one connect attempt each, until one returns a slot map. False when none did.
     /// </summary>
-    private async Task<bool> RefreshAsync(CancellationToken cancellationToken)
+    /// <param name="cancellationToken">Cancels the wait and the reload.</param>
+    /// <param name="seen">
+    /// The reload count a caller read; when another map was installed since, the reload is skipped, so the
+    /// writers a demoted node refused at once share one <c>CLUSTER SLOTS</c>.
+    /// </param>
+    private async Task<bool> RefreshAsync(CancellationToken cancellationToken, long? seen = null)
     {
         await _refreshGate.WaitAsync(cancellationToken);
 
         try
         {
+            if (seen is { } known && Interlocked.Read(ref _reloads) != known)
+            {
+                return true;
+            }
+
             RuvioSocket[] live;
 
             lock (_connections)
