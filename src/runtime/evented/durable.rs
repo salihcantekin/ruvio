@@ -52,10 +52,12 @@ pub(super) async fn hold_until_durable(
             own_mark = Some(target);
         }
 
-        // A primary ships only records it synced: sync now instead of on the next
-        // `everysec` tick. A failed sync leaves the records unshipped, and the wait times out.
+        // The reply waits for its replicas, which sync what they receive. The primary's own
+        // `everysec` sync is started now instead of on the next tick, on its background
+        // thread: syncing here would hold every client of the shard, and the coordinators'
+        // lease renewals, for as long as the disk takes.
         if shard.acks.reached(target) < durability.replicas {
-            let _ = wal.flush();
+            let _ = wal.request_sync();
         }
 
         targets.push((Arc::clone(&shard.acks), target));

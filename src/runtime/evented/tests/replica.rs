@@ -1383,6 +1383,108 @@ fn a_durable_connection_waits_for_its_replica_and_is_refused_without_one() {
     join_within(primary, PATIENCE).unwrap();
 }
 
+/// A durable reply on a primary whose disk is slow does not sync on the shard thread: the
+/// other clients of the shard, and the coordinators' lease renewals, are answered meanwhile.
+#[test]
+fn a_durable_reply_does_not_hold_the_shard_behind_a_slow_sync() {
+    let primary_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let ports = crate::test_ports::reserve();
+    let replication = ports.address_at(0);
+    let persistence = |directory: &std::path::Path| PersistenceConfig {
+        profile: crate::DurabilityProfile::Everysec,
+        data_dir: directory.to_path_buf(),
+        ..PersistenceConfig::default()
+    };
+    let (primary_address, primary_stop, primary) = serve_with(|config| {
+        config.persistence = persistence(primary_dir.path());
+        config.replication = crate::config::ReplicationConfig {
+            role: crate::config::ReplicationRole::Primary,
+            listen: Some(replication),
+            ..Default::default()
+        };
+    });
+    let (_replica_address, replica_stop, replica) = serve_with(|config| {
+        config.persistence = persistence(replica_dir.path());
+        config.replication = crate::config::ReplicationConfig {
+            role: crate::config::ReplicationRole::Replica,
+            primary: Some(replication),
+            ..Default::default()
+        };
+    });
+
+    wait_for_info(primary_address, "replication_replicas", |count| count == 1);
+    // Only the primary's disk is slow.
+    let slow = Duration::from_millis(1500);
+    crate::persistence::SLOW_SYNC_DIRS
+        .lock()
+        .unwrap()
+        .push((primary_dir.path().to_path_buf(), slow));
+
+    let durable = thread::spawn(move || {
+        let mut replies = Vec::new();
+
+        for n in 0..3 {
+            let key = format!("durable{n}");
+
+            replies.push(request_within(
+                primary_address,
+                &resp(&[
+                    &[
+                        b"CLIENT",
+                        b"DURABILITY",
+                        b"REPLICAS",
+                        b"1",
+                        b"TIMEOUT",
+                        b"10000",
+                    ],
+                    &[b"SET", key.as_bytes(), b"1"],
+                ]),
+                Duration::from_secs(15),
+            ));
+        }
+        replies
+    });
+    let started = Instant::now();
+    let mut slowest = Duration::ZERO;
+
+    while !durable.is_finished() {
+        assert!(
+            started.elapsed() < PATIENCE,
+            "the durable writes never finished"
+        );
+        let asked = Instant::now();
+
+        assert_eq!(
+            request_within(
+                primary_address,
+                &resp(&[&[b"PING"]]),
+                Duration::from_secs(10)
+            ),
+            b"+PONG\r\n"
+        );
+        slowest = slowest.max(asked.elapsed());
+        // Paces the pings; nothing is asserted after it.
+        thread::sleep(Duration::from_millis(20));
+    }
+    crate::persistence::SLOW_SYNC_DIRS
+        .lock()
+        .unwrap()
+        .retain(|(dir, _)| dir != primary_dir.path());
+
+    for reply in durable.join().unwrap() {
+        assert_eq!(reply, b"+OK\r\n+OK\r\n");
+    }
+    replica_stop.request();
+    join_within(replica, PATIENCE).unwrap();
+    primary_stop.request();
+    join_within(primary, PATIENCE).unwrap();
+    assert!(
+        slowest < slow * 2 / 3,
+        "a PING waited {slowest:?} behind a durable reply's sync"
+    );
+}
+
 #[test]
 fn client_durability_needs_replication() {
     let (address, stop, server) = serve_on_ephemeral();
