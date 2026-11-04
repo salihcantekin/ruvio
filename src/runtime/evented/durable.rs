@@ -52,10 +52,13 @@ pub(super) async fn hold_until_durable(
             own_mark = Some(target);
         }
 
-        // A primary ships only records it synced: sync now instead of on the next
-        // `everysec` tick. A failed sync leaves the records unshipped, and the wait times out.
+        // A primary ships only records it synced, so the reply waits for this shard's sync.
+        // An `everysec` sync is started now instead of on the next tick, on its background
+        // thread: syncing here would hold every client of the shard, and the coordinators'
+        // lease renewals, for as long as the disk takes. The wait asks again while a sync that
+        // started before these records runs.
         if shard.acks.reached(target) < durability.replicas {
-            let _ = wal.flush();
+            let _ = wal.request_sync();
         }
 
         targets.push((Arc::clone(&shard.acks), target));
@@ -69,6 +72,18 @@ pub(super) async fn hold_until_durable(
 
     let reached = {
         let _waiting = Waiting::new(&waits_on);
+        let request_sync = || {
+            for (shard, (acks, target)) in waits_on.iter().zip(&targets) {
+                if acks.reached(*target) < durability.replicas {
+                    let mut wal = shard.wal.lock().unwrap_or_else(|error| error.into_inner());
+
+                    // Any other profile synced these records in the flush above.
+                    if wal.profile() == crate::DurabilityProfile::Everysec {
+                        let _ = wal.request_sync();
+                    }
+                }
+            }
+        };
 
         super::replica::wait_for_targets(
             state,
@@ -76,6 +91,7 @@ pub(super) async fn hold_until_durable(
             durability.replicas,
             durability.timeout_ms,
             shutdown,
+            &request_sync,
         )
         .await
     };

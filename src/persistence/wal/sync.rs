@@ -361,6 +361,9 @@ impl WalSink {
                 return self.fail_sync(error.to_string());
             }
 
+            #[cfg(test)]
+            delay_sync(&self.config.data_dir);
+
             // Data-only sync: on the preallocated segment the size rarely changes, so no
             // metadata commit is forced per sync.
             file.sync_data()
@@ -448,6 +451,24 @@ impl WalSink {
     }
 
     pub(super) fn poke_background_sync(&mut self) -> Result<(), PersistenceError> {
+        self.start_background_sync(false)
+    }
+
+    /// Asks for the written records to be synced. An `everysec` log starts its background
+    /// sync now instead of on the next tick and returns without waiting for the disk; while a
+    /// sync is already running it does nothing, so a caller waiting for these records calls
+    /// it again until they are synced. Any other profile flushes as before: an `always` log
+    /// syncs before its replies anyway, and a group another task left open must not wait for
+    /// that task.
+    pub fn request_sync(&mut self) -> Result<(), PersistenceError> {
+        if self.profile != DurabilityProfile::Everysec {
+            return self.flush();
+        }
+
+        self.start_background_sync(true)
+    }
+
+    fn start_background_sync(&mut self, now: bool) -> Result<(), PersistenceError> {
         self.observe_sync_error()?;
         // After a failed sync a clean one proves nothing: `durable` stays where it was.
         if self.sync_failed {
@@ -462,7 +483,7 @@ impl WalSink {
         self.publish_staged()?;
         self.mark_published();
 
-        if self.dirty_bytes == 0 || self.last_sync.elapsed() < self.config.sync_interval {
+        if self.dirty_bytes == 0 || (!now && self.last_sync.elapsed() < self.config.sync_interval) {
             return Ok(());
         }
 
@@ -489,6 +510,8 @@ impl WalSink {
         let injected = super::crash::take_io_fault(super::crash::CrashSite::Sync)
             .map(|error| (error, super::crash::take_sync_hold()));
         let sequence = self.last_sequence();
+        #[cfg(test)]
+        let data_dir = self.config.data_dir.clone();
         let running = Arc::clone(&self.sync_running);
         let durable = Arc::clone(&self.durable);
         let sync_error = Arc::clone(&self.sync_error);
@@ -510,7 +533,10 @@ impl WalSink {
                         }
                         Err(error)
                     }
-                    None => cloned.sync_data(),
+                    None => {
+                        delay_sync(&data_dir);
+                        cloned.sync_data()
+                    }
                 };
                 #[cfg(not(test))]
                 let synced = cloned.sync_data();
