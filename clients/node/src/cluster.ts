@@ -1125,6 +1125,16 @@ function replicaFault(v: unknown): boolean {
   return (v instanceof ConnectionError && v.unreachable) || (v instanceof RuvioError && (v.code === 'LOADING' || v.code === 'MASTERDOWN'));
 }
 
+/** The command name of one RESP frame (`*N\r\n$len\r\nNAME...`), upper-cased; empty when it cannot be read. */
+function frameName(frame: Buffer): string {
+  const dollar = frame.indexOf(36); // '$'
+  if (dollar < 0) return '';
+  const eol = frame.indexOf(13, dollar);
+  const len = Number(frame.toString('latin1', dollar + 1, eol));
+  if (eol < 0 || !Number.isInteger(len) || len < 0) return '';
+  return frame.toString('latin1', eol + 2, eol + 2 + len).toUpperCase();
+}
+
 /** Receives a pipeline's replies at the caller's indexes and follows MOVED per command. */
 class ClusterSink implements BatchSink {
   private offs: Int32Array | null = null;
@@ -1148,7 +1158,7 @@ class ClusterSink implements BatchSink {
         return;
       }
     }
-    if (v instanceof RuvioError && isRedirect(v.code)) {
+    if (v instanceof RuvioError && isRedirect(v.code) && !this.inMulti(i)) {
       this.r.moved(v, this.frame(i), null, this.fls[i]!).then(
         (x) => this.out.set(i, x),
         (e) => this.out.set(i, e),
@@ -1156,6 +1166,19 @@ class ClusterSink implements BatchSink {
       return;
     }
     this.out.set(i, v);
+  }
+  /**
+   * Whether command `i` was queued inside a `MULTI` the batch itself sent (rare path): sending it alone
+   * elsewhere would apply it outside the transaction, whose `EXEC` fails, so its redirect is returned.
+   */
+  private inMulti(i: number): boolean {
+    let open = false;
+    for (let k = 0; k < i; k++) {
+      const name = frameName(this.frame(k));
+      if (name === 'MULTI') open = true;
+      else if (name === 'EXEC' || name === 'DISCARD') open = false;
+    }
+    return open;
   }
   /** Frame `i` of the batch bytes (rare path: offsets are rebuilt here). */
   private frame(i: number): Buffer {

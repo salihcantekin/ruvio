@@ -24,6 +24,7 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Routes encoded commands to the node that owns their key's slot.
@@ -113,6 +114,8 @@ public final class ClusterRouter implements AutoCloseable {
     private volatile ClusterNode[] table = new ClusterNode[SLOTS];
     private final AtomicInteger nextIndex = new AtomicInteger();
     private final Object refreshLock = new Object();
+    /** Counts the slot tables {@link #refresh()} installed; lets callers that queued behind a reload skip their own. */
+    private final AtomicLong reloads = new AtomicLong();
     private volatile boolean closed;
 
     private ClusterRouter(RuvioOptions options, ClusterNode seed) {
@@ -359,6 +362,7 @@ public final class ClusterRouter implements AutoCloseable {
             pickReaders(listed);
         }
         table = t;
+        reloads.incrementAndGet();
     }
 
     /** Adds the replicas listed after the primary in a range; an entry that cannot be read is skipped. */
@@ -937,16 +941,18 @@ public final class ClusterRouter implements AutoCloseable {
      * @param readonly the {@code READONLY} error
      */
     public void afterReadonly(RoutedRequest<?> r, Throwable readonly) {
+        int slot = slotOrNone(r);
+        if (slot < 0 || closed) {
+            r.failFinal(readonly);
+            return;
+        }
+        // Taken on the reader thread, when the reply arrived: the node that refused and the table it came from.
+        ClusterNode refused = owner(slot);
+        long seen = reloads.get();
         try {
             BACKGROUND.execute(() -> {
                 try {
-                    int slot = slotOf(r.frame, r.frameOff, r.frameLen);
-                    if (slot < 0 || closed) {
-                        r.failFinal(readonly);
-                        return;
-                    }
-                    ClusterNode refused = owner(slot);
-                    refresh();
+                    reloadUnlessNewer(seen);
                     if (owner(slot) == refused) {
                         r.failFinal(readonly);
                         return;
@@ -959,6 +965,27 @@ public final class ClusterRouter implements AutoCloseable {
             });
         } catch (RejectedExecutionException e) {
             r.failFinal(readonly);
+        }
+    }
+
+    /**
+     * Reloads the slot table unless one was installed after {@code seen} was read: the writers refused by the same
+     * demoted node share one {@code CLUSTER SLOTS} instead of queueing one each behind {@link #refreshLock}.
+     */
+    private void reloadUnlessNewer(long seen) {
+        synchronized (refreshLock) {
+            if (reloads.get() == seen) {
+                refresh();
+            }
+        }
+    }
+
+    /** The slot of a request's command, or -1 when it has no key or cannot be read. */
+    private static int slotOrNone(RoutedRequest<?> r) {
+        try {
+            return slotOf(r.frame, r.frameOff, r.frameLen);
+        } catch (RuntimeException e) {
+            return -1;
         }
     }
 

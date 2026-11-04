@@ -1226,7 +1226,7 @@ impl ClusterRouter {
 
         let mut reply = self.send_routed(target, arguments)?;
 
-        if let Some(owner) = self.owner_after_readonly(target, slot, &reply) {
+        if let Some(owner) = self.owner_after_readonly(slot, &reply) {
             reply = self.send_routed(owner, arguments)?;
         }
 
@@ -1242,21 +1242,18 @@ impl ClusterRouter {
         Ok(reply)
     }
 
-    /// After `refused` answered `READONLY` to a command on `slot` (a failover demoted it): the
+    /// After the owner of `slot` answered `READONLY` to a command (a failover demoted it): the
     /// slot map is reloaded, and the endpoint the new map names is returned when it is another
     /// node, for the command to be sent there once. `READONLY` is sent before a command runs,
     /// so it cannot be applied twice. `None` for any other reply, a keyless command, a map that
-    /// cannot be reloaded or one that still names `refused`.
-    fn owner_after_readonly(
-        &mut self,
-        refused: usize,
-        slot: Option<u16>,
-        reply: &RespValue,
-    ) -> Option<usize> {
+    /// cannot be reloaded or one that still names the node that refused.
+    fn owner_after_readonly(&mut self, slot: Option<u16>, reply: &RespValue) -> Option<usize> {
         let RespValue::Error(text) = reply else {
             return None;
         };
         let slot = slot.filter(|_| is_readonly(text))?;
+        // The node that answered: a MOVED followed on the way already pointed the slot at it.
+        let refused = self.for_slot(slot).ok()?;
 
         self.refresh().ok()?;
         let owner = self.for_slot(slot).ok()?;
@@ -1362,7 +1359,7 @@ impl ClusterRouter {
             connection.send_bytes_with(arguments, asking)
         })?;
 
-        if let Some(owner) = self.owner_after_readonly(current, slot, &reply) {
+        if let Some(owner) = self.owner_after_readonly(slot, &reply) {
             let again = self.connection(owner)?.send_bytes(arguments)?;
 
             reply = self.follow_moved(owner, again, |connection, asking| {

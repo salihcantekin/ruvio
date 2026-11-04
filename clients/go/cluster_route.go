@@ -344,11 +344,12 @@ func (cl *cluster) reloadNode(ctx context.Context, r *request) *Client {
 // r is keyless, the table cannot be reloaded or it still names refused. READONLY is sent
 // before a command runs, so sending r once more cannot apply it twice.
 func (cl *cluster) readonlyNode(ctx context.Context, refused *Client, r *request) *Client {
+	seen := cl.reloads.Load()
 	_, slot, _, err := routeFrame(r.buf)
 	if err != nil || slot < 0 {
 		return nil
 	}
-	if _, err := cl.refresh(ctx, false); err != nil {
+	if err := cl.reloadUnlessNewer(ctx, seen); err != nil {
 		return nil
 	}
 	t := cl.t.Load()
@@ -359,6 +360,20 @@ func (cl *cluster) readonlyNode(ctx context.Context, refused *Client, r *request
 		return n
 	}
 	return nil
+}
+
+// reloadUnlessNewer reloads the slot table unless one was installed after reloads read seen:
+// the writers a demoted node refused at once share one CLUSTER SLOTS instead of queueing one
+// each behind cl.mu.
+func (cl *cluster) reloadUnlessNewer(ctx context.Context, seen uint64) error {
+	cl.mu.Lock()
+	newer := cl.reloads.Load() != seen
+	cl.mu.Unlock()
+	if newer {
+		return nil
+	}
+	_, err := cl.refresh(ctx, false)
+	return err
 }
 
 // redirect resends the command in r after its first -MOVED, -ASK or -TRYAGAIN reply msg

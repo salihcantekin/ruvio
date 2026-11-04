@@ -70,7 +70,7 @@ A cluster client sends a command again after `-TRYAGAIN`, at most 7 times, after
 
 ## Following a failover
 
-After a failover the primary is another node. A standalone client with several seeds, or with a coordinator name, finds it again instead of staying on a node that is now a replica. All six clients do the same; this section is the contract. It applies to standalone connections only: a cluster client (a multi-node slot map) keeps its `MOVED`/`ASK` rules and reloads its slot map after `READONLY` (see "`READONLY` in cluster mode" above) instead.
+After a failover the primary is another node. A standalone client with several seeds, or with a coordinator name, finds it again instead of staying on a node that is now a replica. All six clients do the same; this section is the contract. It applies to standalone connections only: a cluster client (a multi-node slot map) keeps its `MOVED`/`ASK` rules and reloads its slot map after `READONLY` (see "`READONLY` in cluster mode" above) instead. A standalone client pointed at one group of a multi-node cluster (nodes with `cluster_topology`) gets `MOVED` rather than `READONLY` from a demoted primary once that node follows the new primary; it does not follow `MOVED`, so it returns the error, as it already does for keys of other groups. Use a cluster client with such a cluster.
 
 | Client | Follow option (default on) | Coordinator option (default off) |
 | --- | --- | --- |

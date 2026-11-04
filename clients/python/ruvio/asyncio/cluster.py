@@ -43,7 +43,10 @@ class _Node:
 
 
 class _State:
-    __slots__ = ("mode", "slots", "nodes", "by_addr", "seed", "watch", "gate", "targets", "policy", "reps", "rnodes")
+    __slots__ = (
+        "mode", "slots", "nodes", "by_addr", "seed", "watch", "gate", "targets", "policy", "reps", "rnodes",
+        "reloads", "reloading",
+    )
 
     def __init__(self, seed: _Node) -> None:
         self.mode = 0
@@ -57,6 +60,8 @@ class _State:
         self.policy = cl.POLICY_PRIMARY  # where reads go; anything but primary adds the replica paths
         self.reps: List[Optional[_Node]] = []  # per node index: the replica its reads go to (None = none usable)
         self.rnodes: Dict[Tuple[str, int], _Node] = {}  # the replica nodes of the last load, by address
+        self.reloads = 0  # slot tables installed; a READONLY that saw an older count skips its own reload
+        self.reloading: Optional[asyncio.Future] = None  # type: ignore[type-arg]  # the reload READONLY replies share
 
 
 class _RoutedFuture(asyncio.Future):  # type: ignore[type-arg]
@@ -303,6 +308,7 @@ class ClusterRuvio(Ruvio):
         c.nodes = nodes
         c.by_addr = by
         c.slots = topo.slots
+        c.reloads += 1
         c.targets = [*nodes, c.seed]
         if c.policy:
             self._pick_replicas(topo)
@@ -633,8 +639,9 @@ class ClusterRuvio(Ruvio):
         is sent before a command runs, so it was not applied). The retry's reply, an error included, is
         returned; when the table names the same node, or a ``WATCH`` is open, ``err`` is raised."""
         c = self._cl
+        seen = c.reloads
         before = self._route_node(data)
-        if before is None or not await self._refresh():
+        if before is None or not await self._reload_after(seen):
             raise err
         after = self._route_node(data)
         if after is None or (after.host, after.port) == (before.host, before.port) or c.watch is not None:
@@ -647,6 +654,24 @@ class ClusterRuvio(Ruvio):
             if e.__class__ is MovedError or cl.is_tryagain(e):
                 return await self._redirect(e, data, conv, dec, blocking)
             raise
+
+    async def _reload_after(self, seen: int) -> bool:
+        """Reloads the slot table unless one was installed since the reload count was ``seen``. The commands a
+        demoted node refused at once share one ``CLUSTER SLOTS``: a reload already running is awaited."""
+        c = self._cl
+        if c.reloads != seen:
+            return True
+        task = c.reloading
+        if task is None:
+            task = c.reloading = asyncio.ensure_future(self._refresh())
+            task.add_done_callback(self._reloaded)
+        return bool(await asyncio.shield(task))
+
+    def _reloaded(self, task: "asyncio.Future[bool]") -> None:
+        if self._cl.reloading is task:
+            self._cl.reloading = None
+        if not task.cancelled():
+            task.exception()
 
     def _route_node(self, data: bytes) -> Optional[_Node]:
         """The node the current table names for a command's frame (the seed for a keyless one); None for a
