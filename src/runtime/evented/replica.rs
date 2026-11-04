@@ -1017,6 +1017,16 @@ impl ReplicaGroup {
     /// them staged until the log recovers, as for a primary.
     /// Returns false when the group could not be written or synced.
     fn close(&mut self, state: &ShardState) -> bool {
+        self.close_then(state, true)
+    }
+
+    /// `close`, returning only once the group is on disk, even with the sync worker: for a
+    /// record whose effect outlives the log, such as a slot moving.
+    fn close_on_disk(&mut self, state: &ShardState) -> bool {
+        self.close_then(state, false)
+    }
+
+    fn close_then(&mut self, state: &ShardState, soon: bool) -> bool {
         let Some(start) = self.start.take() else {
             return true;
         };
@@ -1025,7 +1035,13 @@ impl ReplicaGroup {
                 .persistence
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            let result = wal.end_group().and_then(|()| wal.sync_batch_soon(start));
+            let result = wal.end_group().and_then(|()| {
+                if soon {
+                    wal.sync_batch_soon(start)
+                } else {
+                    wal.sync_batch(start)
+                }
+            });
 
             (result, wal.sync_totals())
         };
@@ -1192,7 +1208,7 @@ fn drain_replicated_into(state: &ShardState, budget: usize, group: &mut ReplicaG
             {
                 // Slot ownership moves only once its record is on disk: a record whose sync
                 // failed was cut from the log, and the primary sends it again after a restart.
-                if !group.close(state) {
+                if !group.close_on_disk(state) {
                     continue;
                 }
                 let sequence = state

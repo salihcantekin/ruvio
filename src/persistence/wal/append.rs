@@ -410,6 +410,7 @@ impl WalSink {
             // Everything written before the failure was synced above.
             self.file_length = self.write_pos;
             self.dirty_bytes = 0;
+            self.barrier_mark = (0, 0);
 
             if !self.staged.is_empty() {
                 let staged = std::mem::take(&mut self.staged);

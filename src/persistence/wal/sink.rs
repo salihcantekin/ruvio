@@ -271,6 +271,7 @@ impl WalSink {
         self.prefill.reset();
         self.next_sequence = next;
         self.dirty_bytes = 0;
+        self.barrier_mark = (0, 0);
         self.staged.clear();
         self.wait_background_sync();
         self.sync_in_flight = 0;

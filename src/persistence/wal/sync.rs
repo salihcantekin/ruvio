@@ -16,6 +16,7 @@ impl WalSink {
             worker.drain()?;
             if self.durable.load(Ordering::Acquire) >= self.last_sequence() {
                 self.dirty_bytes = 0;
+                self.barrier_mark = (0, 0);
             }
         }
         self.publish_staged()?;
@@ -398,6 +399,7 @@ impl WalSink {
         self.observe_sync_error()?;
         self.synced_pos = self.write_pos;
         self.dirty_bytes = 0;
+        self.barrier_mark = (0, 0);
         self.last_sync = Instant::now();
         Ok(())
     }

@@ -1562,10 +1562,15 @@ async fn serve_async(
 
                     // A turn's hold is released by its first waiter; one whose waiters
                     // all went away is released here. While a durable reply waits on this
-                    // replica's primary, a batch is synced at once, not on the interval.
+                    // replica's primary, a batch is synced at once, not on the interval; a
+                    // failure there is reported where the batch is drained.
+                    let replica_acks_each = state.role.get()
+                        == crate::config::ReplicationRole::Replica
+                        && state.replica_link.ack_each();
                     let synced = wal.release_tick_hold().and_then(|()| {
-                        if state.replica_link.ack_each() {
-                            wal.request_sync()
+                        if replica_acks_each {
+                            let _ = wal.request_sync();
+                            Ok(())
                         } else {
                             wal.sync_if_due()
                         }
