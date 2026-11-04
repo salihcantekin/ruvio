@@ -59,11 +59,11 @@ class Op:
     """One operation: invoke time, completion time, outcome. Slots keep a multi-million
     operation history within the controller's memory."""
 
-    __slots__ = ("p", "f", "k", "pr", "v", "start", "end", "type")
+    __slots__ = ("p", "f", "k", "pr", "v", "start", "end", "type", "r")
 
     def __init__(self, p, f, k, pr, v, start):
         self.p, self.f, self.k, self.pr, self.v, self.start = p, f, k, pr, v, start
-        self.end, self.type = None, "info"
+        self.end, self.type, self.r = None, "info", None
 
 
 def pair(entries) -> list[Op]:
@@ -80,10 +80,41 @@ def pair(entries) -> list[Op]:
             op.type, op.end = entry["type"], entry["t"]
             if entry["type"] == "ok":
                 op.v = entry.get("v")
+                op.r = entry.get("r")
             operations.append(op)
     operations.extend(open_ops.values())
     operations.sort(key=lambda op: op.start)
     return operations
+
+
+def counter_loss_times(acked: list[Op], lost: int) -> list:
+    """When `lost` acknowledged increments of a counter were lost. Each `INCR` reply is the
+    counter after it: one at or below a reply that came back before it was sent shows the
+    counter went back, so increments were lost just before it began. Without such a drop (a
+    history without replies) the newest acknowledged increments stand for the loss, the
+    likeliest tail lost with a primary."""
+    replied = sorted((op for op in acked if op.r is not None), key=lambda op: op.end)
+    ends = [op.end for op in replied]
+    running, top = [], 0
+    for op in replied:
+        top = max(top, op.r)
+        running.append(top)
+    drops, level = [], 0
+    for op in sorted(replied, key=lambda op: op.start):
+        before = bisect_left(ends, op.start) - 1
+        if before < 0:
+            continue
+        highest = running[before]
+        if op.r <= highest and highest > level:
+            drops.append((op.start, highest - op.r + 1))
+            level = highest
+    if not drops:
+        return [op.end for op in acked[len(acked) - lost:]]
+    times = []
+    for index, (start, size) in enumerate(drops):
+        take = lost - len(times) if index == len(drops) - 1 else min(size, lost - len(times))
+        times.extend([start] * max(0, take))
+    return times[:lost]
 
 
 MAX_FINDINGS = 100000  # times kept for attribution; counts are always exact
@@ -137,7 +168,7 @@ def analyse(entries) -> dict:
             # likeliest (a tail lost with a primary), so their times stand for the loss.
             lost = max(0, len(acked) - value)
             note(profile, "lost", lost, f"{key}: {value} < {len(acked)} acknowledged",
-                 [op.end for op in acked[len(acked) - lost:]] if lost else ())
+                 counter_loss_times(acked, lost) if lost else ())
             note(profile, "excess", max(0, value - len(acked) - len(unknown)),
                  f"{key}: {value} > {len(acked)} acknowledged + {len(unknown)} unknown", [final.start])
         elif kind == "append":

@@ -123,7 +123,12 @@ class Worker(threading.Thread):
             self.history.add(dict(base, type="info", v=value, e=f"{type(error).__name__}: {error}"[:120]))
             return None
         self.timed(function, "ok", started)
-        self.history.add(dict(base, type="ok", v=self.result(function, value, reply)))
+        entry = dict(base, type="ok", v=self.result(function, value, reply))
+        if function == "incr" and reply is not None:
+            # The counter's value after this increment: a reply below one seen before tells
+            # the checker when increments were lost.
+            entry["r"] = int(reply)
+        self.history.add(entry)
         return reply
 
     @staticmethod

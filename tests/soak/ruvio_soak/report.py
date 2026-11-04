@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import statistics
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -26,6 +27,11 @@ PRIMARY_FAULTS = ("kill-primary", "kill-host", "isolate-host", "restart-all-data
 
 def read(path: Path):
     return list(entries(path)) if path.exists() else []
+
+
+# A primary stops answering this long before the coordinators fail it over (`down_after`):
+# writes it acknowledged then may be lost in the failover.
+FAILOVER_BEFORE_S = 10.0
 
 
 class Run:
@@ -86,19 +92,46 @@ def merged(entries_, window, prefix=None) -> dict[int, int]:
     return histogram
 
 
+def number(value) -> float | None:
+    """A sample's value as a number: `INFO` fields arrive as strings."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        try:
+            return float(value) if "." in value else int(value)
+        except ValueError:
+            return None
+    return None
+
+
 def per_process(metrics, field, window) -> dict[str, list[float]]:
     values = defaultdict(list)
     for m in metrics:
-        if Run.inside(m["t"], window) and isinstance(m.get(field), (int, float)):
-            values[m["process"]].append(m[field])
+        value = number(m.get(field))
+        if Run.inside(m["t"], window) and value is not None:
+            values[m["process"]].append(value)
     return values
 
 
 def series_of(metrics, field, window) -> dict[str, list[tuple[float, float]]]:
     values = defaultdict(list)
     for m in metrics:
-        if Run.inside(m["t"], window) and isinstance(m.get(field), (int, float)):
-            values[m["process"]].append((m["t"], m[field]))
+        value = number(m.get(field))
+        if Run.inside(m["t"], window) and value is not None:
+            values[m["process"]].append((m["t"], value))
+    return values
+
+
+def overhead_series(metrics, window) -> dict[str, list[tuple[float, float]]]:
+    """Per data node, anonymous memory per byte the server counts for its data: a node whose
+    data keeps growing grows with it, which is not a leak, while a leak raises this ratio."""
+    values = defaultdict(list)
+    for m in metrics:
+        anon, charged = number(m.get("rss_anon_kib")), number(m.get("charged_memory_bytes"))
+        if Run.inside(m["t"], window) and anon is not None and charged:
+            values[m["process"]].append((m["t"], anon * 1024 / charged))
     return values
 
 
@@ -131,16 +164,24 @@ def evaluate(run: Run) -> dict:
             bad = {k: durable.get(k, 0) for k in ("lost", "stale_read", "backwards_read") + always_bad if durable.get(k)}
             criterion(results, 1, "durable: no anomaly of any kind", "fail" if bad else "pass", bad or 0, 0)
         details, failed = {}, False
+        reattributed = _reattributed(run) if run.findings else {}
         for profile, stats in profiles.items():
             if profile == "durable":
                 continue
             bad = {k: stats[k] for k in always_bad if stats.get(k)}
             unexplained = {k: v["unexplained"] for k, v in attribution.get(profile, {}).items() if v["unexplained"]}
+            if run.findings:
+                again = reattributed.get(profile, {})
+                unexplained = {k: v["unexplained"] for k, v in again.items() if v["unexplained"]}
+                by_failover = {k: v["uninjected_failover"] for k, v in again.items() if v["uninjected_failover"]}
+            else:
+                by_failover = None
             by_fault = {k: v["by_fault"] for k, v in attribution.get(profile, {}).items()}
             details[profile] = {"never_allowed": bad, "unexplained": unexplained, "lost": stats.get("lost", 0),
-                                "stale_read": stats.get("stale_read", 0), "by_fault": by_fault}
+                                "stale_read": stats.get("stale_read", 0), "by_fault": by_fault,
+                                "by_uninjected_failover": by_failover}
             failed = failed or bool(bad) or bool(unexplained)
-        criterion(results, 2, "default and client: losses and stale reads only inside primary faults", "fail" if failed else "pass",
+        criterion(results, 2, "default and client: losses and stale reads only inside primary faults or failovers", "fail" if failed else "pass",
                   details=details)
         restarts = [w for w in run.windows if w[2] == "restart-all-data"]
         if not restarts:
@@ -206,8 +247,11 @@ def evaluate(run: Run) -> dict:
         # A primary fault can fail over at most every group whose primary it touched (kill-host,
         # isolate-host, restart-all: up to two groups); anything else is a failover nobody caused.
         allowed = 2 * primary_faults
-        criterion(results, 8, "failovers only from injected faults", "pass" if failovers <= allowed else "fail",
-                  failovers, f"<= {allowed} (2 x {primary_faults} primary faults)")
+        uninjected = _uninjected_failovers(run)
+        ok = failovers <= allowed and not uninjected
+        criterion(results, 8, "failovers only from injected faults", "pass" if ok else "fail",
+                  {"failovers": failovers, "outside_faults": [time.strftime("%H:%M:%S", time.gmtime(t)) for t in uninjected]},
+                  f"<= {allowed} (2 x {primary_faults} primary faults), none outside a fault window")
 
     # 9-12: performance
     base = merged(run.latency, run.quiet_a)
@@ -253,7 +297,7 @@ def evaluate(run: Run) -> dict:
     # 13-16: resources
     memory = _memory(run)
     criterion(results, 13, "no memory growth: data nodes and coordinators", memory["status"], memory.get("value"),
-              "anon B <= 1.1 x A (+2 MiB) or overhead ratio B <= 1.1 x A; slope in B < 1024 KiB/h (data), < 512 KiB/h (coordinator)",
+              "anon B <= 1.1 x A (+2 MiB) or anon/data ratio B <= 1.1 x A; in B the anon/data ratio rises < 2 %/h (data nodes) or anon < 512 KiB/h (coordinator)",
               memory.get("details"))
     fds = _flat(run, "fds_internal", 5)
     clients = _flat(run, "connected_clients_n", 50)
@@ -262,8 +306,8 @@ def evaluate(run: Run) -> dict:
     criterion(results, 14, "open descriptors (without client connections) and threads do not grow", status,
               {"fds": fds, "threads": threads}, "B mean <= A mean + 5 fds, + 2 threads", {"client_connections": clients})
     disk = _disk(run)
-    criterion(results, 15, "WAL + checkpoint size bounded, free disk >= 20 %", disk["status"], disk.get("value"),
-              "B max <= 1.5 x A max + 64 MiB; free >= 20 %", disk.get("details"))
+    criterion(results, 15, "WAL bounded, checkpoint in step with the data, free disk >= 20 %", disk["status"], disk.get("value"),
+              "WAL B max <= 1.5 x A max + 64 MiB; checkpoint/data B <= 1.5 x A + 0.1; free >= 20 %", disk.get("details"))
     raft = per_process([m for m in run.metrics if m["process"].endswith("coordinator")], "data_dir_bytes",
                        (run.load[0] or 0, run.load[1] or float("inf")))
     if not raft:
@@ -293,14 +337,59 @@ def evaluate(run: Run) -> dict:
         "criteria": results, "hourly": _hourly(run)}
 
 
-def _mono_in(run: Run, mono: int, window) -> bool:
-    """Whether a finding's monotonic time falls in an epoch window: the events carry both clocks."""
+def _wall(run: Run, mono: int) -> float | None:
+    """A finding's monotonic time in epoch seconds: the events carry both clocks."""
     pairs = [(e["mono"], e["t"]) for e in run.events if "mono" in e]
     if not pairs:
-        return False
+        return None
     m0, t0 = min(pairs, key=lambda p: abs(p[0] - mono))
-    t = t0 + (mono - m0) / 1e9
-    return window[0] <= t <= window[1]
+    return t0 + (mono - m0) / 1e9
+
+
+def _mono_in(run: Run, mono: int, window) -> bool:
+    """Whether a finding's monotonic time falls in an epoch window."""
+    t = _wall(run, mono)
+    return t is not None and window[0] <= t <= window[1]
+
+
+def _failover_times(run: Run) -> list[float]:
+    """Epoch seconds of each failover the coordinators recorded (`last_failover_unix_ms`), as
+    far as the samples show them: two failovers between samples count once here."""
+    seen = set()
+    for m in run.metrics:
+        if m["process"].endswith("coordinator"):
+            value = number(m.get("last_failover_unix_ms"))
+            if value and (run.load[0] is None or value / 1000 >= run.load[0]):
+                seen.add(int(value))
+    times = []
+    for ms in sorted(seen):
+        if not times or ms / 1000 - times[-1] > 5:
+            times.append(ms / 1000)
+    return times
+
+
+def _uninjected_failovers(run: Run) -> list[float]:
+    """Failovers outside every fault window (a fault's window starts at the fault)."""
+    return [t for t in _failover_times(run) if not any(w[0] - 1 <= t <= w[1] for w in run.windows)]
+
+
+def _reattributed(run: Run) -> dict:
+    """{profile: {count: {"uninjected_failover": n, "unexplained": n}}} for the findings outside
+    every fault window: one from `FAILOVER_BEFORE_S` before an uninjected failover to the
+    window's grace after it is tied to that failover, which criterion 8 judges; the rest stay
+    unexplained."""
+    failovers = _uninjected_failovers(run)
+    out: dict = {}
+    for profile, count, mono, _key in run.findings:
+        t = _wall(run, mono)
+        if t is None or any(w[0] <= t <= w[1] for w in run.windows):
+            continue
+        slot = out.setdefault(profile, {}).setdefault(count, {"uninjected_failover": 0, "unexplained": 0})
+        if any(f - FAILOVER_BEFORE_S <= t <= f + run.grace_s for f in failovers):
+            slot["uninjected_failover"] += 1
+        else:
+            slot["unexplained"] += 1
+    return out
 
 
 def _p(values, fraction):
@@ -377,6 +466,7 @@ def _memory(run: Run) -> dict:
     charged_a = per_process(run.metrics, "charged_memory_bytes", run.quiet_a)
     charged_b = per_process(run.metrics, "charged_memory_bytes", run.quiet_b)
     b_series = series_of(run.metrics, "rss_anon_kib", run.quiet_b)
+    b_overhead = overhead_series(run.metrics, run.quiet_b)
     if not a_anon or not b_anon:
         return {"status": "not_measured", "details": "no anonymous memory samples"}
     details, failed = {}, False
@@ -390,10 +480,19 @@ def _memory(run: Run) -> dict:
                 ra, rb = a * 1024 / ca, b * 1024 / cb
                 entry.update(overhead_a=round(ra, 3), overhead_b=round(rb, 3))
                 grew = rb > 1.1 * ra
-        s = slope(b_series.get(process, []))
-        entry["slope_b_kib_h"] = None if s is None else round(s, 1)
-        limit = 512 if process.endswith("coordinator") else 1024
-        climbing = s is not None and s > limit
+        # Data nodes: once the server counts its data, the slope of memory per byte of data
+        # (at most 2 % of the ratio per hour); otherwise the absolute slope.
+        overhead = b_overhead.get(process, [])
+        if len(overhead) >= 3:
+            s = slope(overhead)
+            mean = statistics.mean(v for _, v in overhead)
+            entry["overhead_slope_per_h"] = None if s is None else round(s, 4)
+            climbing = s is not None and s > 0.02 * mean
+        else:
+            s = slope(b_series.get(process, []))
+            entry["slope_b_kib_h"] = None if s is None else round(s, 1)
+            limit = 512 if process.endswith("coordinator") else 1024
+            climbing = s is not None and s > limit
         entry["status"] = "fail" if grew or climbing else "pass"
         failed = failed or grew or climbing
         details[process] = entry
@@ -433,23 +532,41 @@ def _flat(run: Run, field: str, allowance: float):
 
 
 def _disk(run: Run) -> dict:
+    """The WAL is bounded on its own; a checkpoint holds the data, so it is judged against
+    what the server counts for its data (`charged_memory_bytes`) when that is known."""
     if run.quiet_a is None or run.quiet_b is None:
         return {"status": "not_measured", "details": "no quiet windows"}
-    def total(window):
+
+    def peak(window, field):
         out = defaultdict(int)
         for m in run.metrics:
-            if Run.inside(m["t"], window) and isinstance(m.get("wal_bytes"), int):
-                out[m["process"]] = max(out[m["process"]], m["wal_bytes"] + m.get("checkpoint_bytes", 0))
+            value = number(m.get(field))
+            if Run.inside(m["t"], window) and value is not None and not m["process"].endswith("coordinator"):
+                out[m["process"]] = max(out[m["process"]], int(value))
         return out
-    a, b = total(run.quiet_a), total(run.quiet_b)
+
+    wal_a, wal_b = peak(run.quiet_a, "wal_bytes"), peak(run.quiet_b, "wal_bytes")
+    cp_a, cp_b = peak(run.quiet_a, "checkpoint_bytes"), peak(run.quiet_b, "checkpoint_bytes")
+    data_a, data_b = peak(run.quiet_a, "charged_memory_bytes"), peak(run.quiet_b, "charged_memory_bytes")
     free = [h["disk_avail_bytes"] / h["disk_size_bytes"] for h in run.hosts
             if isinstance(h.get("disk_avail_bytes"), int) and h.get("disk_size_bytes")]
-    if not a or not b or not free:
+    if not wal_a or not wal_b or not free:
         return {"status": "not_measured", "details": "no WAL or disk samples"}
-    grew = {p: (a[p], b[p]) for p in set(a) & set(b) if not p.endswith("coordinator") and b[p] > 1.5 * a[p] + (64 << 20)}
+    grew = {}
+    for p in set(wal_a) & set(wal_b):
+        if wal_b[p] > 1.5 * wal_a[p] + (64 << 20):
+            grew[p] = {"wal": (wal_a[p], wal_b[p])}
+        a_cp, b_cp = cp_a.get(p, 0), cp_b.get(p, 0)
+        if data_a.get(p) and data_b.get(p):
+            ratio_a, ratio_b = a_cp / data_a[p], b_cp / data_b[p]
+            if ratio_b > 1.5 * ratio_a + 0.1:
+                grew.setdefault(p, {})["checkpoint_per_data"] = (round(ratio_a, 3), round(ratio_b, 3))
+        elif b_cp > 1.5 * a_cp + (64 << 20):
+            grew.setdefault(p, {})["checkpoint"] = (a_cp, b_cp)
     ok = not grew and min(free) >= 0.2
     return {"status": "pass" if ok else "fail", "value": {"grew": grew, "min_free_fraction": round(min(free), 3)},
-            "details": {"a_max_bytes": dict(a), "b_max_bytes": dict(b)}}
+            "details": {"wal_a": dict(wal_a), "wal_b": dict(wal_b), "checkpoint_a": dict(cp_a),
+                        "checkpoint_b": dict(cp_b), "data_a": dict(data_a), "data_b": dict(data_b)}}
 
 
 def _hourly(run: Run) -> list[dict]:
