@@ -110,26 +110,75 @@ const WAL_PREALLOC_AHEAD: u64 = 3 * 1024 * 1024;
 #[cfg(test)]
 pub(crate) static FAILING_SYNC_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
-/// Data directories whose WAL syncs take this much longer (a slow disk), on the shard thread
-/// and on the background sync thread alike; the count is how many syncs were delayed.
+/// Data directories whose WAL syncs take this much longer (a slow disk), on the shard thread,
+/// on the background sync thread and on the sync worker alike.
 #[cfg(test)]
-pub(crate) static SLOW_SYNC_DIRS: Mutex<Vec<(PathBuf, std::time::Duration, u32)>> =
-    Mutex::new(Vec::new());
+pub(crate) static SLOW_SYNC_DIRS: Mutex<Vec<SlowSyncDir>> = Mutex::new(Vec::new());
 
 #[cfg(test)]
-fn delay_sync(data_dir: &Path) {
+#[derive(Debug)]
+pub(crate) struct SlowSyncDir {
+    pub(crate) dir: PathBuf,
+    pub(crate) delay: std::time::Duration,
+    /// Syncs delayed so far.
+    pub(crate) started: u32,
+    /// Syncs a shard's own thread ran or waited for the sync worker to finish.
+    pub(crate) on_shard_thread: u32,
+}
+
+#[cfg(test)]
+impl SlowSyncDir {
+    pub(crate) fn new(dir: &Path, delay: std::time::Duration) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            delay,
+            started: 0,
+            on_shard_thread: 0,
+        }
+    }
+}
+
+/// A single-shard server runs its shard on the thread that called `serve`.
+#[cfg(test)]
+fn on_shard_thread() -> bool {
+    std::thread::current()
+        .name()
+        .is_none_or(|name| !name.starts_with("ruvio-") || name.starts_with("ruvio-evented"))
+}
+
+#[cfg(test)]
+pub(super) fn delay_sync(data_dir: &Path) {
+    let on_shard_thread = on_shard_thread();
     let delay = SLOW_SYNC_DIRS
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .iter_mut()
-        .find(|(dir, _, _)| dir == data_dir)
-        .map(|(_, delay, started)| {
-            *started += 1;
-            *delay
+        .find(|slow| slow.dir == data_dir)
+        .map(|slow| {
+            slow.started += 1;
+            slow.on_shard_thread += u32::from(on_shard_thread);
+            slow.delay
         });
 
     if let Some(delay) = delay {
         std::thread::sleep(delay);
+    }
+}
+
+/// A thread is about to wait for the sync worker of a log in `data_dir`: on a shard's
+/// thread that counts as that thread waiting for the disk.
+#[cfg(test)]
+pub(super) fn note_sync_wait(data_dir: &Path) {
+    if !on_shard_thread() {
+        return;
+    }
+    if let Some(slow) = SLOW_SYNC_DIRS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter_mut()
+        .find(|slow| slow.dir == data_dir)
+    {
+        slow.on_shard_thread += 1;
     }
 }
 

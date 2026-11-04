@@ -964,14 +964,16 @@ fn drain_replicated_frames(state: &ShardState) {
         return;
     }
 
-    // A durable reply waits on the primary: make this batch durable now, not on the next
-    // `everysec` tick, so the acknowledgement goes out at once.
+    // A durable reply waits on the primary: start this batch's sync now, not on the next
+    // `everysec` tick, so the acknowledgement goes out once it is on disk. The sync runs
+    // off the shard thread (`request_sync`), which keeps answering its clients; the WAL
+    // tick asks again while the reply waits, for a batch that a running sync missed.
     if state.replica_link.ack_each()
         && let Err(error) = state
             .persistence
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .flush()
+            .request_sync()
     {
         warn!(%error, "replica log sync for a durable reply failed");
     }
@@ -1006,12 +1008,14 @@ impl ReplicaGroup {
     }
 
     /// Writes and syncs the group. Its frames are already in memory, as a primary's batch
-    /// is before its sync. When the sync fails the log cuts them and refuses every later
+    /// is before its sync. With the sync worker the sync is handed to it and the shard
+    /// thread does not wait for the disk: the acknowledgement follows the durable cursor
+    /// the worker advances, and a failed worker sync fails the next group. When the sync fails the log cuts them and refuses every later
     /// frame until restart (the link reports down), and no checkpoint covers a sequence
     /// past the last good sync (`checkpoint_may_cover`): a restart replays the log and
     /// resumes from the primary, which holds these records on disk. A failed write keeps
     /// them staged until the log recovers, as for a primary.
-    /// Returns false when the group's records did not reach the disk.
+    /// Returns false when the group could not be written or synced.
     fn close(&mut self, state: &ShardState) -> bool {
         let Some(start) = self.start.take() else {
             return true;
@@ -1021,7 +1025,7 @@ impl ReplicaGroup {
                 .persistence
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            let result = wal.end_group().and_then(|()| wal.sync_batch(start));
+            let result = wal.end_group().and_then(|()| wal.sync_batch_soon(start));
 
             (result, wal.sync_totals())
         };

@@ -1561,8 +1561,17 @@ async fn serve_async(
                         .unwrap_or_else(|error| error.into_inner());
 
                     // A turn's hold is released by its first waiter; one whose waiters
-                    // all went away is released here.
-                    if let Err(error) = wal.release_tick_hold().and_then(|()| wal.sync_if_due()) {
+                    // all went away is released here. While a durable reply waits on this
+                    // replica's primary, a batch is synced at once, not on the interval.
+                    let synced = wal.release_tick_hold().and_then(|()| {
+                        if state.replica_link.ack_each() {
+                            wal.request_sync()
+                        } else {
+                            wal.sync_if_due()
+                        }
+                    });
+
+                    if let Err(error) = synced {
                         let (wal_last_sequence, wal_unsynced_bytes) = wal.log_fields();
 
                         warn!(

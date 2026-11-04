@@ -41,6 +41,9 @@ struct Shared {
     unavailable: AtomicBool,
     #[cfg(test)]
     fail_sync: std::sync::atomic::AtomicBool,
+    /// The log's data directory, for `SLOW_SYNC_DIRS`.
+    #[cfg(test)]
+    data_dir: Mutex<Option<std::path::PathBuf>>,
 }
 
 /// One active sync and one coalescing slot, independent of connection count.
@@ -67,6 +70,8 @@ impl SyncWorker {
             unavailable: AtomicBool::new(false),
             #[cfg(test)]
             fail_sync: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            data_dir: Mutex::new(None),
         });
         let worker = Arc::clone(&shared);
         let thread = thread::Builder::new()
@@ -76,6 +81,15 @@ impl SyncWorker {
             shared,
             thread: Some(thread),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_data_dir_for_test(&self, data_dir: &std::path::Path) {
+        *self
+            .shared
+            .data_dir
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(data_dir.to_path_buf());
     }
 
     pub(crate) fn submit(
@@ -116,6 +130,18 @@ impl SyncWorker {
         #[cfg(test)]
         let deadline = Instant::now() + std::time::Duration::from_secs(30);
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(test)]
+        if state.busy || state.pending.is_some() {
+            let data_dir = self
+                .shared
+                .data_dir
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(data_dir) = data_dir {
+                super::wal::note_sync_wait(&data_dir);
+            }
+        }
         while state.busy || state.pending.is_some() {
             check_failure(&state)?;
             #[cfg(test)]
@@ -261,6 +287,14 @@ fn run(shared: Arc<Shared>) {
         let result = if shared.fail_sync.load(Ordering::Acquire) {
             Err(io::Error::other("injected worker sync failure"))
         } else {
+            let data_dir = shared
+                .data_dir
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(data_dir) = data_dir {
+                super::wal::delay_sync(&data_dir);
+            }
             job.file.sync_data()
         };
         #[cfg(not(test))]

@@ -132,6 +132,10 @@ impl WalSink {
         } else {
             None
         };
+        #[cfg(test)]
+        if let Some(worker) = &sync_worker {
+            worker.set_data_dir_for_test(&config.data_dir);
+        }
 
         Ok((
             Self {

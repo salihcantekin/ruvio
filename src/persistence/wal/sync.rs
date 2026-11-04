@@ -243,6 +243,21 @@ impl WalSink {
         self.sync_pending()
     }
 
+    /// `sync_batch` for a batch whose sender waits for the durable cursor, not for this call:
+    /// a replica's batch of its primary's frames. With the sync worker the batch goes to the
+    /// worker and the shard thread does not wait for the disk; the cursor advances once it is
+    /// synced, and a failed sync fails the next call. Without the worker it is synced now.
+    pub fn sync_batch_soon(&mut self, start: u64) -> Result<(), PersistenceError> {
+        if self.profile != DurabilityProfile::Always || self.sync_worker.is_none() {
+            return self.sync_batch(start);
+        }
+        if self.failed.is_some() && self.last_sequence() == start {
+            return Ok(());
+        }
+
+        self.prepare_sync_barrier().map(drop)
+    }
+
     /// Closes a batch whose client went away before its commit (`start` as in `sync_batch`).
     /// Its records are still synced and published now, so they do not wait for another
     /// client's sync on this shard.
@@ -457,15 +472,18 @@ impl WalSink {
     /// Asks for the written records to be synced. An `everysec` log starts its background
     /// sync now instead of on the next tick and returns without waiting for the disk; while a
     /// sync is already running it does nothing, so a caller waiting for these records calls
-    /// it again until they are synced. Any other profile flushes as before: an `always` log
-    /// syncs before its replies anyway, and a group another task left open must not wait for
-    /// that task.
+    /// it again until they are synced. An `always` log with the sync worker hands every
+    /// written record to the worker, which covers them all, so one call is enough. Any other
+    /// log flushes: an `always` log syncs before its replies anyway, and a group another task
+    /// left open must not wait for that task.
     pub fn request_sync(&mut self) -> Result<(), PersistenceError> {
-        if self.profile != DurabilityProfile::Everysec {
-            return self.flush();
+        match self.profile {
+            DurabilityProfile::Everysec => self.start_background_sync(true),
+            DurabilityProfile::Always if self.sync_worker.is_some() => {
+                self.prepare_sync_barrier().map(drop)
+            }
+            _ => self.flush(),
         }
-
-        self.start_background_sync(true)
     }
 
     fn start_background_sync(&mut self, now: bool) -> Result<(), PersistenceError> {
