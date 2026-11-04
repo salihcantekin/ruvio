@@ -63,6 +63,13 @@ controller has a public IP, and SSH reaches it only from one address.
 | `kill-host` | SIGKILL to all three processes of one host | local, ssh |
 | `isolate-host` | nftables drops traffic between one host and the other hosts; the controller still reaches it | ssh |
 | `netem` | `tc netem` on one host (`faults.netem`, for example `delay 50ms 20ms loss 2%`) | ssh |
+| `partition-coordinator-leader` | nftables cuts the leading coordinator's Raft port from the other coordinators; it still reaches the data nodes | ssh |
+| `migrate-slots` | `COORDINATOR MOVE` of `faults.migrate_range` (default `4096-4607`) to the other group under load, back the next time; healed when every member names the new owner | local, ssh |
+| `restart-all-data` | SIGKILL to every data node at once; the primary the coordinators name starts first | local, ssh |
+
+Faults run between `faults.start_s` and `faults.stop_s` (seconds after the load started), so a
+run can keep fault-free windows at both ends; `faults.sequence` runs first, in order.
+`"restart_as": "mixed"` picks `replica` or `configured` for each restart.
 
 A fault a backend cannot inject is recorded as skipped, never as passed. On the VMs every
 network fault is also scheduled for removal on the host itself (`systemd-run --on-active`), so it
@@ -73,9 +80,52 @@ A data node that comes back starts as a replica of its group's current primary
 role instead; see [#142](https://github.com/salihcantekin/ruvio/issues/142) for what that does
 today.
 
+## What else is recorded
+
+| File | Every | What |
+| --- | --- | --- |
+| `history-NNNN.jsonl` | `history_segment_s` (3600) | The checked operations, one segment per hour, each uploaded when it closes |
+| `latency.jsonl` | minute | Per profile and command: counts by outcome, p50/p90/p99/p99.9/max and the sparse histogram (16 buckets per power of two), so hours merge exactly |
+| `background-latency-N.jsonl` | minute | The same for the background load (`load.background`, see `ruvio_soak/background.py`): about a million keys of seven types, bounded in size |
+| `metrics.jsonl` | `metrics_interval_s` | Per process: memory, CPU ticks, open descriptors, threads, context switches, data directory, WAL and checkpoint bytes, and the INFO fields of `metrics.py` |
+| `info.jsonl` | `full_info_every` samples | The whole `INFO` of every process |
+| `hosts.jsonl` | `metrics_interval_s` | Per VM: load, free memory and disk, network bytes, chrony offset; the controller's own CPU |
+| `logs/hostN-role.log` | `log_interval_s` (3600) | Each process's journal, with panic, ERROR and WARN counts in `status.json` |
+| `findings.jsonl`, `check.json` | end | Every anomaly with its time and key; `check.json` ties each to the fault window it fell in (`attribution`) |
+| `report.json`, `report.md` | end | `run.py report`: the readiness criteria below, each `pass`, `fail` or `not_measured` |
+
+`load.official` adds a `client` profile that runs counters and registers through the official
+Python client (`clients/python`, cluster mode); its operations are checked like the others.
+
+## The readiness report
+
+`python3 tests/soak/run.py report <run directory>` (also run at the end of every run). The
+quiet windows are the fault-free stretches before the first and after the last fault, minus
+`report_settle_s` at their start.
+
+| # | Criterion |
+| --- | --- |
+| 1 | `durable`: no lost, excess, phantom, duplicate, out-of-order, unread, stale or backwards read |
+| 2 | `default`, `client`: none of excess, phantom, duplicate, order, unread; losses and stale reads only inside a fault window |
+| 3 | After `restart-all-data`: no acknowledged write lost on the `always` group |
+| 4 | No anomaly inside a `migrate-slots` window |
+| 5 | Every fault healed; recovery max <= 60 s, median <= 15 s |
+| 6 | No unexpected process exit, no panic in the logs |
+| 7 | No failed or unknown operation outside fault windows |
+| 8 | Failovers (`failovers_total`) at most two per fault that hits a primary |
+| 9 | p99 and p99.9 in the last quiet window within 20 % (+0.2 ms) of the first |
+| 10 | p99 back within 1.5 x the quiet baseline 60 s after each fault |
+| 11 | Background throughput within +-5 % in the quiet windows |
+| 12 | Replica lag p99 below 1 s in the quiet windows |
+| 13 | Anonymous memory: last quiet window <= 1.1 x the first (or the same overhead per charged byte), slope there < 1 MiB/h (coordinators 0.5) |
+| 14 | Open descriptors and threads do not grow |
+| 15 | WAL + checkpoints bounded, free disk >= 20 % |
+| 16 | Coordinator data grows less than 64 MiB |
+| 17 | Metric gaps < 1 %, clock offset < 10 ms, controller CPU p95 < 70 %, check finished |
+
 ## The history check
 
-`python3 tests/soak/run.py check <history.jsonl>` (also run at the end of every run, written to
+`python3 tests/soak/run.py check history-*.jsonl [--buckets 16] [--events events.jsonl]` (also run at the end of every run, written to
 `check.json`):
 
 | Count | Meaning | Verdict |
@@ -159,6 +209,15 @@ files live only on the controller and in Blob.
 The auto-shutdown deallocates every VM at `autoShutdownTimeUtc` if that is forgotten; the disks
 still cost a little until the group is deleted.
 
+`plans/azure-24h.json` is the production-readiness run: 23 hours of load with the primary lease
+and snapshots on, no faults in the first 2 and the last 3 hours, every fault kind at least five
+times in between (three full restarts), the background load and the official client. It needs
+a bigger controller and disk (`controllerSize=Standard_D8as_v6 controllerDiskSizeGb=128`) and,
+to delete its own VMs at the end, `selfDelete=true` and
+`run.py run ... --delete-resource-group rg-ruvio-soak` (the group is deleted only once every
+file is in Blob; the auto-shutdown stays as the backstop). `plans/local-rehearsal.json` runs
+the same machinery locally in about 12 minutes.
+
 `plans/azure-short.json` is the same in 30 minutes (faults every 2-4 minutes), to try the tool.
 `plans/azure-mini.json` is a 3-hour run: every fault kind every 5-10 minutes, faults lasting
 5-30 s, `durable` writes waiting for both replicas. The cloud-init data-disk detection and the
@@ -168,7 +227,7 @@ still cost a little until the group is deleted.
 
 | Path | What |
 | --- | --- |
-| `run.py` | Entry point: `run`, `check`, `render` |
+| `run.py` | Entry point: `run`, `check`, `report`, `render` |
 | `ruvio_soak/cluster.py` | Topology and the configs it renders |
 | `ruvio_soak/backends.py` | Local processes, or systemd units over SSH with nftables and netem faults |
 | `ruvio_soak/resp.py` | RESP connection and the slot-routing client that classifies outcomes |
@@ -176,6 +235,9 @@ still cost a little until the group is deleted.
 | `ruvio_soak/history.py` | The history checker |
 | `ruvio_soak/runner.py` | Health check, fault schedule, final reads |
 | `ruvio_soak/metrics.py`, `ruvio_soak/status.py` | Metrics, `status.json` and the Blob upload |
+| `ruvio_soak/latency.py`, `ruvio_soak/background.py` | Latency histograms; the background load |
+| `ruvio_soak/report.py` | The readiness criteria |
+| `ruvio_soak/azure.py` | The controller deleting its own resource group |
 | `plans/` | Run plans |
 | `azure/main.bicep` | The run's network, NSG, four VMs, data disks, auto-shutdown |
 | `azure/storage.bicep`, `azure/budget.bicep` | Results storage (90-day retention) and the monthly budget alert |

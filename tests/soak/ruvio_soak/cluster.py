@@ -40,6 +40,7 @@ class Cluster:
     ping_interval_ms: int = 500
     down_after_ms: int = 3000
     primary_lease_ms: int = 0
+    snapshot_interval_ms: int = 0  # 0: the server's default
     password: str = ""
     secret: str = ""
 
@@ -67,6 +68,7 @@ class Cluster:
             "ping_interval_ms": self.ping_interval_ms,
             "down_after_ms": self.down_after_ms,
             "primary_lease_ms": self.primary_lease_ms,
+            "snapshot_interval_ms": self.snapshot_interval_ms,
         }
 
     # Locally every host shares 127.0.0.1, so host i's ports are shifted by 10 * i. A group
@@ -138,11 +140,13 @@ class Cluster:
         return text
 
     def node_env(
-        self, host: int, group: str, data_dir: str, topology_path: str, follow: str | None = None
+        self, host: int, group: str, data_dir: str, topology_path: str, follow: str | None = None,
+        as_primary: bool = False,
     ) -> dict[str, str]:
         """Environment of one data node. The role is the starting role only; after a failover
         the coordinators repoint the members. `follow` (a replication address) starts the node
-        as a replica of that member instead."""
+        as a replica of that member instead; `as_primary` starts it as the primary (after every
+        member of its group was down, the one the coordinators still name)."""
         g = self.group(group)
         env = {
             "RUVIO_ADDR": self.address(host, group),
@@ -155,7 +159,13 @@ class Cluster:
             "RUVIO_CLUSTER_TOPOLOGY": topology_path,
             "RUVIO_CLUSTER_GROUP": group,
         }
-        if follow is None and host == g.first_primary:
+        if self.primary_lease_ms > 0:
+            # The lease is taken only from the coordinators of this cluster (ids 1..hosts).
+            env["RUVIO_PRIMARY_LEASE"] = "yes"
+            env["RUVIO_PRIMARY_LEASE_COORDINATORS"] = ",".join(str(i + 1) for i in range(len(self.hosts)))
+        if self.snapshot_interval_ms > 0:
+            env["RUVIO_SNAPSHOT_INTERVAL_MS"] = str(self.snapshot_interval_ms)
+        if as_primary or (follow is None and host == g.first_primary):
             env["RUVIO_REPLICATION_ROLE"] = "primary"
         else:
             env["RUVIO_REPLICATION_ROLE"] = "replica"

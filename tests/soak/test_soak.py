@@ -18,8 +18,8 @@ import unittest
 from types import SimpleNamespace
 from pathlib import Path
 
-from ruvio_soak import history
-from ruvio_soak.backends import SshBackend, parse_proc_status
+from ruvio_soak import history, latency, workload
+from ruvio_soak.backends import SshBackend, parse_host_stats, parse_proc_status
 from ruvio_soak.cluster import Cluster
 from ruvio_soak.resp import key_slot
 from ruvio_soak.runner import Runner
@@ -274,8 +274,10 @@ class BlobUpload(unittest.TestCase):
                 lines = b"".join(b'{"n":%d}\n' % n for n in range(300000))
                 (Path(directory) / "history.jsonl").write_bytes(lines)
                 (Path(directory) / "check.json").write_bytes(b"{}")
-                Runner.upload(SimpleNamespace(uploader=uploader, directory=Path(directory)),
-                              "history.jsonl", "check.json", "missing.jsonl")
+                runner = SimpleNamespace(uploader=uploader, directory=Path(directory))
+                runner.upload_file = lambda path, name: Runner.upload_file(runner, path, name)
+                runner.note_upload = lambda name, ok: Runner.note_upload(runner, name, ok)
+                Runner.upload(runner, "history.jsonl", "check.json", "missing.jsonl")
             self.assertEqual(sorted(received), ["/soak/run-1/check.json", "/soak/run-1/history.jsonl.gz"])
             self.assertEqual(gzip.decompress(received["/soak/run-1/history.jsonl.gz"]), lines)
         finally:
@@ -285,6 +287,140 @@ class BlobUpload(unittest.TestCase):
     def test_a_url_without_sas_is_refused(self):
         with self.assertRaises(ValueError):
             BlobUploader("https://account.blob.core.windows.net/soak", "x")
+
+
+
+class LongRunPieces(unittest.TestCase):
+    """The parts a 24-hour run needs: bucketed checks, fault attribution, latency histograms,
+    history segments, bounded lists, host stats and the lease settings."""
+
+    def mixed_history(self):
+        r = Recorder()
+        for n in range(1, 40):
+            r.op_("w", "append", f"list{n % 7}", n, "ok", profile="default")
+            r.op_("c", "incr", f"counter{n % 5}", 1, "ok", profile="durable")
+        for k in range(7):
+            r.final(f"list{k}", [n for n in range(1, 40) if n % 7 == k and n != 8], profile="default")  # 8 lost
+        for k in range(5):
+            r.final(f"counter{k}", sum(1 for n in range(1, 40) if n % 5 == k), profile="durable")
+        return r
+
+    def test_bucketed_check_matches_a_single_pass(self):
+        r = self.mixed_history()
+        with tempfile.TemporaryDirectory() as directory:
+            half = len(r.entries) // 2
+            paths = [Path(directory) / "a.jsonl", Path(directory) / "b.jsonl"]
+            for path, part in zip(paths, (r.entries[:half], r.entries[half:])):
+                path.write_text("".join(json.dumps(e, separators=(",", ":")) + "\n" for e in part))
+            single = history.check_files(paths, buckets=1)
+            bucketed = history.check_files(paths, buckets=4, work=Path(directory))
+        self.assertEqual(single["profiles"], bucketed["profiles"])
+        self.assertEqual(bucketed["profiles"]["default"]["lost"], 1)
+        self.assertEqual(single["verdict"], bucketed["verdict"])
+
+    def test_findings_are_tied_to_fault_windows(self):
+        r = self.mixed_history()
+        result = history.check(r.entries)
+        (_, _, t, _), = result["findings"]
+        inside = [{"kind": "kill-primary", "start": t - 5, "end": t + 5}]
+        outside = [{"kind": "kill-primary", "start": t + 100, "end": t + 200}]
+        self.assertEqual(history.attribute(result, inside)["default"]["lost"]["by_fault"], {"kill-primary": 1})
+        self.assertEqual(history.attribute(result, outside)["default"]["lost"]["unexplained"], 1)
+
+    def test_fault_windows_from_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            path.write_text("".join(json.dumps(e) + "\n" for e in [
+                {"event": "fault", "kind": "netem", "mono": 1000},
+                {"event": "healed", "kind": "netem", "mono": 2000},
+                {"event": "fault", "kind": "kill-host", "mono": 5000},
+            ]))
+            windows = history.fault_windows(path, grace_s=0.000001)
+        self.assertEqual(windows[0], {"kind": "netem", "start": 1000, "end": 3000})
+        self.assertIsNone(windows[1]["end"])
+
+    def test_latency_percentiles_never_understate(self):
+        for micros in (1, 3, 17, 999, 1000, 123456, 5_000_000):
+            self.assertGreaterEqual(latency.bucket_upper(latency.bucket(micros)), micros)
+            self.assertLess(latency.bucket_upper(latency.bucket(micros)), micros * 1.07 + 1)
+        histogram = {}
+        for micros in range(1, 1001):
+            index = latency.bucket(micros)
+            histogram[index] = histogram.get(index, 0) + 1
+        self.assertAlmostEqual(latency.percentile(histogram, 0.5), 0.5, delta=0.03)
+        self.assertAlmostEqual(latency.percentile(histogram, 0.99), 0.99, delta=0.05)
+
+    def test_latency_minutes_are_written(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = latency.Recorder(Path(directory) / "latency.jsonl")
+            recorder.add("default:incr", "ok", 0.002)
+            recorder.add("default:incr", "info", 0.5)
+            recorder.close()
+            entry = json.loads((Path(directory) / "latency.jsonl").read_text())
+        self.assertEqual(entry["counts"], {"ok": 1, "info": 1})
+        self.assertAlmostEqual(entry["p99_ms"], 2.0, delta=0.15)
+
+    def test_history_segments_and_written_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            h = workload.History(Path(directory))
+            h.add({"p": "w", "i": 1, "type": "invoke", "f": "incr", "k": "a", "pr": "default", "v": 1})
+            closed = h.rotate()
+            h.add({"p": "w", "i": 1, "type": "ok", "f": "incr", "k": "a", "pr": "default", "v": 1})
+            h.close()
+            self.assertEqual([p.name for p in h.paths()], ["history-0000.jsonl", "history-0001.jsonl"])
+            self.assertEqual(closed.name, "history-0000.jsonl")
+            self.assertEqual(h.written, {"a": ("incr", "default")})
+            result = history.check_files(h.paths())
+        self.assertEqual(result["operations"], 1)
+
+    def test_lists_move_to_a_new_key_at_their_cap(self):
+        worker = workload.AppendWorker.__new__(workload.AppendWorker)
+        sent = []
+        worker.keys, worker.base, worker.generation, worker.next, worker.max_len = ["l"], ["l"], [0], {"l": 1}, 3
+        worker.record = lambda f, k, v, call: sent.append((k, v))
+        for _ in range(5):
+            worker.step()
+        self.assertEqual(sent, [("l", 1), ("l", 2), ("l", 3), ("l:1", 1), ("l:1", 2)])
+
+    def test_host_stats_are_parsed_per_unit(self):
+        text = ("== ruvio@g1\nVmRSS:\t 2048 kB\nRssAnon:\t 1024 kB\nThreads:\t9\nCpuTicks: 77\nFds: 31\n"
+                "DataBytes: 4096\nWalBytes: 1024\nCheckpointBytes: 2048\n== host\nLoad: 0.25\nDiskAvail: 10\n"
+                "ClockOffsetS: -0.000004\n")
+        processes, host = parse_host_stats(text, {"ruvio@g1": "g1"})
+        self.assertEqual(processes["g1"], {"rss_kib": 2048, "rss_anon_kib": 1024, "threads": 9, "cpu_ticks": 77,
+                                           "fds": 31, "data_dir_bytes": 4096, "wal_bytes": 1024, "checkpoint_bytes": 2048})
+        self.assertEqual(host, {"load1": 0.25, "disk_avail_bytes": 10, "clock_offset_s": -0.000004})
+
+    def test_lease_and_snapshot_settings_reach_the_nodes(self):
+        cluster = Cluster(hosts=["10.0.0.1", "10.0.0.2", "10.0.0.3"], primary_lease_ms=2000, snapshot_interval_ms=60000)
+        env = cluster.node_env(1, "g1", "/d", "/t")
+        self.assertEqual(env["RUVIO_PRIMARY_LEASE"], "yes")
+        self.assertEqual(env["RUVIO_PRIMARY_LEASE_COORDINATORS"], "1,2,3")
+        self.assertEqual(env["RUVIO_SNAPSHOT_INTERVAL_MS"], "60000")
+        self.assertEqual(cluster.node_env(1, "g1", "/d", "/t", as_primary=True)["RUVIO_REPLICATION_ROLE"], "primary")
+        self.assertNotIn("RUVIO_PRIMARY_LEASE", Cluster(hosts=["a", "b", "c"]).node_env(0, "g1", "/d", "/t"))
+
+    def test_the_coordinator_partition_cuts_only_the_raft_port(self):
+        commands = []
+        backend = SshBackend(Cluster(hosts=["10.0.0.1", "10.0.0.2", "10.0.0.3"]), "ruvio", "soak",
+                             run=lambda address, command, stdin=None: commands.append((address, command, stdin)) or "")
+        backend.partition_coordinator(0, 60)
+        rules = commands[-1][2].decode()
+        self.assertIn("tcp dport 26400 drop", rules)
+        self.assertIn("{ 10.0.0.2, 10.0.0.3 }", rules)
+        self.assertTrue(any("--on-active=60" in c for _, c, _ in commands))
+
+
+    def test_a_report_without_data_is_never_a_pass(self):
+        from ruvio_soak import report
+
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "plan.json").write_text("{}")
+            result = report.write(Path(directory))
+            self.assertTrue((Path(directory) / "report.md").exists())
+        self.assertEqual(result["verdict"], "incomplete")
+        self.assertEqual({r["status"] for r in result["criteria"]}, {"not_measured"})
+        self.assertEqual(len(result["criteria"]), 17)
 
 
 if __name__ == "__main__":

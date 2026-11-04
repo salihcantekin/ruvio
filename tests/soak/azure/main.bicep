@@ -32,6 +32,12 @@ param nodeSize string = 'Standard_D4ads_v6'
 @description('Size of the controller VM (load, checker, fault injection).')
 param controllerSize string = 'Standard_D4as_v6'
 
+@description('OS disk of the controller: it keeps the whole history (about 12 GB for 24 hours of the checked load) and the checker splits it once more.')
+param controllerDiskSizeGb int = 64
+
+@description('Give the controller a managed identity that may delete this resource group, so a run deletes its own VMs once its results are uploaded (`run.py run --delete-resource-group`). Needs the right to create role assignments.')
+param selfDelete bool = false
+
 @description('Data disk of each data node, mounted on /var/lib/ruvio.')
 param dataDiskSizeGb int = 128
 
@@ -40,6 +46,9 @@ param dataDiskSku string = 'Premium_LRS'
 
 @description('Daily UTC time (HHmm) at which every VM is deallocated: a dead-man switch for a forgotten run. Set it to the planned end of the run plus a margin.')
 param autoShutdownTimeUtc string
+
+@description('Whether the daily auto-shutdown is on. A run longer than about 20 hours cannot use it (it would fire on the first day); it then relies on `run.py backstop` on a controller timer and on `--delete-resource-group`.')
+param autoShutdownEnabled bool = true
 
 @description('Tag values; ttl-hours is informational, the auto-shutdown enforces it.')
 param runId string = utcNow('yyyyMMdd-HHmm')
@@ -199,6 +208,7 @@ resource controller 'Microsoft.Compute/virtualMachines@2024-07-01' = {
   location: location
   tags: tags
   zones: ['1']
+  identity: selfDelete ? { type: 'SystemAssigned' } : null
   properties: {
     hardwareProfile: { vmSize: controllerSize }
     osProfile: {
@@ -212,7 +222,7 @@ resource controller 'Microsoft.Compute/virtualMachines@2024-07-01' = {
       osDisk: {
         createOption: 'FromImage'
         deleteOption: 'Delete'
-        diskSizeGB: 64
+        diskSizeGB: controllerDiskSizeGb
         managedDisk: { storageAccountType: 'Premium_LRS' }
       }
     }
@@ -267,7 +277,7 @@ resource controllerShutdown 'Microsoft.DevTestLab/schedules@2018-09-15' = {
   location: location
   tags: tags
   properties: {
-    status: 'Enabled'
+    status: autoShutdownEnabled ? 'Enabled' : 'Disabled'
     taskType: 'ComputeVmShutdownTask'
     dailyRecurrence: { time: autoShutdownTimeUtc }
     timeZoneId: 'UTC'
@@ -281,7 +291,7 @@ resource nodeShutdown 'Microsoft.DevTestLab/schedules@2018-09-15' = [for (ip, i)
   location: location
   tags: tags
   properties: {
-    status: 'Enabled'
+    status: autoShutdownEnabled ? 'Enabled' : 'Disabled'
     taskType: 'ComputeVmShutdownTask'
     dailyRecurrence: { time: autoShutdownTimeUtc }
     timeZoneId: 'UTC'
@@ -289,6 +299,19 @@ resource nodeShutdown 'Microsoft.DevTestLab/schedules@2018-09-15' = [for (ip, i)
     notificationSettings: { status: 'Disabled' }
   }
 }]
+
+// Contributor on this resource group only: the controller can delete the group it runs in and
+// nothing else (the results storage lives in another group).
+var contributorRole = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b24988ac-6180-42a0-ab88-20f7382dd24c')
+
+resource controllerCanDeleteGroup 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (selfDelete) {
+  name: guid(resourceGroup().id, controller.id, contributorRole)
+  properties: {
+    roleDefinitionId: contributorRole
+    principalId: selfDelete ? controller.identity.principalId : ''
+    principalType: 'ServicePrincipal'
+  }
+}
 
 output controllerPublicIp string = controllerPip.properties.ipAddress
 output nodePrivateIps array = nodeIps

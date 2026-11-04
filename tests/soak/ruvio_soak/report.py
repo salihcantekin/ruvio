@@ -1,0 +1,498 @@
+"""Turns a finished run directory into `report.json` and `report.md`: every criterion of a
+production-readiness run with its measured value, its threshold and `pass`, `fail` or
+`not_measured`. Nothing here is a judgement call: a criterion without data is `not_measured`,
+never `pass`.
+
+Windows (from `events.jsonl`): `quiet_a` is the fault-free stretch before the first fault,
+without its first `settle_s` (data still filling, allocator warming up); `quiet_b` is the
+fault-free stretch after the last fault, without its first `settle_s`. A fault window runs from
+its `fault` event to its `healed` event plus `grace_s`.
+
+    python3 tests/soak/run.py report <run directory>"""
+
+from __future__ import annotations
+
+import json
+import statistics
+from collections import defaultdict
+from pathlib import Path
+
+from . import latency as lat
+from .history import entries
+from .resp import key_slot
+
+PRIMARY_FAULTS = ("kill-primary", "kill-host", "isolate-host", "restart-all-data")
+
+
+def read(path: Path):
+    return list(entries(path)) if path.exists() else []
+
+
+class Run:
+    def __init__(self, directory: Path, settle_s: float = 3600, grace_s: float = 30):
+        self.directory = Path(directory)
+        self.plan = json.loads((self.directory / "plan.json").read_text())
+        self.status = json.loads((self.directory / "status.json").read_text()) if (self.directory / "status.json").exists() else {}
+        self.check = json.loads((self.directory / "check.json").read_text()) if (self.directory / "check.json").exists() else None
+        self.events = read(self.directory / "events.jsonl")
+        self.metrics = read(self.directory / "metrics.jsonl")
+        self.hosts = read(self.directory / "hosts.jsonl")
+        self.latency = read(self.directory / "latency.jsonl")
+        self.background = [e for path in sorted(self.directory.glob("background-latency-*.jsonl")) for e in read(path)]
+        self.findings = read(self.directory / "findings.jsonl")
+        self.grace_s = grace_s
+        self.windows = self._fault_windows()
+        start = next((e["t"] for e in self.events if e["event"] == "load-start"), None)
+        stop = next((e["t"] for e in self.events if e["event"] == "load-stop"), None)
+        self.load = (start, stop)
+        first = min((w[0] for w in self.windows), default=stop)
+        last = max((w[1] for w in self.windows), default=start)
+        settle = min(settle_s, 0.5 * ((first or 0) - (start or 0))) if start and first else settle_s
+        self.quiet_a = (start + settle, first) if start and first and first - start > settle else None
+        settle_b = min(settle_s, 0.5 * ((stop or 0) - (last or 0))) if stop and last else settle_s
+        self.quiet_b = (last + settle_b, stop) if stop and last and stop - last > settle_b else None
+
+    def _fault_windows(self) -> list[tuple[float, float, str]]:
+        """(start, end, kind) in epoch seconds."""
+        windows, current = [], None
+        for e in self.events:
+            if e["event"] == "fault":
+                current = (e["t"], e.get("kind"))
+            elif e["event"] in ("healed", "not-healed") and current:
+                windows.append((current[0], e["t"] + self.grace_s, current[1]))
+                current = None
+        if current:
+            windows.append((current[0], float("inf"), current[1]))
+        return windows
+
+    def in_fault(self, start: float, end: float) -> bool:
+        return any(w[0] < end and start < w[1] for w in self.windows)
+
+    @staticmethod
+    def inside(t: float, window) -> bool:
+        return window is not None and window[0] <= t < window[1]
+
+
+def criterion(results, ident, name, status, value=None, threshold=None, details=None):
+    results.append({"id": ident, "name": name, "status": status, "value": value, "threshold": threshold,
+                    "details": details})
+
+
+def merged(entries_, window, prefix=None) -> dict[int, int]:
+    histogram: dict[int, int] = {}
+    for e in entries_:
+        if Run.inside(e["t"], window) and (prefix is None or e["series"].startswith(prefix)):
+            lat.merge(histogram, e.get("hist", {}))
+    return histogram
+
+
+def per_process(metrics, field, window) -> dict[str, list[float]]:
+    values = defaultdict(list)
+    for m in metrics:
+        if Run.inside(m["t"], window) and isinstance(m.get(field), (int, float)):
+            values[m["process"]].append(m[field])
+    return values
+
+
+def series_of(metrics, field, window) -> dict[str, list[tuple[float, float]]]:
+    values = defaultdict(list)
+    for m in metrics:
+        if Run.inside(m["t"], window) and isinstance(m.get(field), (int, float)):
+            values[m["process"]].append((m["t"], m[field]))
+    return values
+
+
+def slope(points) -> float | None:
+    if len(points) < 3 or points[-1][0] - points[0][0] < 600:
+        return None
+    n = len(points)
+    mt = sum(t for t, _ in points) / n
+    mv = sum(v for _, v in points) / n
+    var = sum((t - mt) ** 2 for t, _ in points)
+    return sum((t - mt) * (v - mv) for t, v in points) / var * 3600 if var else 0.0
+
+
+def evaluate(run: Run) -> dict:
+    results: list[dict] = []
+    check = run.check
+    profiles = (check or {}).get("profiles", {})
+    attribution = (check or {}).get("attribution", {})
+    always_bad = ("excess", "phantom", "duplicate", "order", "unread")
+
+    # 1-4: data
+    if check is None:
+        for ident in (1, 2, 3, 4):
+            criterion(results, ident, "data checks", "not_measured", details="no check.json")
+    else:
+        durable = profiles.get("durable")
+        if durable is None:
+            criterion(results, 1, "durable: no anomaly of any kind", "not_measured")
+        else:
+            bad = {k: durable.get(k, 0) for k in ("lost", "stale_read", "backwards_read") + always_bad if durable.get(k)}
+            criterion(results, 1, "durable: no anomaly of any kind", "fail" if bad else "pass", bad or 0, 0)
+        details, failed = {}, False
+        for profile, stats in profiles.items():
+            if profile == "durable":
+                continue
+            bad = {k: stats[k] for k in always_bad if stats.get(k)}
+            unexplained = {k: v["unexplained"] for k, v in attribution.get(profile, {}).items() if v["unexplained"]}
+            by_fault = {k: v["by_fault"] for k, v in attribution.get(profile, {}).items()}
+            details[profile] = {"never_allowed": bad, "unexplained": unexplained, "lost": stats.get("lost", 0),
+                                "stale_read": stats.get("stale_read", 0), "by_fault": by_fault}
+            failed = failed or bool(bad) or bool(unexplained)
+        criterion(results, 2, "default and client: losses and stale reads only inside primary faults", "fail" if failed else "pass",
+                  details=details)
+        restarts = [w for w in run.windows if w[2] == "restart-all-data"]
+        if not restarts:
+            criterion(results, 3, "full restart: no acknowledged write lost on the `always` group", "not_measured", details="no restart-all-data fault ran")
+        else:
+            g1 = next((g for g in run.plan.get("cluster", {}).get("groups", [])), None)
+            low, high = (0, 8191) if g1 is None else (int(x) for x in g1["slots"].split("-"))
+            lost = [f for f in run.findings if f[1] == "lost" and low <= key_slot(f[3]) <= high
+                    and any(w[2] == "restart-all-data" for w in run.windows if _mono_in(run, f[2], w))]
+            criterion(results, 3, "full restart: no acknowledged write lost on the `always` group", "fail" if lost else "pass",
+                      len(lost), 0, {"restarts": len(restarts)})
+        moves = [w for w in run.windows if w[2] == "migrate-slots"]
+        if not moves:
+            criterion(results, 4, "slot moves: no anomaly during a move", "not_measured", details="no migrate-slots fault ran")
+        else:
+            during = sum(v["by_fault"].get("migrate-slots", 0) for p in attribution.values() for v in p.values())
+            criterion(results, 4, "slot moves: no anomaly during a move", "fail" if during else "pass", during, 0, {"moves": len(moves)})
+
+    # 5-8: availability
+    healed = [e for e in run.events if e["event"] == "healed"]
+    not_healed = [e for e in run.events if e["event"] == "not-healed"]
+    recoveries = [e["recovery_s"] for e in healed]
+    if not recoveries and not not_healed:
+        criterion(results, 5, "every fault recovers: max <= 60 s, median <= 15 s", "not_measured")
+    else:
+        worst = max(recoveries, default=0)
+        median = statistics.median(recoveries) if recoveries else None
+        by_kind = defaultdict(list)
+        for e in healed:
+            by_kind[e["kind"]].append(e["recovery_s"])
+        ok = not not_healed and worst <= 60 and (median or 0) <= 15
+        criterion(results, 5, "every fault recovers: max <= 60 s, median <= 15 s", "pass" if ok else "fail",
+                  {"max_s": worst, "median_s": median, "not_healed": len(not_healed)}, {"max_s": 60, "median_s": 15},
+                  {k: {"n": len(v), "max_s": max(v), "median_s": statistics.median(v)} for k, v in sorted(by_kind.items())})
+    exits = [e for e in run.events if e["event"] == "unexpected-exit"]
+    logs = run.status.get("log_counts")
+    panics = sum(c.get("panic", 0) for c in (logs or {}).values())
+    if logs is None:
+        criterion(results, 6, "no unexpected exit, no panic", "fail" if exits else "not_measured", len(exits), 0, "no log counts")
+    else:
+        criterion(results, 6, "no unexpected exit, no panic", "fail" if exits or panics else "pass",
+                  {"unexpected_exits": len(exits), "panics": panics}, 0,
+                  {"errors": {k: v.get("error", 0) for k, v in logs.items()}, "warnings": {k: v.get("warn", 0) for k, v in logs.items()}})
+    outside = defaultdict(int)
+    minutes = 0
+    for e in run.latency + run.background:
+        # The minute [t, t + 60) overlaps no fault window (each already ends 30 s after its heal).
+        if run.load[0] and Run.inside(e["t"], (run.load[0] + 60, run.load[1] or float("inf"))) and not run.in_fault(e["t"], e["t"] + 60):
+            minutes += 1
+            for outcome, n in e.get("counts", {}).items():
+                if outcome != "ok":
+                    outside[f"{e['series']}:{outcome}"] += n
+    if not minutes:
+        criterion(results, 7, "no failed or unknown operation outside fault windows", "not_measured")
+    else:
+        criterion(results, 7, "no failed or unknown operation outside fault windows", "fail" if outside else "pass",
+                  sum(outside.values()), 0, dict(outside) or None)
+    failovers = _failovers(run)
+    primary_faults = sum(1 for w in run.windows if w[2] in PRIMARY_FAULTS)
+    if failovers is None:
+        criterion(results, 8, "failovers only from injected faults", "not_measured")
+    else:
+        # A primary fault can fail over at most every group whose primary it touched (kill-host,
+        # isolate-host, restart-all: up to two groups); anything else is a failover nobody caused.
+        allowed = 2 * primary_faults
+        criterion(results, 8, "failovers only from injected faults", "pass" if failovers <= allowed else "fail",
+                  failovers, f"<= {allowed} (2 x {primary_faults} primary faults)")
+
+    # 9-12: performance
+    base = merged(run.latency, run.quiet_a)
+    late = merged(run.latency, run.quiet_b)
+    if not base or not late:
+        criterion(results, 9, "p99/p99.9 in the last quiet window within 20 % of the first", "not_measured")
+    else:
+        a, b = lat.summary(base), lat.summary(late)
+        bad = [k for k in ("p99_ms", "p999_ms") if b[k] > a[k] * 1.2 + 0.2]
+        criterion(results, 9, "p99/p99.9 in the last quiet window within 20 % of the first", "fail" if bad else "pass",
+                  {"first": a, "last": b}, "last <= 1.2 x first + 0.2 ms", {"per_series": _per_series(run.latency, run.quiet_a, run.quiet_b)})
+    if not base:
+        criterion(results, 10, "p99 back to the quiet baseline within 60 s after each fault", "not_measured")
+    else:
+        limit = lat.summary(base)["p99_ms"] * 1.5 + 0.2
+        slow = []
+        for e in healed:
+            window = (e["t"] + 60, e["t"] + 180)
+            if run.in_fault(window[0], window[1]):
+                continue  # the next fault already started: no clean minute to judge
+            p99 = lat.summary(merged(run.latency, window)).get("p99_ms")
+            if p99 is not None and p99 > limit:
+                slow.append({"kind": e["kind"], "t": e["t"], "p99_ms": p99})
+        criterion(results, 10, "p99 back to the quiet baseline within 60 s after each fault", "fail" if slow else "pass",
+                  len(slow), f"p99 <= {limit:.2f} ms", slow[:20] or None)
+    rates = [sum(e["counts"].get("ok", 0) for e in run.background if int(e["t"]) == minute)
+             for minute in sorted({int(e["t"]) for e in run.background
+                                   if (Run.inside(e["t"], run.quiet_a) or Run.inside(e["t"], run.quiet_b))})]
+    if len(rates) < 10:
+        criterion(results, 11, "background throughput steady (+-5 %) in quiet windows", "not_measured")
+    else:
+        rates = rates[1:-1]  # a window's edge minutes are partial
+        mean = statistics.mean(rates)
+        spread = (max(rates) - min(rates)) / 2 / mean if mean else 1
+        criterion(results, 11, "background throughput steady (+-5 %) in quiet windows", "pass" if spread <= 0.05 else "fail",
+                  {"ops_per_min_mean": round(mean), "half_spread": round(spread, 4)}, 0.05)
+    lag = _replica_lag_s(run)
+    if lag is None:
+        criterion(results, 12, "replica lag p99 < 1 s in quiet windows", "not_measured")
+    else:
+        criterion(results, 12, "replica lag p99 < 1 s in quiet windows", "pass" if lag["p99_s"] < 1 else "fail", lag, 1)
+
+    # 13-16: resources
+    memory = _memory(run)
+    criterion(results, 13, "no memory growth: data nodes and coordinators", memory["status"], memory.get("value"),
+              "anon B <= 1.1 x A (+2 MiB) or overhead ratio B <= 1.1 x A; slope in B < 1024 KiB/h (data), < 512 KiB/h (coordinator)",
+              memory.get("details"))
+    fds = _flat(run, "fds_internal", 5)
+    clients = _flat(run, "connected_clients_n", 50)
+    threads = _flat(run, "threads", 2)
+    status = "not_measured" if fds is None or threads is None else ("pass" if not fds["grew"] and not threads["grew"] else "fail")
+    criterion(results, 14, "open descriptors (without client connections) and threads do not grow", status,
+              {"fds": fds, "threads": threads}, "B mean <= A mean + 5 fds, + 2 threads", {"client_connections": clients})
+    disk = _disk(run)
+    criterion(results, 15, "WAL + checkpoint size bounded, free disk >= 20 %", disk["status"], disk.get("value"),
+              "B max <= 1.5 x A max + 64 MiB; free >= 20 %", disk.get("details"))
+    raft = per_process([m for m in run.metrics if m["process"].endswith("coordinator")], "data_dir_bytes",
+                       (run.load[0] or 0, run.load[1] or float("inf")))
+    if not raft:
+        criterion(results, 16, "coordinator Raft data bounded (< 64 MiB growth)", "not_measured")
+    else:
+        growth = {p: max(v) - min(v) for p, v in raft.items()}
+        criterion(results, 16, "coordinator Raft data bounded (< 64 MiB growth)",
+                  "pass" if max(growth.values()) < 64 << 20 else "fail", growth, 64 << 20)
+
+    # 17: the measurement itself
+    gap = run.status.get("metric_gap_fraction")
+    offsets = [abs(h["clock_offset_s"]) for h in run.hosts if isinstance(h.get("clock_offset_s"), (int, float))]
+    busy = [h["cpu_busy"] for h in run.hosts if h.get("host") == "controller" and isinstance(h.get("cpu_busy"), (int, float))]
+    uploads = run.status.get("upload_errors", 0)
+    value = {"metric_gap_fraction": gap, "clock_offset_max_s": max(offsets, default=None),
+             "controller_cpu_p95": _p(busy, 0.95), "upload_errors": uploads, "check_done": check is not None}
+    if gap is None or not offsets or not busy:
+        status = "not_measured"
+    else:
+        status = "pass" if gap < 0.01 and max(offsets) < 0.01 and _p(busy, 0.95) < 0.7 and check is not None else "fail"
+    criterion(results, 17, "measurement complete: gaps < 1 %, clock < 10 ms, controller CPU p95 < 70 %, check done", status, value)
+
+    statuses = [r["status"] for r in results]
+    verdict = "fail" if "fail" in statuses else ("incomplete" if "not_measured" in statuses else "pass")
+    return {"run_id": run.status.get("run_id"), "verdict": verdict, "windows": {
+        "load": run.load, "quiet_a": run.quiet_a, "quiet_b": run.quiet_b, "faults": len(run.windows)},
+        "criteria": results, "hourly": _hourly(run)}
+
+
+def _mono_in(run: Run, mono: int, window) -> bool:
+    """Whether a finding's monotonic time falls in an epoch window: the events carry both clocks."""
+    pairs = [(e["mono"], e["t"]) for e in run.events if "mono" in e]
+    if not pairs:
+        return False
+    m0, t0 = min(pairs, key=lambda p: abs(p[0] - mono))
+    t = t0 + (mono - m0) / 1e9
+    return window[0] <= t <= window[1]
+
+
+def _p(values, fraction):
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int(fraction * len(ordered)))]
+
+
+def _per_series(entries_, a, b):
+    out = {}
+    for series in sorted({e["series"] for e in entries_}):
+        ha = merged([e for e in entries_ if e["series"] == series], a)
+        hb = merged([e for e in entries_ if e["series"] == series], b)
+        if ha and hb:
+            out[series] = {"first_p99_ms": lat.summary(ha)["p99_ms"], "last_p99_ms": lat.summary(hb)["p99_ms"]}
+    return out
+
+
+def _failovers(run: Run):
+    """The increase of the leader's `failovers_total`, summed over leaders (each counts what it
+    recorded while leading)."""
+    per = defaultdict(list)
+    for m in run.metrics:
+        if m["process"].endswith("coordinator") and str(m.get("failovers_total", "")).isdigit():
+            per[m["process"]].append(int(m["failovers_total"]))
+    if not per:
+        return None
+    total = 0
+    for values in per.values():
+        # A restarted coordinator starts from 0 again: add every increase between samples.
+        total += sum(max(0, b - a) for a, b in zip(values, values[1:]))
+    return total
+
+
+def _replica_lag_s(run: Run):
+    """Seconds a replica trails its primary: the difference of their `wal_last_sequence`
+    divided by the primary's write rate, per sample in the quiet windows."""
+    samples = defaultdict(dict)  # (group, rounded t) -> {process: (role, seq)}
+    for m in run.metrics:
+        if not (Run.inside(m["t"], run.quiet_a) or Run.inside(m["t"], run.quiet_b)):
+            continue
+        seq = m.get("wal_last_sequence")
+        if seq is None or not str(seq).isdigit():
+            continue
+        group = m["process"].split("-", 1)[1]
+        samples[(group, round(m["t"] / 10))][m["process"]] = (m.get("replication_role"), int(seq), m["t"])
+    lags = []
+    previous: dict[str, tuple[float, int]] = {}
+    for (group, _), members in sorted(samples.items(), key=lambda kv: kv[0][1]):
+        primary = next(((p, v) for p, v in members.items() if v[0] == "primary"), None)
+        if primary is None:
+            continue
+        name, (_, seq, t) = primary
+        rate = None
+        if name in previous and t > previous[name][0]:
+            rate = (seq - previous[name][1]) / (t - previous[name][0])
+        previous[name] = (t, seq)
+        if not rate or rate <= 0:
+            continue
+        for process, (role, rseq, _) in members.items():
+            if role == "replica":
+                lags.append(max(0, seq - rseq) / rate)
+    if not lags:
+        return None
+    return {"p50_s": round(_p(lags, 0.5), 3), "p99_s": round(_p(lags, 0.99), 3), "max_s": round(max(lags), 3), "samples": len(lags)}
+
+
+def _memory(run: Run) -> dict:
+    if run.quiet_a is None or run.quiet_b is None:
+        return {"status": "not_measured", "details": "no quiet window at the start or the end"}
+    a_anon = per_process(run.metrics, "rss_anon_kib", run.quiet_a)
+    b_anon = per_process(run.metrics, "rss_anon_kib", run.quiet_b)
+    charged_a = per_process(run.metrics, "charged_memory_bytes", run.quiet_a)
+    charged_b = per_process(run.metrics, "charged_memory_bytes", run.quiet_b)
+    b_series = series_of(run.metrics, "rss_anon_kib", run.quiet_b)
+    if not a_anon or not b_anon:
+        return {"status": "not_measured", "details": "no anonymous memory samples"}
+    details, failed = {}, False
+    for process in sorted(set(a_anon) & set(b_anon)):
+        a, b = statistics.mean(a_anon[process]), statistics.mean(b_anon[process])
+        entry = {"anon_a_kib": round(a), "anon_b_kib": round(b), "slope_b_kib_h": None}
+        grew = b > 1.1 * a + 2048
+        if grew and process in charged_a and process in charged_b:
+            ca, cb = statistics.mean(charged_a[process]), statistics.mean(charged_b[process])
+            if ca and cb:
+                ra, rb = a * 1024 / ca, b * 1024 / cb
+                entry.update(overhead_a=round(ra, 3), overhead_b=round(rb, 3))
+                grew = rb > 1.1 * ra
+        s = slope(b_series.get(process, []))
+        entry["slope_b_kib_h"] = None if s is None else round(s, 1)
+        limit = 512 if process.endswith("coordinator") else 1024
+        climbing = s is not None and s > limit
+        entry["status"] = "fail" if grew or climbing else "pass"
+        failed = failed or grew or climbing
+        details[process] = entry
+    return {"status": "fail" if failed else "pass", "value": {p: d["status"] for p, d in details.items()}, "details": details}
+
+
+def _by_role(metrics, field, window) -> dict[str, list[float]]:
+    """Values keyed by group and role (`g1:primary`, `g1:replica`) for data nodes and by process
+    for coordinators: a primary holds more connections than a replica, and failovers move the
+    roles between processes."""
+    values = defaultdict(list)
+    for m in metrics:
+        if field == "connected_clients_n" and str(m.get("connected_clients", "")).isdigit():
+            m = dict(m, connected_clients_n=int(m["connected_clients"]))
+        if field == "fds_internal" and isinstance(m.get("fds"), int):
+            # Descriptors besides client connections: clients keep pooled connections to a
+            # node that stopped being the primary, which is the clients' choice, not a leak.
+            clients = int(m["connected_clients"]) if str(m.get("connected_clients", "")).isdigit() else 0
+            m = dict(m, fds_internal=m["fds"] - clients)
+        if Run.inside(m["t"], window) and isinstance(m.get(field), (int, float)):
+            if m["process"].endswith("coordinator"):
+                values[m["process"]].append(m[field])
+            elif m.get("replication_role") in ("primary", "replica"):
+                values[f"{m['process'].split('-', 1)[1]}:{m['replication_role']}"].append(m[field])
+    return values
+
+
+def _flat(run: Run, field: str, allowance: float):
+    if run.quiet_a is None or run.quiet_b is None:
+        return None
+    a, b = _by_role(run.metrics, field, run.quiet_a), _by_role(run.metrics, field, run.quiet_b)
+    if not a or not b:
+        return None
+    grew = {p: (round(statistics.mean(a[p]), 1), round(statistics.mean(b[p]), 1)) for p in set(a) & set(b)
+            if statistics.mean(b[p]) > statistics.mean(a[p]) + allowance}
+    return {"grew": grew, "processes": len(set(a) & set(b))}
+
+
+def _disk(run: Run) -> dict:
+    if run.quiet_a is None or run.quiet_b is None:
+        return {"status": "not_measured", "details": "no quiet windows"}
+    def total(window):
+        out = defaultdict(int)
+        for m in run.metrics:
+            if Run.inside(m["t"], window) and isinstance(m.get("wal_bytes"), int):
+                out[m["process"]] = max(out[m["process"]], m["wal_bytes"] + m.get("checkpoint_bytes", 0))
+        return out
+    a, b = total(run.quiet_a), total(run.quiet_b)
+    free = [h["disk_avail_bytes"] / h["disk_size_bytes"] for h in run.hosts
+            if isinstance(h.get("disk_avail_bytes"), int) and h.get("disk_size_bytes")]
+    if not a or not b or not free:
+        return {"status": "not_measured", "details": "no WAL or disk samples"}
+    grew = {p: (a[p], b[p]) for p in set(a) & set(b) if not p.endswith("coordinator") and b[p] > 1.5 * a[p] + (64 << 20)}
+    ok = not grew and min(free) >= 0.2
+    return {"status": "pass" if ok else "fail", "value": {"grew": grew, "min_free_fraction": round(min(free), 3)},
+            "details": {"a_max_bytes": dict(a), "b_max_bytes": dict(b)}}
+
+
+def _hourly(run: Run) -> list[dict]:
+    """Per hour of load: checked-load p50/p99/p99.9, operations, non-ok outcomes, faults, and the
+    data nodes' mean anonymous memory."""
+    if not run.load[0]:
+        return []
+    out = []
+    start, stop = run.load[0], run.load[1] or max((e["t"] for e in run.latency), default=run.load[0])
+    hour = 0
+    while start + hour * 3600 < stop:
+        window = (start + hour * 3600, min(stop, start + (hour + 1) * 3600))
+        histogram = merged(run.latency, window)
+        counts = defaultdict(int)
+        for e in run.latency + run.background:
+            if Run.inside(e["t"], window):
+                for k, v in e["counts"].items():
+                    counts["ok" if k == "ok" else "not_ok"] += v
+        anon = [m["rss_anon_kib"] for m in run.metrics if Run.inside(m["t"], window)
+                and not m["process"].endswith("coordinator") and isinstance(m.get("rss_anon_kib"), int)]
+        out.append({"hour": hour, **lat.summary(histogram), "ok": counts["ok"], "not_ok": counts["not_ok"],
+                    "faults": sum(1 for w in run.windows if Run.inside(w[0], window)),
+                    "data_anon_mean_kib": round(statistics.mean(anon)) if anon else None})
+        hour += 1
+    return out
+
+
+def markdown(report: dict) -> str:
+    lines = [f"# Soak report {report['run_id']}", "", f"Verdict: **{report['verdict']}**", "",
+             "| # | Criterion | Status | Value | Threshold |", "| --- | --- | --- | --- | --- |"]
+    for r in report["criteria"]:
+        value = json.dumps(r["value"], separators=(",", ":")) if r["value"] is not None else ""
+        lines.append(f"| {r['id']} | {r['name']} | {r['status']} | `{value[:300]}` | {r['threshold'] if r['threshold'] is not None else ''} |")
+    lines += ["", "## Per hour", "", "| Hour | p50 ms | p99 ms | p99.9 ms | max ms | ok | not ok | faults | data anon KiB |",
+              "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+    for h in report["hourly"]:
+        lines.append(f"| {h['hour']} | {h['p50_ms']} | {h['p99_ms']} | {h['p999_ms']} | {h['max_ms']} | {h['ok']} | {h['not_ok']} | {h['faults']} | {h['data_anon_mean_kib']} |")
+    lines += ["", "## Details", "", "```json", json.dumps([{k: r[k] for k in ("id", "details")} for r in report["criteria"]], indent=1)[:60000], "```", ""]
+    return "\n".join(lines)
+
+
+def write(directory: Path, settle_s: float = 3600) -> dict:
+    report = evaluate(Run(directory, settle_s=settle_s))
+    (Path(directory) / "report.json").write_text(json.dumps(report, indent=2))
+    (Path(directory) / "report.md").write_text(markdown(report))
+    return report

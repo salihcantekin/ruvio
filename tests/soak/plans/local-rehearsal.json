@@ -1,0 +1,47 @@
+{
+  "name": "local-rehearsal",
+  "seed": 3,
+  "duration_s": 540,
+  "warmup_s": 20,
+  "restart_as": "mixed",
+  "cluster": { "ping_interval_ms": 200, "down_after_ms": 3000, "primary_lease_ms": 2000, "snapshot_interval_ms": 10000 },
+  "load": {
+    "rate_per_worker": 30,
+    "keys_per_worker": 4,
+    "counters": 1,
+    "appenders": 1,
+    "registers": 1,
+    "readers_per_register": 2,
+    "max_list_len": 500,
+    "profiles": { "default": {}, "durable": { "replicas": 2 } },
+    "official": { "path": "clients/python", "counters": 1, "registers": 1, "readers_per_register": 1 },
+    "background": { "processes": 2, "rate": 300, "keys": 20000, "value_bytes": 100 }
+  },
+  "faults": {
+    "start_s": 120,
+    "stop_s": 400,
+    "interval_s": [25, 40],
+    "down_s": [2, 6],
+    "recovery_timeout_s": 60,
+    "migrate_range": "4096-4607",
+    "sequence": [
+      { "kind": "migrate-slots" },
+      { "kind": "kill-primary" },
+      { "kind": "restart-all-data", "down": 3 },
+      { "kind": "migrate-slots" }
+    ],
+    "kinds": ["kill-primary", "kill-replica", "stall-replica", "kill-coordinator-leader", "kill-host", "migrate-slots"],
+    "at": [{ "at_s": 470, "kind": "restart-all-data", "down": 2 }]
+  },
+  "metrics_interval_s": 5,
+  "full_info_every": 6,
+  "status_interval_s": 30,
+  "artifact_interval_s": 120,
+  "history_segment_s": 120,
+  "log_interval_s": 120,
+  "check_buckets": 4,
+  "report_settle_s": 60,
+  "rss_min_window_s": 120,
+  "rss_warn_percent_per_hour": 1000.0,
+  "startup_timeout_s": 90
+}

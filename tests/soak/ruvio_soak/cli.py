@@ -11,7 +11,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import history
+from . import history, report
 from .backends import LocalBackend, SshBackend
 from .cluster import Cluster, save
 from .runner import Runner
@@ -49,14 +49,43 @@ def run(options) -> int:
     runner.status.data["binary_sha256"] = hashlib.sha256(Path(options.binary).read_bytes()).hexdigest()
     status = runner.run()
     print(json.dumps({k: status[k] for k in ("verdict", "problems", "faults", "operations")}, indent=2))
+    if options.delete_resource_group:
+        missing = runner.missing_uploads() if status.get("phase") == "done" else ["(the run did not finish)"]
+        if missing:
+            print(f"not deleting {options.delete_resource_group}: not uploaded: {missing}", flush=True)
+            runner.status.problem(f"VMs kept: not uploaded: {missing}", severity="warn")
+            runner.status.save()
+        else:
+            from .azure import delete_own_group  # noqa: PLC0415 (only on the controller)
+
+            runner.status.data["resource_group_delete"] = "requested"
+            runner.status.save()
+            delete_own_group(options.delete_resource_group)
     failed = status["verdict"] == "fail" or (options.strict and status["verdict"] == "warn")
     return 1 if failed else 0
 
 
 def check(options) -> int:
-    result = history.check_file(Path(options.history))
+    result = history.check_files([Path(p) for p in options.history], options.buckets)
+    if options.events:
+        result["attribution"] = history.attribute(result, history.fault_windows(Path(options.events)))
+    result.pop("findings", None)
     print(json.dumps(result, indent=2))
     return 0 if result["verdict"] != "fail" else 1
+
+
+def backstop(options) -> int:
+    """Run on the controller by a timer started with the run (`systemd-run --on-active=28h`):
+    if the resource group still exists then, the run did not end on its own; stop its VMs."""
+    from .azure import deallocate_all  # noqa: PLC0415 (only on the controller)
+
+    return 0 if deallocate_all(options.resource_group) else 1
+
+
+def report_command(options) -> int:
+    result = report.write(Path(options.directory), options.settle)
+    print(json.dumps({"verdict": result["verdict"], "criteria": {r["id"]: r["status"] for r in result["criteria"]}}, indent=2))
+    return 0 if result["verdict"] == "pass" else 1
 
 
 def render(options) -> int:
@@ -91,11 +120,24 @@ def main(argv=None) -> int:
     p.add_argument("--duration", type=float, help="override the plan's duration_s")
     p.add_argument("--blob-sas-file", help=f"file holding a container SAS URL (default {DEFAULT_SAS_FILE})")
     p.add_argument("--strict", action="store_true", help="exit 1 on warn too")
+    p.add_argument("--delete-resource-group", metavar="NAME",
+                   help="Azure controller only: when every result is in Blob, delete this resource group (the one the controller runs in)")
     p.set_defaults(handler=run)
 
-    p = commands.add_parser("check", help="check a history file")
-    p.add_argument("history")
+    p = commands.add_parser("check", help="check a history (one or more segment files, in order)")
+    p.add_argument("history", nargs="+")
+    p.add_argument("--buckets", type=int, default=1, help="split by key first, to bound memory")
+    p.add_argument("--events", help="events.jsonl: tie each finding to the fault window it fell in")
     p.set_defaults(handler=check)
+
+    p = commands.add_parser("backstop", help="Azure controller only: deallocate every VM of this resource group")
+    p.add_argument("--resource-group", required=True)
+    p.set_defaults(handler=backstop)
+
+    p = commands.add_parser("report", help="write report.json and report.md for a finished run directory")
+    p.add_argument("directory")
+    p.add_argument("--settle", type=float, default=3600, help="seconds left out at the start of each quiet window")
+    p.set_defaults(handler=report_command)
 
     p = commands.add_parser("render", help="print one host's configs")
     p.add_argument("--plan")
