@@ -64,7 +64,8 @@ func TestFollowAllocsMatchSingleSeed(t *testing.T) {
 	}
 	// The same loop on both clients, warmed up first (pools, buffers). A reader goroutine
 	// allocates too, and AllocsPerRun counts the whole process, so a few runs are averaged
-	// and the smaller of two attempts is taken.
+	// and the smallest of five attempts is taken: a stray allocation elsewhere in the
+	// process only ever adds, so the minimum is the loop's own count.
 	measure := func(c *Client, o op) float64 {
 		p := c.Pipeline()
 		var failed error
@@ -77,8 +78,10 @@ func TestFollowAllocsMatchSingleSeed(t *testing.T) {
 			step()
 		}
 		best := testing.AllocsPerRun(100, step)
-		if again := testing.AllocsPerRun(100, step); again < best {
-			best = again
+		for i := 0; i < 4; i++ {
+			if again := testing.AllocsPerRun(100, step); again < best {
+				best = again
+			}
 		}
 		if failed != nil {
 			t.Fatal(o.name, failed)
@@ -91,7 +94,8 @@ func TestFollowAllocsMatchSingleSeed(t *testing.T) {
 		if s == 0 {
 			t.Fatalf("%s: single-seed client reports no allocations; the measurement is broken", o.name)
 		}
-		if f != s {
+		// Following must cost nothing extra; a lower count is the measurement, not the client.
+		if f > s {
 			t.Errorf("%s: following allocates %.3f per run, single seed %.3f", o.name, f, s)
 		}
 	}
