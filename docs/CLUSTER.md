@@ -17,7 +17,7 @@ One process runs one thread per shard; shard `i` listens on the bind port plus `
 
 ## Replication
 
-A replica copies its primary shard by shard, from the write-ahead log, over a separate replication port. Replication is asynchronous: the primary answers before a replica has the write. Replicas serve reads; once they have finished copying, the primary lists them in `CLUSTER SLOTS`, so the clients can read from them with a read policy ([Client behavior: reads from replicas](CLIENT_BEHAVIOR.md#reads-from-replicas)).
+A replica copies its primary shard by shard, from the write-ahead log, over a separate replication port. Replication is asynchronous: the primary answers before a replica has the write. Replicas serve reads (a replica of a multi-node cluster only on a connection that sent `READONLY`, as in Redis Cluster; other connections get `MOVED` to the primary); once they have finished copying, the primary lists them in `CLUSTER SLOTS`, so the clients can read from them with a read policy ([Client behavior: reads from replicas](CLIENT_BEHAVIOR.md#reads-from-replicas)).
 
 A connection that must not lose an acknowledged write to a failover asks for it with `CLIENT DURABILITY REPLICAS n`: its replies wait until `n` replicas hold the writes on disk ([Configuration](CONFIGURATION.md), [what can be lost](COORDINATOR.md#what-can-be-lost-and-split-brain)). Without it a failover can lose the last writes a primary acknowledged, as in Redis.
 

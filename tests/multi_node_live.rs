@@ -625,7 +625,7 @@ fn a_promoted_replica_redirects_a_range_the_map_gave_away_from_its_first_command
 /// as Redis Cluster does, so a cluster client reloads its slot table instead of writing to a
 /// demoted primary again: a key of its own group goes to its primary, a key of another group
 /// to that group. After the roles are swapped, the demoted primary sends writes to the
-/// promoted replica.
+/// promoted replica. A keyed read goes the same way unless the connection sent `READONLY`.
 #[test]
 fn a_replica_of_a_cluster_sends_writes_to_its_primary_with_moved() {
     let env = [
@@ -676,9 +676,11 @@ fn a_replica_of_a_cluster_sends_writes_to_its_primary_with_moved() {
     let (own_slot, other_slot) = (hash_slot(own.as_bytes()), hash_slot(other.as_bytes()));
     let mut on_primary = Client::connect(&primary.address);
     let mut on_replica = Client::connect(&replica.address);
+    let mut reads_replica = Client::connect(&replica.address);
 
+    assert_eq!(reads_replica.call(&["READONLY"]), "OK");
     assert_eq!(on_primary.call(&["SET", &own, "1"]), "OK");
-    wait_for(&mut on_replica, &["GET", &own], "1");
+    wait_for(&mut reads_replica, &["GET", &own], "1");
 
     assert_eq!(
         on_replica.call(&["SET", &own, "2"]),
@@ -692,8 +694,24 @@ fn a_replica_of_a_cluster_sends_writes_to_its_primary_with_moved() {
         on_replica.call(&["SET", &other, "2"]),
         format!("ERR:MOVED {other_slot} 127.0.0.1:{b_port}")
     );
-    // Reads are still served, a keyless write is still refused.
-    assert_eq!(on_replica.call(&["GET", &own]), "1");
+    // A read goes to the primary too, unless the connection asked for replica reads.
+    assert_eq!(
+        on_replica.call(&["GET", &own]),
+        format!("ERR:MOVED {own_slot} 127.0.0.1:{a_port}")
+    );
+    assert_eq!(
+        on_replica.call(&["GET", &other]),
+        format!("ERR:MOVED {other_slot} 127.0.0.1:{b_port}")
+    );
+    assert_eq!(reads_replica.call(&["GET", &own]), "1");
+    assert_eq!(reads_replica.call(&["READWRITE"]), "OK");
+    assert_eq!(
+        reads_replica.call(&["GET", &own]),
+        format!("ERR:MOVED {own_slot} 127.0.0.1:{a_port}")
+    );
+    assert_eq!(reads_replica.call(&["READONLY"]), "OK");
+    // A command without a key is answered here, a keyless write is still refused.
+    assert_eq!(on_replica.call(&["DBSIZE"]), "1");
     assert!(
         on_replica.call(&["FLUSHALL"]).starts_with("ERR:READONLY"),
         "a keyless write"
