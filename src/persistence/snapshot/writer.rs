@@ -11,6 +11,8 @@ pub(crate) struct SnapshotWriter {
     file: File,
     hasher: blake3::Hasher,
     written: u64,
+    /// How much of `written` was synced by a step sync (see [`SNAPSHOT_SYNC_STEP_BYTES`]).
+    synced: u64,
     entries: u64,
     last_sequence: u64,
     shard_id: u32,
@@ -60,6 +62,7 @@ impl SnapshotWriter {
             file,
             hasher: blake3::Hasher::new(),
             written: 0,
+            synced: 0,
             entries: 0,
             last_sequence,
             shard_id,
@@ -98,6 +101,12 @@ impl SnapshotWriter {
         super::crash::hit_write(super::crash::CrashSite::Snapshot, &mut self.file, bytes)?;
         self.hasher.update(bytes);
         self.written = total;
+        if self.written - self.synced >= SNAPSHOT_SYNC_STEP_BYTES {
+            self.file.sync_data()?;
+            self.synced = self.written;
+            #[cfg(test)]
+            note_step_sync(&self.directory);
+        }
         Ok(())
     }
 
@@ -140,6 +149,12 @@ impl SnapshotWriter {
             digest: *self.hasher.finalize().as_bytes(),
             file_name: self.file_name.clone(),
         })
+    }
+
+    /// Bytes written since the last step sync.
+    #[cfg(test)]
+    pub(super) fn unsynced(&self) -> u64 {
+        self.written - self.synced
     }
 
     /// Drops the partial file.
