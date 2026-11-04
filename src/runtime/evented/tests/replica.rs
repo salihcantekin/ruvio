@@ -1486,6 +1486,87 @@ fn a_durable_reply_does_not_hold_the_shard_behind_a_slow_sync() {
 }
 
 #[test]
+fn a_durable_reply_behind_a_running_sync_gets_its_own_sync() {
+    let primary_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let ports = crate::test_ports::reserve();
+    let replication = ports.address_at(0);
+    // No tick sync: a record the running sync missed is synced only if the reply asks again.
+    let persistence = |directory: &std::path::Path| PersistenceConfig {
+        profile: crate::DurabilityProfile::Everysec,
+        data_dir: directory.to_path_buf(),
+        sync_interval: Duration::from_secs(60),
+        ..PersistenceConfig::default()
+    };
+    let (primary_address, primary_stop, primary) = serve_with(|config| {
+        config.persistence = persistence(primary_dir.path());
+        config.replication = crate::config::ReplicationConfig {
+            role: crate::config::ReplicationRole::Primary,
+            listen: Some(replication),
+            ..Default::default()
+        };
+    });
+    let (_replica_address, replica_stop, replica) = serve_with(|config| {
+        config.persistence = persistence(replica_dir.path());
+        config.replication = crate::config::ReplicationConfig {
+            role: crate::config::ReplicationRole::Replica,
+            primary: Some(replication),
+            ..Default::default()
+        };
+    });
+
+    wait_for_info(primary_address, "replication_replicas", |count| count == 1);
+    let slow = Duration::from_millis(500);
+    crate::persistence::SLOW_SYNC_DIRS
+        .lock()
+        .unwrap()
+        .push((primary_dir.path().to_path_buf(), slow));
+    let durable_set = move |key: &'static [u8]| {
+        let asked = Instant::now();
+        let reply = request_within(
+            primary_address,
+            &resp(&[
+                &[
+                    b"CLIENT",
+                    b"DURABILITY",
+                    b"REPLICAS",
+                    b"1",
+                    b"TIMEOUT",
+                    b"10000",
+                ],
+                &[b"SET", key, b"1"],
+            ]),
+            Duration::from_secs(15),
+        );
+
+        (reply, asked.elapsed())
+    };
+
+    let first = thread::spawn(move || durable_set(b"first"));
+    // Lands the second write while the first one's sync runs; if it lands later, it starts
+    // its own sync and the test proves nothing but still passes.
+    thread::sleep(slow / 5);
+    let (second, waited) = durable_set(b"second");
+    let (first, _) = first.join().unwrap();
+
+    crate::persistence::SLOW_SYNC_DIRS
+        .lock()
+        .unwrap()
+        .retain(|(dir, _)| dir != primary_dir.path());
+    replica_stop.request();
+    join_within(replica, PATIENCE).unwrap();
+    primary_stop.request();
+    join_within(primary, PATIENCE).unwrap();
+
+    assert_eq!(first, b"+OK\r\n+OK\r\n");
+    assert_eq!(second, b"+OK\r\n+OK\r\n", "waited {waited:?}");
+    assert!(
+        waited < Duration::from_secs(5),
+        "the second durable write waited {waited:?}"
+    );
+}
+
+#[test]
 fn client_durability_needs_replication() {
     let (address, stop, server) = serve_on_ephemeral();
 

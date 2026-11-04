@@ -1351,7 +1351,7 @@ pub(super) async fn wait_for_durable_replicas(
             })
             .collect();
 
-    wait_for_targets(state, &targets, replicas, timeout_ms, shutdown).await
+    wait_for_targets(state, &targets, replicas, timeout_ms, shutdown, &|| {}).await
 }
 
 /// The shards whose replicas a connection's writes wait for.
@@ -1383,13 +1383,14 @@ pub(super) fn durable_shards(state: &ShardState, forwarded_shards: u64) -> Vec<S
 }
 
 /// Waits until `replicas` replicas reached every target, or the timeout; returns how many
-/// replicas reached all of them.
+/// replicas reached all of them. `between_polls` runs after each wake that did not reach them.
 pub(super) async fn wait_for_targets(
     state: &ShardState,
     targets: &[(Arc<crate::replication::DurableAcks>, u64)],
     replicas: u64,
     timeout_ms: u64,
     shutdown: &ShutdownToken,
+    between_polls: &dyn Fn(),
 ) -> u64 {
     let reached = || {
         targets
@@ -1421,5 +1422,7 @@ pub(super) async fn wait_for_targets(
             _ = state.durable_acks.notified() => {}
             _ = tokio::time::sleep(Duration::from_millis(20)) => {}
         }
+
+        between_polls();
     }
 }

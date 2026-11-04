@@ -454,12 +454,17 @@ impl WalSink {
         self.start_background_sync(false)
     }
 
-    /// Asks for the written records to be synced soon without waiting on the disk: an
-    /// `everysec` log starts its background sync now instead of on the next tick (unless one
-    /// is running). An `always` log needs nothing: its records are synced before their
-    /// replies, by the shard thread or by the sync worker. A durable reply waits for its
-    /// replicas, not for this sync, so the shard thread never waits for the disk here.
+    /// Asks for the written records to be synced. An `everysec` log starts its background
+    /// sync now instead of on the next tick and returns without waiting for the disk; while a
+    /// sync is already running it does nothing, so a caller waiting for these records calls
+    /// it again until they are synced. Any other profile flushes as before: an `always` log
+    /// syncs before its replies anyway, and a group another task left open must not wait for
+    /// that task.
     pub fn request_sync(&mut self) -> Result<(), PersistenceError> {
+        if self.profile != DurabilityProfile::Everysec {
+            return self.flush();
+        }
+
         self.start_background_sync(true)
     }
 

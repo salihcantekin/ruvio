@@ -52,10 +52,11 @@ pub(super) async fn hold_until_durable(
             own_mark = Some(target);
         }
 
-        // The reply waits for its replicas, which sync what they receive. The primary's own
-        // `everysec` sync is started now instead of on the next tick, on its background
+        // A primary ships only records it synced, so the reply waits for this shard's sync.
+        // An `everysec` sync is started now instead of on the next tick, on its background
         // thread: syncing here would hold every client of the shard, and the coordinators'
-        // lease renewals, for as long as the disk takes.
+        // lease renewals, for as long as the disk takes. The wait asks again while a sync that
+        // started before these records runs.
         if shard.acks.reached(target) < durability.replicas {
             let _ = wal.request_sync();
         }
@@ -71,6 +72,17 @@ pub(super) async fn hold_until_durable(
 
     let reached = {
         let _waiting = Waiting::new(&waits_on);
+        let request_sync = || {
+            for (shard, (acks, target)) in waits_on.iter().zip(&targets) {
+                if acks.reached(*target) < durability.replicas {
+                    let _ = shard
+                        .wal
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .request_sync();
+                }
+            }
+        };
 
         super::replica::wait_for_targets(
             state,
@@ -78,6 +90,7 @@ pub(super) async fn hold_until_durable(
             durability.replicas,
             durability.timeout_ms,
             shutdown,
+            &request_sync,
         )
         .await
     };
