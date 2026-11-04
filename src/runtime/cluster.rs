@@ -605,6 +605,11 @@ pub(crate) struct ClusterCheckpointCoordinator {
     save_clients: AtomicUsize,
     snapshot_requests: Arc<AtomicU64>,
     state: Mutex<ClusterCheckpointState>,
+    /// Held while a closed round's manifest and `CURRENT` are written, outside `state`, so
+    /// shards that only read the round state are not held by the disk (see
+    /// [`Self::commit_if_complete`]). Taken while `state` is held and released before
+    /// `state` is taken again, so rounds publish in the order they closed.
+    commit_lock: Mutex<()>,
     /// The shared hot store, when `hot_keys` adds a hot partition to every round. Only the
     /// coordinator writes that partition, under its lock (see `submit_file`).
     hot_store: Option<crate::hot_store::SharedMemoryStore>,
@@ -640,6 +645,7 @@ impl ClusterCheckpointCoordinator {
             snapshot_requests: Arc::new(AtomicU64::new(0)),
             wals: Mutex::new((0..shard_count).map(|_| None).collect()),
             hot_waiting: AtomicBool::new(false),
+            commit_lock: Mutex::new(()),
             state: Mutex::new(ClusterCheckpointState {
                 generation,
                 open: None,
@@ -793,9 +799,17 @@ impl ClusterCheckpointCoordinator {
                 return Ok(None);
             }
 
-            // Read under the lock rounds publish under: the newest published file is the
-            // one copied, never one a round published meanwhile superseded.
-            let from = self.published_generation();
+            // Read under the locks rounds publish under, after a commit in flight: the
+            // newest published file is the one copied, never one a round published
+            // meanwhile superseded.
+            let from = {
+                let _published = self
+                    .commit_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+                self.published_generation()
+            };
 
             if from == 0 && !log_holds_everything {
                 return Err(PersistenceError::Failed(
@@ -999,7 +1013,7 @@ impl ClusterCheckpointCoordinator {
             return Ok(());
         }
 
-        self.commit_if_complete(&mut state, generation)
+        self.commit_if_complete(state, generation)
     }
 
     /// With a hot store, once every regular shard file is in, writes the round's hot
@@ -1091,12 +1105,17 @@ impl ClusterCheckpointCoordinator {
         }
 
         self.take_hot_partition(&mut state, generation, now, &mut alive)?;
-        self.commit_if_complete(&mut state, generation)
+        self.commit_if_complete(state, generation)
     }
 
+    /// Commits the open round once it holds every file. The round is closed under `state`;
+    /// its manifest and `CURRENT` are written after `state` is released, under
+    /// `commit_lock`, since each write waits for the disk and every shard reads the round
+    /// state on its ticks. The final round at shutdown commits under `state`: a failure
+    /// there leaves it open for a retry, and no shard is serving clients any more.
     fn commit_if_complete(
         &self,
-        state: &mut ClusterCheckpointState,
+        mut state: std::sync::MutexGuard<'_, ClusterCheckpointState>,
         generation: u64,
     ) -> Result<(), PersistenceError> {
         if state.shards.iter().any(Option::is_none) {
@@ -1113,13 +1132,31 @@ impl ClusterCheckpointCoordinator {
         // This round is closed either way: a failure after CURRENT was renamed may already
         // have published it, so its generation is never reused.
         state.open = None;
-        self.manager.commit_round(generation, &complete)?;
-        state.generation = generation;
-        state.final_published |= state.final_round;
+        let committing = self
+            .commit_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if state.final_round {
+            self.manager.commit_round(generation, &complete)?;
+            drop(committing);
+            state.generation = state.generation.max(generation);
+            state.final_published = true;
+        } else {
+            drop(state);
+            self.manager.commit_round(generation, &complete)?;
+            drop(committing);
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            state.generation = state.generation.max(generation);
+        }
         self.published_requests
             .fetch_max(answered, Ordering::AcqRel);
         self.published_generation
-            .store(generation, Ordering::Release);
+            .fetch_max(generation, Ordering::AcqRel);
         Ok(())
     }
 

@@ -2680,3 +2680,111 @@ fn evented_scan_with_a_slot_runs_on_the_owner_from_either_shard() {
     join_within(left_server, PATIENCE).unwrap();
     join_within(right_server, PATIENCE).unwrap();
 }
+
+/// A round commit that waits for a slow disk runs beside the shard: clients are answered
+/// meanwhile, and the round still publishes. On the shard thread every client of the
+/// shard (and a primary's lease grants) waited for the whole commit.
+#[test]
+fn a_slow_checkpoint_commit_does_not_hold_the_shard() {
+    let directory = tempfile::tempdir().unwrap();
+    let persistence = slow_commit_persistence(directory.path());
+    let configured = persistence.clone();
+    let (address, stop, server) = serve_with(move |config| config.persistence = configured);
+
+    wait_until_listening(address, &server);
+    let slowest = writes_while_commits_are_slow(&persistence, address, "key");
+
+    stop.request();
+    join_within(server, PATIENCE).unwrap();
+    assert!(
+        slowest < Duration::from_millis(700),
+        "a write waited {slowest:?} while a checkpoint was committed"
+    );
+}
+
+/// The same with two shards, whose files go to one round that commits once both are in.
+#[test]
+fn a_slow_round_commit_does_not_hold_either_shard() {
+    let directory = tempfile::tempdir().unwrap();
+    let persistence = slow_commit_persistence(directory.path());
+    let configured = persistence.clone();
+    let (left_addr, right_addr, stop, left_server, right_server) =
+        serve_two_shards_with(move |config| config.persistence = configured);
+    let (left, right) = (key_on_shard(0, "left"), key_on_shard(1, "right"));
+    let watcher = {
+        let persistence = persistence.clone();
+
+        thread::spawn(move || writes_while_commits_are_slow(&persistence, right_addr, &right))
+    };
+    let slowest_left = writes_while_commits_are_slow(&persistence, left_addr, &left);
+    let slowest_right = watcher.join().unwrap();
+
+    stop.request();
+    join_within(left_server, PATIENCE).unwrap();
+    let _ = join_within(right_server, PATIENCE);
+    for slowest in [slowest_left, slowest_right] {
+        assert!(
+            slowest < Duration::from_millis(700),
+            "a write waited {slowest:?} while a round was committed"
+        );
+    }
+}
+
+fn slow_commit_persistence(directory: &std::path::Path) -> PersistenceConfig {
+    PersistenceConfig {
+        profile: crate::DurabilityProfile::Always,
+        data_dir: directory.to_path_buf(),
+        snapshot_interval: Duration::from_millis(100),
+        ..PersistenceConfig::default()
+    }
+}
+
+/// Writes `key` for 3 s while every round commit in the data directory takes 1.5 s longer,
+/// then waits for a round to publish once commits are fast again. The slowest write.
+fn writes_while_commits_are_slow(
+    persistence: &PersistenceConfig,
+    address: SocketAddr,
+    key: &str,
+) -> Duration {
+    assert_eq!(
+        request(address, &resp(&[&[b"SET", key.as_bytes(), b"first"]])),
+        b"+OK\r\n"
+    );
+    let directory = persistence.data_dir.clone();
+    let before = published_generation(persistence);
+
+    let delay = (directory.clone(), Duration::from_millis(1500));
+    {
+        let mut delays = crate::persistence::COMMIT_DELAYS.lock().unwrap();
+
+        if !delays.contains(&delay) {
+            delays.push(delay);
+        }
+    }
+    let started = Instant::now();
+    let mut slowest = Duration::ZERO;
+    let mut written = 0u32;
+
+    // Long enough for at least one checkpoint to start committing and be waited for.
+    while started.elapsed() < Duration::from_secs(3) {
+        let asked = Instant::now();
+        let reply = request_within(
+            address,
+            &resp(&[&[b"SET", key.as_bytes(), written.to_string().as_bytes()]]),
+            Duration::from_secs(10),
+        );
+
+        slowest = slowest.max(asked.elapsed());
+        assert_eq!(reply, b"+OK\r\n");
+        written += 1;
+        thread::sleep(Duration::from_millis(20));
+    }
+    crate::persistence::COMMIT_DELAYS
+        .lock()
+        .unwrap()
+        .retain(|(dir, _)| *dir != directory);
+
+    // The commits that were delayed still publish their rounds.
+    wait_for_round_after(persistence, before, address, key);
+    slowest
+}
