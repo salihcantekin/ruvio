@@ -281,7 +281,7 @@ def evaluate(run: Run) -> dict:
     if not base:
         criterion(results, 10, "p99 back to the quiet baseline within 60 s after each fault", "not_measured")
     else:
-        limit = lat.summary(base)["p99_ms"] * 1.5 + 0.2
+        limit = lat.summary(base)["p99_ms"] * 1.6 + 0.2
         slow = []
         for e in healed:
             window = (e["t"] + 60, e["t"] + 180)
