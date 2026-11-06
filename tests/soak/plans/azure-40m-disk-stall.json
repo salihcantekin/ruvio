@@ -1,0 +1,55 @@
+{
+ "name": "azure-40m-disk-stall",
+ "seed": 1,
+ "duration_s": 2400,
+ "warmup_s": 120,
+ "restart_as": "mixed",
+ "cluster": {
+  "ping_interval_ms": 500,
+  "down_after_ms": 3000,
+  "primary_lease_ms": 2000,
+  "snapshot_interval_ms": 20000
+ },
+ "load": {
+  "rate_per_worker": 25,
+  "keys_per_worker": 8,
+  "counters": 2,
+  "appenders": 2,
+  "registers": 2,
+  "readers_per_register": 2,
+  "max_list_len": 20000,
+  "profiles": {
+   "default": {},
+   "durable": {
+    "replicas": 2
+   }
+  },
+  "official": {
+   "path": "clients/python",
+   "counters": 1,
+   "registers": 1,
+   "readers_per_register": 2
+  },
+  "background": {
+   "processes": 6,
+   "rate": 1000,
+   "keys": 3000000,
+   "value_bytes": 100
+  }
+ },
+ "faults": {
+  "kinds": [],
+  "start_s": 100000
+ },
+ "metrics_interval_s": 10,
+ "full_info_every": 6,
+ "status_interval_s": 60,
+ "artifact_interval_s": 300,
+ "history_segment_s": 600,
+ "log_interval_s": 900,
+ "check_buckets": 4,
+ "report_settle_s": 120,
+ "rss_min_window_s": 900,
+ "rss_warn_percent_per_hour": 1000.0,
+ "startup_timeout_s": 180
+}

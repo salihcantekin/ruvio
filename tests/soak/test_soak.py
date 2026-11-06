@@ -414,6 +414,24 @@ class LongRunPieces(unittest.TestCase):
         self.assertEqual(processes["g1"], {"rss_kib": 2048, "rss_anon_kib": 1024, "threads": 9, "cpu_ticks": 77,
                                            "fds": 31, "data_dir_bytes": 4096, "wal_bytes": 1024, "checkpoint_bytes": 2048})
         self.assertEqual(host, {"load1": 0.25, "disk_avail_bytes": 10, "clock_offset_s": -0.000004})
+        _, host = parse_host_stats("== host\nCpuStealTicks: 5\nIoFullUs: 1200\nDiskFlushes: 7\nDirtyKib: 64\n", {})
+        self.assertEqual(host, {"cpu_steal_ticks": 5, "io_full_us": 1200, "disk_flushes": 7, "dirty_kib": 64})
+
+    def test_a_host_that_waited_on_its_disk_is_listed_as_a_stall(self):
+        from ruvio_soak import report
+
+        def sample(t, host, io_full_us, steal):
+            return {"t": t, "host": host, "io_full_us": io_full_us, "cpu_steal_ticks": steal, "clk_tck": 100,
+                    "disk_writes": t * 100}
+        hosts = [sample(0, "host0", 0, 0), sample(10, "host0", 1_000_000, 10), sample(20, "host0", 9_000_000, 10),
+                 sample(0, "host1", 0, 0), sample(10, "host1", 0, 800), sample(0, "controller", 0, 0)]
+        run = report.Run.__new__(report.Run)
+        run.hosts = hosts
+        stalls = report._host_stalls(run)
+        self.assertEqual([(s["host"], s["t"]) for s in stalls], [("host1", 10), ("host0", 20)])
+        self.assertEqual(stalls[1]["io_full_share"], 0.8)
+        self.assertEqual(stalls[0]["steal_share"], 0.8)
+        self.assertEqual(stalls[1]["disk_writes_per_s"], 100.0)
 
     def test_lease_and_snapshot_settings_reach_the_nodes(self):
         cluster = Cluster(hosts=["10.0.0.1", "10.0.0.2", "10.0.0.3"], primary_lease_ms=2000, snapshot_interval_ms=60000)
