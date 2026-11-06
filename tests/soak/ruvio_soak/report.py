@@ -361,7 +361,36 @@ def evaluate(run: Run) -> dict:
     verdict = "fail" if "fail" in statuses else ("incomplete" if "not_measured" in statuses else "pass")
     return {"run_id": run.status.get("run_id"), "verdict": verdict, "windows": {
         "load": run.load, "quiet_a": run.quiet_a, "quiet_b": run.quiet_b, "faults": len(run.windows)},
-        "criteria": results, "hourly": _hourly(run)}
+        "criteria": results, "hourly": _hourly(run), "host_stalls": _host_stalls(run)}
+
+
+def _host_stalls(run: Run, share: float = 0.5) -> list[dict]:
+    """Sample intervals in which a node host spent more than `share` of the time with every
+    task waiting for the disk (`io_full_us` from `/proc/pressure/io`) or the hypervisor gave
+    its CPU away (`cpu_steal_ticks`): what a stall of all processes of one host looks like. Not a
+    criterion; it says whether a fault-free failover or a latency spike came from the machine."""
+    out = []
+    last: dict[str, dict] = {}
+    for h in sorted((h for h in run.hosts if h.get("host") != "controller"), key=lambda h: h["t"]):
+        before = last.get(h.get("host"))
+        last[h.get("host")] = h
+        if before is None or h["t"] <= before["t"]:
+            continue
+        seconds = h["t"] - before["t"]
+        entry = {"host": h.get("host"), "t": h["t"], "seconds": round(seconds, 1)}
+        io = number(h.get("io_full_us")), number(before.get("io_full_us"))
+        if None not in io:
+            entry["io_full_share"] = round((io[0] - io[1]) / 1e6 / seconds, 3)
+        steal, tck = (number(h.get("cpu_steal_ticks")), number(before.get("cpu_steal_ticks"))), number(h.get("clk_tck"))
+        if None not in steal and tck:
+            entry["steal_share"] = round((steal[0] - steal[1]) / tck / seconds, 3)
+        for field in ("disk_writes", "disk_write_sectors", "disk_flushes", "disk_busy_ms"):
+            pair = number(h.get(field)), number(before.get(field))
+            if None not in pair:
+                entry[field + "_per_s"] = round((pair[0] - pair[1]) / seconds, 1)
+        if entry.get("io_full_share", 0) > share or entry.get("steal_share", 0) > share:
+            out.append(entry)
+    return out
 
 
 RECOVERY_NAME = "every fault recovers: after the fault ends, max <= 15 s, median <= 5 s; a slot move <= 60 s"
@@ -717,6 +746,11 @@ def markdown(report: dict) -> str:
               "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for h in report["hourly"]:
         lines.append(f"| {h['hour']} | {h['p50_ms']} | {h['p99_ms']} | {h['p999_ms']} | {h['max_ms']} | {h['ok']} | {h['not_ok']} | {h['faults']} | {h['data_anon_mean_kib']} |")
+    stalls = report.get("host_stalls") or []
+    lines += ["", "## Host stalls", "", f"{len(stalls)} sample intervals in which a node host waited on its disk "
+              "or its hypervisor for more than half the time.", ""]
+    if stalls:
+        lines += ["```json", json.dumps(stalls[:50], indent=1), "```"]
     lines += ["", "## Details", "", "```json", json.dumps([{k: r[k] for k in ("id", "details")} for r in report["criteria"]], indent=1)[:60000], "```", ""]
     return "\n".join(lines)
 

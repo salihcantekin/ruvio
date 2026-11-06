@@ -241,6 +241,18 @@ kinds in order every 240-300 s with faults of 5-30 s between minutes 45 and 135 
 twice), then 45 quiet minutes. It judges all 17 criteria, the memory and disk slopes over windows
 long enough to show them.
 
+`plans/azure-40m-disk-stall.json` looks for a whole host stalling under checkpoint and WAL
+traffic: no faults, 40 minutes of load over a data set growing to about 3 million keys, a
+checkpoint every 20 s. Run it on two clusters at once that differ only in the data disk
+(`dataDiskSizeGb`, `dataDiskSku`) to tell the disk from the server.
+
+Every host sample also records the cumulative counters a short stall leaves behind:
+`/proc/pressure/io` (`io_some_us`, `io_full_us`), CPU iowait and steal ticks, dirty and
+writeback memory, and the data disk's `/proc/diskstats` (reads, writes, sectors written,
+in-flight, busy and queue time, flushes). The report lists under "Host stalls" each sample
+interval in which a node host spent more than half the time with every task waiting for the
+disk, or with its CPU taken by the hypervisor.
+
 `plans/azure-short.json` is the same in 30 minutes (faults every 2-4 minutes), to try the tool.
 `plans/azure-mini.json` is a 3-hour run: every fault kind every 5-10 minutes, faults lasting
 5-30 s, `durable` writes waiting for both replicas. The cloud-init data-disk detection and the
