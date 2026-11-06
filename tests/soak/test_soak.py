@@ -537,6 +537,42 @@ class LongRunPieces(unittest.TestCase):
         self.assertEqual(criteria[11]["status"], "pass", criteria[11])
         self.assertEqual(criteria[11]["value"]["placements"], 2)
 
+    def test_one_checkpoint_dip_in_eight_minutes_is_allowed(self):
+        from ruvio_soak import report
+
+        steady = [100, 101, 99, 100, 102, 98, 100, 100]
+        self.assertTrue(report._throughput_minutes(steady)["steady"])
+        one_dip = [100, 101, 99, 90, 102, 98, 100, 100]
+        judged = report._throughput_minutes(one_dip)
+        self.assertTrue(judged["steady"], judged)
+        self.assertEqual(judged["dips"], [0.9])
+        # Two dips in eight minutes, a dip deeper than -15 %, or a wide spread fail.
+        self.assertFalse(report._throughput_minutes([100, 90, 99, 90, 102, 98, 100, 100])["steady"])
+        self.assertFalse(report._throughput_minutes([100, 101, 99, 80, 102, 98, 100, 100])["steady"])
+        self.assertFalse(report._throughput_minutes([100, 112, 99, 100, 102, 98, 100, 100])["steady"])
+
+    def test_a_coordinator_is_judged_only_since_its_last_leadership_change(self):
+        from ruvio_soak import report
+
+        # host0 becomes leader at t=5040 and its memory steps from 3 to 9 MiB, then stays flat;
+        # host1 never changes and grows the same way: only host1 fails.
+        def sample(t, process, leader, anon):
+            return {"t": t, "process": process, "is_leader": leader, "rss_anon_kib": anon}
+        metrics = []
+        for t in range(0, 10000, 60):
+            metrics.append(sample(t, "host0-coordinator", "1" if t >= 5000 else "0",
+                                  9216 if t >= 5000 else 3072))
+            metrics.append(sample(t, "host1-coordinator", "0", 9216 if t >= 5000 else 3072))
+        with tempfile.TemporaryDirectory() as directory:
+            self.report_run(Path(directory), metrics, events=[
+                {"event": "load-start", "t": 1, "mono": 10**9},
+                {"event": "load-stop", "t": 10000, "mono": 10000 * 10**9},
+            ])
+            criteria = {c["id"]: c for c in report.write(Path(directory))["criteria"]}
+        self.assertEqual(criteria[13]["value"], {"host0-coordinator": "pass", "host1-coordinator": "fail"},
+                         criteria[13]["details"])
+        self.assertEqual(criteria[13]["details"]["host0-coordinator"]["leader_changed_at"], 5040)
+
     def test_a_report_without_data_is_never_a_pass(self):
         from ruvio_soak import report
 

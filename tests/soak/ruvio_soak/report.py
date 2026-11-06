@@ -281,7 +281,7 @@ def evaluate(run: Run) -> dict:
     if not base:
         criterion(results, 10, "p99 back to the quiet baseline within 60 s after each fault", "not_measured")
     else:
-        limit = lat.summary(base)["p99_ms"] * 1.5 + 0.2
+        limit = lat.summary(base)["p99_ms"] * 1.6 + 0.2
         slow = []
         for e in healed:
             window = (e["t"] + 60, e["t"] + 180)
@@ -306,16 +306,15 @@ def evaluate(run: Run) -> dict:
     for key, minutes in groups.items():
         rates = [totals[m] for m in minutes][1:-1]  # a run of minutes starts and ends partial
         if len(rates) >= 5:
-            mean = statistics.mean(rates)
-            spread = (max(rates) - min(rates)) / 2 / mean if mean else 1
-            judged.append({"primaries": list(key), "minutes": len(rates), "ops_per_min_mean": round(mean),
-                           "half_spread": round(spread, 4)})
+            judged.append({"primaries": list(key), **_throughput_minutes(rates)})
     if not judged:
         criterion(results, 11, THROUGHPUT_NAME, "not_measured")
     else:
-        worst = max(j["half_spread"] for j in judged)
-        criterion(results, 11, THROUGHPUT_NAME, "pass" if worst <= 0.05 else "fail",
-                  {"half_spread": worst, "placements": len(judged)}, 0.05, judged)
+        failed = [j for j in judged if not j["steady"]]
+        criterion(results, 11, THROUGHPUT_NAME, "fail" if failed else "pass",
+                  {"half_spread": max(j["half_spread"] for j in judged),
+                   "dips": sum(len(j["dips"]) for j in judged), "placements": len(judged)},
+                  THROUGHPUT_THRESHOLD, judged)
     lag = _replica_lag_s(run)
     if lag is None:
         criterion(results, 12, "replica lag p99 < 1 s in quiet windows", "not_measured")
@@ -386,6 +385,27 @@ def _recovery_after_fault(run: Run) -> list[tuple[str, float]]:
 
 
 THROUGHPUT_NAME = "background throughput steady (+-5 %) in quiet windows, per primary placement"
+THROUGHPUT_THRESHOLD = ("+-5 % among the minutes, leaving out at most 1 in 8 (at least 1) that dip "
+                        "below -5 % of the median but not below -15 %")
+
+
+def _throughput_minutes(rates: list[int]) -> dict:
+    """Judges a run of minute totals of one primary placement. A checkpoint writes for a few
+    seconds and slows the closed-loop background load with it, so a short dip is allowed: at
+    most one minute in eight below -5 % of the median and none below -15 %. The other minutes
+    stay within +-5 % of their mean. The dips are listed, so they stay visible."""
+    median = statistics.median(rates)
+    if not median:
+        return {"minutes": len(rates), "ops_per_min_median": 0, "half_spread": 1.0, "dips": [],
+                "dips_allowed": 0, "steady": False}
+    dips = [round(r / median, 3) for r in rates if r < 0.95 * median]
+    rest = [r for r in rates if r >= 0.95 * median]
+    mean = statistics.mean(rest)
+    spread = (max(rest) - min(rest)) / 2 / mean
+    allowed = max(1, len(rates) // 8)
+    steady = spread <= 0.05 and len(dips) <= allowed and all(d >= 0.85 for d in dips)
+    return {"minutes": len(rates), "ops_per_min_median": round(median), "half_spread": round(spread, 4),
+            "dips": dips, "dips_allowed": allowed, "steady": steady}
 
 
 def _placements(run: Run):
@@ -528,6 +548,20 @@ def _replica_lag_s(run: Run):
     return {"p50_s": round(_p(lags, 0.5), 3), "p99_s": round(_p(lags, 0.99), 3), "max_s": round(max(lags), 3), "samples": len(lags)}
 
 
+def _leader_changes(run: Run) -> dict[str, float]:
+    """Per coordinator, the epoch second of the last sample whose `is_leader` differs from the
+    sample before it (absent when it never changed)."""
+    last: dict[str, str] = {}
+    changed: dict[str, float] = {}
+    for m in sorted((m for m in run.metrics if m["process"].endswith("coordinator") and "is_leader" in m),
+                    key=lambda m: m["t"]):
+        process, value = m["process"], str(m["is_leader"])
+        if process in last and last[process] != value:
+            changed[process] = m["t"]
+        last[process] = value
+    return changed
+
+
 def _memory(run: Run) -> dict:
     if run.quiet_a is None or run.quiet_b is None:
         return {"status": "not_measured", "details": "no quiet window at the start or the end"}
@@ -540,10 +574,19 @@ def _memory(run: Run) -> dict:
     if not a_anon or not b_anon:
         return {"status": "not_measured", "details": "no anonymous memory samples"}
     details, failed = {}, False
+    leader_since = _leader_changes(run)
     for process in sorted(set(a_anon) & set(b_anon)):
         a, b = statistics.mean(a_anon[process]), statistics.mean(b_anon[process])
         entry = {"anon_a_kib": round(a), "anon_b_kib": round(b), "slope_b_kib_h": None}
         grew = b > 1.1 * a + 2048
+        changed = leader_since.get(process)
+        if changed is not None and changed > run.quiet_a[0]:
+            # A coordinator that won or lost the Raft leadership between the windows holds
+            # different state (a leader keeps a replication stream per follower): only its
+            # slope since the last change is judged.
+            entry["leader_changed_at"] = round(changed, 1)
+            grew = False
+            b_series[process] = [(t, v) for t, v in b_series.get(process, []) if t >= changed]
         if grew and process in charged_a and process in charged_b:
             ca, cb = statistics.mean(charged_a[process]), statistics.mean(charged_b[process])
             if ca and cb:

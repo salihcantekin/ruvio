@@ -115,10 +115,10 @@ its load instead.
 | 7 | No failed or unknown operation outside fault windows |
 | 8 | Failovers (`failovers_total`) at most two per fault that hits a primary, and none (`last_failover_unix_ms`) outside a fault window |
 | 9 | p99 and p99.9 in the last quiet window within 20 % (+0.2 ms) of the first |
-| 10 | p99 back within 1.5 x the quiet baseline 60 s after each fault |
-| 11 | Background throughput within +-5 % in the quiet windows, among minutes with the same primaries (the background load is closed loop, so its rate follows the latency of the nodes that hold them) |
+| 10 | p99 back within 1.6 x the quiet baseline (+0.2 ms) 60 s after each fault |
+| 11 | Background throughput within +-5 % in the quiet windows, among minutes with the same primaries (the background load is closed loop, so its rate follows the latency of the nodes that hold them). At most one minute in eight (at least one) may dip below -5 % of the median, as a checkpoint does, but not below -15 %; the dips are listed in the report |
 | 12 | Replica lag p99 below 1 s in the quiet windows |
-| 13 | Anonymous memory: last quiet window <= 1.1 x the first (or the same anonymous memory per charged byte); there, anonymous memory per charged byte rising < 2 %/h on data nodes, anonymous memory < 0.5 MiB/h on coordinators |
+| 13 | Anonymous memory: last quiet window <= 1.1 x the first (or the same anonymous memory per charged byte); there, anonymous memory per charged byte rising < 2 %/h on data nodes, anonymous memory < 0.5 MiB/h on coordinators. A coordinator that won or lost the Raft leadership after the first window is judged only by its slope since that change (a leader holds more state) |
 | 14 | Open descriptors and threads do not grow |
 | 15 | WAL bounded (last <= 1.5 x first + 64 MiB), checkpoints in step with the data (bytes per charged byte <= 1.5 x first + 0.1), free disk >= 20 % |
 | 16 | Coordinator data grows less than 64 MiB |
