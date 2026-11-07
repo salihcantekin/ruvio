@@ -4,6 +4,8 @@ Notable changes to `ruvio-ui`, the web console (Docker image and host binaries).
 
 ## Unreleased
 
+- UI session generation falls back gracefully when `crypto.randomUUID` is unavailable, fixing blank screen errors when accessing the UI over plain HTTP IP addresses in non-secure contexts.
+
 ## 0.2.0 - 2026-10-29
 
 - TLS to the target: set `RUVIO_UI_TLS=true` to connect to the Ruvio server over TLS, with the certificate chain and host name checked. `RUVIO_UI_TLS_CA` (PEM file of the CA to trust), `RUVIO_UI_TLS_CLIENT_CERT` and `RUVIO_UI_TLS_CLIENT_KEY` (mutual TLS), `RUVIO_UI_TLS_SERVER_NAME` and `RUVIO_UI_TLS_INSECURE=true` (skip verification, tests only) refine it. Without `RUVIO_UI_TLS` the UI connects as before.
