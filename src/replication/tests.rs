@@ -378,6 +378,7 @@ fn mixed_expired_delta_and_compacted_history_never_enter_the_replica_wal() {
             value: b"3",
         })
         .unwrap();
+    primary.settle_writes().unwrap();
     let FrameRead::Frames(frames) = read_frames(source_dir.path(), 0, 0, 2, limits).unwrap() else {
         panic!("primary WAL frames unavailable");
     };
@@ -482,6 +483,7 @@ fn transaction_preflight_uses_sequential_key_kinds_before_append() {
                 mutations: &mutations,
             })
             .unwrap();
+        primary.settle_writes().unwrap();
         let FrameRead::Frames(frames) = read_frames(source_dir.path(), 0, 0, 1, limits).unwrap()
         else {
             panic!("transaction frame unavailable");
@@ -696,6 +698,7 @@ fn expired_replica_snapshot_json_delta_requests_snapshot_without_appending() {
         })
         .unwrap();
     primary.record(Mutation::Persist { key: b"doc" }).unwrap();
+    primary.settle_writes().unwrap();
     let FrameRead::Frames(frames) = read_frames(source_dir.path(), 0, 0, 2, limits).unwrap() else {
         panic!("primary WAL frames unavailable");
     };
@@ -802,13 +805,16 @@ fn apply_frame_appends_then_applies_and_stops_on_a_bad_frame() {
             value: b"w",
         })
         .unwrap();
+    primary.settle_writes().unwrap();
 
+    primary.settle_writes().unwrap();
     let FrameRead::Frames(frames) = read_frames(primary_dir.path(), 0, 0, 1, limits).unwrap()
     else {
         panic!("primary did not return the first frame");
     };
 
     let frame = frames[0].clone();
+    primary.settle_writes().unwrap();
     let FrameRead::Frames(next_frames) = read_frames(primary_dir.path(), 0, 1, 2, limits).unwrap()
     else {
         panic!("primary did not return the next frame");
@@ -832,6 +838,7 @@ fn apply_frame_appends_then_applies_and_stops_on_a_bad_frame() {
         Ok(())
     );
     assert_eq!(shard.get(b"k"), Some(&b"v"[..]));
+    replica.settle_writes().unwrap();
     assert_eq!(replica.published().load(Ordering::Acquire), 1);
     assert_eq!(
         apply_frame(&mut shard, &mut replica, &frame, limits),
@@ -846,16 +853,20 @@ fn apply_frame_appends_then_applies_and_stops_on_a_bad_frame() {
         apply_frame(&mut shard, &mut replica, &broken, limits),
         Err(ApplyFailure::BadFrame)
     );
+    replica.settle_writes().unwrap();
     assert_eq!(replica.published().load(Ordering::Acquire), 1);
     crate::persistence::arm_io_fault(crate::persistence::CrashSite::Append);
 
-    let persisted = apply_frame(&mut shard, &mut replica, &next, limits);
+    // The writer thread's write fails after the frame was handed over and applied: the log
+    // keeps it for recovery, as a primary's own `everysec` record.
+    assert_eq!(apply_frame(&mut shard, &mut replica, &next, limits), Ok(()));
+    let persisted = replica.settle_writes();
 
     assert!(
-        matches!(persisted, Err(ApplyFailure::Persist(ref message)) if message.contains("no space")),
+        matches!(persisted, Err(crate::PersistenceError::Failed(ref message)) if message.contains("no space")),
         "{persisted:?}"
     );
-    assert_eq!(shard.get(b"k"), Some(&b"v"[..]));
+    assert_eq!(shard.get(b"k"), Some(&b"w"[..]));
 }
 
 #[test]
@@ -2064,6 +2075,7 @@ fn a_replica_clock_ahead_of_the_primary_neither_loses_an_extended_key_nor_logs_i
             .unwrap()
             .into_owned();
 
+        primary_wal.settle_writes().unwrap();
         primary_last.set(primary_wal.last_sequence());
         reply
     };
@@ -2178,6 +2190,7 @@ fn a_replica_checkpoint_holds_its_snapshot_point_while_frames_keep_arriving() {
     replica.follow_primary(true);
     let mut run = |text: &str| {
         execute_with_sink(&mut primary, command(text), &mut primary_wal).unwrap();
+        primary_wal.settle_writes().unwrap();
         primary_wal.last_sequence()
     };
     // As the replica's shard loop does: log each frame, then apply it.
@@ -2287,6 +2300,7 @@ fn a_replica_checkpoint_holds_its_snapshot_point_while_frames_keep_arriving() {
     for entry in written {
         restarted.restore_snapshot_entry(entry).unwrap();
     }
+    crate::persistence::settle_wal_writers(replica_dir.path());
     let FrameRead::Frames(frames) =
         read_frames(replica_dir.path(), 0, covered, last, limits).unwrap()
     else {
@@ -2721,6 +2735,7 @@ fn shipped_records_are_gathered_into_few_writes_in_order() {
         .unwrap();
     }
 
+    wal.settle_writes().unwrap();
     let FrameRead::Frames(frames) = read_frames(dir.path(), 0, 0, 600, limits).unwrap() else {
         panic!("WAL frames unavailable");
     };
@@ -2793,6 +2808,7 @@ fn a_record_larger_than_a_shipper_write_is_written_on_its_own() {
     for (key, value) in [(b"a", &small), (b"b", &large), (b"c", &small)] {
         wal.record(Mutation::SetBytes { key, value }).unwrap();
     }
+    wal.settle_writes().unwrap();
 
     let FrameRead::Frames(frames) = read_frames(dir.path(), 0, 0, 3, limits).unwrap() else {
         panic!("WAL frames unavailable");

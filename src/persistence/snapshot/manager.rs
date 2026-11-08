@@ -257,6 +257,9 @@ impl CheckpointManager {
 
         let checkpoints = self.config.data_dir.join("checkpoints");
 
+        // A disk that stopped answering (see `STALLED_WRITE_DIRS`).
+        #[cfg(test)]
+        crate::persistence::wal::stall_write(&self.config.data_dir);
         if !checkpoints.exists() {
             crate::persistence::create_private_directory(&checkpoints)?;
             sync_directory(&self.config.data_dir)?;

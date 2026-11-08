@@ -587,6 +587,8 @@ pub(super) async fn handle_client(
         let mut flush_at = flush_threshold(0, output.maximum());
         let mut wal_group = OpenWalGroup::new(&state);
 
+        // Nothing of this batch ran yet.
+        wal_group.quiet = true;
         state.store.borrow().sample_time();
         let _time_sample = TimeSample { state: &state };
 
@@ -772,11 +774,14 @@ pub(super) async fn handle_client(
                         bump_mutations(&state);
                     }
 
-                    if wal_group.uses_wal {
+                    // `PING` reveals nothing and writes nothing: it leaves the group as it is,
+                    // so a health check is answered while an `always` sync waits (`quiet`).
+                    if wal_group.uses_wal && !matches!(command, HotCommand::Ping(_)) {
                         if wal_group_eligible(WalGroupCommand::Hot(&command), &session) {
                             wal_group.begin();
                         } else {
                             wal_group.commit().await?;
+                            wal_group.quiet = false;
                         }
                     }
 
@@ -1076,7 +1081,7 @@ pub(super) async fn handle_client(
                                     wal_group.begin();
                                 } else {
                                     waited = true;
-                                    wal_group.commit().await?;
+                                    wal_group.commit_before(&command).await?;
                                 }
                             }
                             // A command that waited above may find its slot taken over by

@@ -20,6 +20,9 @@ impl WalSink {
             }
         }
         self.publish_staged()?;
+        self.writer.drain();
+        self.observe_write_error()?;
+        self.observe_sync_error()?;
 
         if self.dirty_bytes != 0 {
             self.fsync_always_or_cut()?;
@@ -92,7 +95,7 @@ impl WalSink {
 
         // A batch that appended nothing while the log is failed (reads, refused writes) has
         // nothing to publish; records kept from the failed batch wait for recovery.
-        if self.failed.is_some() && self.group_bytes == 0 {
+        if self.group_bytes == 0 && (self.failed.is_some() || self.writer.has_failure()) {
             return Ok(());
         }
 
@@ -215,6 +218,11 @@ impl WalSink {
     /// or a rotation in between): cut them so a restart does not revive them. With the
     /// worker the shard thread does not know what it synced.
     fn fsync_always_or_cut(&mut self) -> Result<(), PersistenceError> {
+        // A write the writer thread could not make keeps its records for recovery, as a
+        // failed write of staged records always did: only a failed sync cuts them.
+        self.writer.drain();
+        self.observe_write_error()?;
+
         let synced = self.fsync_file();
 
         if synced.is_err() {
@@ -306,23 +314,11 @@ impl WalSink {
             self.dirty_bytes = self.dirty_bytes.saturating_sub(self.barrier_mark.1);
         }
         self.barrier_mark = (sequence, self.dirty_bytes);
-        if self.sync_worker_file.is_none() {
-            let file = self.file.as_ref().ok_or_else(|| {
-                PersistenceError::Failed("WAL-backed profile has no open segment".into())
-            })?;
-            let cloned = match file.try_clone() {
-                Ok(cloned) => cloned,
-                Err(error) => return self.fail(error),
-            };
-            self.sync_worker_file = Some(Arc::new(cloned));
-        }
+        // The worker waits for the writer to write these records before it syncs them.
         self.sync_worker
             .as_ref()
             .expect("enabled sync worker")
-            .submit(
-                Arc::clone(self.sync_worker_file.as_ref().expect("sync file")),
-                sequence,
-            )
+            .submit(self.writer.source(), sequence)
             .map(Some)
     }
 
@@ -364,9 +360,15 @@ impl WalSink {
             ));
         }
 
+        // What the writer holds goes to the file first; a write it could not make fails the
+        // log instead.
+        self.writer.drain();
+        self.observe_write_error()?;
+        self.observe_sync_error()?;
+
         let started = Instant::now();
         let synced = {
-            let Some(file) = &mut self.file else {
+            let Some(file) = self.writer.physical().file.clone() else {
                 return Err(PersistenceError::Failed(
                     "WAL-backed profile has no open segment".into(),
                 ));
@@ -408,7 +410,7 @@ impl WalSink {
         let sequence = self.next_sequence;
 
         if self.group == 0 {
-            self.published.store(sequence, Ordering::Release);
+            self.writer.publish(sequence);
         }
 
         if synced {
@@ -425,8 +427,22 @@ impl WalSink {
         let sequence = self.last_sequence();
 
         if sequence > 0 {
-            self.published.store(sequence, Ordering::Release);
+            self.writer.publish(sequence);
         }
+    }
+
+    /// A write the writer thread could not make fails the log: appends are refused until
+    /// recovery writes what it kept (see `recover_if_failed`). Only paths that need the
+    /// records on disk look: a reply that only handed them over is not refused for it.
+    pub(super) fn observe_write_error(&mut self) -> Result<(), PersistenceError> {
+        if self.failed.is_none()
+            && let Some(message) = self.writer.failure_message()
+        {
+            self.failed = Some(message.clone());
+            return Err(PersistenceError::Failed(message));
+        }
+
+        Ok(())
     }
 
     pub(super) fn observe_sync_error(&mut self) -> Result<(), PersistenceError> {
@@ -511,20 +527,8 @@ impl WalSink {
             return Ok(());
         }
 
-        let Some(file) = &self.file else {
-            self.sync_running.store(false, Ordering::Release);
-
-            return Ok(());
-        };
-
-        let cloned = match file.try_clone() {
-            Ok(file) => file,
-            Err(error) => {
-                self.sync_running.store(false, Ordering::Release);
-
-                return self.fail(error);
-            }
-        };
+        // The thread waits for the writer to write these records, then syncs them.
+        let source = self.writer.source();
 
         #[cfg(test)]
         let injected = super::crash::take_io_fault(super::crash::CrashSite::Sync)
@@ -555,19 +559,22 @@ impl WalSink {
                     }
                     None => {
                         delay_sync(&data_dir);
-                        cloned.sync_data()
+                        Ok(source.sync_through(sequence))
                     }
                 };
                 #[cfg(not(test))]
-                let synced = cloned.sync_data();
+                let synced: io::Result<_> = Ok(source.sync_through(sequence));
 
-                if let Err(error) = synced {
-                    sync_error.report(error.to_string());
-
-                    return;
+                match synced {
+                    Ok(super::sync_worker::SyncOutcome::Synced) => {
+                        durable.fetch_max(sequence, Ordering::Release);
+                    }
+                    // The shard picks up the write failure from the writer.
+                    Ok(super::sync_worker::SyncOutcome::NotWritten(_)) => {}
+                    Ok(super::sync_worker::SyncOutcome::Failed(error)) | Err(error) => {
+                        sync_error.report(error.to_string());
+                    }
                 }
-
-                durable.fetch_max(sequence, Ordering::Release);
             })
         {
             self.sync_running.store(false, Ordering::Release);

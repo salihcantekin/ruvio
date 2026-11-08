@@ -276,12 +276,20 @@ fn reopen(file: &File) -> io::Result<File> {
 }
 
 #[cfg(unix)]
-pub(super) fn write_all_at(file: &File, buffer: &[u8], offset: u64) -> io::Result<()> {
+pub(in crate::persistence) fn write_all_at(
+    file: &File,
+    buffer: &[u8],
+    offset: u64,
+) -> io::Result<()> {
     std::os::unix::fs::FileExt::write_all_at(file, buffer, offset)
 }
 
 #[cfg(windows)]
-pub(super) fn write_all_at(file: &File, buffer: &[u8], offset: u64) -> io::Result<()> {
+pub(in crate::persistence) fn write_all_at(
+    file: &File,
+    buffer: &[u8],
+    offset: u64,
+) -> io::Result<()> {
     let mut done = 0;
 
     while done < buffer.len() {

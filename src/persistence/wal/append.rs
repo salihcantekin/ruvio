@@ -7,9 +7,9 @@ impl WalSink {
         self.append_as::<false>(mutation)
     }
 
-    /// `THROUGH`: inside an `always` group the record is written now (after what is staged)
-    /// instead of staged, so a failed write reaches the caller while it can still roll back.
-    /// Its sync still waits for the group's commit. Other profiles stage it as before.
+    /// `THROUGH`: inside an `always` group the record is handed to the writer now (after what
+    /// is staged) instead of staged. Its sync still waits for the group's commit, which fails
+    /// if the writer could not write it. Other profiles stage it as before.
     pub(super) fn append_as<const THROUGH: bool>(
         &mut self,
         mutation: Mutation<'_>,
@@ -85,7 +85,7 @@ impl WalSink {
 
             written = if through {
                 self.publish_staged_io()
-                    .and_then(|()| self.write_file(&record))
+                    .and_then(|()| self.write_file_now(&record, self.next_sequence))
             } else {
                 self.write_record(&record)
             };
@@ -215,47 +215,36 @@ impl WalSink {
             return Ok(());
         }
 
-        self.write_file(bytes)
+        // Every caller writes the record that will get `next_sequence`.
+        self.write_file(bytes, self.next_sequence)
     }
 
-    fn write_file(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let Some(file) = &mut self.file else {
-            return Err(io::Error::other("WAL-backed profile has no open segment"));
+    /// Hands `bytes`, the records up to `last_sequence`, to the writer thread. A write that
+    /// fails there keeps them for recovery, which writes them before anything newer, as for
+    /// staged records.
+    fn write_file(&mut self, bytes: &[u8], last_sequence: u64) -> io::Result<()> {
+        self.writer.write(bytes, last_sequence)?;
+        self.write_pos += bytes.len() as u64;
+
+        Ok(())
+    }
+
+    /// `write_file`, then waits for the writer: a script or transaction inside an `always`
+    /// group learns of a failed write while it can still roll back, and its record is not
+    /// kept for recovery. Only these wait for the disk on the shard's thread; their replies
+    /// wait for the group's sync anyway.
+    fn write_file_now(&mut self, bytes: &[u8], last_sequence: u64) -> io::Result<()> {
+        self.write_file(bytes, last_sequence)?;
+        self.writer.drain();
+
+        let Some(message) = self.writer.failure_message() else {
+            return Ok(());
         };
-        let end = self.write_pos + bytes.len() as u64;
 
-        // Preallocated *and zero-filled* space: a sync of blocks that already hold data needs no extent
-        // conversion or size change, which made `fdatasync` ~2.4x faster (2.0 -> 0.8 ms per sync) on ext4.
-        if self.prealloc {
-            let cap = self.config.wal_segment_bytes.max(end);
-
-            self.prefill.reserve(
-                file,
-                &mut self.prealloc_end,
-                &mut self.prealloc,
-                end,
-                cap,
-                self.write_pos,
-            );
-        }
-
-        #[cfg(test)]
-        if let Some(error) = injected_write_fault(&self.config.data_dir, self.shard_id) {
-            self.prealloc_end = self.write_pos;
-            return Err(error);
-        }
-        #[cfg(test)]
-        count_write(&self.config.data_dir);
-        let written = super::crash::hit_write(super::crash::CrashSite::Append, file, bytes);
-
-        if written.is_ok() {
-            self.write_pos = end;
-        } else {
-            // Keep whatever a failed write left behind (recovery classifies it); only a clean tail is trimmed.
-            self.prealloc_end = self.write_pos;
-        }
-
-        written
+        // The writer stopped before this record or on it: either way it holds it last.
+        self.writer.physical().forget_last(bytes.len() as u64);
+        self.write_pos -= bytes.len() as u64;
+        Err(io::Error::other(message))
     }
 
     pub(super) fn publish_staged(&mut self) -> Result<(), PersistenceError> {
@@ -277,7 +266,8 @@ impl WalSink {
         }
 
         let staged = std::mem::take(&mut self.staged);
-        let written = self.write_file(&staged);
+        // Staged records end at the last sequence handed out.
+        let written = self.write_file(&staged, self.last_sequence());
 
         self.staged = staged;
         // The staged records already own their sequences (and are applied in memory): a failed
@@ -312,32 +302,28 @@ impl WalSink {
         self.file_length = self.file_length.saturating_sub(length);
         self.dirty_bytes = self.dirty_bytes.saturating_sub(length);
         self.group_bytes = self.group_bytes.saturating_sub(length);
-        // If the file cannot be shortened, overwrite the records with zeros instead: replay
-        // then sees an unwritten preallocated tail.
-        self.prefill.finish(&mut self.prealloc_end);
-        if let Some(file) = &self.file {
-            if file.set_len(self.write_pos).is_ok() {
-                self.prealloc_end = self.write_pos;
-            } else {
-                let zeros = vec![0u8; usize::try_from(length).unwrap_or(0)];
-                let _ = write_all_at(file, &zeros, self.write_pos);
-            }
-        }
+        self.writer.drain();
+        self.writer.physical().forget_last(length);
     }
 
     /// After a write or sync error the log refuses appends. Once the disk accepts a clean
     /// start again (space freed, transient error gone), drop the torn tail and continue in a
     /// fresh segment, so writes resume without a restart. Tried at most twice a second.
     pub(super) fn recover_if_failed(&mut self) -> Result<(), PersistenceError> {
+        // A write the writer thread could not make fails the log here first.
+        if self.failed.is_none() {
+            self.failed = self.writer.failure_message();
+        }
         let Some(message) = self.failed.clone() else {
             return Ok(());
         };
 
         // A sync still running, or one that failed after the write error, may have taken
         // the error for pages recovery's own sync would then report as clean: settle them
-        // first and treat any error they left as a failed sync.
+        // first and treat any error they left as a failed sync. The writer sets aside
+        // whatever it still holds.
         self.wait_background_sync();
-        self.prefill.finish(&mut self.prealloc_end);
+        self.writer.drain();
         if !self.sync_failed
             && let Err(error) = self.observe_sync_error()
         {
@@ -358,15 +344,30 @@ impl WalSink {
 
         self.last_recovery = Some(Instant::now());
 
+        let source = self.writer.source();
+        let mut guard = source.lock_physical();
+        let physical = &mut *guard;
+        // Records the writer could not write, then records still staged, keep their
+        // sequences and are written before anything newer.
+        let mut pending = std::mem::take(&mut physical.unwritten);
+        let resume_at = if !pending.is_empty() {
+            physical.unwritten_first
+        } else if !self.staged.is_empty() {
+            self.staged_first_sequence
+        } else {
+            self.next_sequence
+        };
+
+        pending.extend_from_slice(&self.staged);
+        self.staged.clear();
+
         let mut sync_lost = None;
         let recovered = (|| -> Result<(), PersistenceError> {
-            self.sync_worker_file = None;
-
-            if let Some(file) = &mut self.file {
-                // Drop torn bytes and put the cursor back: a failed write may have moved it.
-                // Only bytes past `write_pos` go; they never reached a successful write.
-                file.set_len(self.write_pos)?;
-                file.seek(SeekFrom::Start(self.write_pos))?;
+            physical.prefill.finish(&mut physical.prealloc_end);
+            if let Some(file) = &physical.file {
+                // Drop torn bytes: only bytes past `write_pos` go; they never reached a
+                // successful write.
+                file.set_len(physical.write_pos)?;
                 #[cfg(test)]
                 let synced = match super::crash::take_io_fault(super::crash::CrashSite::Sync) {
                     Some(error) => Err(error),
@@ -380,54 +381,58 @@ impl WalSink {
                 }
             }
 
-            self.prealloc_end = self.write_pos;
-            self.prefill.reset();
+            physical.prealloc_end = physical.write_pos;
+            physical.prefill.reset();
 
-            // Records staged before the failure keep their sequences and are written first.
-            let resume_at = if self.staged.is_empty() {
-                self.next_sequence
-            } else {
-                self.staged_first_sequence
-            };
-
-            if self.write_pos > WAL_HEADER_LEN as u64 {
+            if physical.write_pos > WAL_HEADER_LEN as u64 || physical.file.is_none() {
                 let directory = shard_wal_directory(&self.config.data_dir, self.shard_id);
-                let (file, segment_id, first_sequence, file_length) =
+                let (file, _, first_sequence, file_length) =
                     create_segment(&directory, self.shard_id, resume_at)?;
 
-                self.file = Some(file);
-                self.segment_id = segment_id;
-                self.segment_first_sequence = first_sequence;
-                self.write_pos = file_length;
-                self.synced_pos = file_length;
-                self.prealloc_end = file_length;
-            } else if self.segment_first_sequence != resume_at {
+                physical.file = Some(Arc::new(file));
+                physical.segment_first_sequence = first_sequence;
+                physical.write_pos = file_length;
+                physical.prealloc_end = file_length;
+            } else if physical.segment_first_sequence != resume_at {
                 return Err(PersistenceError::Failed(
                     "WAL recovery found an empty segment at the wrong sequence".into(),
                 ));
             }
 
             // Everything written before the failure was synced above.
-            self.file_length = self.write_pos;
+            self.segment_id = physical.segment_first_sequence;
+            self.segment_first_sequence = physical.segment_first_sequence;
+            self.write_pos = physical.write_pos;
+            self.file_length = physical.write_pos;
             self.dirty_bytes = 0;
             self.barrier_mark = (0, 0);
 
-            if !self.staged.is_empty() {
-                let staged = std::mem::take(&mut self.staged);
-                let written = self.write_file(&staged);
-
-                self.staged = staged;
-                written?;
-                self.file_length += self.staged.len() as u64;
-                self.dirty_bytes = self.staged.len() as u64;
-                self.staged.clear();
+            if !pending.is_empty() {
+                physical.write_at_end(&pending)?;
+                self.write_pos = physical.write_pos;
+                self.file_length = physical.write_pos;
+                self.dirty_bytes = pending.len() as u64;
             }
+            physical.written = self.last_sequence();
+            physical.failed = None;
 
             Ok(())
         })();
 
+        if recovered.is_err() {
+            // Kept for the next attempt.
+            physical.unwritten_first = resume_at;
+            physical.unwritten = pending;
+            physical.failed.get_or_insert_with(|| message.clone());
+        }
+        drop(guard);
+
         match recovered {
             Ok(()) => {
+                source.note_rewritten(self.last_sequence());
+                if let Some(worker) = &self.sync_worker {
+                    worker.clear_not_written();
+                }
                 self.observe_sync_error()?;
                 self.failed = None;
                 self.synced_pos = self.file_length - self.dirty_bytes;
@@ -462,6 +467,7 @@ impl WalSink {
             );
         }
         self.sync_failed = true;
+        self.sync_error.poison();
         self.failed = Some(error.clone());
         // Also when another descriptor's sync (the preallocation fill) failed and this is
         // only where the error is picked up: the unsynced records' clients are refused.

@@ -244,6 +244,30 @@ pub(super) struct OpenWalGroup<'a> {
     /// Last record sequence when the open group began: the records past it at commit are
     /// this connection's batch.
     group_start_sequence: u64,
+    /// Since the last commit only commands that reveal nothing of the data ran (or none):
+    /// under `always` the next commit has no reply to hold back, so it does not wait for
+    /// other clients' records to reach the disk. A coordinator's `ROLE` and `INFO` are then
+    /// answered while the disk is slow. Only the connection loop sets it.
+    pub(super) quiet: bool,
+}
+
+/// Commands whose replies reveal nothing of the data, so they need not wait for a sync of
+/// records they could otherwise have read: health checks, a connection's handshake, and what
+/// a coordinator asks a node every round (`ROLE`, `INFO`, `CONFIG GET shards`,
+/// `RUVIO TOPOLOGY VERSION`, the primary lease).
+pub(super) fn reveals_no_data(command: &Command<'_>) -> bool {
+    matches!(
+        command,
+        Command::Ping(_)
+            | Command::Echo(_)
+            | Command::Role
+            | Command::Info(_)
+            | Command::ConfigGet(_)
+            | Command::Topology(None)
+            | Command::PrimaryLease(_)
+            | Command::Auth { .. }
+            | Command::Hello { .. }
+    )
 }
 
 /// A batch with more records than this already shares its own `write` among them, so its
@@ -277,6 +301,7 @@ impl<'a> OpenWalGroup<'a> {
             skipped_while_parked: false,
             waiting_for_tick: false,
             group_start_sequence: 0,
+            quiet: false,
         }
     }
 
@@ -284,6 +309,7 @@ impl<'a> OpenWalGroup<'a> {
         if self.open || !self.uses_wal {
             return;
         }
+        self.quiet = false;
 
         {
             let mut persistence = self
@@ -305,6 +331,7 @@ impl<'a> OpenWalGroup<'a> {
     /// is not durable yet: the element came with it, so the reply waits for its sync and
     /// fails with it.
     pub(super) fn skip_records_written_while_parked(&mut self, served_by: Option<u64>) {
+        self.quiet = false;
         if !self.always || self.open {
             return;
         }
@@ -337,6 +364,13 @@ impl<'a> OpenWalGroup<'a> {
             }
             None => Ok(()),
         }
+    }
+
+    /// The commit before `command`, a group boundary, runs: see `quiet`.
+    pub(super) async fn commit_before(&mut self, command: &Command<'_>) -> io::Result<()> {
+        self.commit().await?;
+        self.quiet = reveals_no_data(command);
+        Ok(())
     }
 
     /// Publishes the group and, for `always`, either syncs here (no sync worker) or hands back the
@@ -396,6 +430,11 @@ impl<'a> OpenWalGroup<'a> {
         }
 
         if !self.always {
+            return Ok(None);
+        }
+
+        // Nothing ran since the last commit that a reply could reveal or that wrote.
+        if std::mem::take(&mut self.quiet) && !self.open {
             return Ok(None);
         }
 

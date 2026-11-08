@@ -13,8 +13,30 @@ use tokio::sync::Notify;
 
 use super::PersistenceError;
 
+/// What a sync covers: a file, or the WAL writer, which first writes the records it holds.
+pub(crate) trait SyncSource: Send + Sync {
+    fn sync_through(&self, sequence: u64) -> SyncOutcome;
+}
+
+pub(crate) enum SyncOutcome {
+    Synced,
+    /// The records were not written (the writer failed first): nothing was synced, and the
+    /// log picks up the write failure on its own. Not a failed sync.
+    NotWritten(String),
+    Failed(io::Error),
+}
+
+impl SyncSource for File {
+    fn sync_through(&self, _sequence: u64) -> SyncOutcome {
+        match self.sync_data() {
+            Ok(()) => SyncOutcome::Synced,
+            Err(error) => SyncOutcome::Failed(error),
+        }
+    }
+}
+
 struct Job {
-    file: Arc<File>,
+    file: Arc<dyn SyncSource>,
     sequence: u64,
 }
 
@@ -27,6 +49,9 @@ struct State {
     busy: bool,
     stopped: bool,
     failure: Option<String>,
+    /// The last job whose records were not written, and why: barriers up to it fail until
+    /// the log recovers (`clear_not_written`).
+    not_written: Option<(u64, String)>,
     #[cfg(test)]
     paused: bool,
 }
@@ -39,6 +64,8 @@ struct Shared {
     syncs: AtomicU64,
     sync_nanos: AtomicU64,
     unavailable: AtomicBool,
+    /// `State::not_written`'s sequence, for a barrier's check without the lock.
+    not_written_through: AtomicU64,
     #[cfg(test)]
     fail_sync: std::sync::atomic::AtomicBool,
     /// The log's data directory, for `SLOW_SYNC_DIRS`.
@@ -68,6 +95,7 @@ impl SyncWorker {
             syncs: AtomicU64::new(0),
             sync_nanos: AtomicU64::new(0),
             unavailable: AtomicBool::new(false),
+            not_written_through: AtomicU64::new(0),
             #[cfg(test)]
             fail_sync: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -94,7 +122,7 @@ impl SyncWorker {
 
     pub(crate) fn submit(
         &self,
-        file: Arc<File>,
+        file: Arc<dyn SyncSource>,
         sequence: u64,
     ) -> Result<SyncBarrier, PersistenceError> {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -177,7 +205,18 @@ impl SyncWorker {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .requested = sequence;
+        self.clear_not_written();
         Ok(())
+    }
+
+    /// The log wrote again what its writer could not: later barriers wait for their sync.
+    pub(crate) fn clear_not_written(&self) {
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+
+        state.not_written = None;
+        // A job for those records may have been dropped as not written: ask again.
+        state.requested = 0;
+        self.shared.not_written_through.store(0, Ordering::Release);
     }
 
     pub(crate) fn stats(&self) -> (u64, u64) {
@@ -217,12 +256,53 @@ impl SyncBarrier {
             if self.shared.durable.load(Ordering::Acquire) >= self.sequence {
                 return Ok(());
             }
+            self.shared.check_written(self.sequence)?;
             notified.await;
+        }
+    }
+
+    /// `wait` for a thread outside the runtime (a checkpoint's commit thread).
+    pub(crate) fn wait_blocking(&self) -> Result<(), PersistenceError> {
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+
+        loop {
+            check_failure(&state)?;
+            if self.shared.durable.load(Ordering::Acquire) >= self.sequence {
+                return Ok(());
+            }
+            if let Some((through, message)) = &state.not_written
+                && *through >= self.sequence
+            {
+                return Err(PersistenceError::Failed(message.clone()));
+            }
+            // A job ends with a notification; the timeout only bounds a missed one.
+            state = self
+                .shared
+                .changed
+                .wait_timeout(state, std::time::Duration::from_millis(100))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
     }
 }
 
 impl Shared {
+    /// Fails a barrier whose records the writer could not write.
+    fn check_written(&self, sequence: u64) -> Result<(), PersistenceError> {
+        if self.not_written_through.load(Ordering::Acquire) < sequence {
+            return Ok(());
+        }
+
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+
+        match &state.not_written {
+            Some((through, message)) if *through >= sequence => {
+                Err(PersistenceError::Failed(message.clone()))
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn check(&self) -> Result<(), PersistenceError> {
         if !self.unavailable.load(Ordering::Acquire) {
             return Ok(());
@@ -285,7 +365,7 @@ fn run(shared: Arc<Shared>) {
         super::crash::hit(super::crash::CrashSite::Sync);
         #[cfg(test)]
         let result = if shared.fail_sync.load(Ordering::Acquire) {
-            Err(io::Error::other("injected worker sync failure"))
+            SyncOutcome::Failed(io::Error::other("injected worker sync failure"))
         } else {
             let data_dir = shared
                 .data_dir
@@ -295,10 +375,10 @@ fn run(shared: Arc<Shared>) {
             if let Some(data_dir) = data_dir {
                 super::wal::delay_sync(&data_dir);
             }
-            job.file.sync_data()
+            job.file.sync_through(job.sequence)
         };
         #[cfg(not(test))]
-        let result = job.file.sync_data();
+        let result = job.file.sync_through(job.sequence);
         shared.syncs.fetch_add(1, Ordering::Relaxed);
         shared.sync_nanos.fetch_add(
             u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
@@ -306,6 +386,26 @@ fn run(shared: Arc<Shared>) {
         );
         let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
         state.busy = false;
+        let result = match result {
+            SyncOutcome::Synced => Ok(()),
+            SyncOutcome::NotWritten(message) => {
+                // Not this worker's failure: the log refuses writes until it recovers, and
+                // the barriers up to these records fail.
+                let through = state
+                    .not_written
+                    .as_ref()
+                    .map_or(job.sequence, |(through, _)| (*through).max(job.sequence));
+
+                state.not_written = Some((through, message));
+                shared.not_written_through.store(through, Ordering::Release);
+                // Let a later request for the same records reach the worker again.
+                state.requested = state.requested.min(job.sequence.saturating_sub(1));
+                shared.changed.notify_all();
+                shared.ready.notify_waiters();
+                continue;
+            }
+            SyncOutcome::Failed(error) => Err(error),
+        };
         match result {
             Ok(()) => {
                 // Release pairs with the Acquire loads in submit and wait. Only the captured
@@ -382,9 +482,9 @@ mod tests {
             .build()
             .unwrap();
         block_on_bounded(&runtime, async {
-            let first = worker.submit(Arc::clone(&file), 1).unwrap();
-            let repeated = worker.submit(Arc::clone(&file), 1).unwrap();
-            let later = worker.submit(Arc::clone(&file), 2).unwrap();
+            let first = worker.submit(file.clone(), 1).unwrap();
+            let repeated = worker.submit(file.clone(), 1).unwrap();
+            let later = worker.submit(file.clone(), 2).unwrap();
             let (a, b, c) = tokio::join!(first.wait(), repeated.wait(), later.wait());
             a.unwrap();
             b.unwrap();
@@ -401,7 +501,7 @@ mod tests {
         let durable = Arc::new(super::super::DurableSequence::new(0));
         let worker = SyncWorker::new(Arc::clone(&durable), 0).unwrap();
         worker.shared.fail_sync.store(true, Ordering::Release);
-        let barrier = worker.submit(Arc::clone(&file), 1).unwrap();
+        let barrier = worker.submit(file.clone(), 1).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -418,9 +518,9 @@ mod tests {
         let durable = Arc::new(super::super::DurableSequence::new(0));
         let worker = SyncWorker::new(Arc::clone(&durable), 0).unwrap();
         worker.pause(true);
-        let first = worker.submit(Arc::clone(&file), 1).unwrap();
+        let first = worker.submit(file.clone(), 1).unwrap();
         for sequence in 2..=1000 {
-            worker.submit(Arc::clone(&file), sequence).unwrap();
+            worker.submit(file.clone(), sequence).unwrap();
         }
         assert_eq!(durable.load(Ordering::Acquire), 0);
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -428,7 +528,7 @@ mod tests {
             .build()
             .unwrap();
         block_on_bounded(&runtime, async {
-            let later = worker.submit(Arc::clone(&file), 1000).unwrap();
+            let later = worker.submit(file.clone(), 1000).unwrap();
             let release = async {
                 tokio::task::yield_now().await;
                 assert_eq!(durable.load(Ordering::Acquire), 0);
@@ -448,7 +548,7 @@ mod tests {
         let durable = Arc::new(super::super::DurableSequence::new(0));
         let worker = SyncWorker::new(Arc::clone(&durable), 0).unwrap();
         worker.pause(true);
-        let first = worker.submit(Arc::clone(&file), 1).unwrap();
+        let first = worker.submit(file.clone(), 1).unwrap();
         let other = worker.submit(file, 1).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

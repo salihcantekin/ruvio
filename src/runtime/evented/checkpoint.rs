@@ -100,7 +100,7 @@ enum Progress {
 
 #[allow(clippy::type_complexity)]
 fn spawn_writer(
-    writer: SnapshotWriter,
+    open: impl FnOnce() -> Result<SnapshotWriter, crate::PersistenceError> + Send + 'static,
     cancelled: Arc<AtomicBool>,
 ) -> std::io::Result<(
     SyncSender<IoMessage>,
@@ -113,7 +113,15 @@ fn spawn_writer(
     let handle = std::thread::Builder::new()
         .name("ruvio-snapshot-io".into())
         .spawn(move || {
-            let mut writer = writer;
+            // The round's directory and the file are made here, not on the shard: a disk
+            // that stops answering holds this thread only.
+            let mut writer = match open() {
+                Ok(writer) => writer,
+                Err(error) => {
+                    let _ = done.send(Err(error));
+                    return;
+                }
+            };
 
             for message in messages {
                 if cancelled.load(Ordering::Acquire) {
@@ -240,26 +248,32 @@ fn start_job(state: &ShardState, requested: u64) -> Result<CheckpointJob, crate:
 
     let covered = persistence_state(state).last_sequence();
     let started = (|| {
-        let (manager, generation, shard_count) = if let Some(coordinator) = &state.cluster {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (generation, (sender, result, handle)) = if let Some(coordinator) = &state.cluster {
             let generation = coordinator.begin_round(shard_id)?;
+            let coordinator = Arc::clone(coordinator);
+            let shard_count = coordinator.shard_count() as u32;
+            let open = move || {
+                coordinator.prepare_round(generation)?;
+                coordinator
+                    .manager()
+                    .shard_writer(generation, shard_id, shard_count, covered)
+            };
 
-            (
-                coordinator.manager(),
-                generation,
-                coordinator.shard_count() as u32,
-            )
+            (generation, spawn_writer(open, Arc::clone(&cancelled))?)
         } else {
             // Past every round ever started: one that failed after CURRENT may be published.
             let generation = state
                 .checkpoints
                 .allocate_generation(state.checkpoint_generation.get())?;
+            let checkpoints = Arc::clone(&state.checkpoints);
+            let open = move || {
+                checkpoints.begin_round(generation)?;
+                checkpoints.shard_writer(generation, shard_id, 1, covered)
+            };
 
-            state.checkpoints.begin_round(generation)?;
-            (&*state.checkpoints, generation, 1)
+            (generation, spawn_writer(open, Arc::clone(&cancelled))?)
         };
-        let writer = manager.shard_writer(generation, shard_id, shard_count, covered)?;
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let (sender, result, handle) = spawn_writer(writer, Arc::clone(&cancelled))?;
 
         Ok::<_, crate::PersistenceError>((generation, sender, result, handle, cancelled))
     })();
@@ -546,9 +560,19 @@ fn spawn_commit(
                 // worker, or a batch whose group ended but whose sync has not run): sync them
                 // first, and refuse the file if that fails, since their clients are then
                 // refused.
-                wal.lock()
+                // The log is not held while the disk works: the shard takes it for every
+                // client batch.
+                let barrier = wal
+                    .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .sync_for_checkpoint(covered)?;
+                    .checkpoint_sync(covered)?;
+
+                if let Some(barrier) = barrier {
+                    barrier.wait_blocking()?;
+                    wal.lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .checkpoint_synced(covered)?;
+                }
 
                 // The clock goes to disk before the round, so a crash between the two cannot
                 // leave a checkpoint whose restart floor is below a token granted before it.
@@ -581,6 +605,11 @@ fn spawn_commit(
             }
         })?;
 
+    #[cfg(test)]
+    UNCOLLECTED_COMMITS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push(state.published_config.persistence.data_dir.clone());
     *state.commit.borrow_mut() = Some(Commit {
         thread,
         generation,
@@ -600,6 +629,12 @@ fn wall_clock_millis() -> u64 {
 
 /// Collects a finished commit (waiting for it when `block`) and records it as a completed
 /// checkpoint, or a failed one. True while one still runs.
+/// Data directories with a checkpoint commit the shard has not collected yet, one entry per
+/// commit (for tests that must not race a commit still finishing).
+#[cfg(test)]
+pub(crate) static UNCOLLECTED_COMMITS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
 fn collect_commit(state: &ShardState, block: bool) -> bool {
     let Some(commit) = state.commit.borrow_mut().take() else {
         return false;
@@ -608,6 +643,17 @@ fn collect_commit(state: &ShardState, block: bool) -> bool {
     if !block && !commit.thread.is_finished() {
         *state.commit.borrow_mut() = Some(commit);
         return true;
+    }
+    #[cfg(test)]
+    {
+        let mut uncollected = UNCOLLECTED_COMMITS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let data_dir = &state.published_config.persistence.data_dir;
+
+        if let Some(at) = uncollected.iter().position(|dir| dir == data_dir) {
+            uncollected.swap_remove(at);
+        }
     }
 
     let Commit {

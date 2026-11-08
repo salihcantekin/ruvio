@@ -489,7 +489,7 @@ fn full_disk_during_grouped_write_keeps_wal_sequences_contiguous() {
             .unwrap();
     }
     super::super::crash::arm_io_fault(super::super::crash::CrashSite::Append);
-    assert!(sink.end_group().is_err());
+    assert!(end_group_written(&mut sink).is_err());
     assert!(sink.failure().is_some());
 
     // The disk accepts writes again: the batch that failed to reach it is written first.
@@ -525,7 +525,7 @@ fn full_disk_during_first_grouped_write_reuses_the_empty_segment() {
     })
     .unwrap();
     super::super::crash::arm_io_fault(super::super::crash::CrashSite::Append);
-    assert!(sink.end_group().is_err());
+    assert!(end_group_written(&mut sink).is_err());
     // While failed, a later group that wrote nothing ends cleanly and must not append the
     // kept batch after the torn bytes.
     sink.begin_group();
@@ -765,6 +765,13 @@ fn set(sink: &mut WalSink, key: &[u8], value: &[u8]) -> Result<(), PersistenceEr
     sink.record(Mutation::SetBytes { key, value })
 }
 
+/// Ends the group and waits for the writer thread: a write it could not make fails the log
+/// there, after `end_group` handed the records over.
+fn end_group_written(sink: &mut WalSink) -> Result<(), PersistenceError> {
+    sink.end_group()?;
+    sink.settle_writes()
+}
+
 fn segment_sizes(directory: &Path) -> Vec<u64> {
     discover_segments(&shard_wal_directory(directory, 0))
         .unwrap()
@@ -833,7 +840,8 @@ fn write_failure_while_a_background_sync_fails_is_not_recovered() {
     assert!(sink.sync_running.load(Ordering::Acquire));
     // Meanwhile a write fails (a full disk): an ordinary, recoverable failure.
     super::super::crash::arm_io_fault(super::super::crash::CrashSite::Append);
-    assert!(set(&mut sink, b"three", b"v").is_err());
+    set(&mut sink, b"three", b"v").unwrap();
+    assert!(sink.settle_writes().is_err());
     assert!(!sink.sync_failed);
     // The background sync fails while recovery runs; recovery's own sync would report clean
     // pages the failed sync may have lost.
@@ -857,7 +865,7 @@ fn failed_prefill_sync_is_a_failed_sync_of_the_segment() {
     let (mut sink, _, _) = WalSink::open(config.clone(), 0, limits).unwrap();
 
     let probe = File::create(directory.path().join("probe")).unwrap();
-    if !sink.prealloc || !preallocate(&probe, 0, 4096) {
+    if !sink.writer.physical().prealloc || !preallocate(&probe, 0, 4096) {
         // `fallocate` is unsupported here: no fill, no sync to fail.
         return;
     }
@@ -999,7 +1007,7 @@ fn records_rewritten_by_recovery_are_published_after_their_sync() {
     set(&mut sink, b"a", b"v").unwrap();
     // The batch's write fails (a full disk): its record stays staged for recovery.
     super::super::crash::arm_io_fault(super::super::crash::CrashSite::Append);
-    assert!(sink.end_group().is_err());
+    assert!(end_group_written(&mut sink).is_err());
     sink.last_recovery = None;
     sink.begin_group();
     set(&mut sink, b"b", b"v").unwrap();
@@ -1134,7 +1142,7 @@ fn recovery_sync_failure_is_not_retried_in_place() {
     sink.begin_group();
     set(&mut sink, b"two", b"v").unwrap();
     super::super::crash::arm_io_fault(super::super::crash::CrashSite::Append);
-    assert!(sink.end_group().is_err());
+    assert!(end_group_written(&mut sink).is_err());
     // Recovery syncs "one" before continuing; that sync fails.
     super::super::crash::arm_io_fault(super::super::crash::CrashSite::Sync);
     assert!(set(&mut sink, b"three", b"v").is_err());
@@ -1162,7 +1170,7 @@ fn always_group_write_failure_and_failed_recovery_write_keep_synced_records() {
     set(&mut sink, b"ga", b"v").unwrap();
     set(&mut sink, b"gb", b"v").unwrap();
     super::super::crash::arm_io_fault(super::super::crash::CrashSite::Append);
-    assert!(sink.end_group().is_err());
+    assert!(end_group_written(&mut sink).is_err());
     // The next record triggers recovery, whose own write of the kept batch fails too.
     super::super::crash::arm_io_fault(super::super::crash::CrashSite::Append);
     assert!(set(&mut sink, b"k3", b"v").is_err());
@@ -1231,11 +1239,10 @@ fn everysec_tick_hold_writes_the_turns_records_once() {
     assert_eq!(keys_of(&mutations), [&b"a"[..], b"b", b"c"]);
 }
 
-/// The turn's shared `write` fails: every connection whose record it carried gets the
-/// error (no reply), and the records stay staged for recovery, as with each
-/// connection's own failed `write` before.
+/// The turn's shared `write` fails on the writer thread, after the replies it carried left:
+/// the log refuses writes, and recovery writes the kept records before anything newer.
 #[test]
-fn everysec_tick_hold_failure_cuts_every_waiter() {
+fn everysec_tick_hold_write_failure_keeps_the_records_for_recovery() {
     let directory = tempdir().unwrap();
     let config = config(directory.path(), DurabilityProfile::Everysec);
     let limits = ProtocolLimits::default();
@@ -1250,8 +1257,9 @@ fn everysec_tick_hold_failure_cuts_every_waiter() {
         tickets.push(sink.last_sequence());
     }
     super::super::crash::arm_io_fault(super::super::crash::CrashSite::Append);
-    assert!(sink.publish_through(tickets[0]).is_err());
-    assert!(sink.publish_through(tickets[1]).is_err());
+    sink.publish_through(tickets[0]).unwrap();
+    sink.publish_through(tickets[1]).unwrap();
+    assert!(sink.settle_writes().is_err());
     // A later reply, after the failure, does not wait and is not refused.
     assert!(!sink.reply_waits_for_publish());
     assert_eq!(sink.group, 0);
@@ -1281,7 +1289,7 @@ fn staged_records_of_mixed_sizes_recover_after_a_failed_write() {
     set(&mut sink, b"ga", &[b'y'; 1_777]).unwrap();
     set(&mut sink, b"gb", b"v").unwrap();
     super::super::crash::arm_io_fault(super::super::crash::CrashSite::Append);
-    assert!(sink.end_group().is_err());
+    assert!(end_group_written(&mut sink).is_err());
     for attempt in 0..3 {
         sink.last_recovery = None;
         if attempt < 2 {
@@ -1341,7 +1349,7 @@ fn write_failure_after_synced_but_unsettled_bytes_keeps_them() {
         sink.begin_group();
         set(&mut sink, b"ga", &[b'g'; 123]).unwrap();
         super::super::crash::arm_io_fault(super::super::crash::CrashSite::Append);
-        assert!(sink.end_group().is_err());
+        assert!(end_group_written(&mut sink).is_err());
         set(&mut sink, b"k3", b"v").unwrap();
         assert!(sink.failure().is_none(), "worker {worker}");
         sink.flush().unwrap();
@@ -1762,9 +1770,8 @@ fn a_zero_header_with_data_after_it_or_before_the_last_segment_is_corruption() {
 }
 
 /// Inside an `always` group, `record_now` writes the records staged ahead of it first and
-/// then its own, so the log keeps sequence order and a failed write reaches the script or
-/// transaction that can still roll back. Its sync still waits for the group's commit.
-/// Other profiles stage it like `record`.
+/// then its own, so the log keeps sequence order. Its sync still waits for the group's
+/// commit. Other profiles stage it like `record`.
 #[test]
 fn record_now_writes_the_staged_records_before_its_own() {
     let limits = ProtocolLimits::default();
@@ -1788,6 +1795,7 @@ fn record_now_writes_the_staged_records_before_its_own() {
         assert!(on_disk().is_empty(), "{profile:?}");
         sink.record_now(Mutation::Transaction { mutations: &batch })
             .unwrap();
+        sink.settle_writes().unwrap();
 
         if profile == DurabilityProfile::Always {
             assert!(sink.staged.is_empty());
@@ -1813,6 +1821,7 @@ fn record_now_writes_the_staged_records_before_its_own() {
 
         sink.end_group().unwrap();
         sink.sync_pending().unwrap();
+        sink.settle_writes().unwrap();
         assert_eq!(on_disk().len(), 2, "{profile:?}");
     }
 }
@@ -2180,6 +2189,7 @@ fn compact_keeps_the_change_stream_window_and_nothing_more() {
         sink.flush().unwrap();
         let before = wal_size(&config);
         sink.compact(200).unwrap();
+        sink.settle_writes().unwrap();
 
         (before, wal_size(&config), config.wal_segment_bytes)
     };
@@ -2222,6 +2232,8 @@ fn compact_deletes_segments_covered_by_a_checkpoint() {
     let covered = 50;
 
     sink.compact(covered).unwrap();
+
+    sink.settle_writes().unwrap();
     drop(sink);
 
     let wal_dir = shard_wal_directory(directory.path(), 0);
@@ -2271,11 +2283,13 @@ fn compact_keeps_segments_a_replica_has_not_received() {
 
     sink.backlog_floor().store(0, Ordering::Release);
     sink.compact(sink.last_sequence()).unwrap();
+    sink.settle_writes().unwrap();
 
     assert_eq!(fs::read_dir(&wal_dir).unwrap().count(), before);
 
     sink.backlog_floor().store(u64::MAX, Ordering::Release);
     sink.compact(50).unwrap();
+    sink.settle_writes().unwrap();
 
     let mut segments: Vec<_> = fs::read_dir(&wal_dir)
         .unwrap()
@@ -2314,6 +2328,7 @@ fn compact_drops_a_replica_hold_that_exceeds_the_budget() {
 
     sink.backlog_floor().store(0, Ordering::Release);
     sink.compact(sink.last_sequence()).unwrap();
+    sink.settle_writes().unwrap();
 
     assert!(fs::read_dir(&wal_dir).unwrap().count() < before);
     assert!(REPLICA_HOLDS_DROPPED.load(Ordering::Relaxed) > dropped);
@@ -2598,6 +2613,8 @@ fn compact_of_the_full_log_leaves_recovery_from_the_covered_sequence() {
     let covered = sink.last_sequence();
 
     sink.compact(covered).unwrap();
+
+    sink.settle_writes().unwrap();
     drop(sink);
 
     let (_sink, mutations, report) = WalSink::open_after(config, 0, limits, covered).unwrap();
@@ -2624,6 +2641,8 @@ fn published_sequence_reads_the_exact_wal_frame() {
         value: b"v",
     })
     .unwrap();
+
+    sink.settle_writes().unwrap();
 
     assert_eq!(sink.published().load(Ordering::Acquire), 1);
 
@@ -2654,6 +2673,7 @@ fn published_sequence_reads_the_exact_wal_frame() {
     let (mut replica_sink, _, _) = WalSink::open(replica_config, shard_id, limits).unwrap();
 
     replica_sink.append_frame(&frame).unwrap();
+    replica_sink.settle_writes().unwrap();
     assert_eq!(
         read_frames(replica.path(), shard_id, 0, 1, limits).unwrap(),
         FrameRead::Frames(vec![frame.clone()])
@@ -2685,6 +2705,8 @@ fn everysec_keeps_an_unsynced_record_off_the_durable_sequence() {
         value: b"v",
     })
     .unwrap();
+
+    sink.settle_writes().unwrap();
 
     assert_eq!(sink.published().load(Ordering::Acquire), 1);
     assert_eq!(sink.durable().load(Ordering::Acquire), 0);
@@ -2722,12 +2744,15 @@ fn always_group_commit_syncs_every_record_in_the_batch() {
     }
 
     assert_eq!(sink.durable().load(Ordering::Acquire), 0);
+    sink.settle_writes().unwrap();
     assert_eq!(sink.published().load(Ordering::Acquire), 0);
     sink.end_group().unwrap();
+    sink.settle_writes().unwrap();
     assert_eq!(sink.published().load(Ordering::Acquire), 0);
     assert_eq!(sink.durable().load(Ordering::Acquire), 0);
     sink.sync_pending().unwrap();
     assert_eq!(sink.durable().load(Ordering::Acquire), 8);
+    sink.settle_writes().unwrap();
     assert_eq!(sink.published().load(Ordering::Acquire), 8);
     drop(sink);
 
@@ -2751,8 +2776,10 @@ fn everysec_group_is_readable_before_the_background_sync() {
         value: b"v",
     })
     .unwrap();
+    sink.settle_writes().unwrap();
     assert_eq!(sink.published().load(Ordering::Acquire), 0);
     sink.end_group().unwrap();
+    sink.settle_writes().unwrap();
     assert_eq!(sink.published().load(Ordering::Acquire), 1);
     assert_eq!(sink.durable().load(Ordering::Acquire), 0);
     assert!(matches!(
@@ -2915,12 +2942,14 @@ fn a_checkpoint_closes_a_large_open_segment_so_the_next_one_can_delete_it() {
 
     // A checkpoint covering half of them closes the segment; it keeps the uncovered half.
     sink.compact(100).unwrap();
+    sink.settle_writes().unwrap();
     assert_eq!(first_sequences(), vec![1, 201]);
 
     write(&mut sink, 100);
 
     // The next checkpoint covers the closed segment and deletes it.
     sink.compact(250).unwrap();
+    sink.settle_writes().unwrap();
     assert_eq!(first_sequences(), vec![201, 301]);
     drop(sink);
 
@@ -2951,6 +2980,7 @@ fn a_checkpoint_leaves_a_small_open_segment_open() {
     }
     sink.flush().unwrap();
     sink.compact(10).unwrap();
+    sink.settle_writes().unwrap();
 
     let wal_dir = shard_wal_directory(directory.path(), 0);
     assert_eq!(fs::read_dir(&wal_dir).unwrap().count(), 1);
@@ -2989,11 +3019,40 @@ fn compaction_keeps_a_short_resume_history() {
 
     write(&mut sink, 200);
     sink.compact(100).unwrap();
+    sink.settle_writes().unwrap();
     assert_eq!(first_sequences(), vec![1, 201]);
 
     // The checkpoint covers the closed segment, but the open one holds only ten records: less
     // than an eighth of a segment, so the closed one stays as history.
     write(&mut sink, 10);
     sink.compact(205).unwrap();
+    sink.settle_writes().unwrap();
     assert_eq!(first_sequences(), vec![1, 201]);
+}
+
+#[test]
+fn a_clean_sync_after_a_failed_one_is_not_counted_as_durable() {
+    use crate::persistence::sync_worker::SyncOutcome;
+
+    let directory = tempdir().unwrap();
+    let config = config(directory.path(), DurabilityProfile::Everysec);
+    let (mut sink, _, _) = WalSink::open(config, 0, ProtocolLimits::default()).unwrap();
+
+    sink.record(Mutation::SetBytes {
+        key: b"k",
+        value: b"v",
+    })
+    .unwrap();
+    sink.settle_writes().unwrap();
+    let durable = sink.durable.load(Ordering::Acquire);
+    // A sync on another thread (a rotation, the background sync) failed, and the shard has
+    // taken the error but not acted on it yet. The kernel reports a lost write-back once, so
+    // the next sync of the same file succeeds without proving anything.
+    sink.sync_error.report("injected sync failure".into());
+    assert!(sink.sync_error.take().is_some());
+
+    let outcome = sink.writer.source().sync_through(sink.last_sequence());
+
+    assert!(matches!(outcome, SyncOutcome::Failed(_)));
+    assert_eq!(sink.durable.load(Ordering::Acquire), durable);
 }

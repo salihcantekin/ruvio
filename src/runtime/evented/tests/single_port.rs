@@ -1486,10 +1486,29 @@ fn a_pop_that_waited_through_another_delivery_is_refused_with_its_failed_push() 
     }
 }
 
-/// Under `everysec` a write is answered once its record reached the kernel, so a process kill
-/// keeps it. One connection holds a local write in its open WAL group while it waits for
-/// another shard to run its script; a write another client makes meanwhile on the first
-/// shard must still reach the log file before its `+OK`, not wait in memory behind that group.
+/// Whether a WAL file of `shard` holds `value`, polled until `PATIENCE`: the writer thread
+/// writes a record shortly after the shard handed it over.
+fn wait_logged(directory: &std::path::Path, shard: usize, value: &[u8]) -> bool {
+    let deadline = Instant::now() + PATIENCE;
+
+    loop {
+        let logged = std::fs::read_dir(directory.join(format!("wal/shard-{shard:04}")))
+            .unwrap()
+            .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
+            .any(|bytes| bytes.windows(value.len()).any(|w| w == value));
+
+        if logged || Instant::now() >= deadline {
+            return logged;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Under `everysec` a write is answered once its record is handed to the shard's WAL writer
+/// thread, which writes it at once. One connection holds a local write in its open WAL group
+/// while it waits for another shard to run its script; a write another client makes meanwhile
+/// on the first shard must still be handed over before its `+OK` and reach the log file while
+/// that group is open, not wait in memory behind it.
 #[test]
 fn an_everysec_write_reaches_the_log_before_its_reply_while_a_batch_waits_on_another_shard() {
     const SLOW: &[u8] = b"local i = 0 while i < tonumber(ARGV[1]) do i = i + 1 end return 1";
@@ -1532,10 +1551,7 @@ fn an_everysec_write_reaches_the_log_before_its_reply_while_a_batch_waits_on_ano
             .unwrap();
         read_exactly(&mut writer, b"+OK\r\n");
 
-        let logged = std::fs::read_dir(directory.path().join(format!("wal/shard-{home:04}")))
-            .unwrap()
-            .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
-            .any(|bytes| bytes.windows(value.len()).any(|w| w == value.as_bytes()));
+        let logged = wait_logged(directory.path(), home, value.as_bytes());
 
         read_exactly(&mut holder, b"+OK\r\n:1\r\n");
         stop.request();
@@ -1551,7 +1567,7 @@ fn an_everysec_write_reaches_the_log_before_its_reply_while_a_batch_waits_on_ano
 /// the shard writes meanwhile is only staged. Here a client fills its socket with replies it
 /// does not read, then opens a group with a write and sends a frame that cannot be parsed:
 /// the connection waits to send the error. Another client's `everysec` write made meanwhile
-/// must still reach the log file before its `+OK`.
+/// must still be handed to the writer thread before its `+OK` and reach the log file.
 #[test]
 fn an_everysec_write_reaches_the_log_before_its_reply_while_a_stalled_client_holds_a_group() {
     let directory = tempfile::tempdir().unwrap();
@@ -1585,10 +1601,7 @@ fn an_everysec_write_reaches_the_log_before_its_reply_while_a_stalled_client_hol
         .write_all(&resp(&[&[b"SET", b"acked", b"acked-value"]]))
         .unwrap();
     read_exactly(&mut writer, b"+OK\r\n");
-    let logged = std::fs::read_dir(directory.path().join("wal/shard-0000"))
-        .unwrap()
-        .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
-        .any(|bytes| bytes.windows(11).any(|w| w == b"acked-value"));
+    let logged = wait_logged(directory.path(), 0, b"acked-value");
 
     drop(holder);
     stop.request();

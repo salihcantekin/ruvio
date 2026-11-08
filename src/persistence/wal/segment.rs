@@ -3,6 +3,9 @@
 use super::*;
 
 impl WalSink {
+    /// Drops the segments a checkpoint through `covered_sequence` made redundant. The files
+    /// are closed and removed on the writer thread, in order with the writes; a failure there
+    /// only keeps them longer and is logged.
     pub fn compact(&mut self, covered_sequence: u64) -> Result<(), PersistenceError> {
         if let Some(error) = &self.failed {
             return Err(PersistenceError::Failed(error.clone()));
@@ -12,7 +15,7 @@ impl WalSink {
         let wanted = covered_sequence;
         let mut covered_sequence = covered_sequence.min(floor);
 
-        if !self.profile.uses_wal() || wanted == 0 || self.file.is_none() {
+        if !self.profile.uses_wal() || wanted == 0 {
             return Ok(());
         }
 
@@ -35,32 +38,19 @@ impl WalSink {
             self.rotate()?;
         }
 
-        let directory = shard_wal_directory(&self.config.data_dir, self.shard_id);
-        let current = segment_path(&directory, self.segment_first_sequence);
-        let segments = discover_segments(&directory)?;
+        let retention = Retention {
+            directory: shard_wal_directory(&self.config.data_dir, self.shard_id),
+            history_bytes: self.config.wal_segment_bytes / WAL_CHECKPOINT_ROTATE_DIVISOR,
+            cdc_retain_bytes: self.config.cdc_retain_bytes,
+        };
 
-        let retained_from = self
-            .cdc_retained_from(&segments)?
-            .min(self.history_retained_from(&segments)?);
-
-        for (index, path) in segments.iter().enumerate() {
-            if path == &current || index >= retained_from {
-                continue;
-            }
-
-            let next_first = match segments.get(index + 1) {
-                Some(next) => segment_first_sequence(next)?,
-                None => self.segment_first_sequence,
-            };
-
-            let last_sequence = next_first.saturating_sub(1);
-
-            if last_sequence <= covered_sequence {
-                fs::remove_file(path)?;
-            }
-        }
-
-        Ok(())
+        self.writer
+            .task(Box::new(move |physical, _| {
+                if let Err(error) = retention.remove_covered(physical, covered_sequence) {
+                    tracing::warn!(%error, covered_sequence, "WAL compaction failed");
+                }
+            }))
+            .map_err(PersistenceError::from)
     }
 
     /// True when the segments kept only because a connected replica has not received them
@@ -95,26 +85,141 @@ impl WalSink {
         Ok(held > budget)
     }
 
+    /// Closes the open segment and starts the next one at `next_sequence`. The writer
+    /// thread syncs, shrinks and closes the old file and creates the new one in order with
+    /// the writes; the shard only moves its own cursors. A rotation that fails there fails
+    /// the log, and recovery opens a fresh segment.
+    pub(super) fn rotate(&mut self) -> Result<(), PersistenceError> {
+        let inline = self.profile == DurabilityProfile::Always && self.sync_worker.is_none();
+
+        if inline {
+            // Replies wait for the shard's own sync here: the old segment is synced now, as
+            // before, and a failed sync cuts its unacknowledged records.
+            self.flush()?;
+        } else {
+            if let Some(error) = &self.failed {
+                return Err(PersistenceError::Failed(error.clone()));
+            }
+            self.observe_sync_error()?;
+            self.publish_staged()?;
+        }
+
+        #[cfg(test)]
+        let faults = (
+            self.dirty_bytes != 0
+                && injected_sync_fault(&self.config.data_dir, self.shard_id).is_some(),
+            super::crash::take_io_fault(super::crash::CrashSite::Rotate).is_some(),
+        );
+        let first_sequence = self.next_sequence;
+        let last_sequence = self.last_sequence();
+
+        if let Err(error) = self.writer.task(Box::new(move |physical, shared| {
+            physical.rotate(
+                shared,
+                first_sequence,
+                last_sequence,
+                #[cfg(test)]
+                faults,
+            );
+        })) {
+            return self.fail(error);
+        }
+
+        self.segment_id = first_sequence;
+        self.segment_first_sequence = first_sequence;
+        self.file_length = WAL_HEADER_LEN as u64;
+        self.write_pos = WAL_HEADER_LEN as u64;
+        self.synced_pos = WAL_HEADER_LEN as u64;
+        // The writer syncs the old segment before it opens the new one.
+        self.dirty_bytes = 0;
+        self.barrier_mark = (0, 0);
+        self.sync_in_flight = 0;
+
+        if inline {
+            self.writer.drain();
+            self.observe_write_error()?;
+            self.observe_sync_error()?;
+        }
+        self.mark_published();
+        Ok(())
+    }
+
+    /// Drop the preallocated, never-written tail so closed segments have their exact size.
+    pub(super) fn shrink_to_written(&mut self) {
+        self.writer.drain();
+        self.writer.physical().shrink_to_written();
+    }
+}
+
+/// Which closed segments compaction keeps.
+struct Retention {
+    directory: PathBuf,
+    /// Newest log kept as resume history (see `history_retained_from`).
+    history_bytes: u64,
+    cdc_retain_bytes: u64,
+}
+
+impl Retention {
+    /// Removes the closed segments whose records are all at or before `covered_sequence`,
+    /// except the history and change-stream windows. Runs on the writer thread, after every
+    /// rotation handed over before it.
+    fn remove_covered(
+        &self,
+        physical: &Physical,
+        covered_sequence: u64,
+    ) -> Result<(), PersistenceError> {
+        if physical.file.is_none() {
+            return Ok(());
+        }
+
+        let current = segment_path(&self.directory, physical.segment_first_sequence);
+        let segments = discover_segments(&self.directory)?;
+        let retained_from = self
+            .cdc_retained_from(&segments)?
+            .min(self.history_retained_from(&segments, &current, physical.write_pos)?);
+
+        for (index, path) in segments.iter().enumerate() {
+            if path == &current || index >= retained_from {
+                continue;
+            }
+
+            let next_first = match segments.get(index + 1) {
+                Some(next) => segment_first_sequence(next)?,
+                None => physical.segment_first_sequence,
+            };
+
+            let last_sequence = next_first.saturating_sub(1);
+
+            if last_sequence <= covered_sequence {
+                fs::remove_file(path)?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Index of the oldest segment of the newest log kept as resume history: segments are
     /// kept from the newest back until they hold an eighth of `wal_segment_bytes`. Before a
     /// checkpoint closed large open segments, the open segment kept up to `wal_segment_bytes`
     /// of history by accident; this keeps a bounded part of it on purpose.
-    fn history_retained_from(&self, segments: &[PathBuf]) -> Result<usize, PersistenceError> {
-        let budget = self.config.wal_segment_bytes / WAL_CHECKPOINT_ROTATE_DIVISOR;
-        let directory = shard_wal_directory(&self.config.data_dir, self.shard_id);
-        let current = segment_path(&directory, self.segment_first_sequence);
+    fn history_retained_from(
+        &self,
+        segments: &[PathBuf],
+        current: &Path,
+        written: u64,
+    ) -> Result<usize, PersistenceError> {
         let mut kept = 0u64;
 
         for (index, path) in segments.iter().enumerate().rev() {
             // The open segment's file is preallocated ahead of what was written.
-            let length = if path == &current {
-                self.write_pos
+            let length = if path == current {
+                written
             } else {
                 fs::metadata(path)?.len()
             };
             kept = kept.saturating_add(length);
 
-            if kept >= budget {
+            if kept >= self.history_bytes {
                 return Ok(index);
             }
         }
@@ -125,7 +230,7 @@ impl WalSink {
     /// Index of the oldest segment the change-stream window keeps; `usize::MAX` (nothing
     /// held back) when `cdc_retain_bytes` is `0`.
     fn cdc_retained_from(&self, segments: &[PathBuf]) -> Result<usize, PersistenceError> {
-        let budget = self.config.cdc_retain_bytes;
+        let budget = self.cdc_retain_bytes;
 
         if budget == 0 {
             return Ok(usize::MAX);
@@ -145,45 +250,6 @@ impl WalSink {
         }
 
         Ok(from)
-    }
-
-    pub(super) fn rotate(&mut self) -> Result<(), PersistenceError> {
-        self.flush()?;
-        self.shrink_to_written();
-        self.sync_worker_file = None;
-        let directory = shard_wal_directory(&self.config.data_dir, self.shard_id);
-        let created = create_segment(&directory, self.shard_id, self.next_sequence);
-        let (file, segment_id, first_sequence, file_length) = match created {
-            Ok(created) => created,
-            Err(error) => {
-                // Enter the failed state so appends are refused until recovery opens the segment.
-                self.failed = Some(error.to_string());
-                return Err(error);
-            }
-        };
-
-        self.file = Some(file);
-        self.segment_id = segment_id;
-        self.segment_first_sequence = first_sequence;
-        self.file_length = file_length;
-        self.write_pos = file_length;
-        self.synced_pos = file_length;
-        self.prealloc_end = file_length;
-        self.prefill.reset();
-        Ok(())
-    }
-
-    /// Drop the preallocated, never-written tail so closed segments have their exact size.
-    pub(super) fn shrink_to_written(&mut self) {
-        // A fill still running would write past the new end.
-        self.prefill.finish(&mut self.prealloc_end);
-
-        if self.prealloc_end > self.write_pos {
-            if let Some(file) = &self.file {
-                let _ = file.set_len(self.write_pos);
-            }
-            self.prealloc_end = self.write_pos;
-        }
     }
 }
 
