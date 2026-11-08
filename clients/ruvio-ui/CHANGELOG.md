@@ -4,6 +4,8 @@ Notable changes to `ruvio-ui`, the web console (Docker image and host binaries).
 
 ## Unreleased
 
+- Database selector in the header: choose from databases 0 to 15, with the active database displayed and updated automatically when `SELECT` is executed from the console or any other command.
+
 - New **Cluster** screen, read only: groups (by each node's `cluster-group`, else by process), shards with every slot range, a slot map, primaries and replicas with how far each replica is behind, and the cluster map version every node serves.
 - Optional coordinator view: set `RUVIO_UI_COORDINATORS` (`host:port,host:port`) and `RUVIO_UI_COORDINATOR_SECRET` to show the leader, each group's agreed primary, epoch, members answering and state, the slot move or rebalance in progress, and the failovers seen while the screen is open. The secret never reaches the browser, and the UI sends the coordinators only `INFO`, `SENTINEL masters`, `SENTINEL replicas` and `COORDINATOR STATUS`.
 - New **Dashboard** screen (below Console): time charts of the INFO fields, chosen from 13 (commands per second, command mix, network bytes per second, connections, clients, charged memory, memory breakdown, keys, expired and evicted keys, WAL records, bytes not yet on disk, largest buffers, replication send lag), over the last 5, 15 or 30 minutes, added up or one line per node. The choice is remembered in the browser. Charts are drawn from the same single `INFO` per node each refresh already reads, so they add no load on the server; readings are kept in the tab for up to 30 minutes.

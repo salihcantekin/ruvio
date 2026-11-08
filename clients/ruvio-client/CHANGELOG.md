@@ -4,6 +4,8 @@ Notable changes to the Rust client crate `ruvio-client`. New entries go under "U
 
 ## Unreleased
 
+- `Client::database()` tracks the currently selected database on the connection, updated on successful `SELECT` commands.
+
 - Cluster mode: a `READONLY` reply (the node that owned the slot was demoted by a failover) now reloads the slot map, and when the map names another node the command is sent there once. `READONLY` comes before a command runs, so the retry cannot apply it twice. Before, the client kept writing to the demoted node and got `READONLY` until something else reloaded the map. Pipelines, transactions, split and keyless commands still return the error. Nothing changes on the success path (issue #406).
 
 ## 0.5.0 - 2026-10-29

@@ -94,6 +94,8 @@ struct ConnectBody {
     username: String,
     #[serde(default)]
     password: String,
+    #[serde(default)]
+    database: u32,
 }
 
 #[derive(Deserialize)]
@@ -405,6 +407,7 @@ fn connect(stream: &mut TcpStream, body: &[u8], session_id: &str) -> std::io::Re
 
     options.host = parsed.host.clone();
     options.port = parsed.port;
+    options.database = parsed.database;
     options.username = if parsed.username.is_empty() {
         None
     } else {
@@ -503,11 +506,24 @@ fn command(stream: &mut TcpStream, body: &[u8], session_id: &str) -> std::io::Re
     let result = execute_targeted(&session, &args, parsed.shard.as_ref());
 
     match result {
-        Ok(value) => write_json(
-            stream,
-            200,
-            json!({"ok": true, "value": encode_value(&value)}),
-        ),
+        Ok(value) => {
+            let database = session
+                .lock()
+                .expect("session")
+                .client
+                .lock()
+                .expect("client")
+                .database();
+            write_json(
+                stream,
+                200,
+                json!({
+                    "ok": true,
+                    "value": encode_value(&value),
+                    "database": database,
+                }),
+            )
+        }
         Err(message) => write_json(stream, 200, json!({"ok": false, "error": message})),
     }
 }
@@ -1262,6 +1278,7 @@ fn session(stream: &mut TcpStream, session_id: &str) -> std::io::Result<()> {
     match session_of(session_id) {
         Some(session) => {
             let session = session.lock().expect("session");
+            let database = session.client.lock().expect("client").database();
 
             write_json(
                 stream,
@@ -1273,6 +1290,7 @@ fn session(stream: &mut TcpStream, session_id: &str) -> std::io::Result<()> {
                     "port": session.port,
                     "username": session.username,
                     "coordinators": coordinator::configured(),
+                    "database": database,
                 }),
             )
         }

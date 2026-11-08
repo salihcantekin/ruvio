@@ -1646,6 +1646,15 @@ impl Client {
             self.in_multi = true;
         }
 
+        if !self.in_multi
+            && matches!(&reply, RespValue::Simple(ok) if ok == "OK")
+            && arguments.len() == 2
+            && arguments[0].eq_ignore_ascii_case("SELECT")
+            && let Ok(db) = arguments[1].parse::<u32>()
+        {
+            self.database = db;
+        }
+
         // MONITOR turns this socket into a push stream: drop the command timeout from it,
         // unless the caller set a read timeout to poll with.
         if self.read_timeout.is_none()
@@ -2635,6 +2644,34 @@ mod tests {
         assert_eq!(got, select);
         server.write_all(b"+OK\r\n").unwrap();
         assert_eq!(connecting.join().unwrap().database(), 3);
+    }
+
+    #[test]
+    fn execute_select_updates_database() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = thread::spawn(move || bound(crate::test_support::accept(&listener).0));
+        let connecting = thread::spawn(move || Client::connect("127.0.0.1", port).unwrap());
+
+        let mut server = accepted.join().unwrap();
+        reply_standalone_cluster(&mut server);
+        let mut client = connecting.join().unwrap();
+        assert_eq!(client.database(), 0);
+
+        let select = b"*2\r\n$6\r\nSELECT\r\n$1\r\n5\r\n";
+        let client_thread = thread::spawn(move || {
+            let res = client.execute(&["SELECT", "5"]).unwrap();
+            (client, res)
+        });
+
+        let mut got = vec![0_u8; select.len()];
+        server.read_exact(&mut got).unwrap();
+        assert_eq!(got, select);
+        server.write_all(b"+OK\r\n").unwrap();
+
+        let (client, reply) = client_thread.join().unwrap();
+        assert_eq!(reply, RespValue::Simple("OK".to_owned()));
+        assert_eq!(client.database(), 5);
     }
 
     #[test]

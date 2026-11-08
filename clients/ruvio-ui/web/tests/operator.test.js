@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { families, findTasks } from "../src/catalog.js";
-import { scanOwners, scanSelected, metric, bytes, execute } from "../src/operator.js";
+import { scanOwners, scanSelected, metric, bytes, execute, currentDatabase, setDatabase, onDatabase } from "../src/operator.js";
 import { parseInfoText, sum } from "../src/monitor.js";
 import { present } from "../src/value.js";
 import { api } from "../src/api.js";
@@ -188,4 +188,30 @@ test("JSON helpers address only what the server can address", async () => {
   assert.equal(documentOf("GET", bulk('{"a":1}')), null);
   assert.equal(present("JSON.GET", bulk('[1,2]')).type, "json");
   assert.equal(present("JSON.GET", bulk('"text"')).type, "scalar");
+});
+
+test("database tracker maintains current database and notifies listeners", async (t) => {
+  setDatabase(0);
+  assert.equal(currentDatabase(), 0);
+
+  const observed = [];
+  const unsub = onDatabase((db) => observed.push(db));
+
+  setDatabase(3);
+  assert.equal(currentDatabase(), 3);
+  assert.deepEqual(observed, [3]);
+
+  // execute command with returned database updates the current database
+  const mock = t.mock.method(globalThis, "fetch", async () =>
+    new Response(JSON.stringify({ ok: true, value: { kind: "simple", text: "OK" }, database: 7 }))
+  );
+  await execute(["SELECT", "7"]);
+  assert.equal(currentDatabase(), 7);
+  assert.deepEqual(observed, [3, 7]);
+
+  unsub();
+  setDatabase(0);
+  assert.equal(currentDatabase(), 0);
+  // Unsubscribed listener did not get the 0 notification
+  assert.deepEqual(observed, [3, 7]);
 });
