@@ -8,9 +8,32 @@ export function nodeId(node) {
 // The server takes every argument as text, while number inputs hand back numbers.
 export const textArgs = (args) => args.map((arg) => String(arg ?? ""));
 
+let currentDb = 0;
+const dbListeners = new Set();
+
+export function currentDatabase() {
+  return currentDb;
+}
+
+export function setDatabase(db) {
+  const next = Number(db);
+  currentDb = Number.isInteger(next) && next >= 0 ? next : 0;
+  for (const listener of dbListeners) {
+    try { listener(currentDb); } catch {}
+  }
+}
+
+export function onDatabase(listener) {
+  dbListeners.add(listener);
+  return () => dbListeners.delete(listener);
+}
+
 export async function execute(args, shard = null) {
   const result = await api("/api/command", { args: textArgs(args), shard });
   if (result.value?.kind === "error") throw new Error(result.value.text);
+  if (result.database != null && result.database !== currentDb) {
+    setDatabase(result.database);
+  }
   return result.value;
 }
 

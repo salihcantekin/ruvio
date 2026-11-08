@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { families, findTasks } from "../src/catalog.js";
-import { scanOwners, scanSelected, metric, bytes, execute } from "../src/operator.js";
+import { scanOwners, scanSelected, metric, bytes, execute, currentDatabase, setDatabase, onDatabase } from "../src/operator.js";
 import { parseInfoText, sum } from "../src/monitor.js";
 import { present } from "../src/value.js";
 import { api, generateUuid } from "../src/api.js";
@@ -217,4 +217,30 @@ test("generateUuid falls back gracefully in non-secure HTTP contexts", () => {
     crypto.randomUUID = origRandomUuid;
     crypto.getRandomValues = origGetRandomValues;
   }
+});
+
+test("database tracker maintains current database and notifies listeners", async (t) => {
+  setDatabase(0);
+  assert.equal(currentDatabase(), 0);
+
+  const observed = [];
+  const unsub = onDatabase((db) => observed.push(db));
+
+  setDatabase(3);
+  assert.equal(currentDatabase(), 3);
+  assert.deepEqual(observed, [3]);
+
+  // execute command with returned database updates the current database
+  const mock = t.mock.method(globalThis, "fetch", async () =>
+    new Response(JSON.stringify({ ok: true, value: { kind: "simple", text: "OK" }, database: 7 }))
+  );
+  await execute(["SELECT", "7"]);
+  assert.equal(currentDatabase(), 7);
+  assert.deepEqual(observed, [3, 7]);
+
+  unsub();
+  setDatabase(0);
+  assert.equal(currentDatabase(), 0);
+  // Unsubscribed listener did not get the 0 notification
+  assert.deepEqual(observed, [3, 7]);
 });
