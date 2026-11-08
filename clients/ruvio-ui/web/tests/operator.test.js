@@ -5,7 +5,7 @@ import { families, findTasks } from "../src/catalog.js";
 import { scanOwners, scanSelected, metric, bytes, execute } from "../src/operator.js";
 import { parseInfoText, sum } from "../src/monitor.js";
 import { present } from "../src/value.js";
-import { api } from "../src/api.js";
+import { api, generateUuid } from "../src/api.js";
 
 const bulk = (text) => ({ kind: "bulk", text });
 const array = (...items) => ({ kind: "array", items });
@@ -188,4 +188,33 @@ test("JSON helpers address only what the server can address", async () => {
   assert.equal(documentOf("GET", bulk('{"a":1}')), null);
   assert.equal(present("JSON.GET", bulk('[1,2]')).type, "json");
   assert.equal(present("JSON.GET", bulk('"text"')).type, "scalar");
+});
+
+test("generateUuid falls back gracefully in non-secure HTTP contexts", () => {
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+  // 1. Native crypto.randomUUID (secure context)
+  const standard = generateUuid();
+  assert.match(standard, uuidRegex);
+  assert.equal(standard.length, 36);
+
+  const origRandomUuid = crypto.randomUUID;
+  const origGetRandomValues = crypto.getRandomValues;
+
+  try {
+    // 2. Fallback to crypto.getRandomValues (non-secure context in modern browsers)
+    delete crypto.randomUUID;
+    const getRandomValuesUuid = generateUuid();
+    assert.match(getRandomValuesUuid, uuidRegex);
+    assert.equal(getRandomValuesUuid.length, 36);
+
+    // 3. Fallback to Math.random (no Web Crypto available)
+    delete crypto.getRandomValues;
+    const mathRandomUuid = generateUuid();
+    assert.match(mathRandomUuid, uuidRegex);
+    assert.equal(mathRandomUuid.length, 36);
+  } finally {
+    crypto.randomUUID = origRandomUuid;
+    crypto.getRandomValues = origGetRandomValues;
+  }
 });
