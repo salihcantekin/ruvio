@@ -1,12 +1,13 @@
 diff --git a/src/persistence/wal/append.rs b/src/persistence/wal/append.rs
-index 1f9310e..16a73e8 100644
+index e0fdf85..cfe39ad 100644
 --- a/src/persistence/wal/append.rs
 +++ b/src/persistence/wal/append.rs
-@@ -412,7 +412,7 @@ impl WalSink {
+@@ -466,8 +466,7 @@ impl WalSink {
                  "WAL fsync failed; writes are refused until restart"
              );
          }
 -        self.sync_failed = true;
+-        self.sync_error.poison();
 +        // Recovery retries the segment like after a failed write.
          self.failed = Some(error.clone());
          // Also when another descriptor's sync (the preallocation fill) failed and this is

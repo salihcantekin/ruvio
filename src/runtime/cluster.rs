@@ -3,7 +3,7 @@
 use std::{
     io::{self, Write},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
@@ -558,7 +558,13 @@ struct ClusterCheckpointState {
     /// A log holds a hot write it refused, which the shared hot store may still hold: no
     /// hot partition is taken until restart (see `WalSink::sync_hot_records`).
     hot_blocked: bool,
+    /// The newest round opened and the creation of its directory, made once by whichever
+    /// writer gets there first (see `prepare_round`), never under this lock.
+    prepared: Option<(u64, Arc<RoundDirectory>)>,
 }
+
+/// A round's directory, created once by the first writer that needs it (`prepare_round`).
+type RoundDirectory = OnceLock<Result<(), String>>;
 
 /// Clears a shard's carrying mark when its copy ends (see `carry_published_file`).
 struct CarryingMark<'a> {
@@ -656,6 +662,7 @@ impl ClusterCheckpointCoordinator {
                 carrying: vec![false; shard_count],
                 hot_tried_at: None,
                 hot_blocked: false,
+                prepared: None,
             }),
         }
     }
@@ -723,7 +730,38 @@ impl ClusterCheckpointCoordinator {
             .len()
     }
 
-    /// Returns the open round, opening a new generation directory for the first caller.
+    /// Creates the directory of round `generation` from `begin_round`, once, before the
+    /// first file goes into it. A shard calls it from the thread that writes its file, not
+    /// its own: a disk that stops answering must not hold the shard (or this coordinator's
+    /// lock, which every shard takes).
+    pub(crate) fn prepare_round(&self, generation: u64) -> Result<(), PersistenceError> {
+        let once = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            match &state.prepared {
+                Some((prepared, once)) if *prepared == generation => Arc::clone(once),
+                _ => {
+                    return Err(PersistenceError::Failed(format!(
+                        "checkpoint round {generation} is no longer the newest"
+                    )));
+                }
+            }
+        };
+
+        once.get_or_init(|| {
+            self.manager
+                .begin_round(generation)
+                .map_err(|error| error.to_string())
+        })
+        .clone()
+        .map_err(PersistenceError::Failed)
+    }
+
+    /// Returns the open round, opening a new generation for the first caller; its
+    /// directory is created by `prepare_round`.
     pub(crate) fn begin_round(&self, shard_id: u32) -> Result<u64, PersistenceError> {
         let mut state = self
             .state
@@ -764,7 +802,7 @@ impl ClusterCheckpointCoordinator {
         // Past every round ever started: one that failed after CURRENT may be published.
         let generation = manager.allocate_generation(state.generation)?;
 
-        manager.begin_round(generation)?;
+        state.prepared = Some((generation, Arc::new(RoundDirectory::new())));
         state.open = Some(generation);
         state.hot_tried_at = None;
         Ok(generation)
@@ -844,6 +882,8 @@ impl ClusterCheckpointCoordinator {
             index,
         };
 
+        self.prepare_round(generation)?;
+
         let file = if from == 0 {
             self.manager
                 .empty_shard_file(generation, shard_id, self.shard_count() as u32)
@@ -889,6 +929,8 @@ impl ClusterCheckpointCoordinator {
         }
 
         let generation = self.begin_round(checkpoint.shard_id)?;
+
+        self.prepare_round(generation)?;
         let file =
             self.manager
                 .write_shard_file(generation, self.shard_count() as u32, &checkpoint)?;
@@ -1525,6 +1567,7 @@ mod tests {
         covers: u64,
     ) {
         let generation = coordinator.begin_round(shard_id).unwrap();
+        coordinator.prepare_round(generation).unwrap();
         let file = coordinator
             .manager()
             .write_shard_file(
@@ -1685,6 +1728,7 @@ mod tests {
         };
         let file = |shard_id, last_sequence| {
             let generation = coordinator.begin_round(shard_id).unwrap();
+            coordinator.prepare_round(generation).unwrap();
             let file = coordinator
                 .manager()
                 .write_shard_file(

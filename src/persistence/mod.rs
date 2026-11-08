@@ -12,7 +12,8 @@ pub(crate) use snapshot::{CARRY_DELAYS, COMMIT_DELAYS, FAILING_COMMITS, SHARD_FI
 #[cfg(test)]
 pub(crate) use wal::{
     COUNTED_WRITE_DIRS, FAILING_NEXT_SYNC_SHARDS, FAILING_SYNC_DIRS, FAILING_SYNC_SHARDS,
-    FAILING_WRITE_SHARDS, SLOW_SYNC_DIRS, SlowSyncDir,
+    FAILING_WRITE_SHARDS, SLOW_SYNC_DIRS, STALLED_WRITE_DIRS, SlowSyncDir, inspect_shard_wal,
+    settle_wal_writers,
 };
 
 use std::{
@@ -49,6 +50,7 @@ pub use tooling::{
 };
 
 pub(crate) use wal::REPLICA_HOLDS_DROPPED;
+pub(crate) use wal::WrittenWait;
 pub(crate) use wal::{FrameCursor, read_frames_resuming};
 pub use wal::{FrameRead, RecoveredMutations, RecoveryReport, WalSink, read_frames};
 

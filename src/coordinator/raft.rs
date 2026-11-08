@@ -812,11 +812,14 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachine {
             data: data.clone(),
         };
 
-        write_durably(
-            &self.snapshot_path(),
-            &serde_json::to_vec(&stored)
+        // On the blocking pool, like the log and vote: a slow disk must not hold one of the
+        // coordinator's two async workers, which also renew the primaries' leases.
+        write_durably_blocking(
+            self.snapshot_path(),
+            serde_json::to_vec(&stored)
                 .map_err(|error| StorageIOError::write_snapshot(None, &error))?,
         )
+        .await
         .map_err(|error| StorageIOError::write_snapshot(Some(meta.signature()), &error))?;
 
         Ok(Snapshot {
@@ -905,11 +908,12 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
             data,
         };
 
-        write_durably(
-            &self.snapshot_path(),
-            &serde_json::to_vec(&stored)
+        write_durably_blocking(
+            self.snapshot_path(),
+            serde_json::to_vec(&stored)
                 .map_err(|error| StorageIOError::write_snapshot(Some(meta.signature()), &error))?,
         )
+        .await
         .map_err(|error| StorageIOError::write_snapshot(Some(meta.signature()), &error))?;
         *self
             .state

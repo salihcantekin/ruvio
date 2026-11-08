@@ -186,6 +186,41 @@ pub(crate) fn hit_write(site: CrashSite, file: &mut File, bytes: &[u8]) -> io::R
     file.write_all(bytes)
 }
 
+/// [`hit_write`] for a write at `offset` (the WAL writer's positional writes).
+pub(crate) fn hit_write_at(
+    site: CrashSite,
+    file: &File,
+    bytes: &[u8],
+    offset: u64,
+) -> io::Result<()> {
+    #[cfg(test)]
+    if armed_hit(site) {
+        let partial = bytes.len() / 2;
+
+        if partial > 0 {
+            super::wal::write_all_at(file, &bytes[..partial], offset)?;
+        }
+
+        process::abort();
+    }
+
+    #[cfg(test)]
+    if let Some(error) = take_io_fault(site) {
+        let partial = bytes.len() / 2;
+
+        if partial > 0 {
+            super::wal::write_all_at(file, &bytes[..partial], offset)?;
+        }
+
+        return Err(error);
+    }
+
+    #[cfg(not(test))]
+    let _ = site;
+
+    super::wal::write_all_at(file, bytes, offset)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{

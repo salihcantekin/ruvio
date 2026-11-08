@@ -26,6 +26,28 @@ impl WalSink {
             let durable = Arc::new(DurableSequence::new(0));
             let backlog_floor = Arc::new(AtomicU64::new(u64::MAX));
             let replica_count = Arc::new(AtomicU64::new(0));
+            let sync_error = Arc::new(SyncError::default());
+            let writer = Writer::new(
+                Physical {
+                    file: None,
+                    write_pos: 0,
+                    prealloc_end: 0,
+                    prealloc: false,
+                    prefill: Prefill::default(),
+                    segment_first_sequence: 1,
+                    segment_bytes: config.wal_segment_bytes,
+                    written: 0,
+                    failed: None,
+                    unwritten: Vec::new(),
+                    unwritten_first: 0,
+                    data_dir: config.data_dir.clone(),
+                    shard_id,
+                },
+                Arc::clone(&published),
+                Arc::clone(&durable),
+                Arc::clone(&sync_error),
+                false,
+            )?;
 
             return Ok((
                 Self {
@@ -36,13 +58,9 @@ impl WalSink {
                     next_sequence: 1,
                     segment_id: 0,
                     segment_first_sequence: 1,
-                    file: None,
                     file_length: 0,
                     write_pos: 0,
                     synced_pos: 0,
-                    prealloc_end: 0,
-                    prealloc: false,
-                    prefill: Prefill::default(),
                     dirty_bytes: 0,
                     barrier_mark: (0, 0),
                     last_sync: Instant::now(),
@@ -62,12 +80,12 @@ impl WalSink {
                     group_bytes: 0,
                     tick_hold: false,
                     sync_running: Arc::new(AtomicBool::new(false)),
-                    sync_error: Arc::default(),
+                    sync_error,
                     sync_in_flight: 0,
                     sync_worker: None,
-                    sync_worker_file: None,
                     inline_syncs: 0,
                     inline_sync_nanos: 0,
+                    writer,
                 },
                 Vec::new(),
                 RecoveryReport::default(),
@@ -136,6 +154,27 @@ impl WalSink {
         if let Some(worker) = &sync_worker {
             worker.set_data_dir_for_test(&config.data_dir);
         }
+        let writer = Writer::new(
+            Physical {
+                file: Some(Arc::new(file)),
+                write_pos: file_length,
+                prealloc_end: file_length,
+                prealloc: prefill_enabled,
+                prefill: Prefill::reporting_to(Arc::clone(&sync_error)),
+                segment_first_sequence,
+                segment_bytes: config.wal_segment_bytes,
+                written: report.last_sequence,
+                failed: None,
+                unwritten: Vec::new(),
+                unwritten_first: 0,
+                data_dir: config.data_dir.clone(),
+                shard_id,
+            },
+            Arc::clone(&published),
+            Arc::clone(&durable),
+            Arc::clone(&sync_error),
+            true,
+        )?;
 
         Ok((
             Self {
@@ -146,13 +185,9 @@ impl WalSink {
                 next_sequence,
                 segment_id,
                 segment_first_sequence,
-                file: Some(file),
                 file_length,
                 write_pos: file_length,
                 synced_pos: file_length,
-                prealloc_end: file_length,
-                prealloc: prefill_enabled,
-                prefill: Prefill::reporting_to(Arc::clone(&sync_error)),
                 dirty_bytes: 0,
                 barrier_mark: (0, 0),
                 last_sync: Instant::now(),
@@ -175,9 +210,9 @@ impl WalSink {
                 sync_error,
                 sync_in_flight: 0,
                 sync_worker,
-                sync_worker_file: None,
                 inline_syncs: 0,
                 inline_sync_nanos: 0,
+                writer,
             },
             mutations,
             report,
@@ -245,9 +280,19 @@ impl WalSink {
         if let Some(worker) = &self.sync_worker {
             worker.drain()?;
             worker.reset(sequence)?;
-            self.sync_worker_file = None;
         }
-        self.file = None;
+        self.writer.drain();
+        self.wait_background_sync();
+
+        let source = self.writer.source();
+        let mut guard = source.lock_physical();
+        let physical = &mut *guard;
+
+        physical.prefill.finish(&mut physical.prealloc_end);
+        physical.file = None;
+        // What the writer kept from before the base belongs to the old history.
+        physical.failed = None;
+        physical.unwritten.clear();
         fs::create_dir_all(&directory)?;
 
         for entry in fs::read_dir(&directory)? {
@@ -261,23 +306,36 @@ impl WalSink {
         let (file, segment_id, first_sequence, file_length) =
             create_segment(&directory, self.shard_id, next)?;
 
-        self.file = Some(file);
+        physical.file = Some(Arc::new(file));
+        physical.segment_first_sequence = first_sequence;
+        physical.write_pos = file_length;
+        physical.prealloc_end = file_length;
+        physical.prefill.reset();
+        physical.written = sequence;
+        drop(guard);
+        source.note_rewritten(sequence);
+        self.writer.reset_cursors(sequence);
+
         self.segment_id = segment_id;
         self.segment_first_sequence = first_sequence;
         self.file_length = file_length;
         self.write_pos = file_length;
         self.synced_pos = file_length;
-        self.prealloc_end = file_length;
-        self.prefill.reset();
         self.next_sequence = next;
         self.dirty_bytes = 0;
         self.barrier_mark = (0, 0);
         self.staged.clear();
-        self.wait_background_sync();
         self.sync_in_flight = 0;
-        self.published.store(sequence, Ordering::Release);
         self.durable.store(sequence, Ordering::Release);
         Ok(())
+    }
+
+    /// Waits for the writer thread and picks up a write it could not make.
+    #[cfg(test)]
+    pub(crate) fn settle_writes(&mut self) -> Result<(), PersistenceError> {
+        self.writer.drain();
+        self.observe_write_error()?;
+        self.observe_sync_error()
     }
 
     pub fn shard_id(&self) -> u32 {
@@ -369,12 +427,15 @@ impl WalSink {
     }
 
     pub fn failure(&self) -> Option<&str> {
-        self.failed.as_deref().or_else(|| {
-            self.sync_worker
-                .as_ref()
-                .filter(|worker| worker.unavailable())
-                .map(|_| "WAL sync worker unavailable")
-        })
+        self.failed
+            .as_deref()
+            .or_else(|| self.writer.has_failure().then_some("WAL write failed"))
+            .or_else(|| {
+                self.sync_worker
+                    .as_ref()
+                    .filter(|worker| worker.unavailable())
+                    .map(|_| "WAL sync worker unavailable")
+            })
     }
 
     /// Whether a checkpoint of memory as it stood at `sequence` may be published. With
@@ -399,19 +460,39 @@ impl WalSink {
     /// sync, or one the sync worker holds) are synced now. If that sync fails their clients
     /// are refused, so the checkpoint is too (see `checkpoint_may_cover`).
     pub fn sync_for_checkpoint(&mut self, sequence: u64) -> Result<(), PersistenceError> {
+        match self.checkpoint_sync(sequence)? {
+            Some(barrier) => {
+                barrier.wait_blocking()?;
+                self.checkpoint_synced(sequence)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// `sync_for_checkpoint` for a caller that must not hold the log while the disk works:
+    /// with the sync worker it hands back the barrier to wait for without the lock, then
+    /// `checkpoint_synced`. Without it the records are synced here.
+    pub(crate) fn checkpoint_sync(
+        &mut self,
+        sequence: u64,
+    ) -> Result<Option<super::sync_worker::SyncBarrier>, PersistenceError> {
         if self.profile != DurabilityProfile::Always
             || sequence <= self.durable.load(Ordering::Acquire)
         {
-            return Ok(());
+            return Ok(None);
         }
 
         self.checkpoint_may_cover(sequence)?;
         if self.sync_worker.is_some() {
-            self.flush()?;
-        } else {
-            self.sync_pending()?;
+            return self.prepare_sync_barrier();
         }
 
+        self.sync_pending()?;
+        self.checkpoint_synced(sequence)?;
+        Ok(None)
+    }
+
+    pub(crate) fn checkpoint_synced(&self, sequence: u64) -> Result<(), PersistenceError> {
         if sequence > self.durable.load(Ordering::Acquire) {
             return Err(PersistenceError::Failed(
                 "checkpoint covers WAL records that are not synced".into(),

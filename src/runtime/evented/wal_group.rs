@@ -244,12 +244,36 @@ pub(super) struct OpenWalGroup<'a> {
     /// Last record sequence when the open group began: the records past it at commit are
     /// this connection's batch.
     group_start_sequence: u64,
+    /// Since the last commit only commands that reveal nothing of the data ran (or none):
+    /// under `always` the next commit has no reply to hold back, so it does not wait for
+    /// other clients' records to reach the disk. A coordinator's `ROLE` and `INFO` are then
+    /// answered while the disk is slow. Only the connection loop sets it.
+    pub(super) quiet: bool,
+    /// `everysec`: the last record sequence at this connection's previous commit (taken
+    /// before it ran any command). Records past it at commit mean it may have written: after
+    /// a failed WAL write its reply then fails with them, while a reply that only read is
+    /// answered (see `WalSink::written_wait`).
+    written_mark: u64,
 }
 
-/// A batch with more records than this already shares its own `write` among them, so its
-/// reply does not wait for the end of the turn: the extra turn would cost more than the
-/// `write` it saves.
-const TICK_SHARE_MAX_RECORDS: u64 = 4;
+/// Commands whose replies reveal nothing of the data, so they need not wait for a sync of
+/// records they could otherwise have read: health checks, a connection's handshake, and what
+/// a coordinator asks a node every round (`ROLE`, `INFO`, `CONFIG GET shards`,
+/// `RUVIO TOPOLOGY VERSION`, the primary lease).
+pub(super) fn reveals_no_data(command: &Command<'_>) -> bool {
+    matches!(
+        command,
+        Command::Ping(_)
+            | Command::Echo(_)
+            | Command::Role
+            | Command::Info(_)
+            | Command::ConfigGet(_)
+            | Command::Topology(None)
+            | Command::PrimaryLease(_)
+            | Command::Auth { .. }
+            | Command::Hello { .. }
+    )
+}
 
 impl<'a> OpenWalGroup<'a> {
     pub(super) fn new(state: &'a ShardState) -> Self {
@@ -257,7 +281,7 @@ impl<'a> OpenWalGroup<'a> {
         let always = profile == crate::DurabilityProfile::Always;
         // A write outside a group may still be staged behind another connection's group, so
         // the mark is taken before any command runs, not when one opens a group.
-        let start_sequence = if always {
+        let start_sequence = if profile.uses_wal() {
             state
                 .persistence
                 .lock()
@@ -277,6 +301,8 @@ impl<'a> OpenWalGroup<'a> {
             skipped_while_parked: false,
             waiting_for_tick: false,
             group_start_sequence: 0,
+            quiet: false,
+            written_mark: start_sequence,
         }
     }
 
@@ -284,6 +310,7 @@ impl<'a> OpenWalGroup<'a> {
         if self.open || !self.uses_wal {
             return;
         }
+        self.quiet = false;
 
         {
             let mut persistence = self
@@ -305,6 +332,7 @@ impl<'a> OpenWalGroup<'a> {
     /// is not durable yet: the element came with it, so the reply waits for its sync and
     /// fails with it.
     pub(super) fn skip_records_written_while_parked(&mut self, served_by: Option<u64>) {
+        self.quiet = false;
         if !self.always || self.open {
             return;
         }
@@ -339,11 +367,30 @@ impl<'a> OpenWalGroup<'a> {
         }
     }
 
+    /// A commit with no command run since it: if only commands that reveal nothing ran
+    /// before it (a coordinator's `AUTH` reaching a cluster node's routing), the batch stays
+    /// quiet, so a reply that reveals nothing still does not wait for the disk.
+    pub(super) async fn commit_keeping_quiet(&mut self) -> io::Result<()> {
+        let quiet = self.quiet;
+
+        self.commit().await?;
+        self.quiet = quiet;
+        Ok(())
+    }
+
+    /// The commit before `command`, a group boundary, runs: see `quiet`.
+    pub(super) async fn commit_before(&mut self, command: &Command<'_>) -> io::Result<()> {
+        self.commit().await?;
+        self.quiet = reveals_no_data(command);
+        Ok(())
+    }
+
     /// Publishes the group and, for `always`, either syncs here (no sync worker) or hands back the
     /// worker barrier to wait on later. Lets a caller keep executing while the sync worker works,
     /// then send replies once `DurabilityWait::wait` returns.
     pub(super) async fn commit_deferred(&mut self) -> io::Result<Option<DurabilityWait>> {
         let mut wait_through = None;
+        let mut written_through = None;
 
         if self.open || (self.uses_wal && !self.always) {
             let mut persistence = self
@@ -353,14 +400,12 @@ impl<'a> OpenWalGroup<'a> {
                 .unwrap_or_else(|error| error.into_inner());
             // Under `everysec` with other clients on the shard, the records wait for the end
             // of the scheduler turn: the connections served in it stage theirs too and the
-            // first to resume writes them all at once (`publish_through`). A lone client
-            // writes now, as the wait would only add a turn, and so does a pipelined batch
-            // (`TICK_SHARE_MAX_RECORDS`).
+            // first to resume hands them all to the WAL writer at once (`publish_through`),
+            // so the writer is woken once per turn, not once per connection. Pipelined
+            // batches share it too: their replies wait for the writer anyway. A lone client
+            // hands its records over now, as the wait would only add a turn.
             let waits = !self.always
                 && self.state.active_connections.get() > 1
-                && (!self.open
-                    || persistence.last_sequence() - self.group_start_sequence
-                        <= TICK_SHARE_MAX_RECORDS)
                 && persistence.reply_waits_for_publish();
 
             if waits {
@@ -380,6 +425,7 @@ impl<'a> OpenWalGroup<'a> {
                 persistence
                     .publish_before_reply()
                     .map_err(|error| io::Error::other(error.to_string()))?;
+                written_through = Some(persistence.last_sequence());
             }
         }
 
@@ -393,9 +439,36 @@ impl<'a> OpenWalGroup<'a> {
                 .unwrap_or_else(|error| error.into_inner())
                 .publish_through(through)
                 .map_err(|error| io::Error::other(error.to_string()))?;
+            written_through = Some(through);
         }
 
         if !self.always {
+            // `everysec` replies leave once their records reach the kernel: a process kill
+            // loses no acknowledged write. The writer thread writes them, so a stalled disk
+            // holds these replies, not the shard. Replies that reveal nothing do not wait.
+            if std::mem::take(&mut self.quiet) {
+                return Ok(None);
+            }
+            let written = written_through.and_then(|through| {
+                let persistence = self
+                    .state
+                    .persistence
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let wrote = through > self.written_mark;
+
+                self.written_mark = through.max(self.written_mark);
+                persistence.written_wait(through, wrote)
+            });
+
+            return Ok(written.map(|wait| DurabilityWait::Written {
+                wait,
+                write_timeout: self.state.live.write_timeout.get(),
+            }));
+        }
+
+        // Nothing ran since the last commit that a reply could reveal or that wrote.
+        if std::mem::take(&mut self.quiet) && !self.open {
             return Ok(None);
         }
 
@@ -440,7 +513,7 @@ impl<'a> OpenWalGroup<'a> {
                     .ok_or_else(|| io::Error::other("configured WAL sync worker is unavailable"))?
             };
 
-            return Ok(Some(DurabilityWait {
+            return Ok(Some(DurabilityWait::Synced {
                 barrier,
                 write_timeout: self.state.live.write_timeout.get(),
             }));
@@ -468,15 +541,36 @@ impl<'a> OpenWalGroup<'a> {
     }
 }
 
-/// A group already handed to the sync worker; `wait` returns once it is on disk.
-pub(super) struct DurabilityWait {
-    barrier: crate::persistence::SyncBarrier,
-    write_timeout: std::time::Duration,
+/// What a batch's replies wait for: an `always` group handed to the sync worker (on disk), or
+/// `everysec` records handed to the WAL writer (in the kernel).
+pub(super) enum DurabilityWait {
+    Synced {
+        barrier: crate::persistence::SyncBarrier,
+        write_timeout: std::time::Duration,
+    },
+    Written {
+        wait: crate::persistence::WrittenWait,
+        write_timeout: std::time::Duration,
+    },
 }
 
 impl DurabilityWait {
     pub(super) async fn wait(self, state: &ShardState) -> io::Result<()> {
-        timeout(self.write_timeout, self.barrier.wait())
+        let (barrier, write_timeout) = match self {
+            Self::Synced {
+                barrier,
+                write_timeout,
+            } => (barrier, write_timeout),
+            Self::Written {
+                wait,
+                write_timeout,
+            } => {
+                return timeout(write_timeout, wait.wait()).await.map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "WAL write wait timed out")
+                })?;
+            }
+        };
+        timeout(write_timeout, barrier.wait())
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "WAL durability wait timed out"))?
             .map_err(|e| io::Error::other(e.to_string()))?;

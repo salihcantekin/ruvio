@@ -32,10 +32,19 @@ mod recovery;
 mod segment;
 mod sink;
 mod sync;
+mod writer;
+#[cfg(test)]
+pub(in crate::persistence) use writer::stall_write;
 
 use prefill::*;
 use recovery::*;
 use segment::*;
+use writer::*;
+
+pub(in crate::persistence) use prefill::write_all_at;
+pub(crate) use writer::WrittenWait;
+#[cfg(test)]
+pub(crate) use writer::{STALLED_WRITE_DIRS, settle_wal_writers};
 
 #[cfg(test)]
 pub(crate) use reader::read_bounded_history;
@@ -61,6 +70,10 @@ const WAL_GROUP_BYTES: usize = 64 * 1024;
 #[derive(Default)]
 struct SyncError {
     set: AtomicBool,
+    /// Never cleared: once any sync of the log failed, a later clean sync of the same file
+    /// proves nothing (the kernel reports a lost write-back once), so nothing may count as
+    /// durable from then on.
+    poisoned: AtomicBool,
     message: Mutex<Option<String>>,
 }
 
@@ -76,6 +89,7 @@ impl SyncError {
         let mut slot = self.lock();
 
         *slot = Some(message);
+        self.poison();
         self.set.store(true, Ordering::Release);
     }
 
@@ -84,7 +98,17 @@ impl SyncError {
         let mut slot = self.lock();
 
         slot.get_or_insert(message);
+        self.poison();
         self.set.store(true, Ordering::Release);
+    }
+
+    /// Marks the log as having failed a sync, for good.
+    fn poison(&self) {
+        self.poisoned.store(true, Ordering::SeqCst);
+    }
+
+    fn poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::SeqCst)
     }
 
     fn is_set(&self) -> bool {
@@ -277,17 +301,13 @@ pub struct WalSink {
     next_sequence: u64,
     segment_id: u64,
     segment_first_sequence: u64,
-    file: Option<File>,
     file_length: u64,
-    /// Bytes physically written; `file` is not in append mode so a preallocated tail does not move the cursor.
+    /// Bytes handed to the writer for the open segment (written or on their way); the
+    /// writer's `Physical` has what is on disk.
     write_pos: u64,
     /// End of what the last successful shard-thread `fsync` of the open segment covered.
     /// Not advanced by the sync worker, so only used where the worker is off.
     synced_pos: u64,
-    /// Size the segment file has been extended to by `fallocate` (equals `write_pos` when not preallocating).
-    prealloc_end: u64,
-    prealloc: bool,
-    prefill: Prefill,
     dirty_bytes: u64,
     /// The last sync barrier handed to the worker: its sequence and `dirty_bytes` then.
     /// Once that sequence is durable those bytes are synced, so steady writes, where a
@@ -321,10 +341,12 @@ pub struct WalSink {
     /// Bytes covered by the running background `everysec` sync; still counted in `dirty_bytes`.
     sync_in_flight: u64,
     sync_worker: Option<super::sync_worker::SyncWorker>,
-    sync_worker_file: Option<Arc<File>>,
     /// `fsync`s issued on the shard thread (rotation, shutdown, fallback, no worker) and their time.
     inline_syncs: u64,
     inline_sync_nanos: u64,
+    /// Writes the records and changes the segments; declared last, so the sync worker, which
+    /// may wait for it, stops first.
+    writer: Writer,
 }
 
 struct ClearSync(Arc<AtomicBool>);

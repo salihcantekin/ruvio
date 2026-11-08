@@ -356,6 +356,11 @@ cap cannot exceed `max_global`.
 WAL-backed profiles exclusively lock `<data_dir>/LOCK` before opening a
 listener. `everysec` acknowledges after the bytes are written to the kernel and
 runs `fdatasync` in the background every `sync_interval_ms` (default 1000).
+Each shard's WAL writer thread does the writing, so a disk that stops answering
+for a few seconds holds the replies of writes (and of reads that could see
+them), not the shard: `PING`, `ROLE` and `INFO` are still answered. The writer
+queues up to 64 MiB and then the shard waits for it. `SAVE`, a checkpoint,
+shutdown and recovery after a failed write wait for the writer.
 That interval is the loss window: `60000` is about one minute, `500` is twice
 a second. There is no separate `everyminute` profile; the contract stays
 `everysec` and the number is the user's. Stalls can make the window longer.

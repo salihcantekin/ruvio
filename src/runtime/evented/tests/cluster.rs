@@ -1987,12 +1987,49 @@ fn rounds_publish_after_a_shard_log_failed_before_any_round() {
 }
 
 /// Fails the next `count` WAL writes of `shard` in `directory`; the log resumes by itself
-/// once they are used up.
+/// once they are used up. Records already handed to the WAL writer threads are written
+/// first, so a failure meant for the next command is not used up by an earlier one.
 fn fail_shard_writes(directory: &std::path::Path, shard: u32, count: u32) {
+    crate::persistence::settle_wal_writers(directory);
     crate::persistence::FAILING_WRITE_SHARDS
         .lock()
         .unwrap()
         .push((directory.to_path_buf(), shard, count));
+}
+
+/// Waits until the shard behind `address` reports its log failed: the WAL writer thread's
+/// failed write reaches the shard's state just after the write's connection learned of it.
+fn wait_persistence_error(address: SocketAddr) {
+    let deadline = Instant::now() + PATIENCE;
+
+    while !request(address, &resp(&[&[b"INFO"]]))
+        .windows(29)
+        .any(|window| window == b"ruvio_persistence_state:error")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the log never reported its failure"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Waits until every shard in `directory` has collected its checkpoint commits.
+fn wait_commits_collected(directory: &std::path::Path) {
+    let deadline = Instant::now() + PATIENCE;
+
+    while super::super::checkpoint::UNCOLLECTED_COMMITS
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|dir| dir == directory)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "a checkpoint commit was never collected"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 fn stop_failing_writes(directory: &std::path::Path) {
@@ -2046,6 +2083,9 @@ fn a_bgsave_during_a_slow_carry_does_not_lose_writes_made_after_the_log_resumed(
     );
     assert_eq!(request(left_addr, &resp(&[&[b"SAVE"]])), b"+OK\r\n");
     let saved = published_generation(&persistence);
+    // A commit still finishing after the round was published would take the `BGSAVE` below
+    // as one to run after it.
+    wait_commits_collected(directory.path());
 
     crate::persistence::CARRY_DELAYS
         .lock()
@@ -2511,7 +2551,10 @@ fn a_refused_hot_key_write_leaves_the_old_value_for_every_shard() {
     fail_shard_writes(directory.path(), 0, u32::MAX);
     let failed = request(left_addr, &resp(&[&[b"SET", b"lock:b", b"x"]]));
 
-    assert!(failed.starts_with(b"-MISCONF"), "{failed:?}");
+    // Its write fails on the WAL writer thread while the reply waits for it: the connection
+    // closes with no reply, as for a failed grouped write.
+    assert!(failed.is_empty(), "{failed:?}");
+    wait_persistence_error(left_addr);
     for refused in [
         &[&b"SET"[..], b"lock:a", b"new"][..],
         &[b"DEL", b"lock:a"],
@@ -2567,8 +2610,11 @@ fn a_hot_key_write_whose_log_write_failed_is_written_when_the_log_resumes() {
     fail_shard_writes(directory.path(), 0, 1);
     let failed = request(left_addr, &resp(&[&[b"SET", b"lock:a", b"kept"]]));
 
+    wait_persistence_error(left_addr);
     stop_failing_writes(directory.path());
-    assert!(failed.starts_with(b"-MISCONF"), "{failed:?}");
+    // Its write fails on the WAL writer thread while the reply waits for it: the connection
+    // closes with no reply, as for a failed grouped write.
+    assert!(failed.is_empty(), "{failed:?}");
     assert_eq!(
         request(right_addr, &resp(&[&[b"GET", b"lock:a"]])),
         b"$4\r\nkept\r\n"

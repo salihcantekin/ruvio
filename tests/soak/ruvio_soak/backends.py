@@ -43,13 +43,29 @@ df -B1 --output=avail,size /var/lib/ruvio | tail -1 | awk '{{print "DiskAvail: "
 awk '/eth0:/ {{print "NetRx: " $2; print "NetTx: " $10}}' /proc/net/dev
 echo "ClockOffsetS: $(chronyc -c tracking 2>/dev/null | cut -d, -f5)"
 echo "ClkTck: $(getconf CLK_TCK)"
+awk '/^cpu / {{print "CpuIowaitTicks: " $6; print "CpuStealTicks: " $9}}' /proc/stat
+awk '/^some/ {{split($5, a, "="); print "IoSomeUs: " a[2]}} /^full/ {{split($5, a, "="); print "IoFullUs: " a[2]}}' /proc/pressure/io 2>/dev/null
+awk '/^Dirty:/ {{print "DirtyKib: " $2}} /^Writeback:/ {{print "WritebackKib: " $2}}' /proc/meminfo
+src=$(findmnt -no SOURCE /var/lib/ruvio 2>/dev/null)
+dev=$(lsblk -no PKNAME "$src" 2>/dev/null | head -1); [ -z "$dev" ] && [ -n "$src" ] && dev=$(basename "$(readlink -f "$src")")
+[ -n "$dev" ] && awk -v d="$dev" '$3 == d {{print "DiskReads: " $4; print "DiskWrites: " $8; print "DiskWriteSectors: " $10;
+  print "DiskInFlight: " $12; print "DiskBusyMs: " $13; print "DiskQueueMs: " $14; print "DiskFlushes: " $19;
+  print "DiskFlushMs: " $20}}' /proc/diskstats
 """
 
 STAT_NAMES = {"CpuTicks": "cpu_ticks", "Fds": "fds", "DataBytes": "data_dir_bytes", "WalBytes": "wal_bytes", "CheckpointBytes": "checkpoint_bytes",
               "voluntary_ctxt_switches": "ctx_voluntary", "nonvoluntary_ctxt_switches": "ctx_involuntary"}
 HOST_NAMES = {"Load": "load1", "MemAvailableKib": "mem_available_kib", "DiskAvail": "disk_avail_bytes",
               "DiskSize": "disk_size_bytes", "NetRx": "net_rx_bytes", "NetTx": "net_tx_bytes",
-              "ClockOffsetS": "clock_offset_s", "ClkTck": "clk_tck"}
+              "ClockOffsetS": "clock_offset_s", "ClkTck": "clk_tck",
+              # Cumulative counters: a stall shorter than the sample interval still shows as a
+              # jump in the time the disk was busy or tasks waited for it.
+              "CpuIowaitTicks": "cpu_iowait_ticks", "CpuStealTicks": "cpu_steal_ticks",
+              "IoSomeUs": "io_some_us", "IoFullUs": "io_full_us", "DirtyKib": "dirty_kib",
+              "WritebackKib": "writeback_kib", "DiskReads": "disk_reads", "DiskWrites": "disk_writes",
+              "DiskWriteSectors": "disk_write_sectors", "DiskInFlight": "disk_in_flight",
+              "DiskBusyMs": "disk_busy_ms", "DiskQueueMs": "disk_queue_ms", "DiskFlushes": "disk_flushes",
+              "DiskFlushMs": "disk_flush_ms"}
 
 
 def parse_host_stats(text: str, roles: dict[str, str]) -> tuple[dict[str, dict], dict]:
