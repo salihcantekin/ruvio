@@ -1806,6 +1806,68 @@ fn an_everysec_shard_keeps_answering_while_its_wal_writes_are_stalled() {
     join_within(server, PATIENCE).unwrap();
 }
 
+/// On a node that routes commands between shards, a keyless command such as a
+/// coordinator's `AUTH` or `ROLE` first commits the batch on its way to the routing code.
+/// That commit must not cost it its quiet standing: while another client's `everysec`
+/// write waits for a stalled disk, the checks are still answered, so the node is not
+/// failed over.
+#[test]
+fn a_routing_node_answers_health_checks_while_its_wal_writes_are_stalled() {
+    let directory = tempfile::tempdir().unwrap();
+    let persistence = PersistenceConfig {
+        profile: crate::DurabilityProfile::Everysec,
+        data_dir: directory.path().to_path_buf(),
+        snapshot_interval: Duration::from_secs(3600),
+        ..PersistenceConfig::default()
+    };
+    let (address, _, stop, left, right) = serve_two_shards_with(|config| {
+        config.persistence = persistence.clone();
+    });
+
+    assert_eq!(
+        request(address, &resp(&[&[b"SET", b"before", b"v"]])),
+        b"+OK\r\n"
+    );
+    let stalled = StalledWrites::new(directory.path());
+    let mut writer = StdTcpStream::connect(address).unwrap();
+
+    writer.set_read_timeout(Some(PATIENCE)).unwrap();
+    // Keys on both shards, so each has a write waiting for the disk.
+    let mut pipeline = Vec::new();
+
+    for index in 0..32 {
+        pipeline.extend(resp(&[&[
+            b"SET",
+            format!("during-{index}").as_bytes(),
+            b"v",
+        ]]));
+    }
+    writer.write_all(&pipeline).unwrap();
+    let quick = Duration::from_secs(5);
+
+    for _ in 0..10 {
+        let role = request_within(address, &resp(&[&[b"ROLE"]]), quick);
+
+        assert!(role.starts_with(b"*3\r\n$6\r\nmaster\r\n"), "{role:?}");
+        let info = request_within(address, &resp(&[&[b"INFO", b"replication"]]), quick);
+
+        assert!(info.windows(13).any(|w| w == b"# Replication"), "{info:?}");
+        assert_eq!(
+            request_within(address, &resp(&[&[b"PING"]]), quick),
+            b"+PONG\r\n"
+        );
+    }
+
+    drop(stalled);
+    let mut replies = vec![0u8; 5 * 32];
+
+    writer.read_exact(&mut replies).unwrap();
+    assert_eq!(replies, b"+OK\r\n".repeat(32));
+    stop.request();
+    join_within(left, PATIENCE).unwrap();
+    join_within(right, PATIENCE).unwrap();
+}
+
 /// Under `always` with the sync worker a write's reply still waits for its record to be on
 /// disk, and so do replies that could reveal it, but the shard itself does not: a
 /// coordinator's `ROLE` and `INFO` are answered meanwhile, so it does not fail the shard over.

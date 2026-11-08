@@ -953,8 +953,10 @@ pub(super) async fn handle_client(
                                     waited = true;
                                     // Neither a plain command nor this shard's alone: it
                                     // may wait on another shard (see `MAX_PENDING_FORWARDS`).
+                                    // Nothing ran since this commit: the batch stays quiet,
+                                    // and the command decides below whether it still is.
                                     if !wal_group.always {
-                                        wal_group.commit().await?;
+                                        wal_group.commit_keeping_quiet().await?;
                                     }
                                     settle(
                                         &state,
@@ -978,7 +980,7 @@ pub(super) async fn handle_client(
                                         let mut counted = CommandRateLimiter::new(0);
                                         let _timing = forwarded_timing(&state, &command);
 
-                                        wal_group.commit().await?;
+                                        wal_group.commit_before(&command).await?;
                                         dispatch_command(
                                             &state,
                                             &mut local,

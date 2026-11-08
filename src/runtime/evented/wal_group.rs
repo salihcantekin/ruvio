@@ -367,6 +367,17 @@ impl<'a> OpenWalGroup<'a> {
         }
     }
 
+    /// A commit with no command run since it: if only commands that reveal nothing ran
+    /// before it (a coordinator's `AUTH` reaching a cluster node's routing), the batch stays
+    /// quiet, so a reply that reveals nothing still does not wait for the disk.
+    pub(super) async fn commit_keeping_quiet(&mut self) -> io::Result<()> {
+        let quiet = self.quiet;
+
+        self.commit().await?;
+        self.quiet = quiet;
+        Ok(())
+    }
+
     /// The commit before `command`, a group boundary, runs: see `quiet`.
     pub(super) async fn commit_before(&mut self, command: &Command<'_>) -> io::Result<()> {
         self.commit().await?;
