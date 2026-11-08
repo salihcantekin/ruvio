@@ -1486,8 +1486,10 @@ fn readonly_wal_directory_blocks_rotation_and_keeps_acked_records() {
     });
 
     fs::set_permissions(&shard_dir, original).unwrap();
+    // The writer thread creates the next segment, so the refusal arrives as its failure
+    // message rather than as the original `io::Error`.
     assert!(
-        matches!(denied, Err(PersistenceError::Io(ref error)) if error.kind() == std::io::ErrorKind::PermissionDenied),
+        matches!(denied, Err(PersistenceError::Failed(ref message)) if message.contains("Permission denied")),
         "{denied:?}"
     );
     drop(sink);
