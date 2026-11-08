@@ -1835,6 +1835,15 @@ fn an_always_write_waits_for_a_stalled_disk_without_stopping_the_shard() {
         request(address, &resp(&[&[b"SET", b"before", b"v"]])),
         b"+OK\r\n"
     );
+    // Expires while the disk does not answer: its delete is logged by the shard's
+    // maintenance, which must not wait for the disk either.
+    assert_eq!(
+        request(
+            address,
+            &resp(&[&[b"SET", b"expiring", b"v", b"PX", b"100"]])
+        ),
+        b"+OK\r\n"
+    );
     let stalled = StalledWrites::new(directory.path());
     let mut writer = StdTcpStream::connect(address).unwrap();
 
@@ -1843,6 +1852,19 @@ fn an_always_write_waits_for_a_stalled_disk_without_stopping_the_shard() {
         .write_all(&resp(&[&[b"SET", b"during", b"v"]]))
         .unwrap();
     let quick = Duration::from_secs(5);
+    let deadline = Instant::now() + PATIENCE;
+
+    // The active expiry removes `expiring` and logs its delete meanwhile.
+    while !request_within(address, &resp(&[&[b"INFO"]]), quick)
+        .windows(20)
+        .any(|window| window == b"expired_keys_active:")
+        || request_within(address, &resp(&[&[b"INFO"]]), quick)
+            .windows(22)
+            .any(|window| window == b"expired_keys_active:0\r")
+    {
+        assert!(Instant::now() < deadline, "the key never expired");
+        thread::sleep(Duration::from_millis(10));
+    }
 
     for _ in 0..20 {
         let role = request_within(address, &resp(&[&[b"ROLE"]]), quick);

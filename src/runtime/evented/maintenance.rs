@@ -52,7 +52,10 @@ pub(super) fn log_expired_removals<C: crate::time::Clock>(
             persistence.record(crate::mutation::Mutation::Delete { keys: &keys })
         })
         .and(persistence.end_group())
-        .and_then(|()| persistence.sync_batch(start));
+        // Nobody waits for these records: under `always` the sync worker syncs them (a
+        // client reply after them waits for that sync), so a slow disk does not hold the
+        // shard here.
+        .and_then(|()| persistence.sync_batch_soon(start));
 
     persistence.select_database(active);
     if let Err(error) = logged {
@@ -99,7 +102,7 @@ pub(super) fn evict_debt_logged<C: crate::time::Clock>(
 
     persistence
         .end_group()
-        .and_then(|()| persistence.sync_batch(start))
+        .and_then(|()| persistence.sync_batch_soon(start))
         .and(owed)
 }
 
