@@ -42,6 +42,7 @@ use segment::*;
 use writer::*;
 
 pub(in crate::persistence) use prefill::write_all_at;
+pub(crate) use writer::WrittenWait;
 #[cfg(test)]
 pub(crate) use writer::{STALLED_WRITE_DIRS, settle_wal_writers};
 

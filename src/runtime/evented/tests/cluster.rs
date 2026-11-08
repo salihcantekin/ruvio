@@ -1997,8 +1997,8 @@ fn fail_shard_writes(directory: &std::path::Path, shard: u32, count: u32) {
         .push((directory.to_path_buf(), shard, count));
 }
 
-/// Waits until the shard behind `address` reports its log failed. Under `everysec` a write is
-/// answered once the WAL writer thread has it, so its failed write shows up just after.
+/// Waits until the shard behind `address` reports its log failed: the WAL writer thread's
+/// failed write reaches the shard's state just after the write's connection learned of it.
 fn wait_persistence_error(address: SocketAddr) {
     let deadline = Instant::now() + PATIENCE;
 
@@ -2548,11 +2548,12 @@ fn a_refused_hot_key_write_leaves_the_old_value_for_every_shard() {
     assert_eq!(request(right_addr, &resp(&[&[b"GET", b"lock:a"]])), old);
 
     // The log fails on another key's write and cannot resume while writes keep failing.
-    // That write was acknowledged once the writer thread had it.
     fail_shard_writes(directory.path(), 0, u32::MAX);
     let failed = request(left_addr, &resp(&[&[b"SET", b"lock:b", b"x"]]));
 
-    assert_eq!(failed, b"+OK\r\n");
+    // Its write fails on the WAL writer thread while the reply waits for it: the connection
+    // closes with no reply, as for a failed grouped write.
+    assert!(failed.is_empty(), "{failed:?}");
     wait_persistence_error(left_addr);
     for refused in [
         &[&b"SET"[..], b"lock:a", b"new"][..],
@@ -2607,12 +2608,13 @@ fn a_hot_key_write_whose_log_write_failed_is_written_when_the_log_resumes() {
     let (left_addr, right_addr, stop, left_server, right_server) = start(persistence.clone());
 
     fail_shard_writes(directory.path(), 0, 1);
-    // Acknowledged once the writer thread has it; the write there fails.
     let failed = request(left_addr, &resp(&[&[b"SET", b"lock:a", b"kept"]]));
 
     wait_persistence_error(left_addr);
     stop_failing_writes(directory.path());
-    assert_eq!(failed, b"+OK\r\n");
+    // Its write fails on the WAL writer thread while the reply waits for it: the connection
+    // closes with no reply, as for a failed grouped write.
+    assert!(failed.is_empty(), "{failed:?}");
     assert_eq!(
         request(right_addr, &resp(&[&[b"GET", b"lock:a"]])),
         b"$4\r\nkept\r\n"

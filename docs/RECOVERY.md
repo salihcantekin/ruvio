@@ -17,7 +17,7 @@ are contractual bounds, not measured SLAs on a particular disk.
 | --- | --- | --- |
 | `memory` | All in-memory state | Entire process lifetime |
 | `snapshot` | Writes after the last durable `CURRENT` | Last checkpoint interval, plus in-flight `SAVE` |
-| `everysec` | Writes not yet synchronized, including records the shard's WAL writer thread had not yet written to the kernel when the process died | One `sync_interval_ms` / `RUVIO_WAL_SYNC_INTERVAL_MS` / `--wal-sync-interval-ms` (default 1000). `60000` is about one minute. Storage or scheduler stalls can widen the window. |
+| `everysec` | Writes accepted by the kernel but not yet synchronized | One `sync_interval_ms` / `RUVIO_WAL_SYNC_INTERVAL_MS` / `--wal-sync-interval-ms` (default 1000). `60000` is about one minute. Storage or scheduler stalls can widen the window. |
 | `always` | Only a write that was never acknowledged | Torn final WAL record. Acknowledged writes must survive process and OS restart when the filesystem honors the documented sync semantics. |
 
 A lost connection around a write is an unknown outcome. Replay applies a WAL

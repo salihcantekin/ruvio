@@ -1008,11 +1008,8 @@ fn evented_shutdown_after_wal_append_failure_keeps_memory_and_log_consistent() {
         false
     });
     assert!(ready, "fault-injection server failed to start");
-    // The write is acknowledged once the writer thread has it; its write there fails...
-    assert_eq!(
-        request(address, &resp(&[&[b"SET", b"failed", b"no"]])),
-        b"+OK\r\n"
-    );
+    // The write is never acknowledged...
+    assert!(request(address, &resp(&[&[b"SET", b"failed", b"no"]])).is_empty());
     // ...but what memory holds after it is what the log holds after a restart.
     let in_memory = request(address, &resp(&[&[b"GET", b"failed"]]));
     stop.request();
@@ -1029,11 +1026,10 @@ fn evented_shutdown_after_wal_append_failure_keeps_memory_and_log_consistent() {
     join_within(server, PATIENCE).unwrap();
 }
 
-/// Under `always` the refused record rolls the transaction back and the client gets no
-/// acknowledgement. Under `everysec` it is staged with its group and acknowledged once handed
-/// to the writer thread, so the failed write there leaves it applied and kept for the log's
-/// recovery, like a plain grouped write (see docs/RECOVERY.md). Either way memory and the log
-/// agree after a restart.
+/// Under `always` the refused record rolls the transaction back. Under `everysec` it is staged
+/// with its group, so the failed group write leaves it applied and kept for the log's
+/// recovery, like a plain grouped write (see docs/RECOVERY.md). Either way the client gets no
+/// acknowledgement, and memory and the log agree after a restart.
 #[test]
 fn evented_transaction_refused_by_the_wal_leaves_memory_and_log_alike() {
     transaction_refused_by_the_wal_leaves_memory_and_log_alike(crate::DurabilityProfile::Always);
@@ -1099,10 +1095,9 @@ fn transaction_refused_by_the_wal_leaves_memory_and_log_alike(profile: crate::Du
     batch.extend(resp(&[&[b"EXEC"]]));
     let replied = request(address, &batch);
 
-    assert_eq!(
-        replied.windows(6).any(|window| window == b"*5\r\n$3"),
-        profile == crate::DurabilityProfile::Everysec,
-        "{profile:?}: {}",
+    assert!(
+        !replied.windows(6).any(|window| window == b"*5\r\n$3"),
+        "the refused batch was acknowledged: {}",
         String::from_utf8_lossy(&replied)
     );
     let mut check = resp(&[&[b"GET", b"{t}a"]]);
@@ -1357,8 +1352,8 @@ fn evented_write_larger_than_a_wal_segment_gets_a_clear_error_and_no_misconf() {
 }
 
 /// Under `everysec` a pipeline of plain writes, scripts and transactions is one WAL write,
-/// handed to the writer thread before any of its replies leaves, so a process kill once it
-/// wrote them keeps every acknowledged write.
+/// made before any of its replies leaves, so a process kill right after the replies keeps
+/// every acknowledged write.
 #[test]
 fn an_everysec_pipeline_of_scripts_and_transactions_is_one_wal_write() {
     let directory = tempfile::tempdir().unwrap();
@@ -1390,7 +1385,6 @@ fn an_everysec_pipeline_of_scripts_and_transactions_is_one_wal_write() {
         .unwrap()
         .push((directory.path().to_path_buf(), 0));
     let replies = request(address, &payload);
-    crate::persistence::settle_wal_writers(directory.path());
     let writes = {
         let mut counted = crate::persistence::COUNTED_WRITE_DIRS.lock().unwrap();
         let position = counted
@@ -1406,9 +1400,7 @@ fn an_everysec_pipeline_of_scripts_and_transactions_is_one_wal_write() {
     );
     assert_eq!(writes, 1);
 
-    // A kill once the writer thread wrote what was acknowledged: the copy holds what reached
-    // the kernel, synced or not.
-    crate::persistence::settle_wal_writers(directory.path());
+    // A kill: the copy holds what reached the kernel, synced or not.
     let killed = tempfile::tempdir().unwrap();
 
     copy_dir(directory.path(), killed.path());
@@ -1434,8 +1426,8 @@ fn an_everysec_pipeline_of_scripts_and_transactions_is_one_wal_write() {
 }
 
 /// Under `everysec` single-command clients served in one scheduler turn share one WAL
-/// write, handed to the writer thread before any of their replies leaves: a process kill
-/// once it wrote them keeps every acknowledged write.
+/// write, made before any of their replies leaves: a process kill right after the replies
+/// keeps every acknowledged write.
 #[test]
 fn everysec_clients_served_in_one_turn_share_a_wal_write() {
     const CLIENTS: usize = 16;
@@ -1480,7 +1472,6 @@ fn everysec_clients_served_in_one_turn_share_a_wal_write() {
             assert_eq!(&reply, b"+OK\r\n");
             acknowledged += 1;
         }
-        crate::persistence::settle_wal_writers(directory.path());
         fewest = fewest.min(usize::try_from(written(directory.path()) - before).unwrap());
         if fewest < CLIENTS {
             break;
@@ -1492,9 +1483,7 @@ fn everysec_clients_served_in_one_turn_share_a_wal_write() {
         .retain(|(dir, _)| dir != directory.path());
     assert!(fewest < CLIENTS, "every client wrote on its own");
 
-    // A kill once the writer thread wrote what was acknowledged: the copy holds what reached
-    // the kernel, synced or not.
-    crate::persistence::settle_wal_writers(directory.path());
+    // A kill: the copy holds what reached the kernel, synced or not.
     let killed = tempfile::tempdir().unwrap();
 
     copy_dir(directory.path(), killed.path());
@@ -1574,10 +1563,9 @@ fn an_everysec_grouped_script_or_transaction_whose_write_fails_acts_like_a_plain
             .lock()
             .unwrap()
             .retain(|(dir, _, _)| dir != directory.path());
-        // The group's one write fails on the writer thread, after its replies left: under
-        // `everysec` they are acknowledged once handed over, as a plain write's.
+        // The group's one write failed: no reply at all, not even the plain write's.
         assert!(
-            refused.ends_with(b"+OK\r\n") && !refused.contains(&b'-'),
+            refused.is_empty(),
             "{:?}",
             String::from_utf8_lossy(&refused)
         );
@@ -1591,24 +1579,6 @@ fn an_everysec_grouped_script_or_transaction_whose_write_fails_acts_like_a_plain
             request(address, &resp(&[&[b"SET", b"later", b"v"]])),
             b"+OK\r\n"
         );
-        // A kill once the writer thread has written it.
-        let deadline = Instant::now() + PATIENCE;
-        while !crate::persistence::inspect_shard_wal(
-            directory.path(),
-            0,
-            crate::protocol::ProtocolLimits::default(),
-            persistence.wal_segment_bytes,
-            0,
-        )
-        .unwrap()
-        .0
-        .iter()
-        .any(|(_, mutation)| {
-            matches!(mutation, crate::OwnedMutation::SetBytes { key, .. } if key == b"later")
-        }) {
-            assert!(Instant::now() < deadline, "the write never reached the log");
-            thread::sleep(Duration::from_millis(1));
-        }
         let killed = tempfile::tempdir().unwrap();
 
         copy_dir(directory.path(), killed.path());
@@ -1762,10 +1732,11 @@ fn logged_keys(directory: &std::path::Path) -> Vec<Vec<u8>> {
     .collect()
 }
 
-/// A disk that stops answering holds only the shard's WAL writer thread. The shard keeps
-/// answering health checks and reads, and `everysec` writes are acknowledged, while none of
-/// their records reaches the file; once the disk answers they are all written, in order.
-/// A coordinator that checks the shard meanwhile sees it alive and does not fail it over.
+/// A disk that stops answering holds only the shard's WAL writer thread. `everysec` replies
+/// wait until their records reach the kernel, so a process kill loses no acknowledged write,
+/// but the shard itself keeps answering health checks and a coordinator's `ROLE` and `INFO`,
+/// so it is not failed over. Once the disk answers the records are written, in order, and
+/// the replies leave.
 #[test]
 fn an_everysec_shard_keeps_answering_while_its_wal_writes_are_stalled() {
     let directory = tempfile::tempdir().unwrap();
@@ -1781,34 +1752,52 @@ fn an_everysec_shard_keeps_answering_while_its_wal_writes_are_stalled() {
         b"+OK\r\n"
     );
     let stalled = StalledWrites::new(directory.path());
+    let mut writer = StdTcpStream::connect(address).unwrap();
+    let mut pipeline = Vec::new();
+
+    for index in 0..20 {
+        pipeline.extend(resp(&[&[
+            b"SET",
+            format!("during-{index}").as_bytes(),
+            b"v",
+        ]]));
+    }
+    writer.set_read_timeout(Some(PATIENCE)).unwrap();
+    writer.write_all(&pipeline).unwrap();
     // A reply that waited for the stalled writer would not come within a stall that lasts
     // until the test releases it.
     let quick = Duration::from_secs(5);
 
-    for index in 0..20 {
-        let key = format!("during-{index}");
-
-        assert_eq!(
-            request_within(address, &resp(&[&[b"SET", key.as_bytes(), b"v"]]), quick),
-            b"+OK\r\n"
-        );
+    for _ in 0..20 {
         assert_eq!(
             request_within(address, &resp(&[&[b"PING"]]), quick),
             b"+PONG\r\n"
         );
-        assert_eq!(
-            request_within(address, &resp(&[&[b"GET", b"before"]]), quick),
-            b"$1\r\nv\r\n"
-        );
-        assert_eq!(
-            request_within(address, &resp(&[&[b"GET", key.as_bytes()]]), quick),
-            b"$1\r\nv\r\n"
-        );
+        let role = request_within(address, &resp(&[&[b"ROLE"]]), quick);
+
+        assert!(role.starts_with(b"*3\r\n$6\r\nmaster\r\n"), "{role:?}");
+        let info = request_within(address, &resp(&[&[b"INFO", b"replication"]]), quick);
+
+        assert!(info.windows(13).any(|w| w == b"# Replication"), "{info:?}");
     }
     assert_eq!(logged_keys(directory.path()), [b"before".to_vec()]);
+    // Not acknowledged while the records cannot reach the kernel.
+    writer.set_nonblocking(true).unwrap();
+    let mut reply = [0u8; 5];
+    let early = writer.read(&mut reply);
+
+    assert!(
+        matches!(&early, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "{early:?}"
+    );
+    writer.set_nonblocking(false).unwrap();
 
     drop(stalled);
-    crate::persistence::settle_wal_writers(directory.path());
+    let mut replies = vec![0u8; 5 * 20];
+
+    writer.read_exact(&mut replies).unwrap();
+    assert_eq!(replies, b"+OK\r\n".repeat(20));
+    // Acknowledged means written: a kill now keeps all of them.
     let mut expected = vec![b"before".to_vec()];
 
     expected.extend((0..20).map(|index| format!("during-{index}").into_bytes()));

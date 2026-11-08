@@ -752,6 +752,8 @@ pub(super) async fn handle_client(
                             session.tracking,
                         )?
                     {
+                        // Its reply can show a hot-key record: the batch's reply waits for it.
+                        wal_group.quiet = false;
                         continue;
                     }
 

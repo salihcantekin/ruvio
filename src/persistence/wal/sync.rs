@@ -137,6 +137,15 @@ impl WalSink {
         Ok(())
     }
 
+    /// After `publish_before_reply` or `publish_through`: a wait for the records up to
+    /// `through` that were handed to the writer to reach the kernel, `None` if they have.
+    /// An `everysec` reply sends after it, so a process kill loses no acknowledged write,
+    /// while a stalled disk holds only the replies, not the shard.
+    /// `wrote`: the reply's connection may have written some of these records.
+    pub(crate) fn written_wait(&self, through: u64, wrote: bool) -> Option<super::WrittenWait> {
+        self.writer.written_wait(through, wrote)
+    }
+
     /// An `everysec` reply that waits for records staged in memory (its own or another
     /// task's) may wait for the end of the scheduler turn instead of writing them now, so
     /// every connection served in the turn shares one `write`. True when there is such a

@@ -50,6 +50,7 @@ pub use tooling::{
 };
 
 pub(crate) use wal::REPLICA_HOLDS_DROPPED;
+pub(crate) use wal::WrittenWait;
 pub(crate) use wal::{FrameCursor, read_frames_resuming};
 pub use wal::{FrameRead, RecoveredMutations, RecoveryReport, WalSink, read_frames};
 

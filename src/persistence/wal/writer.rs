@@ -84,6 +84,21 @@ pub(super) struct WriterShared {
     progress: Condvar,
     physical: Mutex<Physical>,
     written: AtomicU64,
+    /// Woken when `written` moves or the writer fails or stops. Only one task on the shard
+    /// thread waits here (`watch_written`) and wakes the replies waiting on `written_local`:
+    /// a write wakes one task across threads, not every waiting connection.
+    written_ready: tokio::sync::Notify,
+    /// `everysec` replies waiting for their records to reach the kernel (`WrittenWait`); only
+    /// the shard thread touches it.
+    written_local: tokio::sync::Notify,
+    /// Replies waiting on `written_local`, and whether `watch_written` runs for them.
+    written_waiters: AtomicU64,
+    watching: AtomicBool,
+    /// `Queue::stopped`, readable without the queue's lock.
+    stopped: AtomicBool,
+    /// The last sequence handed to the writer: a reply never waits for records still
+    /// staged on the shard (a failed log keeps them there until recovery).
+    handed: AtomicU64,
     /// The last sequence the shard published; readers see it once it is written too.
     publish_target: AtomicU64,
     published: Arc<AtomicU64>,
@@ -133,6 +148,12 @@ impl Writer {
             progress: Condvar::new(),
             physical: Mutex::new(physical),
             written: AtomicU64::new(written),
+            written_ready: tokio::sync::Notify::new(),
+            written_local: tokio::sync::Notify::new(),
+            written_waiters: AtomicU64::new(0),
+            watching: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            handed: AtomicU64::new(written),
             publish_target: AtomicU64::new(published.load(Ordering::Acquire)),
             published,
             durable,
@@ -192,6 +213,7 @@ impl Writer {
             queued.extend_from_slice(bytes);
             *queued_last = last_sequence;
             queue.bytes += bytes.len() as u64;
+            self.shared.handed.store(last_sequence, Ordering::Release);
             return Ok(());
         }
         let mut buffer = queue
@@ -200,6 +222,7 @@ impl Writer {
             .unwrap_or_else(|| Vec::with_capacity(SPARE_BUFFER_BYTES.max(bytes.len())));
 
         buffer.extend_from_slice(bytes);
+        self.shared.handed.store(last_sequence, Ordering::Release);
         self.push(
             queue,
             Op::Write {
@@ -306,13 +329,128 @@ impl Writer {
     /// Every record up to `sequence` is in the file and published (a new base, after a drain).
     pub(super) fn reset_cursors(&self, sequence: u64) {
         self.shared.written.store(sequence, Ordering::SeqCst);
+        self.shared.handed.store(sequence, Ordering::Release);
         self.shared.publish_target.store(sequence, Ordering::SeqCst);
         self.shared.published.store(sequence, Ordering::Release);
+        self.shared.written_ready.notify_waiters();
+    }
+
+    /// A wait for the records up to `sequence` to reach the kernel, or `None` when they
+    /// already have or no writer thread runs (such a log writes nothing). After a failed
+    /// write the unwritten records wait for recovery: a reply that only read does not wait
+    /// for them, as when the shard wrote them itself (refusing it would cut off every client
+    /// of the shard, readers too), while one whose connection `wrote` fails with them.
+    pub(super) fn written_wait(&self, sequence: u64, wrote: bool) -> Option<WrittenWait> {
+        let sequence = sequence.min(self.shared.handed.load(Ordering::Acquire));
+
+        if self.thread.is_none()
+            || self.shared.written.load(Ordering::Acquire) >= sequence
+            || (!wrote && self.shared.failed.load(Ordering::Acquire))
+        {
+            return None;
+        }
+
+        Some(WrittenWait {
+            shared: Arc::clone(&self.shared),
+            sequence,
+        })
     }
 
     /// The writer, for a sync that must cover records up to a sequence.
     pub(super) fn source(&self) -> Arc<WriterShared> {
         Arc::clone(&self.shared)
+    }
+}
+
+/// An `everysec` reply's wait for its records to be written (not synced): a process kill
+/// then loses no acknowledged write, as when the shard wrote them itself, while the shard
+/// keeps serving other clients if the disk stalls.
+pub(crate) struct WrittenWait {
+    shared: Arc<WriterShared>,
+    sequence: u64,
+}
+
+impl WrittenWait {
+    /// Runs on the shard's `LocalSet`, as the connections that call it do.
+    pub(crate) async fn wait(&self) -> io::Result<()> {
+        let shared = &self.shared;
+        let _waiting = WaitingReply::new(shared);
+
+        loop {
+            // Register before checking: `notify_waiters` stores no permit.
+            let notified = shared.written_local.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(result) = shared.written_outcome(self.sequence) {
+                return result;
+            }
+            if !shared.watching.swap(true, Ordering::AcqRel) {
+                tokio::task::spawn_local(watch_written(Arc::clone(shared)));
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Counts a reply waiting on `written_local` while it lives.
+struct WaitingReply<'a>(&'a WriterShared);
+
+impl<'a> WaitingReply<'a> {
+    fn new(shared: &'a WriterShared) -> Self {
+        shared.written_waiters.fetch_add(1, Ordering::AcqRel);
+        Self(shared)
+    }
+}
+
+impl Drop for WaitingReply<'_> {
+    fn drop(&mut self) {
+        self.0.written_waiters.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Wakes the shard's waiting replies each time the writer makes progress, while any wait.
+async fn watch_written(shared: Arc<WriterShared>) {
+    loop {
+        let notified = shared.written_ready.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        // Progress made before the registration above is seen by the replies woken here.
+        shared.written_local.notify_waiters();
+        if shared.written_waiters.load(Ordering::Acquire) == 0 {
+            shared.watching.store(false, Ordering::Release);
+            // A reply that began waiting after the count was read may have seen `watching`
+            // still set and started no watcher: keep watching for it.
+            if shared.written_waiters.load(Ordering::Acquire) == 0
+                || shared.watching.swap(true, Ordering::AcqRel)
+            {
+                return;
+            }
+            continue;
+        }
+        notified.await;
+    }
+}
+
+impl WriterShared {
+    /// `Some` once a reply waiting for records up to `sequence` can leave or must fail.
+    fn written_outcome(&self, sequence: u64) -> Option<io::Result<()>> {
+        if self.written.load(Ordering::Acquire) >= sequence {
+            return Some(Ok(()));
+        }
+        if self.failed.load(Ordering::Acquire) {
+            let message = self
+                .failure
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+                .unwrap_or_else(|| "WAL write failed".into());
+
+            return Some(Err(io::Error::other(message)));
+        }
+        if self.stopped.load(Ordering::Acquire) {
+            return Some(Err(io::Error::other("WAL writer stopped")));
+        }
+        None
     }
 }
 
@@ -322,9 +460,11 @@ impl Drop for Writer {
             let mut queue = self.shared.lock_queue();
 
             queue.stopped = true;
+            self.shared.stopped.store(true, Ordering::Release);
             self.shared.work.notify_all();
             self.shared.progress.notify_all();
         }
+        self.shared.written_ready.notify_waiters();
         if let Some(thread) = self.thread.take()
             && thread.join().is_err()
         {
@@ -356,6 +496,7 @@ impl WriterShared {
 
         self.published
             .fetch_max(sequence.min(target), Ordering::Release);
+        self.written_ready.notify_waiters();
     }
 
     pub(super) fn note_rewritten(&self, sequence: u64) {
@@ -373,6 +514,7 @@ impl WriterShared {
             .unwrap_or_else(|error| error.into_inner())
             .get_or_insert(message);
         self.failed.store(true, Ordering::Release);
+        self.written_ready.notify_waiters();
     }
 
     /// Waits until the records up to `sequence` are in the file, then syncs it. A record the
@@ -643,6 +785,7 @@ impl Drop for StopOnPanic<'_> {
         let mut queue = self.0.lock_queue();
 
         queue.stopped = true;
+        self.0.stopped.store(true, Ordering::Release);
         queue.busy = false;
         self.0.progress.notify_all();
     }
