@@ -560,8 +560,11 @@ struct ClusterCheckpointState {
     hot_blocked: bool,
     /// The newest round opened and the creation of its directory, made once by whichever
     /// writer gets there first (see `prepare_round`), never under this lock.
-    prepared: Option<(u64, Arc<OnceLock<Result<(), String>>>)>,
+    prepared: Option<(u64, Arc<RoundDirectory>)>,
 }
+
+/// A round's directory, created once by the first writer that needs it (`prepare_round`).
+type RoundDirectory = OnceLock<Result<(), String>>;
 
 /// Clears a shard's carrying mark when its copy ends (see `carry_published_file`).
 struct CarryingMark<'a> {
@@ -799,7 +802,7 @@ impl ClusterCheckpointCoordinator {
         // Past every round ever started: one that failed after CURRENT may be published.
         let generation = manager.allocate_generation(state.generation)?;
 
-        state.prepared = Some((generation, Arc::new(OnceLock::new())));
+        state.prepared = Some((generation, Arc::new(RoundDirectory::new())));
         state.open = Some(generation);
         state.hot_tried_at = None;
         Ok(generation)

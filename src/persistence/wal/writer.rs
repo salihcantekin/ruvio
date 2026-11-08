@@ -21,6 +21,8 @@ const WAL_WRITER_QUEUE_BYTES: u64 = 64 * 1024 * 1024;
 /// Write buffers kept for reuse, and the largest one kept.
 const SPARE_BUFFERS: usize = 8;
 const SPARE_BUFFER_BYTES: usize = 256 * 1024;
+/// Room for queued operations before the queue grows.
+const OPS_CAPACITY: usize = 16;
 
 /// Work on the files that runs in order with the writes.
 pub(super) type Task = Box<dyn FnOnce(&mut Physical, &WriterShared) + Send>;
@@ -112,7 +114,21 @@ impl Writer {
         #[cfg(test)]
         let data_dir = physical.data_dir.clone();
         let shared = Arc::new(WriterShared {
-            queue: Mutex::new(Queue::default()),
+            queue: Mutex::new(Queue {
+                // Two buffers, one filling while the writer writes the other, cover the steady
+                // state. Untouched capacity is not resident.
+                spare: if spawn {
+                    (0..2)
+                        .map(|_| Vec::with_capacity(SPARE_BUFFER_BYTES))
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                // The shard and the writer swap this with the writer's own queue; both start
+                // with room so a push on the shard does not allocate.
+                ops: VecDeque::with_capacity(if spawn { OPS_CAPACITY } else { 0 }),
+                ..Queue::default()
+            }),
             work: Condvar::new(),
             progress: Condvar::new(),
             physical: Mutex::new(physical),
@@ -155,12 +171,37 @@ impl Writer {
             super::crash::take_io_fault(super::crash::CrashSite::Append).is_some(),
             super::crash::take_io_fault(super::crash::CrashSite::PrefillSync).is_some(),
         );
-        let mut queue = self.wait_for_space(bytes.len() as u64)?;
-        let mut buffer = queue.spare.pop().unwrap_or_default();
+        let mut guard = self.wait_for_space(bytes.len() as u64)?;
+        let queue = &mut *guard;
+
+        // A write the writer has not taken yet absorbs this one: the shard and the writer then
+        // swap two warm buffers instead of one per append, and the steady state allocates nothing.
+        #[cfg(test)]
+        let joins = fault == (false, false);
+        #[cfg(not(test))]
+        let joins = true;
+        if joins
+            && let Some(Op::Write {
+                bytes: queued,
+                last_sequence: queued_last,
+                #[cfg(test)]
+                    fault: (false, false),
+            }) = queue.ops.back_mut()
+            && (queued.capacity() - queued.len() >= bytes.len() || queue.spare.is_empty())
+        {
+            queued.extend_from_slice(bytes);
+            *queued_last = last_sequence;
+            queue.bytes += bytes.len() as u64;
+            return Ok(());
+        }
+        let mut buffer = queue
+            .spare
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(SPARE_BUFFER_BYTES.max(bytes.len())));
 
         buffer.extend_from_slice(bytes);
         self.push(
-            &mut queue,
+            queue,
             Op::Write {
                 bytes: buffer,
                 last_sequence,
@@ -609,7 +650,7 @@ impl Drop for StopOnPanic<'_> {
 
 fn run(shared: &WriterShared) {
     let _stop_on_panic = StopOnPanic(shared);
-    let mut batch = VecDeque::new();
+    let mut batch = VecDeque::with_capacity(OPS_CAPACITY);
     let mut scratch = Vec::new();
     let mut done = Vec::new();
 
