@@ -20,7 +20,7 @@ COPY --from=web /web/dist /src/ruvio-ui/web/dist
 WORKDIR /src/ruvio-ui
 RUN cargo build --locked --release
 
-FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
 LABEL org.opencontainers.image.title="Ruvio UI" \
       org.opencontainers.image.description="Browser operator console for a Ruvio server." \
