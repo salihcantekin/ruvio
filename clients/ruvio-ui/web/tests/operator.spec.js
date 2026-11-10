@@ -77,7 +77,7 @@ async function nav(page, name) {
 }
 
 async function selectShard(page, id) {
-  const dropdown = page.locator(".scope-dropdown");
+  const dropdown = page.locator(".scope-dropdown").first();
   if (!(await dropdown.evaluate((element) => element.open))) await dropdown.locator("summary").click();
   await dropdown.getByRole("checkbox", { name: new RegExp(`Shard ${id}`) }).check();
   await dropdown.locator("summary").click();
@@ -645,4 +645,29 @@ test("the dashboard draws the chosen charts from the probe readings and remember
   // Every chart comes from the probe: the dashboard sends no command of its own.
   expect(requests.filter((item) => item.path === "/api/command")).toEqual([]);
   expect(errors).toEqual([]);
+});
+
+test("database dropdown shows key counts, dims empty databases and selects", async ({ page }) => {
+  const { requests } = await setup(page, {
+    shards: [shards[0]],
+    command: (args) => args[0] === "INFO" && args[1] === "keyspace"
+      ? { ok: true, value: bulk("# Keyspace\r\ndb0:keys=12,expires=0,avg_ttl=0\r\ndb3:keys=1200,expires=0,avg_ttl=0\r\n") }
+      : undefined,
+  });
+  await page.getByRole("button", { name: "Open operator panel" }).click();
+  await expect(page.getByRole("heading", { name: "Overview", exact: true })).toBeVisible();
+  await page.locator(".db-dropdown > summary").click();
+  await expect(page.getByRole("option", { name: "DB 3 · 1,200 keys" })).toBeVisible();
+  await expect(page.getByRole("option", { name: "DB 5 · empty" })).toHaveClass(/empty/);
+  await page.getByRole("option", { name: "DB 3 · 1,200 keys" }).click();
+  await expect(page.locator(".db-dropdown > summary")).toHaveText("DB 3");
+  expect(requests.some((r) => r.path === "/api/command" && r.body.args[0] === "SELECT" && r.body.args[1] === "3")).toBe(true);
+});
+
+test("database dropdown allows only DB 0 when several shards are present", async ({ page }) => {
+  await setup(page);
+  await signIn(page);
+  await page.locator(".db-dropdown > summary").click();
+  await expect(page.getByRole("option", { name: "DB 0" })).toBeEnabled();
+  await expect(page.getByRole("option", { name: "DB 1", exact: true })).toBeDisabled();
 });
