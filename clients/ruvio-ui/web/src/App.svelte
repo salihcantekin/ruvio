@@ -9,7 +9,7 @@
       if (event.type === "keydown" ? event.key === "Escape" : !menu.contains(event.target)) menu.open = false;
     }
   }
-  import { api } from "./api.js";
+  import { api, textOf } from "./api.js";
   import { execute, nodeId, scanOwners, scanSelected, setDatabase, onDatabase, currentDatabase } from "./operator.js";
   import { preference, savePreference } from "./preferences.js";
   import { summarize } from "./value.js";
@@ -22,6 +22,7 @@
   import PubSub from "./PubSub.svelte";
   import Users from "./Users.svelte";
   import Console from "./Console.svelte";
+  import { parseKeyspace, dbLabel } from "./keyspace.js";
   import ThemeToggle from "./ThemeToggle.svelte";
 
   const navigation = [
@@ -59,6 +60,7 @@
   let pubsubDatabase = $state("0");
   let currentDb = $state(0);
   let dbMenu = $state();
+  let dbCounts = $state(null);
   let scopeBusy = $derived(switching || pubBusy || activeCommands > 0);
   let task = $state("locking");
   let lines = $state([]);
@@ -266,6 +268,15 @@
     }
   }
 
+  async function loadDbCounts(event) {
+    if (!event.currentTarget.open || shards.length > 1) return;
+    try {
+      dbCounts = parseKeyspace(textOf(await execute(["INFO", "keyspace"], shard ? { host: shard.host, port: shard.port } : null)));
+    } catch {
+      dbCounts = null;
+    }
+  }
+
   async function pickDatabase(index) {
     if (scopeBusy || currentDb === index) return;
     switching = true;
@@ -371,22 +382,22 @@
           <p class="hint">Multiple selections filter Overview and Data scans. Keyed commands still route to their owner. One selection pins commands to that shard.</p>
         </div>
       </details>
-      <details class="scope-dropdown db-dropdown" bind:this={dbMenu}>
+      <details class="scope-dropdown db-dropdown" bind:this={dbMenu} ontoggle={loadDbCounts}>
         <summary title="Select database">{scopeBusy ? "DB..." : `DB ${currentDb}`}</summary>
-        <div class="scope-menu db-menu" role="group" aria-label="Database selector">
-          <p class="eyebrow">SELECT DATABASE</p>
-          <div class="db-grid">
-            {#each Array.from({ length: 16 }, (_, i) => i) as db}
-              <button
-                type="button"
-                class:on={currentDb === db}
-                disabled={scopeBusy || (shards.length > 1 && db !== 0)}
-                onclick={() => pickDatabase(db)}
-              >
-                {db}
-              </button>
-            {/each}
-          </div>
+        <div class="scope-menu db-menu" role="listbox" aria-label="Database selector">
+          {#each Array.from({ length: 16 }, (_, i) => i) as db}
+            <button
+              type="button"
+              role="option"
+              aria-selected={currentDb === db}
+              class:on={currentDb === db}
+              class:empty={dbCounts && !dbCounts[db] && currentDb !== db}
+              disabled={scopeBusy || (shards.length > 1 && db !== 0)}
+              onclick={() => pickDatabase(db)}
+            >
+              {dbLabel(db, shards.length > 1 ? null : dbCounts)}
+            </button>
+          {/each}
           {#if shards.length > 1}
             <p class="hint">Multiple shards detected. SELECT is not allowed in cluster mode.</p>
           {/if}

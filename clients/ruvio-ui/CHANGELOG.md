@@ -6,7 +6,7 @@ Notable changes to `ruvio-ui`, the web console (Docker image and host binaries).
 
 - UI session generation falls back gracefully when `crypto.randomUUID` is unavailable, fixing blank screen errors when accessing the UI over plain HTTP IP addresses in non-secure contexts.
 
-- Database selector in the header: choose from databases 0 to 15, with the active database displayed and updated automatically when `SELECT` is executed from the console or any other command.
+- Database selector in the header: a compact dropdown of databases 0 to 15 that lists the number of keys in each one (read with `INFO keyspace` when the menu opens) and dims empty databases. The active database is updated automatically when `SELECT` is executed from the console or any other command; in a cluster only database 0 can be chosen.
 
 - New **Cluster** screen, read only: groups (by each node's `cluster-group`, else by process), shards with every slot range, a slot map, primaries and replicas with how far each replica is behind, and the cluster map version every node serves.
 - Optional coordinator view: set `RUVIO_UI_COORDINATORS` (`host:port,host:port`) and `RUVIO_UI_COORDINATOR_SECRET` to show the leader, each group's agreed primary, epoch, members answering and state, the slot move or rebalance in progress, and the failovers seen while the screen is open. The secret never reaches the browser, and the UI sends the coordinators only `INFO`, `SENTINEL masters`, `SENTINEL replicas` and `COORDINATOR STATUS`.
