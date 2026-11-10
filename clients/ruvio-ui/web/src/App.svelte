@@ -10,7 +10,7 @@
     }
   }
   import { api } from "./api.js";
-  import { execute, nodeId, scanOwners, scanSelected } from "./operator.js";
+  import { execute, nodeId, scanOwners, scanSelected, setDatabase, onDatabase, currentDatabase } from "./operator.js";
   import { preference, savePreference } from "./preferences.js";
   import { summarize } from "./value.js";
   import Overview from "./Overview.svelte";
@@ -57,6 +57,8 @@
   let pubBusy = $state(false);
   let activeCommands = $state(0);
   let pubsubDatabase = $state("0");
+  let currentDb = $state(0);
+  let dbMenu = $state();
   let scopeBusy = $derived(switching || pubBusy || activeCommands > 0);
   let task = $state("locking");
   let lines = $state([]);
@@ -144,6 +146,10 @@
 
   onMount(() => {
     let active = true;
+    const unsubDb = onDatabase((db) => {
+      currentDb = db;
+      pubsubDatabase = String(db);
+    });
     async function restore() {
       try {
         const session = await api("/api/session");
@@ -152,6 +158,9 @@
           host = session.host;
           port = session.port;
           username = session.username;
+          if (session.database != null) {
+            setDatabase(session.database);
+          }
           connected = true;
           await loadShards();
         } else {
@@ -171,7 +180,10 @@
       }
     }
     restore();
-    return () => { active = false; };
+    return () => {
+      active = false;
+      unsubDb();
+    };
   });
 
   function note(command, detail, ok = true, ms = null, location = scopeLabel) {
@@ -195,6 +207,7 @@
       coordinator = null;
       failovers = [];
       sessionError = "";
+      setDatabase(0);
       note("CONNECT", `${username || "default"} @ ${host}:${port}`);
       await loadShards();
     } catch (error) {
@@ -245,10 +258,26 @@
       password = "";
       shards = [];
       lines = [];
+      setDatabase(0);
     } catch (error) {
       sessionError = `Could not sign out: ${error.message}`;
     } finally {
       switching = false;
+    }
+  }
+
+  async function pickDatabase(index) {
+    if (scopeBusy || currentDb === index) return;
+    switching = true;
+    sessionError = "";
+    try {
+      await run(["SELECT", String(index)]);
+      setDatabase(index);
+    } catch (error) {
+      sessionError = `Could not select database: ${error.message}`;
+    } finally {
+      switching = false;
+      if (dbMenu) dbMenu.open = false;
     }
   }
 
@@ -264,6 +293,10 @@
         : !destination && args[0] === "SCAN"
         ? await scanOwners(args, (page) => execute(page, destination))
         : await execute(args, destination);
+      if (currentDatabase() !== currentDb) {
+        currentDb = currentDatabase();
+        pubsubDatabase = String(currentDb);
+      }
       note(label, args[0] === "ACL" ? "Completed" : summarize(value), true, performance.now() - started, location);
       return value;
     } catch (error) {
@@ -338,6 +371,27 @@
           <p class="hint">Multiple selections filter Overview and Data scans. Keyed commands still route to their owner. One selection pins commands to that shard.</p>
         </div>
       </details>
+      <details class="scope-dropdown db-dropdown" bind:this={dbMenu}>
+        <summary title="Select database">{scopeBusy ? "DB..." : `DB ${currentDb}`}</summary>
+        <div class="scope-menu db-menu" role="group" aria-label="Database selector">
+          <p class="eyebrow">SELECT DATABASE</p>
+          <div class="db-grid">
+            {#each Array.from({ length: 16 }, (_, i) => i) as db}
+              <button
+                type="button"
+                class:on={currentDb === db}
+                disabled={scopeBusy || (shards.length > 1 && db !== 0)}
+                onclick={() => pickDatabase(db)}
+              >
+                {db}
+              </button>
+            {/each}
+          </div>
+          {#if shards.length > 1}
+            <p class="hint">Multiple shards detected. SELECT is not allowed in cluster mode.</p>
+          {/if}
+        </div>
+      </details>
       <ThemeToggle />
       <button class="quiet" onclick={disconnect} aria-disabled={scopeBusy}>Sign out</button>
     </header>
@@ -369,9 +423,9 @@
             <Cluster {shards} {readings} {coordinator} {coordinatorsConfigured} {failovers} {topologyNotice} bind:interval bind:paused {refreshing} {updated} {probeError} refresh={refreshNow} reload={loadShards} />
           {:else if section === "data"}
             <header class="page-head"><div><p class="eyebrow">EXPLORE & MANAGE</p><h1>Data</h1><p>Find a key, inspect its value, or manage its lifetime.</p></div><button onclick={() => openTask("strings")}>Write data <span aria-hidden="true">&rarr;</span></button></header>
-            {#key scope}<Browser {run} />{/key}
+            {#key `${scope}-db${currentDb}`}<Browser {run} />{/key}
           {:else if section === "tasks"}
-            {#key scope}<Tasks {run} initial={task} {scopeLabel} />{/key}
+            {#key `${scope}-db${currentDb}`}<Tasks {run} initial={task} {scopeLabel} />{/key}
           {:else if section === "users"}
             <header class="page-head"><div><p class="eyebrow">ACCESS CONTROL</p><h1>ACL users</h1><p>Inspect access and update live server users.</p></div><span class="badge">Signed in as {username || "default"}</span></header>
             {#key scope}<Users {run} />{/key}
