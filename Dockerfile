@@ -1,4 +1,4 @@
-FROM rust:1.99.1-slim-bookworm@sha256:24707e70a4f1e23d9a7b25202ec43126d28a52294b96aad5c670df1fd1f1d400 AS builder
+FROM rust:1.99.1-slim-bookworm@sha256:f2c004e3d2d8b547e8cf7ffbc29205385f4e71d23e53e4e383065db5e9f822cd AS builder
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential \
@@ -8,7 +8,7 @@ WORKDIR /src
 COPY . .
 RUN cargo build --locked --release --bin ruvio --bin ruvio-ctl
 
-FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
 LABEL org.opencontainers.image.title="Ruvio" \
       org.opencontainers.image.description="Ruvio server: a memory-first key-value store that speaks the Redis protocol (RESP2)." \
