@@ -555,7 +555,7 @@ class LongRunPieces(unittest.TestCase):
         self.assertEqual(criteria[11]["status"], "pass", criteria[11])
         self.assertEqual(criteria[11]["value"]["placements"], 2)
 
-    def test_one_checkpoint_dip_in_eight_minutes_is_allowed(self):
+    def test_a_quarter_of_the_minutes_may_dip_in_the_throughput(self):
         from ruvio_soak import report
 
         steady = [100, 101, 99, 100, 102, 98, 100, 100]
@@ -564,10 +564,133 @@ class LongRunPieces(unittest.TestCase):
         judged = report._throughput_minutes(one_dip)
         self.assertTrue(judged["steady"], judged)
         self.assertEqual(judged["dips"], [0.9])
-        # Two dips in eight minutes, a dip deeper than -15 %, or a wide spread fail.
-        self.assertFalse(report._throughput_minutes([100, 90, 99, 90, 102, 98, 100, 100])["steady"])
-        self.assertFalse(report._throughput_minutes([100, 101, 99, 80, 102, 98, 100, 100])["steady"])
-        self.assertFalse(report._throughput_minutes([100, 112, 99, 100, 102, 98, 100, 100])["steady"])
+        # Two dips in eight minutes, a dip to -20 % and a +-6 % spread are within the limits.
+        self.assertTrue(report._throughput_minutes([100, 90, 99, 90, 102, 98, 100, 100])["steady"])
+        self.assertTrue(report._throughput_minutes([100, 101, 99, 80, 102, 98, 100, 100])["steady"])
+        self.assertTrue(report._throughput_minutes([100, 112, 99, 100, 102, 98, 100, 100])["steady"])
+        # Three dips in eight minutes, a dip below -25 % or a +-10 % spread fail.
+        self.assertFalse(report._throughput_minutes([100, 90, 99, 90, 91, 98, 100, 100])["steady"])
+        self.assertFalse(report._throughput_minutes([100, 101, 99, 70, 102, 98, 100, 100])["steady"])
+        self.assertFalse(report._throughput_minutes([100, 120, 99, 100, 102, 98, 100, 100])["steady"])
+
+    def stall_hosts(self, directory, io_full_us_at):
+        """hosts.jsonl samples every 60 s from 0 to 9960 s on one node host; `io_full_us_at`
+        maps a sample time to the cumulative io_full_us (else 0)."""
+        (directory / "hosts.jsonl").write_text("".join(
+            json.dumps({"t": t, "host": "host0", "io_full_us": io_full_us_at(t)}) + "\n"
+            for t in range(0, 10000, 60)))
+
+    def test_failures_in_a_host_stall_minute_are_not_unexplained(self):
+        from ruvio_soak import report
+
+        # A stall sample at t=6000 (45 % of its 60 s interval) widens to 5910-6030.
+        def io(t):
+            return 0 if t < 6000 else 27_000_000
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            events = [{"event": "load-start", "t": 1, "mono": 10**9},
+                      {"event": "load-stop", "t": 10000, "mono": 10000 * 10**9}]
+            self.report_run(directory, [], events=events)
+            self.stall_hosts(directory, io)
+
+            def series(timeouts_at, ok=1000):
+                rows = []
+                for t in range(60, 10000, 60):
+                    counts = {"ok": ok}
+                    if t in timeouts_at:
+                        counts["timeout"] = 10
+                    rows.append({"t": t, "series": "durable:set", "counts": counts})
+                return "".join(json.dumps(r) + "\n" for r in rows)
+            (directory / "latency.jsonl").write_text(series({5940}))
+            first = {c["id"]: c for c in report.write(directory)["criteria"]}[7]
+            # Ten timeouts in a quiet minute: 10 > max(5, 0.16) fails.
+            (directory / "latency.jsonl").write_text(series({3000}))
+            second = {c["id"]: c for c in report.write(directory)["criteria"]}[7]
+            # Four timeouts outside a stall are within the allowance of 5.
+            rows = [json.loads(l) for l in series({3000}).splitlines()]
+            for r in rows:
+                r["counts"]["timeout"] = 4 if "timeout" in r["counts"] else 0
+                if not r["counts"]["timeout"]:
+                    del r["counts"]["timeout"]
+            (directory / "latency.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+            third = {c["id"]: c for c in report.write(directory)["criteria"]}[7]
+            # Past 5 the allowance is one per million ok ops: 20 failures among 300 M ok ops pass.
+            big = [{"t": t, "series": "durable:set", "counts": {"ok": 300_000_000 if t == 60 else 1000,
+                                                                "timeout": 20 if t == 3000 else 0}}
+                   for t in range(60, 10000, 60)]
+            for r in big:
+                if not r["counts"]["timeout"]:
+                    del r["counts"]["timeout"]
+            (directory / "latency.jsonl").write_text("".join(json.dumps(r) + "\n" for r in big))
+            fourth = {c["id"]: c for c in report.write(directory)["criteria"]}[7]
+        self.assertEqual(first["status"], "pass", first)
+        self.assertEqual(first["value"], {"unexplained": 0, "during_host_stall": 10})
+        self.assertEqual(first["details"]["during_host_stall"], {"durable:set:timeout": 10})
+        self.assertEqual(second["status"], "fail", second)
+        self.assertEqual(second["value"], {"unexplained": 10, "during_host_stall": 0})
+        self.assertEqual(third["status"], "pass", third)
+        self.assertEqual(fourth["status"], "pass", fourth)
+
+    def test_stall_minutes_are_left_out_of_the_throughput_groups(self):
+        from ruvio_soak import report
+
+        # A flat 300 ops per minute with one minute at 150 (during a stall) in each of two
+        # runs: left out, the placement is steady; counted, the dip would be -50 %.
+        def io(t):
+            return 0 if t < 6000 else 27_000_000
+        metrics = [{"t": t, "process": "host0-g1", "replication_role": "primary"} for t in range(0, 10000, 60)]
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            self.report_run(directory, metrics, events=[
+                {"event": "load-start", "t": 1, "mono": 10**9},
+                {"event": "load-stop", "t": 10000, "mono": 10000 * 10**9}])
+            self.stall_hosts(directory, io)
+            (directory / "background-latency-0.jsonl").write_text("".join(
+                json.dumps({"t": t, "series": "bg:get", "counts": {"ok": 150 if t == 5940 else 300}}) + "\n"
+                for t in range(0, 10000, 60)))
+            criteria = {c["id"]: c for c in report.write(directory)["criteria"]}
+        self.assertEqual(criteria[11]["status"], "pass", criteria[11])
+        self.assertEqual(criteria[11]["details"][0]["dips"], [])
+
+    def test_latency_step_between_1_2_and_1_5_passes_and_is_listed(self):
+        from ruvio_soak import report
+
+        def hist(ms):
+            return {str(latency.bucket(ms * 1000)): 1000}
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            self.report_run(directory, [], events=[
+                {"event": "load-start", "t": 1, "mono": 10**9},
+                {"event": "load-stop", "t": 10000, "mono": 10000 * 10**9}])
+            rows = [{"t": t, "series": "durable:set", "counts": {"ok": 1000},
+                     "hist": hist(10.0 if t < 7000 else 13.0)} for t in range(0, 10000, 60)]
+            (directory / "latency.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+            criteria = {c["id"]: c for c in report.write(directory)["criteria"]}
+        self.assertEqual(criteria[9]["status"], "pass", criteria[9])
+        self.assertEqual(criteria[9]["details"]["series_over_1_2"], ["durable:set"])
+
+    def test_a_coordinator_with_a_late_leader_change_is_not_judged(self):
+        from ruvio_soak import report
+
+        # host0 becomes leader at t=9000: 45 min later is 11700, past the end of the run, so
+        # nothing is left and it is not judged; host1 grows the whole time and fails.
+        def sample(t, process, leader, anon):
+            return {"t": t, "process": process, "is_leader": leader, "rss_anon_kib": anon}
+        metrics = []
+        for t in range(0, 10000, 60):
+            metrics.append(sample(t, "host0-coordinator", "1" if t >= 9000 else "0",
+                                  9216 if t >= 9000 else 3072))
+            metrics.append(sample(t, "host1-coordinator", "0", 3072 + t))
+        with tempfile.TemporaryDirectory() as directory:
+            self.report_run(Path(directory), metrics, events=[
+                {"event": "load-start", "t": 1, "mono": 10**9},
+                {"event": "load-stop", "t": 10000, "mono": 10000 * 10**9},
+            ])
+            criteria = {c["id"]: c for c in report.write(Path(directory))["criteria"]}
+        self.assertEqual(criteria[13]["details"]["host0-coordinator"]["status"], "not_judged")
+        self.assertIn("leader changed at 02:30", criteria[13]["details"]["host0-coordinator"]["reason"])
+        self.assertEqual(criteria[13]["value"]["host1-coordinator"], "fail", criteria[13]["details"])
+        self.assertEqual(criteria[13]["status"], "fail")
 
     def test_a_coordinator_is_judged_only_since_its_last_leadership_change(self):
         from ruvio_soak import report
