@@ -74,6 +74,7 @@ pub(super) fn validate_command_payloads(
         | Command::Migrate(_)
         | Command::Role
         | Command::Bgsave
+        | Command::Shutdown(_)
         | Command::DbSize
         | Command::RandomKey
         | Command::ClientId

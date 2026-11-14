@@ -500,6 +500,7 @@ mod misc;
 mod replica;
 mod replica_reads;
 mod role_change;
+mod shutdown;
 mod single_port;
 mod slot_moves;
 mod wal;

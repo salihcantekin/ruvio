@@ -198,6 +198,7 @@ export const COMMAND_KEY_RULES: ReadonlyMap<string, CommandKeyRule> = new Map<st
   ["SETNX", [1, 1, 1, 1, [], 13]],
   ["SETRANGE", [1, 1, 1, 1, [], 9]],
   ["SETV", [1, 1, 1, 1, [], 13]],
+  ["SHUTDOWN", [0, 0, 0, 0, [], 0]],
   ["SINTER", [1, 1, -1, 1, [], 2]],
   ["SINTERCARD", [2, 1, 0, 0, [], 2]],
   ["SINTERSTORE", [1, 1, -1, 1, [], 9]],

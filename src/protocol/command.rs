@@ -126,6 +126,7 @@ impl<'a> Command<'a> {
             Self::Info(message) => Command::Info(message.map(owned)),
             Self::Save => Command::Save,
             Self::Bgsave => Command::Bgsave,
+            Self::Shutdown(mode) => Command::Shutdown(mode),
             Self::Get(key) => Command::Get(owned(key)),
             Self::JsonGet { key, path } => Command::JsonGet {
                 key: owned(key),
@@ -1286,6 +1287,7 @@ pub(crate) fn command_mutates_store(command: &Command<'_>) -> bool {
             | Command::Migrate(_)
             | Command::Role
             | Command::Bgsave
+            | Command::Shutdown(_)
             | Command::Get(_)
             | Command::JsonGet { .. }
             | Command::JsonMGet { .. }

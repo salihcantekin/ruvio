@@ -1105,7 +1105,6 @@ fn rejects_mutating_admin_and_cluster_verbs() {
             b"*3\r\n$7\r\nCLUSTER\r\n$4\r\nMEET\r\n$9\r\n127.0.0.1\r\n",
             "only CLUSTER SLOTS, NODES, SHARDS, INFO, MYID, and KEYSLOT are supported",
         ),
-        (b"*1\r\n$8\r\nSHUTDOWN\r\n", "unknown command"),
         (b"*1\r\n$7\r\nMONITOR\r\n", "unknown command"),
         (
             b"*2\r\n$5\r\nDEBUG\r\n$8\r\nSEGFAULT\r\n",

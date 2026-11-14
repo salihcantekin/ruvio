@@ -147,6 +147,7 @@ pub fn command_slot(command: &Command<'_>) -> Result<Option<u16>, CrossSlot> {
         | Command::Migrate(_)
         | Command::Role
         | Command::Bgsave
+        | Command::Shutdown(_)
         | Command::Scan { .. }
         | Command::Keys(_)
         | Command::JsonIndex { .. }
@@ -467,6 +468,7 @@ pub fn command_keys<'a>(command: &'a Command<'_>) -> Vec<&'a [u8]> {
         | Command::Migrate(_)
         | Command::Role
         | Command::Bgsave
+        | Command::Shutdown(_)
         | Command::Scan { .. }
         | Command::Keys(_)
         | Command::JsonIndex { .. }

@@ -212,6 +212,7 @@ var commandKeyRules = map[string]commandKeyRule{
 	"SETNX":             {1, 1, 1, 1, nil, 13},
 	"SETRANGE":          {1, 1, 1, 1, nil, 9},
 	"SETV":              {1, 1, 1, 1, nil, 13},
+	"SHUTDOWN":          {0, 0, 0, 0, nil, 0},
 	"SINTER":            {1, 1, -1, 1, nil, 2},
 	"SINTERCARD":        {2, 1, 0, 0, nil, 2},
 	"SINTERSTORE":       {1, 1, -1, 1, nil, 9},

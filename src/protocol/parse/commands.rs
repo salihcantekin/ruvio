@@ -266,6 +266,26 @@ pub(in crate::protocol) fn cmd_save<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
     }
 }
 
+pub(in crate::protocol) fn cmd_shutdown<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
+    match args.len() {
+        0 => Ok(Command::Shutdown(ShutdownMode::Default)),
+        1 => {
+            let word = args.arg(0);
+
+            if word.eq_ignore_ascii_case(b"SAVE") {
+                Ok(Command::Shutdown(ShutdownMode::Save))
+            } else if word.eq_ignore_ascii_case(b"NOSAVE") {
+                Ok(Command::Shutdown(ShutdownMode::NoSave))
+            } else {
+                Err(ProtocolError::Invalid("SHUTDOWN expects SAVE or NOSAVE"))
+            }
+        }
+        _ => Err(ProtocolError::Invalid(
+            "SHUTDOWN expects zero or one argument",
+        )),
+    }
+}
+
 pub(in crate::protocol) fn cmd_bgsave<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
     match args.len() {
         0 => Ok(Command::Bgsave),

@@ -2422,6 +2422,7 @@ mod tests {
         "MoveSlots",
         "Topology",
         "Role",
+        "Shutdown",
         "Discard",
         "Echo",
         "Eval",

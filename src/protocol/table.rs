@@ -824,6 +824,14 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
         commands::cmd_bgsave,
     ),
     CommandSpec::migrated(
+        "shutdown",
+        -1,
+        0,
+        (0, 0, 0),
+        &["admin", "slow", "dangerous"],
+        commands::cmd_shutdown,
+    ),
+    CommandSpec::migrated(
         "json.get",
         -2,
         READONLY,

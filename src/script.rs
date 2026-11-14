@@ -1369,6 +1369,7 @@ fn scriptable(command: &Command<'_>) -> bool {
                 | Command::Migrate(_)
                 | Command::Role
                 | Command::Bgsave
+                | Command::Shutdown(_)
                 | Command::Hello { .. }
                 | Command::ClientGetName
                 | Command::ClientSetName(_)

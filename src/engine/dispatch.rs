@@ -95,6 +95,7 @@ pub fn execute_in_database<'a, C: Clock, I: StorageIndex, S: MutationSink, W: Li
         Command::Save | Command::Bgsave => {
             Ok(Response::Error(b"ERR SAVE is handled by the server"))
         }
+        Command::Shutdown(_) => Ok(Response::Error(b"ERR SHUTDOWN is handled by the server")),
         Command::ConfigSet(_) | Command::ConfigRewrite => {
             Ok(Response::Error(b"ERR CONFIG SET is handled by the server"))
         }
