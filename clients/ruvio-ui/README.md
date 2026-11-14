@@ -104,6 +104,11 @@ keyboard-accessible controls. Every color and font lives in
   response. Memory breakdowns distinguish live data, index capacity, and reusable
   buffers from process RSS. Deleting the last key releases empty index capacity;
   retained reusable buffers can still account for a nonzero memory charge.
+  The **Restart** panel at the bottom lists every answering node with its
+  durability profile. "Restart..." asks first and says what a stop costs (under
+  `memory` every key is lost and a tick is required), sends `SHUTDOWN` to that
+  node and waits until it answers again. It needs a server with `SHUTDOWN`, an
+  ACL user that may run it, and a supervisor that starts the node again.
 - **Dashboard** (below Console) draws time charts of the `INFO` fields the
   refresh already reads: commands per second and the command mix, network bytes
   per second, connections and clients, charged memory and its breakdown (keys,

@@ -237,6 +237,8 @@ in the compose files, a Kubernetes pod). A single node is down from the stop unt
 *Recovery-Time Objective*). With replication, restart one node at a time and follow
 [COORDINATOR.md](COORDINATOR.md#data-nodes) (*Way A*) for a primary, so writes pause only for the switchover.
 
+The operator UI shows a *Restart* panel on its Overview with the same warning and the same wait.
+
 To restart at a fixed time, let the system's timer call it, for example
 [deploy/ruvio-restart.timer](../deploy/ruvio-restart.timer) with `OnCalendar=*-*-* 03:00:00`. Under `memory`
 the unit would need `--allow-data-loss`, which the example leaves out on purpose.

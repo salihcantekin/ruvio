@@ -671,3 +671,35 @@ test("database dropdown allows only DB 0 when several shards are present", async
   await expect(page.getByRole("option", { name: "DB 0" })).toBeEnabled();
   await expect(page.getByRole("option", { name: "DB 1", exact: true })).toBeDisabled();
 });
+
+test("restart names the loss, needs a tick under memory durability and waits until the node answers", async ({ page }, testInfo) => {
+  let stopped = false;
+  let infoCalls = 0;
+  const { requests, errors } = await setup(page, {
+    command: (args, shard) => {
+      if (args[0] === "SHUTDOWN") { stopped = true; return { ok: true, value: bulk("OK") }; }
+      if (args[0] === "INFO" && stopped) {
+        infoCalls += 1;
+        // The first reading after the stop fails, the next one is a new process.
+        return infoCalls === 1 ? { ok: false, error: "connection refused" } : { ok: true, value: bulk(infoText(shard?.port).replace("run_id:r1", "run_id:r2")) };
+      }
+      return undefined;
+    },
+  });
+  await signIn(page);
+  const first = page.getByRole("region", { name: "Restart nodes" }).getByRole("button", { name: "Restart..." }).first();
+  await first.scrollIntoViewIfNeeded();
+  await first.click();
+  const dialog = page.getByRole("alertdialog", { name: /Confirm restart of 127.0.0.1:6380/ });
+  await expect(dialog).toContainText("Every key on this node is lost");
+  const confirm = dialog.getByRole("button", { name: "Restart 127.0.0.1:6380" });
+  await expect(confirm).toBeDisabled();
+  await page.screenshot({ path: testInfo.outputPath("restart-confirm.png"), fullPage: true });
+  await dialog.getByRole("checkbox").check();
+  await confirm.click();
+  await expect(page.getByRole("status").filter({ hasText: "Back after" })).toBeVisible({ timeout: 15000 });
+  const shutdown = requests.find((item) => item.path === "/api/command" && item.body.args[0] === "SHUTDOWN");
+  expect(shutdown.body.args).toEqual(["SHUTDOWN", "NOSAVE"]);
+  expect(shutdown.body.shard).toEqual({ host: "127.0.0.1", port: 6380 });
+  expect(errors).toEqual([]);
+});
