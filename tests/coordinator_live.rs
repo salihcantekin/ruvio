@@ -602,6 +602,133 @@ fn a_switchover_hands_the_primary_over_without_losing_an_acknowledged_write() {
     assert!(info.contains("failovers_total:1\r\n"), "{info}");
 }
 
+/// `ruvio-ctl rolling-restart` stops every node of a group in turn, with a supervisor (this
+/// test) starting each again, while a client keeps writing: no acknowledged write is lost, the
+/// primary changes once, and every node is a new process afterwards.
+#[test]
+fn a_rolling_restart_stops_every_node_in_turn_and_loses_no_acknowledged_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let group = Group::new();
+    let follow = [None, Some(0), Some(0)];
+    let mut nodes: Vec<Process> = (0..3)
+        .map(|index| group.node(dir.path(), index, follow[index]))
+        .collect();
+    let _coordinators: Vec<Process> = (0..3)
+        .map(|index| group.coordinator(dir.path(), index))
+        .collect();
+
+    wait_until("the coordinators to agree on the primary", || {
+        (0..3).all(|index| group.primary_by(index) == Some(0))
+    });
+    let addresses: Vec<String> = group.resp.iter().map(ToString::to_string).collect();
+    let run_id = |node: &str| -> Option<String> {
+        call(node, &["INFO", "server"])?
+            .lines()
+            .find_map(|line| line.strip_prefix("run_id:").map(|id| id.trim().to_owned()))
+    };
+    let before: Vec<Option<String>> = addresses.iter().map(|node| run_id(node)).collect();
+
+    assert!(before.iter().all(Option::is_some));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let (stop, addresses) = (stop.clone(), addresses.clone());
+
+        std::thread::spawn(move || {
+            let mut acknowledged = Vec::new();
+            let mut next = 0u64;
+
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let key = format!("w{next}");
+
+                if addresses
+                    .iter()
+                    .any(|node| call(node, &["SET", &key, "1"]).as_deref() == Some("OK"))
+                {
+                    acknowledged.push(key);
+                    next += 1;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            acknowledged
+        })
+    };
+    wait_until("the writer to get going", || {
+        call(&addresses[0], &["EXISTS", "w20"]).as_deref() == Some("1")
+    });
+
+    let coordinators = group
+        .coordinators
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut ctl = Command::new(env!("CARGO_BIN_EXE_ruvio-ctl"))
+        .args(["rolling-restart", "--coordinator", &coordinators])
+        .args(["--group", "main", "--yes", "--wait-secs", "60"])
+        .env("RUVIO_COORDINATOR_SECRET", SECRET)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+
+    // The supervisor: any node that exits is started again with its own configuration.
+    let status = loop {
+        for index in 0..3 {
+            if nodes[index].0.try_wait().unwrap().is_some() {
+                // Started as a replica of the primary the coordinators agree on, as a
+                // supervisor that reads the cluster's state would.
+                let following = match group.primary_by(0) {
+                    Some(primary) if primary != index => Some(primary),
+                    _ => follow[index],
+                };
+
+                nodes[index] = group.node(dir.path(), index, following);
+            }
+        }
+        if let Some(status) = ctl.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "the rolling restart did not end");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let output = ctl.wait_with_output().unwrap();
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(status.success(), "{report}");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let acknowledged = writer.join().unwrap();
+
+    wait_until("every node to answer again", || {
+        addresses.iter().all(|node| ping(node))
+    });
+    let promoted = group.primary_by(0).unwrap();
+
+    assert_ne!(promoted, 0, "{report}");
+    for (index, node) in addresses.iter().enumerate() {
+        assert_ne!(
+            run_id(node),
+            before[index],
+            "node {index} was not restarted\n{report}"
+        );
+    }
+    wait_until("a primary that takes writes", || {
+        call(&addresses[promoted], &["SET", "after", "1"]).as_deref() == Some("OK")
+    });
+    for key in &acknowledged {
+        assert_eq!(
+            call(&addresses[promoted], &["GET", key]).as_deref(),
+            Some("1"),
+            "{key} was acknowledged and is missing on the primary\n{report}"
+        );
+    }
+    eprintln!("{} writes acknowledged\n{report}", acknowledged.len());
+}
+
 #[test]
 fn a_leader_cut_off_from_the_other_coordinators_does_not_act() {
     let dir = tempfile::tempdir().unwrap();

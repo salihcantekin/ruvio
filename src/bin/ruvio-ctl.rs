@@ -91,6 +91,30 @@ enum Command {
         #[arg(long, default_value_t = 120)]
         wait_secs: u64,
     },
+    /// Restart every node of one or more replication groups, one at a time, without losing an
+    /// acknowledged write: the replicas first, then `COORDINATOR SWITCHOVER`, then the old
+    /// primary. Needs `ruvio coordinator` and a supervisor that starts each stopped node again.
+    /// The coordinator secret comes from RUVIO_COORDINATOR_SECRET, the nodes' password from
+    /// RUVIO_PASSWORD (and RUVIO_USER).
+    RollingRestart {
+        /// Coordinator addresses (host:port), comma separated or repeated; the leader is found
+        /// among them.
+        #[arg(long, required = true, value_delimiter = ',')]
+        coordinator: Vec<String>,
+        /// Group to restart; repeat for several, in that order. Without it every group is
+        /// restarted, one after the other.
+        #[arg(long)]
+        group: Vec<String>,
+        /// A node (client host:port) to leave out, for one already restarted by an earlier run.
+        #[arg(long)]
+        skip: Vec<String>,
+        /// Go ahead after the plan was read; without it the plan is printed and nothing is stopped.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+        /// Seconds to wait for each node to stop and answer again, and for each step after it.
+        #[arg(long, default_value_t = 180)]
+        wait_secs: u64,
+    },
     /// Restore a previously checked backup into a data directory.
     Restore {
         #[arg(long)]
@@ -123,6 +147,13 @@ fn run(cli: Cli) -> Result<(), PersistenceError> {
             allow_data_loss,
             wait_secs,
         } => restart(address, yes, allow_data_loss, wait_secs)?,
+        Command::RollingRestart {
+            coordinator,
+            group,
+            skip,
+            yes,
+            wait_secs,
+        } => rolling_restart(&coordinator, &group, &skip, yes, wait_secs)?,
         Command::Check { data_dir } => {
             verify_backup_signature(&data_dir, &backup_key(None)?)?;
             print_report(&check_data_dir(data_dir)?, false);
@@ -467,9 +498,381 @@ fn restart(
     }))
 }
 
+/// One reply of a RESP2 server, as much of it as `rolling-restart` reads.
+#[derive(Debug, PartialEq)]
+enum Resp {
+    Text(String),
+    Error(String),
+    Int(i64),
+    Array(Vec<Resp>),
+    Nil,
+}
+
+impl Resp {
+    fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// A flat key/value array (a Sentinel description) as pairs.
+    fn pairs(&self) -> Vec<(String, String)> {
+        let Self::Array(items) = self else {
+            return Vec::new();
+        };
+
+        items
+            .chunks(2)
+            .filter_map(|pair| Some((pair[0].text()?.to_owned(), pair.get(1)?.text()?.to_owned())))
+            .collect()
+    }
+}
+
+fn read_resp(reader: &mut impl std::io::BufRead) -> std::io::Result<Resp> {
+    use std::io::Error;
+
+    let mut line = String::new();
+
+    if reader.read_line(&mut line)? == 0 {
+        return Err(Error::other("the connection closed"));
+    }
+    let line = line.trim_end_matches(['\r', '\n']);
+    let (kind, rest) = line.split_at(line.chars().next().map_or(0, char::len_utf8));
+    let number = || {
+        rest.parse::<i64>()
+            .map_err(|_| Error::other("malformed reply"))
+    };
+
+    Ok(match kind {
+        "+" => Resp::Text(rest.to_owned()),
+        "-" => Resp::Error(rest.to_owned()),
+        ":" => Resp::Int(number()?),
+        "$" => match number()? {
+            length if length < 0 => Resp::Nil,
+            length => {
+                let mut bytes = vec![0u8; length as usize + 2];
+
+                reader.read_exact(&mut bytes)?;
+                bytes.truncate(length as usize);
+                Resp::Text(String::from_utf8_lossy(&bytes).into_owned())
+            }
+        },
+        "*" => match number()? {
+            length if length < 0 => Resp::Nil,
+            length => Resp::Array(
+                (0..length)
+                    .map(|_| read_resp(reader))
+                    .collect::<std::io::Result<_>>()?,
+            ),
+        },
+        _ => return Err(Error::other("unexpected reply")),
+    })
+}
+
+/// A connection that sends commands and reads whole replies, after `AUTH` when asked to.
+struct Link {
+    reader: std::io::BufReader<std::net::TcpStream>,
+}
+
+impl Link {
+    fn open(address: &str, auth: &[&str]) -> std::io::Result<Self> {
+        use std::net::ToSocketAddrs;
+        use std::time::Duration;
+
+        let target = address
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| std::io::Error::other(format!("{address} did not resolve")))?;
+        let stream = std::net::TcpStream::connect_timeout(&target, Duration::from_secs(3))?;
+
+        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let mut link = Self {
+            reader: std::io::BufReader::new(stream),
+        };
+
+        if !auth.is_empty() && link.call(auth)? != Resp::Text("OK".into()) {
+            return Err(std::io::Error::other(format!(
+                "AUTH to {address} was refused"
+            )));
+        }
+        Ok(link)
+    }
+
+    fn call(&mut self, parts: &[&str]) -> std::io::Result<Resp> {
+        use std::io::Write;
+
+        let mut out = format!("*{}\r\n", parts.len()).into_bytes();
+
+        for part in parts {
+            out.extend_from_slice(format!("${}\r\n{part}\r\n", part.len()).as_bytes());
+        }
+        self.reader.get_mut().write_all(&out)?;
+        read_resp(&mut self.reader)
+    }
+}
+
+/// Credentials for a data node, from the environment.
+fn node_auth() -> Vec<String> {
+    match (std::env::var("RUVIO_USER"), std::env::var("RUVIO_PASSWORD")) {
+        (Ok(user), Ok(password)) => vec!["AUTH".into(), user, password],
+        (Err(_), Ok(password)) => vec!["AUTH".into(), password],
+        _ => Vec::new(),
+    }
+}
+
+/// Sends `parts` to the first coordinator that answers it. A leader-only command skips the
+/// coordinators that say they are not the leader.
+fn ask_coordinators(
+    coordinators: &[String],
+    parts: &[&str],
+    leader_only: bool,
+) -> std::io::Result<Resp> {
+    let secret = std::env::var("RUVIO_COORDINATOR_SECRET").ok();
+    let auth: Vec<&str> = secret
+        .as_deref()
+        .map(|secret| vec!["AUTH", secret])
+        .unwrap_or_default();
+    let mut last = std::io::Error::other("no coordinator answered");
+
+    for address in coordinators {
+        let reply = Link::open(address, &auth).and_then(|mut link| link.call(parts));
+
+        match reply {
+            Ok(Resp::Error(error))
+                if leader_only
+                    && (error.starts_with("ERR not the leader")
+                        || error.starts_with("ERR no leader")
+                        || error.starts_with("ERR the leader is still applying")) =>
+            {
+                last = std::io::Error::other(format!("{address}: {error}"));
+            }
+            Ok(reply) => return Ok(reply),
+            Err(error) => last = std::io::Error::other(format!("{address}: {error}")),
+        }
+    }
+    Err(last)
+}
+
+/// One group as the coordinators describe it: its name, the primary's client address, and the
+/// replicas'. A member the coordinators see as down stops the plan.
+struct GroupPlan {
+    name: String,
+    primary: String,
+    replicas: Vec<String>,
+}
+
+fn address_of(pairs: &[(String, String)]) -> Option<(String, bool)> {
+    let value = |key: &str| pairs.iter().find(|(name, _)| name == key).map(|(_, v)| v);
+    let down = value("flags")?.contains("down");
+
+    Some((format!("{}:{}", value("ip")?, value("port")?), down))
+}
+
+fn plan_groups(coordinators: &[String], wanted: &[String]) -> std::io::Result<Vec<GroupPlan>> {
+    use std::io::Error;
+
+    let names: Vec<String> = if wanted.is_empty() {
+        match ask_coordinators(coordinators, &["SENTINEL", "masters"], false)? {
+            Resp::Array(groups) => groups
+                .iter()
+                .filter_map(|group| {
+                    group
+                        .pairs()
+                        .into_iter()
+                        .find(|(key, _)| key == "name")
+                        .map(|(_, name)| name)
+                })
+                .collect(),
+            other => return Err(Error::other(format!("unexpected reply: {other:?}"))),
+        }
+    } else {
+        wanted.to_vec()
+    };
+    let mut plans = Vec::new();
+
+    for name in names {
+        let master = ask_coordinators(coordinators, &["SENTINEL", "master", &name], false)?;
+        let Some((primary, down)) = address_of(&master.pairs()) else {
+            return Err(Error::other(format!("group {name} has no agreed primary")));
+        };
+        let Resp::Array(replicas) =
+            ask_coordinators(coordinators, &["SENTINEL", "replicas", &name], false)?
+        else {
+            return Err(Error::other(format!(
+                "could not list the replicas of {name}"
+            )));
+        };
+        let mut addresses = Vec::new();
+
+        for replica in &replicas {
+            let (address, replica_down) = address_of(&replica.pairs())
+                .ok_or_else(|| Error::other(format!("a replica of {name} has no address")))?;
+
+            if replica_down {
+                return Err(Error::other(format!(
+                    "{address}, a replica of {name}, is down: restarting the others now could leave the group without a copy"
+                )));
+            }
+            addresses.push(address);
+        }
+        if down {
+            return Err(Error::other(format!("the primary of {name} is down")));
+        }
+        if addresses.is_empty() {
+            return Err(Error::other(format!(
+                "group {name} has no replica: a rolling restart needs one to hand writes to (use `restart` for a node that may stop)"
+            )));
+        }
+        plans.push(GroupPlan {
+            name,
+            primary,
+            replicas: addresses,
+        });
+    }
+    Ok(plans)
+}
+
+/// Waits until the node at `address` answers `ROLE` as a replica connected to its primary.
+fn wait_for_replica(address: &str, wait_secs: u64) -> std::io::Result<()> {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(wait_secs);
+    let auth = node_auth();
+    let auth: Vec<&str> = auth.iter().map(String::as_str).collect();
+
+    while Instant::now() < deadline {
+        let role = Link::open(address, &auth).and_then(|mut link| link.call(&["ROLE"]));
+
+        if let Ok(Resp::Array(role)) = role
+            && role.first().and_then(Resp::text) == Some("slave")
+            && role.get(3).and_then(Resp::text) == Some("connected")
+        {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Err(std::io::Error::other(format!(
+        "{address} did not become a connected replica in {wait_secs} s"
+    )))
+}
+
+fn rolling_restart(
+    coordinators: &[String],
+    groups: &[String],
+    skip: &[String],
+    yes: bool,
+    wait_secs: u64,
+) -> std::io::Result<()> {
+    let allow_data_loss = false;
+    let plans = plan_groups(coordinators, groups)?;
+    let skipped = |address: &String| skip.contains(address);
+
+    for plan in &plans {
+        println!("group {}:", plan.name);
+        for replica in plan.replicas.iter().filter(|a| !skipped(a)) {
+            println!("  restart replica {replica}, wait until it follows the primary again");
+        }
+        println!(
+            "  COORDINATOR SWITCHOVER {} (writes pause briefly)",
+            plan.name
+        );
+        if !skipped(&plan.primary) {
+            println!("  restart the old primary {}", plan.primary);
+        }
+    }
+    println!(
+        "one node at a time; a supervisor must start each stopped node again; a node under durability memory is refused"
+    );
+    if !yes {
+        return Err(std::io::Error::other(
+            "nothing was stopped; run again with --yes to start",
+        ));
+    }
+
+    for plan in &plans {
+        for replica in plan.replicas.iter().filter(|a| !skipped(a)) {
+            println!("[{}] restarting replica {replica}", plan.name);
+            restart(Some(replica.clone()), true, allow_data_loss, wait_secs)?;
+            wait_for_replica(replica, wait_secs)?;
+        }
+
+        println!("[{}] switching over", plan.name);
+        let reply = ask_coordinators(
+            coordinators,
+            &["COORDINATOR", "SWITCHOVER", &plan.name],
+            true,
+        )?;
+        let Resp::Text(new_primary) = reply else {
+            return Err(std::io::Error::other(format!(
+                "the switchover of {} was refused: {reply:?}; nothing more was stopped, and the nodes restarted so far are listed above (rerun with --skip for them)",
+                plan.name
+            )));
+        };
+
+        println!("[{}] the new primary is {new_primary}", plan.name);
+        if skipped(&plan.primary) {
+            continue;
+        }
+        wait_for_replica(&plan.primary, wait_secs)?;
+        println!(
+            "[{}] restarting the old primary {}",
+            plan.name, plan.primary
+        );
+        restart(Some(plan.primary.clone()), true, allow_data_loss, wait_secs)?;
+        wait_for_replica(&plan.primary, wait_secs)?;
+        println!("[{}] done", plan.name);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_nested_replies_and_key_value_pairs() {
+        let reply = b"*4\r\n$4\r\nname\r\n$4\r\nmain\r\n$2\r\nip\r\n$9\r\n127.0.0.1\r\n";
+        let parsed = read_resp(&mut std::io::BufReader::new(&reply[..])).unwrap();
+
+        assert_eq!(
+            parsed.pairs(),
+            vec![
+                ("name".to_owned(), "main".to_owned()),
+                ("ip".to_owned(), "127.0.0.1".to_owned())
+            ]
+        );
+        let mixed = b"*3\r\n+slave\r\n:7\r\n$-1\r\n";
+
+        assert_eq!(
+            read_resp(&mut std::io::BufReader::new(&mixed[..])).unwrap(),
+            Resp::Array(vec![Resp::Text("slave".into()), Resp::Int(7), Resp::Nil])
+        );
+        assert_eq!(
+            read_resp(&mut std::io::BufReader::new(&b"-ERR no\r\n"[..])).unwrap(),
+            Resp::Error("ERR no".into())
+        );
+    }
+
+    #[test]
+    fn a_member_flagged_down_is_reported_down() {
+        let pair = |key: &str, value: &str| (key.to_owned(), value.to_owned());
+        let up = [
+            pair("ip", "10.0.0.1"),
+            pair("port", "6379"),
+            pair("flags", "slave"),
+        ];
+        let down = [
+            pair("ip", "10.0.0.2"),
+            pair("port", "6379"),
+            pair("flags", "slave,s_down"),
+        ];
+
+        assert_eq!(address_of(&up), Some(("10.0.0.1:6379".into(), false)));
+        assert_eq!(address_of(&down), Some(("10.0.0.2:6379".into(), true)));
+        assert_eq!(address_of(&[]), None);
+    }
 
     #[test]
     fn reads_the_durability_profile_from_a_config_get_reply() {

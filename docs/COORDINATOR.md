@@ -656,6 +656,8 @@ Each data node's own files are read by the newer release as in a single-server u
 
 Two ways, per group. Neither loses an acknowledged write.
 
+`ruvio-ctl rolling-restart` (see *A group of nodes* in [RECOVERY.md](RECOVERY.md#a-group-of-nodes)) does a restart of every node of a group with `COORDINATOR SWITCHOVER`, one node at a time; the two ways below are for an upgrade to a binary the group cannot follow across (a changed replication handshake).
+
 `ruvio-ctl restart --yes` stops one node cleanly and waits for it to answer again (see *Restart* in [RECOVERY.md](RECOVERY.md#restart)); use it for a replica, and for a primary only through Way A so writes pause once.
 
 **Way A: switch over to an upgraded replica.** Reads go on throughout. Writes pause from step 1
