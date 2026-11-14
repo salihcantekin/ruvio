@@ -49,6 +49,10 @@ pub(in crate::protocol) fn cmd_ruvio<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
         return parse_lease(args);
     }
 
+    if args.len() >= 1 && args.bytes(0).eq_ignore_ascii_case(b"FENCE") {
+        return parse_fence(args);
+    }
+
     if args.len() >= 2 && args.bytes(0).eq_ignore_ascii_case(b"MIGRATE") {
         return Ok(Command::Migrate(
             (1..args.len()).map(|at| args.arg(at)).collect(),
@@ -60,6 +64,22 @@ pub(in crate::protocol) fn cmd_ruvio<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
         1 => Ok(Command::Ruvio(Some(args.arg(0)))),
         _ => Err(ProtocolError::Invalid("RUVIO expects zero or one argument")),
     }
+}
+
+/// `RUVIO FENCE ms`: at most a minute; `0` lifts a fence.
+fn parse_fence<'a>(args: &Args<'a, '_>) -> Parsed<'a> {
+    const USAGE: &str = "RUVIO FENCE expects milliseconds, from 0 to 60000";
+
+    if args.len() != 2 {
+        return Err(ProtocolError::Invalid(USAGE));
+    }
+
+    std::str::from_utf8(args.bytes(1))
+        .ok()
+        .and_then(|text| text.parse::<u64>().ok())
+        .filter(|ms| *ms <= 60_000)
+        .map(Command::Fence)
+        .ok_or(ProtocolError::Invalid(USAGE))
 }
 
 /// `RUVIO LEASE BEGIN` or `RUVIO LEASE GRANT token coordinator voters epoch lease_ms`.

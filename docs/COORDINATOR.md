@@ -594,6 +594,30 @@ Without `join = true` a new coordinator would propose `peers` as a membership of
 waits to be added. A coordinator that starts with `peers` different from the record logs a warning and
 uses the record.
 
+## Planned switchover
+
+`COORDINATOR SWITCHOVER group [TO host:port]` on the leader (after `AUTH secret`) hands a working
+primary to one of its replicas without losing an acknowledged write. `TO` names the replica by its
+client address; without it the coordinator takes the replica holding the most history.
+
+1. The old primary is told to refuse writes (`RUVIO FENCE`, see [COMPATIBILITY.md](COMPATIBILITY.md)):
+   they get `-NOREPLICAS Writes are paused for a switchover; retry shortly.` on every shard. Reads and replication go on.
+2. The coordinator waits until the chosen replica's `wal_durable_sequence` has reached the old
+   primary's `wal_last_sequence` on every shard, for up to 10 seconds.
+3. The change is recorded exactly as a failover records it (epoch plus one, the same committed
+   records rule), the replica is promoted, and the old primary and the other replicas are pointed at it.
+
+If the wait runs out, the leader loses its place, or the record is not made, the pause is lifted
+and the group stays as it was, except when the record may have been made but its outcome is unknown: the old
+primary then stays paused, because a later leader may still promote the replica. The pause ends by itself
+(20 seconds after it began, 60 seconds once the replica has caught up), and the old primary is pointed at the
+new one at once, so a coordinator that dies half way leaves the old primary taking writes again after that time. Refused when the
+primary does not answer as a primary (use `FAILOVER group FORCE` for a dead one), when the named
+member is not a complete replica of it, and while `primary_lease_ms` is on (not supported yet).
+It replaces steps 1, 2 and 4 of Way A below. Verified: a live test of three nodes and three
+coordinators with a client writing during the switch; behaviour with `primary-lease`, with several
+shards and across two versions, and the length of the write pause on real hardware: not measured.
+
 ## Upgrading
 
 Upgrade the coordinators first, then the data nodes group by group. Clients need no change for
@@ -633,6 +657,8 @@ Each data node's own files are read by the newer release as in a single-server u
 [RECOVERY.md](RECOVERY.md#upgrade)).
 
 Two ways, per group. Neither loses an acknowledged write.
+
+`ruvio-ctl rolling-restart` (see *A group of nodes* in [RECOVERY.md](RECOVERY.md#a-group-of-nodes)) does a restart of every node of a group with `COORDINATOR SWITCHOVER`, one node at a time; the two ways below are for an upgrade to a binary the group cannot follow across (a changed replication handshake).
 
 `ruvio-ctl restart --yes` stops one node cleanly and waits for it to answer again (see *Restart* in [RECOVERY.md](RECOVERY.md#restart)); use it for a replica, and for a primary only through Way A so writes pause once.
 

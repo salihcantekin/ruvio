@@ -557,6 +557,9 @@ pub enum Command<'a> {
     /// `RUVIO LEASE BEGIN` (`None`) and `RUVIO LEASE GRANT ...`: the primary lease
     /// `ruvio coordinator` renews (see `primary-lease`). Rare, so the grant is boxed.
     PrimaryLease(Option<Box<LeaseGrant>>),
+    /// `RUVIO FENCE ms`: the primary refuses writes for `ms` (0 lifts it), sent by the
+    /// coordinators for a planned switchover; it ends by itself.
+    Fence(u64),
     /// `RUVIO MIGRATE ...`: the steps of moving a slot range to another node, sent by the
     /// coordinators and by the source node; the runtime reads the arguments.
     Migrate(Vec<Bytes<'a>>),

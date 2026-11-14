@@ -111,6 +111,7 @@ pub fn execute_in_database<'a, C: Clock, I: StorageIndex, S: MutationSink, W: Li
         Command::PrimaryLease(_) => {
             Ok(Response::Error(b"ERR RUVIO LEASE is handled by the server"))
         }
+        Command::Fence(_) => Ok(Response::Error(b"ERR RUVIO FENCE is handled by the server")),
         Command::Migrate(_) => Ok(Response::Error(
             b"ERR RUVIO MIGRATE is handled by the server",
         )),

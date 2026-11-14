@@ -1366,6 +1366,7 @@ fn scriptable(command: &Command<'_>) -> bool {
                 | Command::MoveSlots(_)
                 | Command::Topology(_)
                 | Command::PrimaryLease(_)
+                | Command::Fence(_)
                 | Command::Migrate(_)
                 | Command::Role
                 | Command::Bgsave

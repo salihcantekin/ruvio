@@ -306,7 +306,8 @@ impl Api {
 
     /// `COORDINATOR MOVE first last group shard`, `COORDINATOR STATUS`, `COORDINATOR CANCEL`:
     /// moving slot ranges between groups. `COORDINATOR FAILOVER group FORCE`: promoting a
-    /// replica that lacks committed records.
+    /// replica that lacks committed records. `COORDINATOR SWITCHOVER group [TO member]`: a planned
+    /// handover of a working primary.
     async fn coordinator(&self, words: &[String]) -> Value {
         let word = |index: usize| words.get(index).map(String::as_str);
 
@@ -334,6 +335,33 @@ impl Api {
                 };
 
                 match monitor::force_failover(force, group).await {
+                    Ok(address) => Value::bulk(address),
+                    Err(error) => Value::Error(error),
+                }
+            }
+            (Some("switchover"), 3 | 5) if words.len() == 3 || word(3) == Some("to") => {
+                if !self.moves.leading().await {
+                    return Value::Error(self.moves.not_leader().await);
+                }
+                let Some(group) = self
+                    .config
+                    .groups
+                    .iter()
+                    .find(|group| group.name.eq_ignore_ascii_case(&words[2]))
+                else {
+                    return Value::Error(format!("ERR no group named {}", words[2]));
+                };
+                let force = monitor::Force {
+                    config: &self.config,
+                    raft: &self.raft,
+                    machine: &self.machine,
+                    sightings: &self.sightings,
+                    commits: &self.commits,
+                    switches: &self.switches,
+                    leadership: &self.moves.leadership,
+                };
+
+                match monitor::switchover(force, group, word(4)).await {
                     Ok(address) => Value::bulk(address),
                     Err(error) => Value::Error(error),
                 }
@@ -402,7 +430,7 @@ impl Api {
                 Err(error) => Value::Error(error),
             },
             _ => Value::Error(
-                "ERR COORDINATOR expects MOVE first last group shard, REBALANCE [DRYRUN], STATUS, CANCEL or FAILOVER group FORCE".into(),
+                "ERR COORDINATOR expects MOVE first last group shard, REBALANCE [DRYRUN], STATUS, CANCEL, SWITCHOVER group [TO host:port] or FAILOVER group FORCE".into(),
             ),
         }
     }

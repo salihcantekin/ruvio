@@ -117,6 +117,7 @@ impl<'a> Command<'a> {
             Self::MoveSlots(target) => Command::MoveSlots(target),
             Self::Topology(map) => Command::Topology(map.map(owned)),
             Self::PrimaryLease(grant) => Command::PrimaryLease(grant),
+            Self::Fence(ms) => Command::Fence(ms),
             Self::Migrate(args) => Command::Migrate(args.into_iter().map(owned).collect()),
             Self::ReplicaOf { primary, force } => Command::ReplicaOf {
                 primary: primary.map(|(host, port)| (owned(host), owned(port))),
@@ -1284,6 +1285,7 @@ pub(crate) fn command_mutates_store(command: &Command<'_>) -> bool {
             | Command::MoveSlots(_)
             | Command::Topology(_)
             | Command::PrimaryLease(_)
+            | Command::Fence(_)
             | Command::Migrate(_)
             | Command::Role
             | Command::Bgsave

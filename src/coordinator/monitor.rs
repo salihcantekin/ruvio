@@ -1880,6 +1880,72 @@ async fn failover(
     force: bool,
     fence: &impl Fence,
 ) -> Result<String, String> {
+    let choice = choose(
+        failing.group,
+        failing.at,
+        failing.seen,
+        config.down_after,
+        failing.committed,
+        force || config.unclean_failover,
+    );
+    let clean = matches!(choice, Choice::Promote(_));
+    let candidate = match choice {
+        Choice::Promote(candidate) => candidate,
+        Choice::Unclean(candidate) => {
+            warn!(
+                group = %failing.group.name,
+                to = %failing.group.members[candidate].address,
+                missing = %missing(&failing.seen[candidate], failing.committed),
+                "no replica holds every record a durable reply was released for; promoting the best one, and the records it lacks are lost"
+            );
+            candidate
+        }
+        Choice::Wait => {
+            if failing
+                .stats
+                .enter(&failing.group.name, GroupState::Waiting)
+            {
+                warn!(
+                    group = %failing.group.name,
+                    "primary is down and no replica holds every record a durable reply was released for; waiting (unclean_failover or COORDINATOR FAILOVER group FORCE promotes one anyway; repeated at most every 10 s)"
+                );
+            }
+            return Err("ERR no replica holds every committed record; waiting for one".into());
+        }
+        Choice::Nobody => {
+            if failing
+                .stats
+                .enter(&failing.group.name, GroupState::NoCandidate)
+            {
+                warn!(group = %failing.group.name, "primary is down and no replica can take over (repeated at most every 10 s)");
+            }
+            return Err("ERR no replica can take over".into());
+        }
+    };
+
+    promote(
+        config, raft, machine, switches, failing, candidate, clean, force, false, fence,
+    )
+    .await
+}
+
+/// Records `candidate` as the group's primary and points the members at it: the part of a
+/// failover (`planned` false: the old primary is down) and of a switchover (`planned` true:
+/// the old primary is fenced and the candidate holds everything it wrote) that is the same.
+/// The promoted member's address.
+#[allow(clippy::too_many_arguments)]
+async fn promote(
+    config: &CoordinatorConfig,
+    raft: &Raft,
+    machine: &StateMachine,
+    switches: &Switches,
+    failing: Failing<'_>,
+    candidate: usize,
+    clean: bool,
+    force: bool,
+    planned: bool,
+    fence: &impl Fence,
+) -> Result<String, String> {
     let Failing {
         group,
         primary,
@@ -1890,43 +1956,6 @@ async fn failover(
         decided,
         stats,
     } = failing;
-    let choice = choose(
-        group,
-        at,
-        seen,
-        config.down_after,
-        committed,
-        force || config.unclean_failover,
-    );
-    let clean = matches!(choice, Choice::Promote(_));
-    let candidate = match choice {
-        Choice::Promote(candidate) => candidate,
-        Choice::Unclean(candidate) => {
-            warn!(
-                group = %group.name,
-                to = %group.members[candidate].address,
-                missing = %missing(&seen[candidate], committed),
-                "no replica holds every record a durable reply was released for; promoting the best one, and the records it lacks are lost"
-            );
-            candidate
-        }
-        Choice::Wait => {
-            if stats.enter(&group.name, GroupState::Waiting) {
-                warn!(
-                    group = %group.name,
-                    "primary is down and no replica holds every record a durable reply was released for; waiting (unclean_failover or COORDINATOR FAILOVER group FORCE promotes one anyway; repeated at most every 10 s)"
-                );
-            }
-            return Err("ERR no replica holds every committed record; waiting for one".into());
-        }
-        Choice::Nobody => {
-            if stats.enter(&group.name, GroupState::NoCandidate) {
-                warn!(group = %group.name, "primary is down and no replica can take over (repeated at most every 10 s)");
-            }
-            return Err("ERR no replica can take over".into());
-        }
-    };
-
     let promoted = &group.members[candidate];
     // Its last answer may be up to `down_after` old: a replica that died with the primary
     // still looks fresh. Looked at once more, now, before anything is recorded; the next tick
@@ -1949,7 +1978,8 @@ async fn failover(
         from = %group.members[at].address,
         to = %promoted.address,
         force,
-        "primary is down; failing over"
+        planned,
+        "promoting a replica of the group (a failover, or a planned switchover)"
     );
     // Decided once, here, from the promoted member as the leader sees it now, and recorded with
     // the promotion: every coordinator takes the same values from the record.
@@ -2008,7 +2038,7 @@ async fn failover(
         "{} {} {} {} {}",
         group.name, old.host, old.port, new.host, new.port
     ));
-    info!(group = %group.name, primary = %new, "failover done");
+    info!(group = %group.name, primary = %new, planned, "failover done");
     reconcile(
         config,
         group,
@@ -2132,6 +2162,270 @@ pub async fn force_failover(force: Force<'_>, configured: &Group) -> Result<Stri
         &fence,
     )
     .await
+}
+
+/// How long `COORDINATOR SWITCHOVER` waits for the new primary to hold everything the old one
+/// wrote, once the old one stopped taking writes.
+const SWITCHOVER_WAIT: Duration = Duration::from_secs(10);
+/// How long the old primary is told to refuse writes: the wait, and time to record the change
+/// and point it at the new primary. It lifts the pause by itself, whatever happens to the
+/// coordinator.
+const SWITCHOVER_FENCE: Duration = Duration::from_secs(20);
+
+/// `field` of `section` for each of `shards` shards of `member`, `None` when one does not
+/// answer.
+async fn shard_numbers(
+    member: &Member,
+    auth: Option<&str>,
+    shards: u16,
+    section: &[u8],
+    field: &str,
+) -> Option<Vec<u64>> {
+    let mut numbers = Vec::new();
+
+    for shard in 0..shards.max(1) {
+        let mut client = NodeClient::connect(&member.address.plus(shard), auth, CALL_TIMEOUT)
+            .await
+            .ok()?;
+        let text = client
+            .call(&[b"INFO", section], CALL_TIMEOUT)
+            .await
+            .ok()?
+            .text()?;
+
+        numbers.push(
+            text.lines()
+                .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))?
+                .trim()
+                .parse::<u64>()
+                .ok()?,
+        );
+    }
+    Some(numbers)
+}
+
+/// `COORDINATOR SWITCHOVER group [TO member]` on the leader: hands a group's primary to one of
+/// its replicas without losing a write. The old primary refuses writes (`RUVIO FENCE`), the
+/// replica is waited for until it holds every record the old primary wrote, the change is
+/// recorded like a failover, and the old primary follows the new one. Writes pause for the
+/// time that takes (typically well under a second plus one ping interval). Any failure before
+/// the record lifts the pause and leaves the group as it was. The new primary's address.
+pub async fn switchover(
+    force: Force<'_>,
+    configured: &Group,
+    target: Option<&str>,
+) -> Result<String, String> {
+    if !caught_up(force.raft) {
+        return Err("ERR the leader is still applying the log; try again".into());
+    }
+    if force.config.primary_lease.is_some() {
+        return Err("ERR COORDINATOR SWITCHOVER does not work with primary_lease_ms yet".into());
+    }
+    let group = &force.machine.group(configured);
+    let Some(primary) = force.machine.primaries().get(&group.name).cloned() else {
+        return Err(format!(
+            "ERR group {} has no agreed primary yet",
+            group.name
+        ));
+    };
+    let Some(at) = primary.index(group) else {
+        return Err(format!(
+            "ERR the primary of {} is not among its members",
+            group.name
+        ));
+    };
+    let seen = force.sightings.seen(group);
+    let down_after = force.config.down_after;
+    let fresh = |sighting: &Sighting| {
+        sighting
+            .last_ok
+            .is_some_and(|at| at.elapsed() <= down_after)
+            && sighting.complete()
+            && !sighting.loading
+    };
+
+    if !fresh(&seen[at]) || seen[at].role != Some(Role::Master) {
+        return Err(format!(
+            "ERR the primary of {} does not answer as a primary; use FAILOVER FORCE if it is down",
+            group.name
+        ));
+    }
+    let committed =
+        force
+            .commits
+            .learn(group, &primary, &seen, down_after, &force.machine.commits());
+    let following = Some(Role::Replica(Some(
+        group.members[at].replication.to_string(),
+    )));
+    let candidate = match target {
+        Some(wanted) => {
+            let Some(index) = group
+                .members
+                .iter()
+                .position(|member| member.address.to_string().eq_ignore_ascii_case(wanted))
+            else {
+                return Err(format!("ERR {wanted} is not a member of {}", group.name));
+            };
+            if index == at {
+                return Err(format!(
+                    "ERR {wanted} is already the primary of {}",
+                    group.name
+                ));
+            }
+            if !fresh(&seen[index]) || seen[index].role != following {
+                return Err(format!(
+                    "ERR {wanted} does not answer as a complete replica of the primary of {}",
+                    group.name
+                ));
+            }
+            index
+        }
+        None => {
+            let eligible: Vec<Sighting> = seen
+                .iter()
+                .map(|sighting| {
+                    if sighting.role == following {
+                        sighting.clone()
+                    } else {
+                        Sighting::default()
+                    }
+                })
+                .collect();
+
+            choose_candidate(group, at, &eligible, down_after, &committed)
+                .ok_or_else(|| format!("ERR no replica of {} can take over", group.name))?
+        }
+    };
+    let auth = force.config.auth.as_deref();
+    let timeout = command_timeout(force.config);
+    let (old, new) = (&group.members[at], &group.members[candidate]);
+    let decided = force.sightings.grants().decision(&group.name).await;
+
+    if force.machine.primaries().get(&group.name) != Some(&primary) {
+        return Err(format!(
+            "ERR the primary of {} changed; try again",
+            group.name
+        ));
+    }
+    let leading = Leading {
+        leadership: force.leadership,
+        raft: force.raft,
+    };
+    if !leading.holds().await {
+        return Err("ERR no longer the leader; try again".into());
+    }
+
+    let pause = SWITCHOVER_FENCE.as_millis().to_string();
+
+    command(old, auth, &[b"RUVIO", b"FENCE", pause.as_bytes()], timeout)
+        .await
+        .map_err(|error| format!("ERR the primary refused to pause writes: {error}"))?;
+    warn!(group = %group.name, from = %old.address, to = %new.address, "switchover: the old primary no longer takes writes");
+
+    let lift = || async {
+        if let Err(error) = command(old, auth, &[b"RUVIO", b"FENCE", b"0"], timeout).await {
+            warn!(group = %group.name, member = %old.address, %error, "could not lift the write pause; it ends by itself");
+        }
+    };
+    let shards = seen[at].shards;
+    let deadline = Instant::now() + SWITCHOVER_WAIT;
+
+    // The pause holds on every shard once the command answered, so the old primary's last
+    // sequence cannot move any more; the new one has to reach it in each shard.
+    let caught_up_at = loop {
+        let wrote = shard_numbers(old, auth, shards, b"server", "wal_last_sequence").await;
+        let holds = shard_numbers(new, auth, shards, b"replication", "wal_durable_sequence").await;
+
+        if let (Some(wrote), Some(holds)) = (wrote, holds)
+            && wrote
+                .iter()
+                .zip(&holds)
+                .all(|(wrote, holds)| holds >= wrote)
+        {
+            break Some(holds);
+        }
+        if Instant::now() >= deadline || !leading.holds().await {
+            break None;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+
+    if caught_up_at.is_none() {
+        lift().await;
+        return Err(format!(
+            "ERR {} did not catch up with the primary of {} in time; writes resumed on the old primary",
+            new.address, group.name
+        ));
+    }
+    // The wait spent part of the pause: held again for as long as a node may take for the rest
+    // (the longest a pause lasts), so it cannot end before the old primary follows the new one.
+    if command(old, auth, &[b"RUVIO", b"FENCE", b"60000"], timeout)
+        .await
+        .is_err()
+    {
+        lift().await;
+        return Err(format!(
+            "ERR the primary of {} stopped answering; writes resumed on it",
+            group.name
+        ));
+    }
+    let failing = Failing {
+        group,
+        primary,
+        at,
+        seen: &seen,
+        committed: &committed,
+        commits: force.commits,
+        decided,
+        stats: force.sightings.stats(),
+    };
+
+    match promote(
+        force.config,
+        force.raft,
+        force.machine,
+        force.switches,
+        failing,
+        candidate,
+        true,
+        false,
+        true,
+        &leading,
+    )
+    .await
+    {
+        Ok(address) => {
+            // At once, not on the next tick (which skips a member not heard from lately):
+            // the old primary must follow before its pause ends.
+            let (host, port) = (
+                new.replication.host.clone(),
+                new.replication.port.to_string(),
+            );
+
+            if leading.holds().await
+                && let Err(error) = command(
+                    old,
+                    auth,
+                    &[b"REPLICAOF", host.as_bytes(), port.as_bytes(), b"YIELD"],
+                    timeout,
+                )
+                .await
+            {
+                warn!(group = %group.name, member = %old.address, %error, "the old primary was not pointed at the new one; the next tick does it");
+            }
+            Ok(address)
+        }
+        // Only a refusal before anything was recorded lifts the pause. When the record may
+        // have been made (the outcome is unknown), the old primary stays paused: a later
+        // leader may still promote the replica, and a primary taking writes by then loses them.
+        Err(error) if error.starts_with("ERR the chosen replica did not answer") => {
+            lift().await;
+            Err(error)
+        }
+        Err(error) => Err(format!(
+            "{error}; the old primary stays paused until a coordinator settles the group or the pause ends"
+        )),
+    }
 }
 
 /// Makes every answering member agree with the record: the primary takes writes, the others

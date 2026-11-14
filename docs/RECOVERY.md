@@ -234,8 +234,30 @@ error when the server does not answer again within `--wait-secs` (default 120). 
 `RUVIO_USER`) sign it in. The process does not start itself again: run it under a supervisor that restarts it
 after a clean exit (`Restart=always` in [deploy/ruvio.service](../deploy/ruvio.service), `restart: unless-stopped`
 in the compose files, a Kubernetes pod). A single node is down from the stop until recovery ends (see
-*Recovery-Time Objective*). With replication, restart one node at a time and follow
-[COORDINATOR.md](COORDINATOR.md#data-nodes) (*Way A*) for a primary, so writes pause only for the switchover.
+*Recovery-Time Objective*). In a group run by `ruvio coordinator`, restart it with `ruvio-ctl rolling-restart`
+(below) so writes pause only for a switchover.
+
+### A group of nodes
+
+```bash
+export RUVIO_COORDINATOR_SECRET=...                    # the coordinators' secret
+ruvio-ctl rolling-restart --coordinator c1:26379,c2:26379,c3:26379 --group main          # prints the plan, stops nothing
+ruvio-ctl rolling-restart --coordinator c1:26379,c2:26379,c3:26379 --group main --yes
+```
+
+For each group (every group when `--group` is left out, one after the other) it restarts the replicas one at a
+time, each until `ROLE` says it follows its primary again, then runs `COORDINATOR SWITCHOVER` (see
+[COORDINATOR.md](COORDINATOR.md#planned-switchover); writes pause briefly), then restarts the old primary the
+same way. Never more than one node is down. It stops at the first step that fails and says what it did; started
+again, `--skip host:port` leaves out a node an earlier run already restarted. It refuses a group without a replica,
+or with a member the coordinators see as down. The restart of each node is `ruvio-ctl restart`, so a node under
+durability `memory` is refused. The nodes need a supervisor that starts them again, and one that starts them as
+replicas of the current primary: a restarted old primary whose configuration still says primary takes writes
+until the coordinators make it follow (they do on the next ping), and those writes are lost.
+Clients that follow the coordinators see `-NOREPLICAS` during each pause and while a restarted replica is
+away if `min-replicas-to-write` needs it.
+Verified: a live test with three nodes and three coordinators, a supervisor and a client writing; `primary-lease`,
+several shards, systemd or Docker as supervisor, and large data sets: not measured.
 
 The operator UI shows a *Restart* panel on its Overview with the same warning and the same wait.
 

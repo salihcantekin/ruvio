@@ -270,6 +270,7 @@ pub(super) fn reveals_no_data(command: &Command<'_>) -> bool {
             | Command::ConfigGet(_)
             | Command::Topology(None)
             | Command::PrimaryLease(_)
+            | Command::Fence(_)
             | Command::Auth { .. }
             | Command::Hello { .. }
     )

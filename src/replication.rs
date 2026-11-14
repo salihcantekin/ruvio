@@ -58,6 +58,8 @@ pub const NOREPLICAS_LINE: &[u8] = b"NOREPLICAS Not enough good replicas to writ
 /// Same code as [`NOREPLICAS_LINE`], so clients treat both alike.
 pub const NOLEASE_LINE: &[u8] =
     b"NOREPLICAS Primary lease expired: too few coordinators renewed it.";
+/// Same code as [`NOREPLICAS_LINE`]: a planned switchover pauses writes for a moment.
+pub const PAUSED_LINE: &[u8] = b"NOREPLICAS Writes are paused for a switchover; retry shortly.";
 /// A replica that has nothing new to acknowledge repeats its last acknowledgement this
 /// often, so a primary can tell a quiet replica from a lost one (`min-replicas-max-lag`).
 pub const ACK_HEARTBEAT: Duration = Duration::from_secs(1);
@@ -78,6 +80,8 @@ pub enum WriteGate {
     NoReplicas,
     /// A primary with `primary-lease` on whose lease from the coordinators is not running.
     NoLease,
+    /// A primary told to pause writes for a planned switchover (`RUVIO FENCE`); it ends by itself.
+    Paused,
 }
 
 impl WriteGate {
@@ -89,6 +93,7 @@ impl WriteGate {
             Self::Fenced => Some(FENCED_LINE),
             Self::NoReplicas => Some(NOREPLICAS_LINE),
             Self::NoLease => Some(NOLEASE_LINE),
+            Self::Paused => Some(PAUSED_LINE),
         }
     }
 }

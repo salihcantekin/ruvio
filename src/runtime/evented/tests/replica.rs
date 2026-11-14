@@ -1383,6 +1383,54 @@ fn a_durable_connection_waits_for_its_replica_and_is_refused_without_one() {
     join_within(primary, PATIENCE).unwrap();
 }
 
+/// `RUVIO FENCE` pauses writes on a primary for a bounded time: writes are refused with a
+/// retryable line, reads still work, the pause ends by itself and `RUVIO FENCE 0` lifts it.
+#[test]
+fn a_fence_pauses_writes_on_a_primary_until_it_expires_or_is_lifted() {
+    let ports = crate::test_ports::reserve();
+    let replication = ports.address_at(0);
+    let (address, stop, server) = serve_with(|config| {
+        config.replication = crate::config::ReplicationConfig {
+            role: crate::config::ReplicationRole::Primary,
+            listen: Some(replication),
+            ..Default::default()
+        };
+    });
+    let paused: &[u8] = b"-NOREPLICAS Writes are paused for a switchover; retry shortly.\r\n";
+
+    assert_eq!(
+        request(address, &resp(&[&[b"SET", b"k", b"1"]])),
+        b"+OK\r\n"
+    );
+    assert_eq!(
+        request(address, &resp(&[&[b"RUVIO", b"FENCE", b"60000"]])),
+        b"+OK\r\n"
+    );
+    wait_until("writes are paused", || {
+        request(address, &resp(&[&[b"SET", b"k", b"2"]])) == paused
+    });
+    assert_eq!(request(address, &resp(&[&[b"GET", b"k"]])), b"$1\r\n1\r\n");
+
+    assert_eq!(
+        request(address, &resp(&[&[b"RUVIO", b"FENCE", b"0"]])),
+        b"+OK\r\n"
+    );
+    wait_until("writes resume after a lift", || {
+        request(address, &resp(&[&[b"SET", b"k", b"3"]])) == b"+OK\r\n"
+    });
+
+    assert_eq!(
+        request(address, &resp(&[&[b"RUVIO", b"FENCE", b"300"]])),
+        b"+OK\r\n"
+    );
+    wait_until("writes resume after expiry", || {
+        request(address, &resp(&[&[b"SET", b"k", b"4"]])) == b"+OK\r\n"
+    });
+
+    stop.request();
+    join_within(server, PATIENCE).unwrap();
+}
+
 /// A durable reply on a primary whose disk is slow does not sync on the shard thread: the
 /// other clients of the shard, and the coordinators' lease renewals, are answered meanwhile.
 #[test]
