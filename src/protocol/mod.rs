@@ -563,6 +563,8 @@ pub enum Command<'a> {
     Info(Option<Bytes<'a>>),
     Save,
     Bgsave,
+    /// `SHUTDOWN [SAVE|NOSAVE]`: stops the server the way `SIGTERM` does.
+    Shutdown(ShutdownMode),
     Get(Bytes<'a>),
     JsonGet {
         key: Bytes<'a>,
@@ -1368,6 +1370,17 @@ pub enum Command<'a> {
         key: Bytes<'a>,
         db: i64,
     },
+}
+
+/// The argument of `SHUTDOWN`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownMode {
+    /// No argument.
+    Default,
+    /// `SAVE`: refused when nothing is saved (durability `memory`).
+    Save,
+    /// `NOSAVE`: the caller accepts losing the data (durability `memory`).
+    NoSave,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

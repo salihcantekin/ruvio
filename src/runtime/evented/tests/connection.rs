@@ -653,7 +653,7 @@ fn evented_rejected_admin_verbs_reply_and_keep_the_connection() {
         request(
             address,
             b"*3\r\n$6\r\nCONFIG\r\n$3\r\nSET\r\n$11\r\nrequirepass\r\n\
-                  *1\r\n$8\r\nSHUTDOWN\r\n\
+                  *1\r\n$7\r\nMONITOR\r\n\
                   *2\r\n$5\r\nDEBUG\r\n$8\r\nSEGFAULT\r\n\
                   *3\r\n$7\r\nCLUSTER\r\n$4\r\nMEET\r\n$9\r\n127.0.0.1\r\n\
                   *1\r\n$4\r\nPING\r\n",

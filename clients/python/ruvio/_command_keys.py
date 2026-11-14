@@ -202,6 +202,7 @@ COMMAND_KEY_RULES = {
     b"SETNX": (1, 1, 1, 1, (), 13),
     b"SETRANGE": (1, 1, 1, 1, (), 9),
     b"SETV": (1, 1, 1, 1, (), 13),
+    b"SHUTDOWN": (0, 0, 0, 0, (), 0),
     b"SINTER": (1, 1, -1, 1, (), 2),
     b"SINTERCARD": (2, 1, 0, 0, (), 2),
     b"SINTERSTORE": (1, 1, -1, 1, (), 9),

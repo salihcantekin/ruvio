@@ -778,6 +778,9 @@ async def test_server(c):
         await c.replicaof_no_one()
     assert await c.save() is True
     assert "saving" in (await c.bgsave()).lower() or await c.bgsave()
+    # An unknown mode is always refused, so this never stops the server under test.
+    with pytest.raises(ruvio.ResponseError, match="SHUTDOWN expects SAVE or NOSAVE"):
+        await c.shutdown("BOGUS")
 
 
 async def test_transactions_raw(c):

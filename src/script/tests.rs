@@ -19,6 +19,7 @@ const KEYLESS_IN_SCRIPTS: &[&str] = &[
     "StreamGroupRead",
 ];
 const KEYLESS_REFUSED_IN_SCRIPTS: &[&str] = &[
+    "Shutdown",
     "Acl",
     "Auth",
     "Bgsave",

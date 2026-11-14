@@ -2495,6 +2495,14 @@
       }
     },
     {
+      "name": "SHUTDOWN",
+      "arity": -1,
+      "flags": [],
+      "keys": {
+        "kind": "none"
+      }
+    },
+    {
       "name": "SINTER",
       "arity": -2,
       "flags": [

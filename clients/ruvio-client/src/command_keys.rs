@@ -215,6 +215,7 @@ pub(crate) static COMMAND_KEY_RULES: &[(&str, KeyRule, u8)] = &[
     ("SETNX", KeyRule::Range { first: 1, last: 1, step: 1 }, 13),
     ("SETRANGE", KeyRule::Range { first: 1, last: 1, step: 1 }, 9),
     ("SETV", KeyRule::Range { first: 1, last: 1, step: 1 }, 13),
+    ("SHUTDOWN", KeyRule::None, 0),
     ("SINTER", KeyRule::Range { first: 1, last: -1, step: 1 }, 2),
     ("SINTERCARD", KeyRule::NumKeys { count_at: 1, before: 0 }, 2),
     ("SINTERSTORE", KeyRule::Range { first: 1, last: -1, step: 1 }, 9),

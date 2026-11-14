@@ -204,6 +204,43 @@ Do not restore into a directory owned by a running server. After restore, start
 backup. The server acquires `LOCK` and runs the conservative startup recovery
 path.
 
+## Restart
+
+A restart that loses no acknowledged write is a stop through `SIGTERM` or `SHUTDOWN` (the server drains its
+clients for `RUVIO_SHUTDOWN_GRACE_MS`, flushes its log and writes a final checkpoint), followed by a start of
+the same data directory. A kill or a crash is not that. What a stop costs depends on the durability profile:
+
+| Profile | `SIGTERM` or `SHUTDOWN` | Kill or crash |
+| --- | --- | --- |
+| `memory` | **Every key is lost.** Nothing is saved | Every key is lost |
+| `snapshot` | Final checkpoint written | Writes after the last `SAVE` are lost |
+| `everysec` | Log flushed, final checkpoint written | Up to one sync window |
+| `always` | Nothing is lost | Nothing acknowledged is lost |
+
+Restarting does not shrink memory that holds live data: the data is loaded again. It helps with memory the
+allocator kept after keys were deleted or shrunk; compare `INFO` memory before and after to see which case it is.
+
+`SHUTDOWN` refuses under `memory` unless it is `SHUTDOWN NOSAVE`, so a restart from a script cannot drop the
+data by accident. `ruvio-ctl restart` does the whole round trip for one node:
+
+```bash
+ruvio-ctl restart --address 127.0.0.1:6379            # prints what a stop costs, stops nothing
+ruvio-ctl restart --address 127.0.0.1:6379 --yes      # SHUTDOWN, then waits until PING answers again
+ruvio-ctl restart --yes --allow-data-loss             # needed as well under durability memory
+```
+
+It reads the profile with `CONFIG GET durability`, prints the line above that matches it, and exits with an
+error when the server does not answer again within `--wait-secs` (default 120). `RUVIO_PASSWORD` (and
+`RUVIO_USER`) sign it in. The process does not start itself again: run it under a supervisor that restarts it
+after a clean exit (`Restart=always` in [deploy/ruvio.service](../deploy/ruvio.service), `restart: unless-stopped`
+in the compose files, a Kubernetes pod). A single node is down from the stop until recovery ends (see
+*Recovery-Time Objective*). With replication, restart one node at a time and follow
+[COORDINATOR.md](COORDINATOR.md#data-nodes) (*Way A*) for a primary, so writes pause only for the switchover.
+
+To restart at a fixed time, let the system's timer call it, for example
+[deploy/ruvio-restart.timer](../deploy/ruvio-restart.timer) with `OnCalendar=*-*-* 03:00:00`. Under `memory`
+the unit would need `--allow-data-loss`, which the example leaves out on purpose.
+
 ## Upgrade
 
 An upgrade keeps the data directory and replaces the `ruvio` binary. Shard

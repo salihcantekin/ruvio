@@ -1129,6 +1129,7 @@ pub fn command_acl_name(command: &Command<'_>) -> &'static str {
         Command::Info(_) => "info",
         Command::Save => "save",
         Command::Bgsave => "bgsave",
+        Command::Shutdown(_) => "shutdown",
         Command::Get(_) => "get",
         Command::Set(_, _, _) => "set",
         Command::Increment(_, _) | Command::IncrementCapped { .. } => "incr",

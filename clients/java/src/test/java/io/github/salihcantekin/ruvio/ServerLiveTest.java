@@ -156,6 +156,8 @@ class ServerLiveTest {
         assertThrows(RuvioServerException.class, () -> c.replicaOfNoOne(false));
         c.save();
         assertNotNull(c.bgsave());
+        // An unknown mode is always refused, so this never stops the server under test.
+        assertThrows(RuvioServerException.class, () -> c.shutdown("BOGUS"));
         assertEquals(0L, c.waitReplicas(0, 10));
     }
 

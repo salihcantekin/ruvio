@@ -83,6 +83,10 @@ func TestLiveConnectionAndServer(t *testing.T) {
 	}
 	okOrServerErr(t, "SAVE", c.Save(ctx))
 	okOrServerErr(t, "BGSAVE", func() error { _, err := c.BgSave(ctx); return err }())
+	// An unknown mode is always refused, so this never stops the server the test runs against.
+	if err := c.Shutdown(ctx, "BOGUS"); err == nil || !strings.Contains(err.Error(), "SHUTDOWN expects SAVE or NOSAVE") {
+		t.Fatalf("SHUTDOWN BOGUS answered %v, want the syntax error", err)
+	}
 	cmd := must[Value](t)(c.Command(ctx))
 	if len(cmd.Array) < 200 {
 		t.Fatalf("COMMAND returned %d entries", len(cmd.Array))

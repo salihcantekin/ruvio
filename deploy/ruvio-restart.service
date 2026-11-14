@@ -1,0 +1,12 @@
+[Unit]
+Description=Restart the Ruvio server and wait until it answers again
+After=ruvio.service
+
+[Service]
+Type=oneshot
+User=ruvio
+Group=ruvio
+# Prints what a stop costs under the server's durability profile. Under durability memory every
+# key is lost and the command refuses without --allow-data-loss, which is left out on purpose.
+# Add Environment=RUVIO_PASSWORD=... (or EnvironmentFile=) when the server needs AUTH.
+ExecStart=/usr/local/bin/ruvio-ctl restart --address 127.0.0.1:6379 --yes --wait-secs 300

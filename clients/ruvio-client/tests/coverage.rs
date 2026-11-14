@@ -146,6 +146,7 @@ fn methods_exist() {
     let _ = Client::bf_reserve;
     let _ = Client::bf_reserve_with;
     let _ = Client::bgsave;
+    let _ = Client::shutdown;
     let _ = Client::bitcount;
     let _ = Client::bitcount_range;
     let _ = Client::bitfield;

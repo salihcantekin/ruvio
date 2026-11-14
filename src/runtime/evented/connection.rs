@@ -920,7 +920,12 @@ pub(super) async fn handle_client(
                                     consumed += frame_length;
                                     batch_commands += 1;
                                     session.mark_queue_error();
-                                    output.write_all(reply)?;
+                                    // A client that may not run the command (no login, or
+                                    // a denying ACL) gets that refusal, not this one.
+                                    match forward_refusal(&auth, None, &command) {
+                                        Some(refusal) => write_response(&mut output, refusal)?,
+                                        None => output.write_all(reply)?,
+                                    }
                                     continue;
                                 }
 
@@ -1596,6 +1601,7 @@ fn plain_command(command: &Command<'_>) -> bool {
                 | Command::Migrate(_)
                 | Command::Role
                 | Command::Bgsave
+                | Command::Shutdown(_)
                 | Command::ChangesSubscribe(_)
                 | Command::Multi
                 | Command::Exec
@@ -2067,6 +2073,15 @@ async fn dispatch_inner<'s>(
 
             Command::Role => {
                 write_response(output, super::replica::role_response(state))?;
+
+                return Ok(());
+            }
+
+            Command::Shutdown(mode) => {
+                let response =
+                    shutdown_response(*mode, state.published_config.persistence.profile, shutdown);
+
+                write_response(output, response)?;
 
                 return Ok(());
             }
@@ -3200,4 +3215,35 @@ fn script_limits(state: &ShardState) -> crate::config::ScriptLimits {
         .with(|leases| leases.remaining(crate::primary_lease::now()));
 
     crate::primary_lease::limit_script_time(limits, left)
+}
+
+/// `SHUTDOWN [SAVE|NOSAVE]`: asks every shard to stop the way `SIGTERM` does (drain, final
+/// log flush, final checkpoint). Under durability `memory` nothing is saved, so the data
+/// would be lost: it needs `NOSAVE`. Under a saving profile the stop always saves, so
+/// `NOSAVE` is refused instead of being ignored.
+fn shutdown_response(
+    mode: crate::protocol::ShutdownMode,
+    profile: crate::DurabilityProfile,
+    shutdown: &ShutdownToken,
+) -> Response<'static> {
+    use crate::protocol::ShutdownMode;
+
+    let saves = profile != crate::DurabilityProfile::Memory;
+
+    match (mode, saves) {
+        (ShutdownMode::NoSave, true) => Response::Error(
+            b"ERR SHUTDOWN NOSAVE is for durability memory; this server saves when it stops",
+        ),
+        (ShutdownMode::Save, false) => {
+            Response::Error(b"ERR SHUTDOWN SAVE needs a durability profile that saves")
+        }
+        (ShutdownMode::Default, false) => Response::Error(
+            b"ERR durability is memory: every key is lost when the server stops; use SHUTDOWN NOSAVE to confirm",
+        ),
+        _ => {
+            shutdown.request();
+
+            Response::Simple(b"OK")
+        }
+    }
 }

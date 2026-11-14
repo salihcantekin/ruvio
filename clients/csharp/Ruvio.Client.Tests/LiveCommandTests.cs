@@ -648,6 +648,9 @@ public sealed class LiveCommandTests(ITestOutputHelper output)
 
         await db.SaveAsync();
         await db.SaveInBackgroundAsync();
+        // An unknown mode is always refused, so this never stops the server under test.
+        RuvioException unknownMode = await Assert.ThrowsAsync<RuvioException>(async () => await db.ShutdownAsync("BOGUS"));
+        Assert.Contains("SHUTDOWN expects SAVE or NOSAVE", unknownMode.Message);
         Assert.True(await db.GetSlowLogLengthAsync() >= 0);
         Assert.NotNull(await db.GetSlowLogAsync(5));
         await db.ResetSlowLogAsync();

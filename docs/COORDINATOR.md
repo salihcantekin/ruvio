@@ -634,6 +634,8 @@ Each data node's own files are read by the newer release as in a single-server u
 
 Two ways, per group. Neither loses an acknowledged write.
 
+`ruvio-ctl restart --yes` stops one node cleanly and waits for it to answer again (see *Restart* in [RECOVERY.md](RECOVERY.md#restart)); use it for a replica, and for a primary only through Way A so writes pause once.
+
 **Way A: switch over to an upgraded replica.** Reads go on throughout. Writes pause from step 1
 until the promoted replica takes them: the replicas' restarts, then about `down_after_ms` plus one
 `ping_interval_ms` after step 4.

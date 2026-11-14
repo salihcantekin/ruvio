@@ -207,6 +207,7 @@ internal static class CommandKeyRules
         ["SETNX"] = new(1, 1, 1, 1, [], 13),
         ["SETRANGE"] = new(1, 1, 1, 1, [], 9),
         ["SETV"] = new(1, 1, 1, 1, [], 13),
+        ["SHUTDOWN"] = new(0, 0, 0, 0, [], 0),
         ["SINTER"] = new(1, 1, -1, 1, [], 2),
         ["SINTERCARD"] = new(2, 1, 0, 0, [], 2),
         ["SINTERSTORE"] = new(1, 1, -1, 1, [], 9),

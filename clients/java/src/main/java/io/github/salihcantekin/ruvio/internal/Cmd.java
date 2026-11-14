@@ -408,6 +408,8 @@ public final class Cmd {
     public static final byte[] SETRANGE = RespOut.fragment("SETRANGE");
     /** The word {@code SETV}, pre-encoded as a RESP bulk string. */
     public static final byte[] SETV = RespOut.fragment("SETV");
+    /** The word {@code SHUTDOWN}, pre-encoded as a RESP bulk string. */
+    public static final byte[] SHUTDOWN = RespOut.fragment("SHUTDOWN");
     /** The word {@code SINTER}, pre-encoded as a RESP bulk string. */
     public static final byte[] SINTER = RespOut.fragment("SINTER");
     /** The word {@code SINTERCARD}, pre-encoded as a RESP bulk string. */
