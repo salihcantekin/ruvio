@@ -13,6 +13,25 @@ export type LongRun = {
 
 export const longRuns: LongRun[] = [
   {
+    date: "2026-11-13",
+    title: "Twelve hours of load and failures",
+    environment: "Azure, 3 nodes (4 vCPU, 16 GB, one 128 GB Premium SSD each) and a load machine (8 vCPU)",
+    duration: "12 hours: 2 quiet hours, 7.5 hours with a fault every 10 to 15 minutes, 2.5 quiet hours",
+    tested: [
+      "25.2 million counter, list and register operations in three modes (async replication, writes that wait for both replicas, the official Python client), every one recorded and checked at the end",
+      "A background load of 6,000 operations per second over a key space of a million keys, part of them expiring and coming back",
+      "34 faults of ten kinds: primary, replica and coordinator leader killed, a replica frozen, a whole machine killed or cut off the network, network delay and packet loss, the coordinator leader cut off from the other coordinators, slots moved between groups, and every data process killed and restarted at once",
+      "17 pass or fail checks on correctness, recovery, failovers, latency, throughput, memory, file descriptors, disk and the coordinators' Raft log",
+    ],
+    result: [
+      "No acknowledged write lost, duplicated, invented or out of order and no stale read, in any of the three modes",
+      "Every fault recovered: the slowest 9.7 seconds after the fault ended, the median 3 seconds; a slot move took at most 13 seconds",
+      "No failover the test did not cause, no crash; after a full restart the group that syncs every write lost nothing",
+      "Memory, descriptors, the write-ahead log and the Raft log stayed bounded; free disk never fell below 94 %",
+      "All 17 checks passed. Latency followed the cloud disks: when two hosts' disks slowed for the last hours, writes that wait for both replicas went from about 22 to 30 ms at the median",
+    ],
+  },
+  {
     date: "2026-10-26",
     title: "Throughput as shards are added",
     environment: "Azure F16as_v6 (16 cores): servers on 8 cores, load on the other 8",

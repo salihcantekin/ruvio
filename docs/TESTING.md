@@ -168,9 +168,12 @@ A run writes `status.json` (and uploads it to Azure Blob when a SAS URL is confi
 checker's unit tests run in the PR gate (`python3 tests/soak/test_soak.py`); the runs themselves
 are started by hand. Local, debug build: `plans/local-smoke.json` (60 s, every local fault kind) ends with
 no durable write lost (lost `default` writes around a killed primary are counted as warnings); `plans/local-restart-as-configured.json` reproduces
-[#142](https://github.com/salihcantekin/ruvio/issues/142). On four Azure VMs, a 3-hour run with
-faults and a 2-hour fixed-load run lost no acknowledged `CLIENT DURABILITY` write; the results
-are on the [long-run tests](https://ruviodb.com/testing/) page.
+[#142](https://github.com/salihcantekin/ruvio/issues/142). On four Azure VMs, a 12-hour run
+(`plans/azure-12h.json`: 25.2 million recorded operations, 34 faults of ten kinds, a background
+load over a million keys) passed all 17 checks of the run report: no acknowledged write lost or
+read stale in any mode, every fault recovered within 10 s of its end, no failover the test did
+not cause, and memory, WAL and Raft log bounded. The results are on the
+[long-run tests](https://ruviodb.com/testing/) page.
 
 ## Long model-check sessions
 
@@ -347,7 +350,7 @@ published production-hardware latency or durability evidence.
 | Evidence gap | What remains |
 | --- | --- |
 | Host and device failure | Power-loss testing and validation of flush behavior on production-like Linux filesystems and storage |
-| Long-duration stability | A 24-hour mixed-workload soak with resource and recovery evidence; 3-hour and 2-hour multi-node runs are on the [long-run tests](https://ruviodb.com/testing/) page |
+| Long-duration stability | A 24-hour multi-node run; a 12-hour run with faults passed every check and is on the [long-run tests](https://ruviodb.com/testing/) page |
 | Native macOS faults | Process/filesystem fault scenarios against a Ruvio process running directly on macOS, rather than inside Docker's Linux VM |
 | Production performance | Published Linux bare-metal p50/p95/p99 latency and repeatable throughput measurements |
 | Failure operations | Measured recovery time across repeated automatic failovers; failovers by `ruvio coordinator` and client following already run in `scripts/coordinator_faults.py`, the client suites and the long runs |
