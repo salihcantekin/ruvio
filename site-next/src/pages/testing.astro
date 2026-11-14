@@ -44,10 +44,22 @@ import { longRuns } from "../data/long-run-tests";
         <h2>How a run works</h2>
         <p>
           Each run builds the server from source on fresh virtual machines, starts a coordinator and two replicated
-          groups on three machines, and drives load from a fourth. Every operation is written to a history file with its
-          outcome: acknowledged, refused, or unknown. Faults are injected and healed on a schedule, and after each one the
-          cluster must agree on its primaries and take writes again. At the end every key is read back and the history
-          is checked for lost, duplicated, invented and out-of-order writes and for stale reads.
+          groups on three machines, and drives load from a fourth. One group syncs every write to disk, the other once
+          a second. Every operation is written to a history file with its outcome: acknowledged, refused, or unknown.
+          A background load runs beside it over a large, partly expiring data set, so memory and disk are measured
+          under real work.
+        </p>
+        <p>
+          The longer runs start and end with hours without faults. In between, faults are injected and healed on a
+          schedule, and after each one the cluster must agree on its primaries and take writes again within a time
+          limit. At the end every key is read back and the history is checked for lost, duplicated, invented and
+          out-of-order writes and for stale reads.
+        </p>
+        <p>
+          The run then judges 17 checks, each with a fixed threshold: correctness in every mode, recovery time, no
+          failover the test did not cause, no crash, latency and throughput in the last quiet hours against the first,
+          and memory, file descriptors, disk and the Raft log bounded. Each host's disk is sampled too, so a slowdown
+          of the cloud disk is told apart from one of the server. A run passes only when every check passes.
         </p>
         <p>
           The tool, its plans and the machine templates are in{" "}

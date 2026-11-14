@@ -225,6 +225,11 @@ to delete its own VMs at the end, `selfDelete=true` and
 file is in Blob; the auto-shutdown stays as the backstop). `plans/local-rehearsal.json` runs
 the same machinery locally in about 12 minutes.
 
+`plans/azure-12h.json` is the same in 12 hours: 2 quiet hours, a fault every 10-15 minutes from
+hour 2 to hour 9.5 (each of the ten kinds three times, the rest at random, about 35 faults), then
+2.5 quiet hours. It uses the same controller, disk and self-delete settings as the 24-hour plan,
+with `ttlHours=16` and the backstop at 16 hours.
+
 `plans/azure-1h.json` is the same in one hour: 18 quiet minutes, a fault every 150-170 s for
 24 minutes (each kind about once), 18 quiet minutes. Its quiet windows are under the 10 minutes
 a memory slope needs, so criterion 13 judges only the first and last window there.
@@ -256,7 +261,7 @@ disk, or with its CPU taken by the hypervisor.
 `plans/azure-short.json` is the same in 30 minutes (faults every 2-4 minutes), to try the tool.
 `plans/azure-mini.json` is a 3-hour run: every fault kind every 5-10 minutes, faults lasting
 5-30 s, `durable` writes waiting for both replicas. The cloud-init data-disk detection and the
-`nft`/`tc` faults have not been run on Azure yet.
+`nft`/`tc` faults have since run on Azure in every plan above.
 
 ## Files
 
