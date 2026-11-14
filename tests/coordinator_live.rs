@@ -488,6 +488,120 @@ fn coordinators_fail_over_a_dead_primary_and_bring_it_back_as_a_replica() {
     );
 }
 
+/// `COORDINATOR SWITCHOVER`: a working primary is handed to a replica while a client keeps
+/// writing; every write the old primary acknowledged is on the new one, the old one follows,
+/// and the refusals leave the group alone.
+#[test]
+fn a_switchover_hands_the_primary_over_without_losing_an_acknowledged_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let group = Group::new();
+    let _nodes = [
+        group.node(dir.path(), 0, None),
+        group.node(dir.path(), 1, Some(0)),
+        group.node(dir.path(), 2, Some(0)),
+    ];
+    let _coordinators: Vec<Process> = (0..3)
+        .map(|index| group.coordinator(dir.path(), index))
+        .collect();
+
+    wait_until("the coordinators to agree on the primary", || {
+        (0..3).all(|index| group.primary_by(index) == Some(0))
+    });
+    let addresses: Vec<String> = group.resp.iter().map(ToString::to_string).collect();
+    let on_leader = |args: &[&str]| -> String {
+        let mut reply = None;
+
+        wait_until("the leader to answer", || {
+            reply = group.coordinators.iter().find_map(|coordinator| {
+                call_with_secret(&coordinator.to_string(), args).filter(|reply| {
+                    !reply.starts_with("ERR not the leader")
+                        && !reply.starts_with("ERR no leader")
+                        && !reply.starts_with("ERR the leader is still applying")
+                })
+            });
+            reply.is_some()
+        });
+        reply.unwrap()
+    };
+
+    // Refusals change nothing.
+    assert!(on_leader(&["COORDINATOR", "SWITCHOVER", "nosuch"]).starts_with("ERR no group"));
+    assert!(
+        on_leader(&["COORDINATOR", "SWITCHOVER", "main", "TO", &addresses[0]])
+            .contains("already the primary")
+    );
+    assert!(
+        on_leader(&["COORDINATOR", "SWITCHOVER", "main", "TO", "127.0.0.1:1"])
+            .contains("is not a member")
+    );
+    assert_eq!(group.primary_by(0), Some(0));
+
+    // A client keeps writing to whichever node accepts it; it counts what was acknowledged.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let (stop, addresses) = (stop.clone(), addresses.clone());
+
+        std::thread::spawn(move || {
+            let mut acknowledged = Vec::new();
+            let mut next = 0u64;
+
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let key = format!("w{next}");
+
+                if addresses
+                    .iter()
+                    .any(|node| call(node, &["SET", &key, "1"]).as_deref() == Some("OK"))
+                {
+                    acknowledged.push(key);
+                    next += 1;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            acknowledged
+        })
+    };
+    wait_until("the writer to get going", || {
+        call(&addresses[0], &["EXISTS", "w50"]).as_deref() == Some("1")
+    });
+
+    let started = Instant::now();
+    let reply = on_leader(&["COORDINATOR", "SWITCHOVER", "main"]);
+
+    eprintln!("switchover answered in {:?}", started.elapsed());
+
+    assert!(!reply.starts_with("ERR"), "{reply}");
+    let promoted = group.primary_by(0).unwrap();
+
+    assert_ne!(promoted, 0, "the primary did not change");
+    assert_eq!(reply, group.resp[promoted].to_string());
+    wait_until("the new primary to take writes", || {
+        call(&addresses[promoted], &["SET", "after", "1"]).as_deref() == Some("OK")
+    });
+    wait_until("the old primary to follow the new one", || {
+        call(&addresses[0], &["GET", "after"]).as_deref() == Some("1")
+    });
+    assert!(
+        call(&addresses[0], &["SET", "late", "1"])
+            .unwrap()
+            .starts_with("READONLY")
+    );
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let acknowledged = writer.join().unwrap();
+
+    eprintln!("{} writes acknowledged", acknowledged.len());
+    assert!(acknowledged.len() > 50);
+    for key in &acknowledged {
+        assert_eq!(
+            call(&addresses[promoted], &["GET", key]).as_deref(),
+            Some("1"),
+            "{key} was acknowledged and is missing on the new primary"
+        );
+    }
+    let info = group.leader_info().unwrap();
+
+    assert!(info.contains("failovers_total:1\r\n"), "{info}");
+}
+
 #[test]
 fn a_leader_cut_off_from_the_other_coordinators_does_not_act() {
     let dir = tempfile::tempdir().unwrap();
