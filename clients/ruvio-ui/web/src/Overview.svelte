@@ -5,6 +5,7 @@
   import Icon from "./Icon.svelte";
   import LiveControls from "./LiveControls.svelte";
   import SlotMap from "./SlotMap.svelte";
+  import Restart from "./Restart.svelte";
   import { preference, savePreference } from "./preferences.js";
   const taskIcons = { locking: "lock", conditional: "layers", limiting: "clock", idempotency: "key", inventory: "cart", sessions: "users", jobs: "tasks", changes: "list", json: "doc", strings: "doc", keys: "key", lists: "list" };
   let { shards, selected, readings, openTask, onData, onCluster, onDashboard, lines, interval = $bindable(), paused = $bindable(), refreshing, updated, probeError, refresh } = $props();
@@ -140,3 +141,5 @@
     <p class="hint">Open Session activity below for replies and errors.</p>
   </section>
 </div>
+
+<Restart readings={visible} clustered={!!onCluster} />

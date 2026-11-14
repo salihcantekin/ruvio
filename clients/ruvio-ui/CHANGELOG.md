@@ -4,6 +4,7 @@ Notable changes to `ruvio-ui`, the web console (Docker image and host binaries).
 
 ## Unreleased
 
+- Overview: a **Restart** panel lists every answering node with its durability profile. "Restart..." opens a confirmation that says what a stop costs (under `memory` every key is lost and a tick is required; the UI then sends `SHUTDOWN NOSAVE`), then sends `SHUTDOWN` to that node and waits until it answers again. It needs a server with `SHUTDOWN` (the `dev` server) and an ACL user that may run it, and a supervisor that starts the node again. Checked with browser tests on a mocked API (desktop and phone) and unit tests; against a real node and a real supervisor: not checked.
 - UI session generation falls back gracefully when `crypto.randomUUID` is unavailable, fixing blank screen errors when accessing the UI over plain HTTP IP addresses in non-secure contexts.
 
 - Database selector in the header: a compact dropdown of databases 0 to 15 that lists the number of keys in each one (read with `INFO keyspace` when the menu opens) and dims empty databases. The active database is updated automatically when `SELECT` is executed from the console or any other command; in a cluster only database 0 can be chosen.
