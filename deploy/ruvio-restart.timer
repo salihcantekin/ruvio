@@ -1,0 +1,10 @@
+[Unit]
+Description=Restart the Ruvio server every night
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=false
+RandomizedDelaySec=0
+
+[Install]
+WantedBy=timers.target

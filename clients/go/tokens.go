@@ -194,6 +194,7 @@ var (
 	cSETNX             = preEnc("SETNX")
 	cSETRANGE          = preEnc("SETRANGE")
 	cSETV              = preEnc("SETV")
+	cSHUTDOWN          = preEnc("SHUTDOWN")
 	cSINTER            = preEnc("SINTER")
 	cSINTERCARD        = preEnc("SINTERCARD")
 	cSINTERSTORE       = preEnc("SINTERSTORE")

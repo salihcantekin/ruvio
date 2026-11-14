@@ -5829,6 +5829,19 @@ public abstract class RuvioSyncCommands<K, V> {
     }
 
     /**
+     * Sends {@code SHUTDOWN}: the server stops the way {@code SIGTERM} stops it (drains clients,
+     * flushes its log, writes a final checkpoint) and a supervisor has to start it again. Under
+     * durability {@code memory} nothing is saved, so the server refuses unless {@code mode} is
+     * {@code NOSAVE}: every key is lost. {@code NOSAVE} is refused under a saving profile.
+     *
+     * @param mode nothing, {@code SAVE} or {@code NOSAVE}
+     * @throws RuvioServerException {@code ERR} when the server refuses
+     */
+    public void shutdown(String... mode) {
+        await(async.shutdown(mode));
+    }
+
+    /**
      * Sends {@code WAIT numreplicas timeout}: blocks until replicas have synced the shard's WAL sequence to disk. With {@code port_mode = "per-shard"} it covers the shard the connection reaches plus shards its writes were forwarded to. A write is never undone when the wait times out. Not allowed inside a transaction or a script.
      *
      * @param replicas how many replicas must catch up

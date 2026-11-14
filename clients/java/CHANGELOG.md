@@ -4,6 +4,7 @@ Notable changes to the Java client `io.github.salihcantekin:ruvio-client`. New e
 
 ## Unreleased
 
+- `shutdown` sends `SHUTDOWN [SAVE|NOSAVE]`: the server stops like `SIGTERM`; under durability `memory` it refuses without `NOSAVE`.
 - Cluster mode: a `READONLY` reply (the node that owned the slot was demoted by a failover) now reloads the slot table off the reader threads, and when the table names another node the command is sent there once. `READONLY` comes before a command runs, so the retry cannot apply it twice. Before, the client kept writing to the demoted node and got `READONLY` until something else reloaded the table. A keyless command still returns the error. Nothing changes on the success path (issue #406).
 
 ## 0.2.0 - 2026-10-29

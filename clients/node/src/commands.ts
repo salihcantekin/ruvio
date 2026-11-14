@@ -5757,6 +5757,16 @@ export abstract class Commands {
     return this._0(null, C.BGSAVE);
   }
   /**
+   * Stops the server the way `SIGTERM` does (`SHUTDOWN`): it drains clients, flushes its log and
+   * writes a final checkpoint, and a supervisor has to start it again. Under durability `memory`
+   * nothing is saved, so the server refuses unless `rest` is `'NOSAVE'`: every key is lost.
+   * `NOSAVE` is refused under a saving profile.
+   *
+   * @param rest Nothing, `'SAVE'` or `'NOSAVE'`.
+   * @returns `OK`, sent before the server stops.
+   */
+  shutdown(...rest: Arg[]): R<unknown> { return this._v(null, C.SHUTDOWN, [...rest]); }
+  /**
    * Waits for replicas (`WAIT numReplicas timeoutMs`). Blocks only the calling connection until that many replicas have synced this shard's WAL to disk, or the timeout. A missing replica never rolls the write back. Not allowed inside MULTI or scripts. With `port_mode = "per-shard"` it also covers the shards this connection's writes were forwarded to.
    *
    * @param numReplicas Replicas to wait for.

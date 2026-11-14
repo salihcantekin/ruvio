@@ -1032,9 +1032,11 @@ fn xclaim_rejects_idle_with_time_and_sends_every_option() {
 fn simple_admin_commands_send_their_words() {
     type Call = fn(&mut Client) -> Result<(), Error>;
 
-    let calls: [(Call, &[&str]); 11] = [
+    let calls: [(Call, &[&str]); 13] = [
         (|c| c.save(), &["SAVE"]),
         (|c| c.bgsave(), &["BGSAVE"]),
+        (|c| c.shutdown(&[]), &["SHUTDOWN"]),
+        (|c| c.shutdown(&["NOSAVE"]), &["SHUTDOWN", "NOSAVE"]),
         (|c| c.flushall(), &["FLUSHALL"]),
         (|c| c.swapdb(1, 2), &["SWAPDB", "1", "2"]),
         (|c| c.watch_key("k"), &["WATCH", "k"]),

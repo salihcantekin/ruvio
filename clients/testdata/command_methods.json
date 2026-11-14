@@ -217,6 +217,7 @@
     "SETNX": {"rust": "setnx", "csharp": "SetIfNotExistsAsync", "go": "SetNX", "java": "setnx", "node": "setnx", "python": "setnx"},
     "SETRANGE": {"rust": "setrange", "csharp": "SetRangeAsync", "go": "SetRange", "java": "setrange", "node": "setrange", "python": "setrange"},
     "SETV": {"rust": "setv", "csharp": "SetVersionAsync", "go": "SetV", "java": "setv", "node": "setv", "python": "setv"},
+    "SHUTDOWN": {"rust": "shutdown", "csharp": "ShutdownAsync", "go": "Shutdown", "java": "shutdown", "node": "shutdown", "python": "shutdown"},
     "SINTER": {"rust": "sinter", "csharp": "GetSetIntersectionAsync", "go": "SInter", "java": "sinter", "node": "sinter", "python": "sinter"},
     "SINTERCARD": {"rust": "sintercard", "csharp": "GetSetIntersectionCountAsync", "go": "SInterCard", "java": "sintercard", "node": "sintercard", "python": "sintercard"},
     "SINTERSTORE": {"rust": "sinterstore", "csharp": "StoreSetIntersectionAsync", "go": "SInterStore", "java": "sinterstore", "node": "sinterstore", "python": "sinterstore"},

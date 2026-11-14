@@ -653,6 +653,19 @@ func (c *cmds) Save(ctx context.Context) error { return c.ok(ctx, newCmd(1, cSAV
 // saving started"). Ruvio runs it inside the process, not in a forked child.
 func (c *cmds) BgSave(ctx context.Context) (string, error) { return c.strR(ctx, newCmd(1, cBGSAVE)) }
 
+// Shutdown stops the server the way SIGTERM does (SHUTDOWN): it drains clients, flushes its log
+// and writes a final checkpoint, and a supervisor has to start it again. rest is empty, "SAVE"
+// or "NOSAVE". Under durability memory nothing is saved, so the server refuses unless rest is
+// "NOSAVE": every key is lost. NOSAVE is refused under a saving profile. The server answers OK
+// before it stops.
+func (c *cmds) Shutdown(ctx context.Context, rest ...string) error {
+	r := newCmd(1+len(rest), cSHUTDOWN)
+	for _, a := range rest {
+		r.s(a)
+	}
+	return c.ok(ctx, r)
+}
+
 // Command returns the full COMMAND reply: one entry per command in COMMAND INFO form.
 // Only useful for tooling; the reply is large.
 func (c *cmds) Command(ctx context.Context) (Value, error) { return c.value(ctx, newCmd(1, cCOMMAND)) }

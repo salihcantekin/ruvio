@@ -5593,6 +5593,25 @@ Sends ``XCLAIM key group consumer min_idle_ms id... [IDLE ms] [TIME ms] [RETRYCO
         """
         return self._c(None, "BGSAVE")
 
+    def shutdown(self, *rest) -> Any:
+        """``SHUTDOWN`` - stops the server the way ``SIGTERM`` does.
+
+        The server drains its clients, flushes its log and writes a final checkpoint; a
+        supervisor has to start it again. Under durability ``memory`` nothing is saved, so the
+        server refuses unless ``rest`` is ``"NOSAVE"``: every key is lost. ``NOSAVE`` is refused
+        under a saving profile.
+
+        Args:
+            *rest: Nothing, ``"SAVE"`` or ``"NOSAVE"``.
+
+        Returns:
+            ``OK``, sent before the server stops.
+
+        Raises:
+            ResponseError: The server refused (see above).
+        """
+        return self._c(None, "SHUTDOWN", *rest)
+
     # ======================================================= transactions (raw)
     def multi(self) -> Any:
         """``MULTI`` - raw transaction start. Prefer ``pipeline(transaction=True)`` or :meth:`transaction`.

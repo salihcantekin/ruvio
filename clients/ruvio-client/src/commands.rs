@@ -2901,6 +2901,18 @@ impl Client {
         self.ok(["BGSAVE"])
     }
 
+    /// Sends `SHUTDOWN`: the server stops the way `SIGTERM` stops it (drains clients, flushes its
+    /// log, writes a final checkpoint) and a supervisor has to start it again.
+    ///
+    /// `rest` is empty, `["SAVE"]` or `["NOSAVE"]`. Under durability `memory` nothing is saved, so
+    /// the server refuses unless `rest` is `["NOSAVE"]`: every key is lost. `NOSAVE` is refused
+    /// under a saving profile. The server answers `OK` before it stops.
+    pub fn shutdown(&mut self, rest: &[&str]) -> Result<(), Error> {
+        let mut arguments = vec!["SHUTDOWN"];
+        arguments.extend_from_slice(rest);
+        self.ok(arguments)
+    }
+
     /// Sends `FLUSHDB`: deletes every key of the selected database.
     ///
     /// A routing client sends it to every shard. A client opened with `discover_cluster: false`

@@ -1896,6 +1896,12 @@ public sealed partial class RuvioClient
     }
 
     /// <inheritdoc />
+    public ValueTask ShutdownAsync(string? mode = null, CancellationToken cancellationToken = default)
+    {
+        return Ok(mode is null ? new RespCommand("SHUTDOWN") : new RespCommand("SHUTDOWN", mode), cancellationToken);
+    }
+
+    /// <inheritdoc />
     public ValueTask<long> PublishAsync(string channel, string message, CancellationToken cancellationToken = default)
     {
         return Integer(new RespCommand("PUBLISH", channel, message), cancellationToken);

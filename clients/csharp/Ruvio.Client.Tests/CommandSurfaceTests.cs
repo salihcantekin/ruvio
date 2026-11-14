@@ -911,6 +911,18 @@ public partial class CommandSurfaceTests
         await session.Reply("+OK\r\n");
         await bgsave;
 
+        ValueTask stop = session.Client.ShutdownAsync();
+
+        await session.Expect("SHUTDOWN");
+        await session.Reply("+OK\r\n");
+        await stop;
+
+        ValueTask stopWithoutSaving = session.Client.ShutdownAsync("NOSAVE");
+
+        await session.Expect("SHUTDOWN", "NOSAVE");
+        await session.Reply("+OK\r\n");
+        await stopWithoutSaving;
+
         ValueTask<long> pub = session.Client.PublishAsync("c", "m");
 
         await session.Expect("PUBLISH", "c", "m");

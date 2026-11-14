@@ -1928,6 +1928,16 @@
       ]
     },
     {
+      "name": "SHUTDOWN",
+      "family": "introspection",
+      "status": "supported",
+      "same_slot": false,
+      "limitations": "Stops the server like SIGTERM (drain, final log flush, final checkpoint) and answers +OK first. Under durability memory it needs NOSAVE, because every key is lost; NOSAVE is refused under a saving profile. NOW, FORCE and ABORT are not supported.",
+      "coverage": [
+        "src/runtime/evented/tests/shutdown.rs"
+      ]
+    },
+    {
       "name": "MULTI",
       "family": "transactions",
       "status": "supported",

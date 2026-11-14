@@ -3051,6 +3051,19 @@ public partial interface IRuvioClient
     ValueTask SaveInBackgroundAsync(CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Sends <c>SHUTDOWN</c>: the server stops the way <c>SIGTERM</c> stops it (drains clients, flushes its log, writes a final checkpoint) and a supervisor has to start it again. The server answers <c>OK</c> before it stops.
+    /// </summary>
+    /// <param name="mode">Nothing, <c>SAVE</c> or <c>NOSAVE</c>. Under durability <c>memory</c> nothing is saved, so the server refuses unless this is <c>NOSAVE</c>: every key is lost. <c>NOSAVE</c> is refused under a saving profile.</param>
+    /// <param name="cancellationToken">Abandons the wait for the reply with an <see cref="OperationCanceledException"/>. A command that was already sent still runs on the server.</param>
+    /// <exception cref="RuvioException">The server refused (see <paramref name="mode"/>).</exception>
+    /// <example>
+    /// <code>
+    /// await db.ShutdownAsync("SAVE");
+    /// </code>
+    /// </example>
+    ValueTask ShutdownAsync(string? mode = null, CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Sends <c>PUBLISH</c>: delivers a message to every client subscribed to the channel or to a matching pattern.
     /// </summary>
     /// <param name="channel">The channel name.</param>
