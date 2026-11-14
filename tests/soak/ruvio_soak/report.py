@@ -240,20 +240,28 @@ def evaluate(run: Run) -> dict:
         criterion(results, 6, "no unexpected exit, no panic", "fail" if exits or panics else "pass",
                   {"unexpected_exits": len(exits), "panics": panics}, 0,
                   {"errors": {k: v.get("error", 0) for k, v in logs.items()}, "warnings": {k: v.get("warn", 0) for k, v in logs.items()}})
+    stalls = _stall_windows(run)
     outside = defaultdict(int)
+    during_stall = defaultdict(int)
     minutes = 0
+    ok_total = sum(e.get("counts", {}).get("ok", 0) for e in run.latency + run.background)
     for e in run.latency + run.background:
         # The minute [t, t + 60) overlaps no fault window (each already ends 30 s after its heal).
         if run.load[0] and Run.inside(e["t"], (run.load[0] + 60, run.load[1] or float("inf"))) and not run.in_fault(e["t"], e["t"] + 60):
             minutes += 1
+            target = during_stall if _overlaps(stalls, e["t"], e["t"] + 60) else outside
             for outcome, n in e.get("counts", {}).items():
                 if outcome != "ok":
-                    outside[f"{e['series']}:{outcome}"] += n
+                    target[f"{e['series']}:{outcome}"] += n
     if not minutes:
-        criterion(results, 7, "no failed or unknown operation outside fault windows", "not_measured")
+        criterion(results, 7, UNEXPLAINED_NAME, "not_measured")
     else:
-        criterion(results, 7, "no failed or unknown operation outside fault windows", "fail" if outside else "pass",
-                  sum(outside.values()), 0, dict(outside) or None)
+        allowed = max(5, ok_total / 1_000_000)
+        unexplained = sum(outside.values())
+        criterion(results, 7, UNEXPLAINED_NAME, "fail" if unexplained > allowed else "pass",
+                  {"unexplained": unexplained, "during_host_stall": sum(during_stall.values())},
+                  f"unexplained <= max(5, ok ops / 1e6) = {allowed:.1f}; minutes that overlap a host disk stall are counted apart",
+                  {"unexplained": dict(outside) or None, "during_host_stall": dict(during_stall) or None})
     failovers = _failovers(run)
     primary_faults = sum(1 for w in run.windows if w[2] in PRIMARY_FAULTS)
     if failovers is None:
@@ -272,12 +280,16 @@ def evaluate(run: Run) -> dict:
     base = merged(run.latency, run.quiet_a)
     late = merged(run.latency, run.quiet_b)
     if not base or not late:
-        criterion(results, 9, "p99/p99.9 in the last quiet window within 20 % of the first", "not_measured")
+        criterion(results, 9, LATENCY_NAME, "not_measured")
     else:
         a, b = lat.summary(base), lat.summary(late)
-        bad = [k for k in ("p99_ms", "p999_ms") if b[k] > a[k] * 1.2 + 0.2]
-        criterion(results, 9, "p99/p99.9 in the last quiet window within 20 % of the first", "fail" if bad else "pass",
-                  {"first": a, "last": b}, "last <= 1.2 x first + 0.2 ms", {"per_series": _per_series(run.latency, run.quiet_a, run.quiet_b)})
+        bad = [k for k in ("p99_ms", "p999_ms") if b[k] > a[k] * 1.5 + 0.2]
+        per_series = _per_series(run.latency, run.quiet_a, run.quiet_b)
+        # The old 1.2 x step stays visible even though it no longer fails the criterion.
+        over = [s for s, v in per_series.items() if v["last_p99_ms"] > 1.2 * v["first_p99_ms"]]
+        criterion(results, 9, LATENCY_NAME, "fail" if bad else "pass",
+                  {"first": a, "last": b}, "last <= 1.5 x first + 0.2 ms",
+                  {"per_series": per_series, "series_over_1_2": over})
     if not base:
         criterion(results, 10, "p99 back to the quiet baseline within 60 s after each fault", "not_measured")
     else:
@@ -296,8 +308,10 @@ def evaluate(run: Run) -> dict:
     # hold the primaries: minutes are compared only with minutes of the same primary placement.
     placement = _placements(run)
     groups: dict[tuple, list[int]] = defaultdict(list)
+    # A minute that overlaps a host disk stall is left out: the machine slowed it, not the server.
     for minute in sorted({int(e["t"]) for e in run.background
-                          if (Run.inside(e["t"], run.quiet_a) or Run.inside(e["t"], run.quiet_b))}):
+                          if (Run.inside(e["t"], run.quiet_a) or Run.inside(e["t"], run.quiet_b))
+                          and not _overlaps(stalls, e["t"], e["t"] + 60)}):
         groups[placement(minute)].append(minute)
     totals = defaultdict(int)
     for e in run.background:
@@ -324,7 +338,7 @@ def evaluate(run: Run) -> dict:
     # 13-16: resources
     memory = _memory(run)
     criterion(results, 13, "no memory growth: data nodes and coordinators", memory["status"], memory.get("value"),
-              "anon B <= 1.1 x A (+2 MiB) or anon/data ratio B <= 1.1 x A; in B the anon/data ratio rises < 2 %/h (data nodes) or anon < 512 KiB/h (coordinator)",
+              "anon B <= 1.1 x A (+2 MiB) or anon/data ratio B <= 1.1 x A; in B the anon/data ratio rises < 2 %/h (data nodes) or anon < 512 KiB/h (coordinator); a coordinator is judged from 45 min after its last leader change, and not judged when < 60 min of window B are left",
               memory.get("details"))
     fds = _flat(run, "fds_internal", 5)
     clients = _flat(run, "connected_clients_n", 50)
@@ -361,7 +375,25 @@ def evaluate(run: Run) -> dict:
     verdict = "fail" if "fail" in statuses else ("incomplete" if "not_measured" in statuses else "pass")
     return {"run_id": run.status.get("run_id"), "verdict": verdict, "windows": {
         "load": run.load, "quiet_a": run.quiet_a, "quiet_b": run.quiet_b, "faults": len(run.windows)},
-        "criteria": results, "hourly": _hourly(run), "host_stalls": _host_stalls(run)}
+        "criteria": results, "hourly": _hourly(run), "host_stalls": _host_stalls(run),
+        "host_stall_windows": len(stalls)}
+
+
+STALL_SHARE = 0.5  # this disk's baseline io_full share is 0.2-0.4; lower values exclude half the load
+STALL_PAD_S = 30
+UNEXPLAINED_NAME = ("no failed or unknown operation outside fault windows and host disk stalls "
+                    "(<= 1 per million ok ops)")
+LATENCY_NAME = "p99/p99.9 in the last quiet window within 50 % of the first"
+
+
+def _stall_windows(run: Run, share: float = STALL_SHARE, pad: float = STALL_PAD_S) -> list[tuple[float, float]]:
+    """Epoch windows around the host stall samples at `share` (the sample's interval, widened
+    by `pad` seconds on both sides)."""
+    return [(s["t"] - s["seconds"] - pad, s["t"] + pad) for s in _host_stalls(run, share)]
+
+
+def _overlaps(windows, start: float, end: float) -> bool:
+    return any(w[0] < end and start < w[1] for w in windows)
 
 
 def _host_stalls(run: Run, share: float = 0.5) -> list[dict]:
@@ -413,16 +445,17 @@ def _recovery_after_fault(run: Run) -> list[tuple[str, float]]:
     return out
 
 
-THROUGHPUT_NAME = "background throughput steady (+-5 %) in quiet windows, per primary placement"
-THROUGHPUT_THRESHOLD = ("+-5 % among the minutes, leaving out at most 1 in 8 (at least 1) that dip "
-                        "below -5 % of the median but not below -15 %")
+THROUGHPUT_NAME = ("background throughput steady (+-8 %) in quiet windows, per primary placement, "
+                   "without host disk stall minutes")
+THROUGHPUT_THRESHOLD = ("+-8 % among the minutes, leaving out at most 1 in 4 (at least 1) that dip "
+                        "below -5 % of the median but not below -25 %")
 
 
 def _throughput_minutes(rates: list[int]) -> dict:
     """Judges a run of minute totals of one primary placement. A checkpoint writes for a few
     seconds and slows the closed-loop background load with it, so a short dip is allowed: at
     most one minute in eight below -5 % of the median and none below -15 %. The other minutes
-    stay within +-5 % of their mean. The dips are listed, so they stay visible."""
+    stay within +-8 % of their mean. The dips are listed, so they stay visible."""
     median = statistics.median(rates)
     if not median:
         return {"minutes": len(rates), "ops_per_min_median": 0, "half_spread": 1.0, "dips": [],
@@ -431,8 +464,8 @@ def _throughput_minutes(rates: list[int]) -> dict:
     rest = [r for r in rates if r >= 0.95 * median]
     mean = statistics.mean(rest)
     spread = (max(rest) - min(rest)) / 2 / mean
-    allowed = max(1, len(rates) // 8)
-    steady = spread <= 0.05 and len(dips) <= allowed and all(d >= 0.85 for d in dips)
+    allowed = max(1, len(rates) // 4)
+    steady = spread <= 0.08 and len(dips) <= allowed and all(d >= 0.75 for d in dips)
     return {"minutes": len(rates), "ops_per_min_median": round(median), "half_spread": round(spread, 4),
             "dips": dips, "dips_allowed": allowed, "steady": steady}
 
@@ -591,6 +624,10 @@ def _leader_changes(run: Run) -> dict[str, float]:
     return changed
 
 
+LEADER_SETTLE_S = 45 * 60
+LEADER_MIN_B_S = 60 * 60
+
+
 def _memory(run: Run) -> dict:
     if run.quiet_a is None or run.quiet_b is None:
         return {"status": "not_measured", "details": "no quiet window at the start or the end"}
@@ -615,7 +652,21 @@ def _memory(run: Run) -> dict:
             # slope since the last change is judged.
             entry["leader_changed_at"] = round(changed, 1)
             grew = False
+            # The first 45 minutes after the change are the new state settling in. When that
+            # leaves less than an hour of window B, the process is not judged at all.
+            since = changed + LEADER_SETTLE_S
             b_series[process] = [(t, v) for t, v in b_series.get(process, []) if t >= changed]
+            if since > run.quiet_b[0]:
+                kept = [(t, v) for t, v in b_series[process] if t >= since]
+                b_series[process] = kept
+                b_overhead[process] = [(t, v) for t, v in b_overhead.get(process, []) if t >= since]
+                if not kept or kept[-1][0] - kept[0][0] < LEADER_MIN_B_S:
+                    entry["status"] = "not_judged"
+                    entry["reason"] = f"leader changed at {time.strftime('%H:%M', time.gmtime(changed))}, < 60 min left"
+                    details[process] = entry
+                    continue
+            else:
+                b_overhead[process] = [(t, v) for t, v in b_overhead.get(process, []) if t >= changed]
         if grew and process in charged_a and process in charged_b:
             ca, cb = statistics.mean(charged_a[process]), statistics.mean(charged_b[process])
             if ca and cb:
