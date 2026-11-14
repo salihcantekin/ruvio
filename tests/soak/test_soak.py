@@ -583,9 +583,9 @@ class LongRunPieces(unittest.TestCase):
     def test_failures_in_a_host_stall_minute_are_not_unexplained(self):
         from ruvio_soak import report
 
-        # A stall sample at t=6000 (45 % of its 60 s interval) widens to 5910-6030.
+        # A stall sample at t=6000 (60 % of its 60 s interval) widens to 5910-6030.
         def io(t):
-            return 0 if t < 6000 else 27_000_000
+            return 0 if t < 6000 else 36_000_000
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             events = [{"event": "load-start", "t": 1, "mono": 10**9},
@@ -637,8 +637,8 @@ class LongRunPieces(unittest.TestCase):
         # A flat 300 ops per minute with one minute at 150 (during a stall) in each of two
         # runs: left out, the placement is steady; counted, the dip would be -50 %.
         def io(t):
-            return 0 if t < 6000 else 27_000_000
-        metrics = [{"t": t, "process": "host0-g1", "replication_role": "primary"} for t in range(0, 10000, 60)]
+            return 0 if t < 6000 else 36_000_000
+        metrics =[{"t": t, "process": "host0-g1", "replication_role": "primary"} for t in range(0, 10000, 60)]
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             self.report_run(directory, metrics, events=[

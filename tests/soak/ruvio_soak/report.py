@@ -376,10 +376,10 @@ def evaluate(run: Run) -> dict:
     return {"run_id": run.status.get("run_id"), "verdict": verdict, "windows": {
         "load": run.load, "quiet_a": run.quiet_a, "quiet_b": run.quiet_b, "faults": len(run.windows)},
         "criteria": results, "hourly": _hourly(run), "host_stalls": _host_stalls(run),
-        "host_stall_windows_0_4": len(stalls)}
+        "host_stall_windows": len(stalls)}
 
 
-STALL_SHARE = 0.4  # this disk's baseline io_full share is 0.2-0.4; 0.44 already caused timeouts
+STALL_SHARE = 0.5  # this disk's baseline io_full share is 0.2-0.4; lower values exclude half the load
 STALL_PAD_S = 30
 UNEXPLAINED_NAME = ("no failed or unknown operation outside fault windows and host disk stalls "
                     "(<= 1 per million ok ops)")
