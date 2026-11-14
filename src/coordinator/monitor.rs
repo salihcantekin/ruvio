@@ -2357,6 +2357,18 @@ pub async fn switchover(
             new.address, group.name
         ));
     }
+    // The wait spent part of the pause: held again for as long as a node may take for the rest
+    // (the longest a pause lasts), so it cannot end before the old primary follows the new one.
+    if command(old, auth, &[b"RUVIO", b"FENCE", b"60000"], timeout)
+        .await
+        .is_err()
+    {
+        lift().await;
+        return Err(format!(
+            "ERR the primary of {} stopped answering; writes resumed on it",
+            group.name
+        ));
+    }
     let failing = Failing {
         group,
         primary,
@@ -2382,11 +2394,37 @@ pub async fn switchover(
     )
     .await
     {
-        Ok(address) => Ok(address),
-        Err(error) => {
+        Ok(address) => {
+            // At once, not on the next tick (which skips a member not heard from lately):
+            // the old primary must follow before its pause ends.
+            let (host, port) = (
+                new.replication.host.clone(),
+                new.replication.port.to_string(),
+            );
+
+            if leading.holds().await
+                && let Err(error) = command(
+                    old,
+                    auth,
+                    &[b"REPLICAOF", host.as_bytes(), port.as_bytes(), b"YIELD"],
+                    timeout,
+                )
+                .await
+            {
+                warn!(group = %group.name, member = %old.address, %error, "the old primary was not pointed at the new one; the next tick does it");
+            }
+            Ok(address)
+        }
+        // Only a refusal before anything was recorded lifts the pause. When the record may
+        // have been made (the outcome is unknown), the old primary stays paused: a later
+        // leader may still promote the replica, and a primary taking writes by then loses them.
+        Err(error) if error.starts_with("ERR the chosen replica did not answer") => {
             lift().await;
             Err(error)
         }
+        Err(error) => Err(format!(
+            "{error}; the old primary stays paused until a coordinator settles the group or the pause ends"
+        )),
     }
 }
 

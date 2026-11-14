@@ -608,8 +608,10 @@ client address; without it the coordinator takes the replica holding the most hi
    records rule), the replica is promoted, and the old primary and the other replicas are pointed at it.
 
 If the wait runs out, the leader loses its place, or the record is not made, the pause is lifted
-and the group stays as it was; the pause also ends by itself 20 seconds after it began, so a
-coordinator that dies half way leaves the old primary taking writes again. Refused when the
+and the group stays as it was, except when the record may have been made but its outcome is unknown: the old
+primary then stays paused, because a later leader may still promote the replica. The pause ends by itself
+(20 seconds after it began, 60 seconds once the replica has caught up), and the old primary is pointed at the
+new one at once, so a coordinator that dies half way leaves the old primary taking writes again after that time. Refused when the
 primary does not answer as a primary (use `FAILOVER group FORCE` for a dead one), when the named
 member is not a complete replica of it, and while `primary_lease_ms` is on (not supported yet).
 It replaces steps 1, 2 and 4 of Way A below. Verified: a live test of three nodes and three

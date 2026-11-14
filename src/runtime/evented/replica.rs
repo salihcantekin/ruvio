@@ -371,6 +371,8 @@ pub(super) fn promote(state: &ShardState, shard_id: u32, force: bool) -> io::Res
     if state.role.get() != crate::config::ReplicationRole::Replica {
         return Ok(());
     }
+    // A switchover's write pause belongs to the primary it paused, not to a later promotion.
+    state.write_fence.set(None);
 
     // Dropping the reader joins its thread; frames it queued are applied before the fork.
     drop(state.replication.borrow_mut().take());
@@ -466,6 +468,7 @@ pub(super) fn demote(
     primary_name: Option<(String, u16)>,
     yields: bool,
 ) -> io::Result<()> {
+    state.write_fence.set(None);
     state.write_gate.set(crate::replication::WriteGate::Replica);
     // Grants were for this node as a primary; promoted again, it waits for new ones.
     state

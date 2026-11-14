@@ -734,6 +734,40 @@ fn plan_groups(coordinators: &[String], wanted: &[String]) -> std::io::Result<Ve
     Ok(plans)
 }
 
+/// Whether every shard of the node (shard i listens on the port plus i) answers `ROLE` as a
+/// replica whose link is connected.
+fn replica_connected_on_every_shard(address: &str, auth: &[&str]) -> bool {
+    let Some((host, port)) = address.rsplit_once(':') else {
+        return false;
+    };
+    let Ok(port) = port.parse::<u16>() else {
+        return false;
+    };
+    let Ok(mut first) = Link::open(address, auth) else {
+        return false;
+    };
+    let shards = match first.call(&["CONFIG", "GET", "shards"]) {
+        Ok(Resp::Array(pair)) => pair
+            .get(1)
+            .and_then(Resp::text)
+            .and_then(|count| count.parse::<u16>().ok())
+            .unwrap_or(1),
+        _ => return false,
+    };
+
+    (0..shards.max(1)).all(|shard| {
+        let Some(shard_port) = port.checked_add(shard) else {
+            return false;
+        };
+        let role = Link::open(&format!("{host}:{shard_port}"), auth)
+            .and_then(|mut link| link.call(&["ROLE"]));
+
+        matches!(role, Ok(Resp::Array(role))
+            if role.first().and_then(Resp::text) == Some("slave")
+                && role.get(3).and_then(Resp::text) == Some("connected"))
+    })
+}
+
 /// Waits until the node at `address` answers `ROLE` as a replica connected to its primary.
 fn wait_for_replica(address: &str, wait_secs: u64) -> std::io::Result<()> {
     use std::time::{Duration, Instant};
@@ -743,12 +777,7 @@ fn wait_for_replica(address: &str, wait_secs: u64) -> std::io::Result<()> {
     let auth: Vec<&str> = auth.iter().map(String::as_str).collect();
 
     while Instant::now() < deadline {
-        let role = Link::open(address, &auth).and_then(|mut link| link.call(&["ROLE"]));
-
-        if let Ok(Resp::Array(role)) = role
-            && role.first().and_then(Resp::text) == Some("slave")
-            && role.get(3).and_then(Resp::text) == Some("connected")
-        {
+        if replica_connected_on_every_shard(address, &auth) {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -798,6 +827,10 @@ fn rolling_restart(
             wait_for_replica(replica, wait_secs)?;
         }
 
+        if skipped(&plan.primary) {
+            println!("[{}] the primary is skipped: no switchover", plan.name);
+            continue;
+        }
         println!("[{}] switching over", plan.name);
         let reply = ask_coordinators(
             coordinators,
@@ -812,9 +845,6 @@ fn rolling_restart(
         };
 
         println!("[{}] the new primary is {new_primary}", plan.name);
-        if skipped(&plan.primary) {
-            continue;
-        }
         wait_for_replica(&plan.primary, wait_secs)?;
         println!(
             "[{}] restarting the old primary {}",
