@@ -123,6 +123,8 @@ struct ShardState {
     replication: RefCell<Option<crate::replication::ReplicationThread>>,
     /// Whether this shard takes writes; read for every write.
     write_gate: Cell<crate::replication::WriteGate>,
+    /// Until when a primary pauses writes for a planned switchover (`RUVIO FENCE`).
+    write_fence: Cell<Option<Instant>>,
     /// Epoch of the history this shard writes as a primary (0 otherwise).
     epoch: Cell<u64>,
     /// Highest epoch a refused replica followed, set by the replication thread; checked on
@@ -1268,6 +1270,7 @@ async fn serve_async(
             _ if config.replication.primary_lease => crate::replication::WriteGate::NoLease,
             _ => crate::replication::WriteGate::Open,
         }),
+        write_fence: Cell::new(None),
         epoch: Cell::new(0),
         newer_epoch: Arc::new(AtomicU64::new(0)),
         dropping: RefCell::new(Vec::new()),

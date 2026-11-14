@@ -1598,6 +1598,7 @@ fn plain_command(command: &Command<'_>) -> bool {
                 | Command::MoveSlots(_)
                 | Command::Topology(_)
                 | Command::PrimaryLease(_)
+                | Command::Fence(_)
                 | Command::Migrate(_)
                 | Command::Role
                 | Command::Bgsave
@@ -2037,6 +2038,12 @@ async fn dispatch_inner<'s>(
 
             Command::Topology(map) => {
                 super::topology::command(state, map.as_deref(), output)?;
+
+                return Ok(());
+            }
+
+            Command::Fence(ms) => {
+                write_response(output, super::replica::fence_command(state, *ms).await)?;
 
                 return Ok(());
             }

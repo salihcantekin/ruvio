@@ -542,7 +542,7 @@ pub(super) fn fence_if_replaced(state: &ShardState) {
     // for one tick when that reason clears.
     if matches!(
         state.write_gate.get(),
-        WriteGate::Open | WriteGate::NoReplicas | WriteGate::NoLease
+        WriteGate::Open | WriteGate::NoReplicas | WriteGate::NoLease | WriteGate::Paused
     ) && state.newer_epoch.load(Ordering::Acquire) > state.epoch.get()
     {
         warn!(
@@ -568,7 +568,7 @@ pub(super) fn gate_on_replicas(state: &ShardState) {
 
     if !matches!(
         gate,
-        WriteGate::Open | WriteGate::NoReplicas | WriteGate::NoLease
+        WriteGate::Open | WriteGate::NoReplicas | WriteGate::NoLease | WriteGate::Paused
     ) || role == ReplicationRole::Replica
     {
         return;
@@ -581,7 +581,17 @@ pub(super) fn gate_on_replicas(state: &ShardState) {
             live.replication.primary_lease,
         )
     });
-    let next = if lease
+    let paused = state.write_fence.get().is_some_and(|until| {
+        if Instant::now() < until {
+            true
+        } else {
+            state.write_fence.set(None);
+            false
+        }
+    });
+    let next = if paused && role == ReplicationRole::Primary {
+        WriteGate::Paused
+    } else if lease
         && !state
             .primary_lease
             .with(|leases| leases.holds(crate::primary_lease::now()))
@@ -598,6 +608,8 @@ pub(super) fn gate_on_replicas(state: &ShardState) {
 
     if next != gate {
         match next {
+            WriteGate::Paused => warn!("writes are paused for a switchover (RUVIO FENCE)"),
+            _ if gate == WriteGate::Paused => warn!("the write pause for a switchover ended"),
             WriteGate::NoLease => warn!(
                 "the primary lease from the coordinators is not running; refusing writes (primary-lease)"
             ),
@@ -1444,5 +1456,40 @@ pub(super) async fn wait_for_targets(
         }
 
         between_polls();
+    }
+}
+
+/// `RUVIO FENCE ms`, sent by the coordinators for a planned switchover: every shard of a
+/// primary refuses writes (`NOREPLICAS`) until `ms` pass, or until `RUVIO FENCE 0`. It ends by
+/// itself, so a coordinator that dies half way leaves the primary taking writes again. Not
+/// persisted or replicated; a replica ignores it.
+pub(super) async fn fence_command(state: &ShardState, ms: u64) -> Response<'static> {
+    let change = SharedFence(if ms == 0 {
+        None
+    } else {
+        Some(Instant::now() + Duration::from_millis(ms))
+    });
+
+    change.apply_to(state);
+    if let Some(forwarding) = state.forwarding.as_ref() {
+        forwarding.apply_everywhere(Box::new(change)).await;
+    }
+
+    Response::Simple(b"OK")
+}
+
+struct SharedFence(Option<Instant>);
+
+impl SharedFence {
+    fn apply_to(&self, state: &ShardState) {
+        state.write_fence.set(self.0);
+        // At once, not on the next maintenance tick.
+        gate_on_replicas(state);
+    }
+}
+
+impl super::forward::ShardChange for SharedFence {
+    fn apply(&self, state: &ShardState) {
+        self.apply_to(state);
     }
 }
