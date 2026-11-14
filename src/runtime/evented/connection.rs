@@ -920,7 +920,12 @@ pub(super) async fn handle_client(
                                     consumed += frame_length;
                                     batch_commands += 1;
                                     session.mark_queue_error();
-                                    output.write_all(reply)?;
+                                    // A client that may not run the command (no login, or
+                                    // a denying ACL) gets that refusal, not this one.
+                                    match forward_refusal(&auth, None, &command) {
+                                        Some(refusal) => write_response(&mut output, refusal)?,
+                                        None => output.write_all(reply)?,
+                                    }
                                     continue;
                                 }
 
