@@ -924,7 +924,14 @@ impl Link {
             Some(b'-') => Err(format!("the target refused: {}", &text[1..])),
             Some(b'$') => {
                 // Not sent by these commands; read it whole so the link stays in step.
+                // The peer is a host the caller named, so the length is untrusted: cap it
+                // rather than size a buffer from it.
+                const REPLY_MAX: i64 = 1 << 20;
                 let length: i64 = text[1..].parse().unwrap_or(-1);
+
+                if length > REPLY_MAX {
+                    return Err(format!("the target answered a {length}-byte bulk reply"));
+                }
 
                 if length >= 0 {
                     let mut rest = vec![0; length as usize + 2];

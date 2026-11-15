@@ -72,7 +72,16 @@ pub(super) fn decode_manifest(
 
     let count = u32_at(bytes, 20)? as usize;
     let mut decoder = Decoder::new(&bytes[24..digest_offset]);
-    let mut items = Vec::with_capacity(count);
+
+    // Each item is at least a shard id and a file-name length: a count the file cannot
+    // hold is corruption, not a reason to reserve memory for it.
+    if count.saturating_mul(8) > decoder.left() {
+        return Err(PersistenceError::Corruption(
+            "manifest shard count exceeds the file".into(),
+        ));
+    }
+
+    let mut items = Vec::with_capacity(count.min(1024));
 
     for expected_shard in 0..count {
         let shard_id = decoder.u32()?;

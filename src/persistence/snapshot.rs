@@ -295,6 +295,11 @@ impl<'a> Decoder<'a> {
         Ok(value)
     }
 
+    /// Bytes left in the payload: a count the payload cannot hold is corruption.
+    fn left(&self) -> usize {
+        self.remaining.len()
+    }
+
     fn is_empty(&self) -> bool {
         self.remaining.is_empty()
     }
