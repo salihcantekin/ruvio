@@ -610,7 +610,7 @@ pub(super) fn decode_value(
             let last_sequence = decoder.u64()?;
             let count = decoder.u32()? as usize;
 
-            if count > limits.max_command_bytes / 16 {
+            if count > limits.max_command_bytes / 16 || count.saturating_mul(16) > decoder.left() {
                 return Err(PersistenceError::Corruption(
                     "snapshot stream entry count is excessive".into(),
                 ));
@@ -623,13 +623,16 @@ pub(super) fn decode_value(
                 let sequence = decoder.u64()?;
                 let field_count = decoder.u32()? as usize;
 
-                if field_count == 0 || field_count > limits.max_arguments {
+                if field_count == 0
+                    || field_count > limits.max_arguments
+                    || field_count.saturating_mul(8) > decoder.left()
+                {
                     return Err(PersistenceError::Corruption(
                         "invalid stream field count in snapshot".into(),
                     ));
                 }
 
-                let mut fields = Vec::with_capacity(field_count);
+                let mut fields = Vec::with_capacity(field_count.min(1024));
 
                 for _ in 0..field_count {
                     fields.push((
@@ -654,13 +657,13 @@ pub(super) fn decode_value(
             } else {
                 let count = decoder.u32()? as usize;
 
-                if count > limits.max_arguments {
+                if count > limits.max_arguments || count.saturating_mul(24) > decoder.left() {
                     return Err(PersistenceError::Corruption(
                         "snapshot stream group count is excessive".into(),
                     ));
                 }
 
-                let mut groups = Vec::with_capacity(count);
+                let mut groups = Vec::with_capacity(count.min(1024));
 
                 for _ in 0..count {
                     let name = decoder.bytes(limits.max_value_bytes)?;
@@ -668,13 +671,15 @@ pub(super) fn decode_value(
                     let last_sequence = decoder.u64()?;
                     let pending_count = decoder.u32()? as usize;
 
-                    if pending_count > limits.max_arguments {
+                    if pending_count > limits.max_arguments
+                        || pending_count.saturating_mul(4) > decoder.left()
+                    {
                         return Err(PersistenceError::Corruption(
                             "snapshot stream pending count is excessive".into(),
                         ));
                     }
 
-                    let mut pending = Vec::with_capacity(pending_count);
+                    let mut pending = Vec::with_capacity(pending_count.min(1024));
 
                     for _ in 0..pending_count {
                         pending.push(crate::stream::PendingDelivery {
@@ -764,7 +769,7 @@ pub(super) fn decode_value(
             let next_token = decoder.u64()?;
             let count = decoder.u32()? as usize;
 
-            if count > limits.max_command_bytes / 16 {
+            if count > limits.max_command_bytes / 16 || count.saturating_mul(16) > decoder.left() {
                 return Err(PersistenceError::Corruption(
                     "snapshot semaphore holder count is excessive".into(),
                 ));

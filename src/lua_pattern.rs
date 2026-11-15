@@ -182,11 +182,32 @@ impl MatchState<'_> {
 
     #[inline]
     fn step(&mut self) -> Result<(), PatternError> {
-        self.steps = self.steps.checked_sub(1).ok_or(PatternError::Quota)?;
+        self.charge(1)
+    }
+
+    /// Charges `bytes` of scanning, so a class of length n costs n steps, not one.
+    #[inline]
+    fn charge(&mut self, bytes: usize) -> Result<(), PatternError> {
+        self.steps = self
+            .steps
+            .checked_sub(bytes as u64)
+            .ok_or(PatternError::Quota)?;
         Ok(())
     }
 
-    fn class_end(&self, mut p: usize) -> Result<usize, PatternError> {
+    fn class_end(&mut self, p: usize) -> Result<usize, PatternError> {
+        let end = self.class_end_scan(p)?;
+
+        // A single-byte token costs the step the match loop already charges; a class or
+        // an escape is scanned here, so charge the bytes it walks.
+        if end - p > 1 {
+            self.charge(end - p)?;
+        }
+
+        Ok(end)
+    }
+
+    fn class_end_scan(&self, mut p: usize) -> Result<usize, PatternError> {
         let first = self.pc(p);
 
         p += 1;
@@ -229,7 +250,14 @@ impl MatchState<'_> {
     }
 
     /// Whether `c` is in the class `[...]` from `p` (the `[`) to `ec` (the `]`).
-    fn match_bracket_class(&self, c: u8, mut p: usize, ec: usize) -> bool {
+    fn match_bracket_class(
+        &mut self,
+        c: u8,
+        mut p: usize,
+        ec: usize,
+    ) -> Result<bool, PatternError> {
+        self.charge(ec - p)?;
+
         let mut sig = true;
 
         if self.pc(p + 1) == b'^' {
@@ -246,28 +274,28 @@ impl MatchState<'_> {
             if self.pc(p) == b'%' {
                 p += 1;
                 if match_class(c, self.pc(p)) {
-                    return sig;
+                    return Ok(sig);
                 }
             } else if self.pc(p + 1) == b'-' && p + 2 < ec {
                 p += 2;
                 if self.pc(p - 2) <= c && c <= self.pc(p) {
-                    return sig;
+                    return Ok(sig);
                 }
             } else if self.pc(p) == c {
-                return sig;
+                return Ok(sig);
             }
         }
 
-        !sig
+        Ok(!sig)
     }
 
-    fn single_match(&self, c: u8, p: usize, ep: usize) -> bool {
-        match self.pc(p) {
+    fn single_match(&mut self, c: u8, p: usize, ep: usize) -> Result<bool, PatternError> {
+        Ok(match self.pc(p) {
             b'.' => true,
             b'%' => match_class(c, self.pc(p + 1)),
-            b'[' => self.match_bracket_class(c, p, ep - 1),
+            b'[' => self.match_bracket_class(c, p, ep - 1)?,
             byte => byte == c,
-        }
+        })
     }
 
     fn match_balance(&mut self, mut s: usize, p: usize) -> Result<Option<usize>, PatternError> {
@@ -305,7 +333,7 @@ impl MatchState<'_> {
     fn max_expand(&mut self, s: usize, p: usize, ep: usize) -> Result<Option<usize>, PatternError> {
         let mut count = 0;
 
-        while s + count < self.src.len() && self.single_match(self.src[s + count], p, ep) {
+        while s + count < self.src.len() && self.single_match(self.src[s + count], p, ep)? {
             self.step()?;
             count += 1;
         }
@@ -334,7 +362,7 @@ impl MatchState<'_> {
                 return Ok(Some(end));
             }
 
-            if s < self.src.len() && self.single_match(self.src[s], p, ep) {
+            if s < self.src.len() && self.single_match(self.src[s], p, ep)? {
                 s += 1;
             } else {
                 return Ok(None);
@@ -450,8 +478,8 @@ impl MatchState<'_> {
                     let ep = self.class_end(p)?;
                     let previous = if s == 0 { 0 } else { self.src[s - 1] };
 
-                    if self.match_bracket_class(previous, p, ep - 1)
-                        || !self.match_bracket_class(self.sc(s), p, ep - 1)
+                    if self.match_bracket_class(previous, p, ep - 1)?
+                        || !self.match_bracket_class(self.sc(s), p, ep - 1)?
                     {
                         return Ok(None);
                     }
@@ -476,7 +504,7 @@ impl MatchState<'_> {
 
                 _ => {
                     let ep = self.class_end(p)?;
-                    let matches = s < self.src.len() && self.single_match(self.src[s], p, ep);
+                    let matches = s < self.src.len() && self.single_match(self.src[s], p, ep)?;
 
                     match self.pc(ep) {
                         b'?' => {
@@ -593,5 +621,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_long_bracket_class_charges_the_bytes_it_scans() {
+        // A class of n bytes used to cost one step per subject position, so the work was
+        // pattern length x subject length for a budget of eight million steps.
+        let class = format!("[{}]", "b".repeat(100_000));
+        let pattern = class.clone();
+        let subject = "a".repeat(200_000);
+        let mut steps = 8_000_000u64;
+        let mut found = Found::new();
+        let outcome = search(
+            subject.as_bytes(),
+            pattern.as_bytes(),
+            0,
+            Anchor::Leading,
+            &mut steps,
+            &mut found,
+        );
+
+        assert_eq!(outcome, Err(PatternError::Quota));
     }
 }

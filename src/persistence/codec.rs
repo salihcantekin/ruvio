@@ -1360,15 +1360,18 @@ fn decode_payload(
 
             for _ in 0..count {
                 let record_type = decoder.u16()?;
-                let length = decoder.u32()? as usize;
-                let payload = decoder.take(length)?;
-                let mutation = decode_payload(record_type, payload, limits)?;
 
-                if matches!(mutation, OwnedMutation::Transaction { .. }) {
+                // Refused before the recursive call: a chain of transactions six bytes
+                // apart would otherwise recurse once per level and overflow the stack.
+                if record_type == record::TRANSACTION {
                     return Err(PersistenceError::Corruption(
                         "nested WAL transactions are not supported".into(),
                     ));
                 }
+
+                let length = decoder.u32()? as usize;
+                let payload = decoder.take(length)?;
+                let mutation = decode_payload(record_type, payload, limits)?;
 
                 mutations.push(mutation);
             }
@@ -1852,7 +1855,9 @@ impl<'a> Decoder<'a> {
     ) -> Result<Vec<Vec<u8>>, PersistenceError> {
         let count = self.u32()? as usize;
 
-        if count > maximum_count {
+        // Each element needs a 4-byte length before its bytes: a count the payload cannot
+        // hold is corruption, not a reason to reserve memory for it.
+        if count > maximum_count || count.saturating_mul(4) > self.remaining.len() {
             return Err(PersistenceError::Corruption(
                 "WAL collection count exceeds configured limit".into(),
             ));
@@ -1874,7 +1879,7 @@ impl<'a> Decoder<'a> {
     ) -> Result<Vec<OwnedScoreMember>, PersistenceError> {
         let count = self.u32()? as usize;
 
-        if count > maximum_count {
+        if count > maximum_count || count.saturating_mul(12) > self.remaining.len() {
             return Err(PersistenceError::Corruption(
                 "WAL sorted-set pair count exceeds configured limit".into(),
             ));
@@ -1896,7 +1901,7 @@ impl<'a> Decoder<'a> {
     ) -> Result<Vec<OwnedBytePair>, PersistenceError> {
         let count = self.u32()? as usize;
 
-        if count > maximum_count {
+        if count > maximum_count || count.saturating_mul(8) > self.remaining.len() {
             return Err(PersistenceError::Corruption(
                 "WAL pair count exceeds configured limit".into(),
             ));

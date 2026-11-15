@@ -225,6 +225,12 @@ const MAX_POOLED_VALUE_BYTES: usize = 64 * 1024;
 const MAX_BUFFERS_PER_CLASS: usize = 64;
 pub(crate) const LOG_VALUE_MAX: usize = 64;
 
+/// Upper bound on the bytes a repeated `SRANDMEMBER`/`HRANDFIELD`/`ZRANDMEMBER` draw
+/// copies before the reply is written, matching the default `max_output_buffer_bytes`.
+/// The draw repeats one member `count` times, so without a byte bound a request of a few
+/// dozen bytes could ask for terabytes of copies.
+pub(crate) const MAX_RANDOM_REPLY_BYTES: usize = 64 * 1024 * 1024;
+
 /// Returned when a command targets a key containing an incompatible data type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WrongType;

@@ -384,19 +384,24 @@ pub(super) fn list_mpop<'a, C: Clock, I: StorageIndex, S: MutationSink>(
 
     before_mutation_allow_oom(shard, sink, [key.as_ref()], 0)?;
 
-    let operations: Vec<OwnedMutation> = (0..take)
-        .map(|_| {
-            if from_left {
-                OwnedMutation::ListPopFront { key: key.to_vec() }
-            } else {
-                OwnedMutation::ListPopBack { key: key.to_vec() }
-            }
-        })
-        .collect();
+    // One record drops the whole run, as pop_list does for LPOP COUNT: a record per
+    // element would copy the key once per popped element.
+    if take == 1 {
+        if from_left {
+            sink.record(Mutation::ListPopFront { key })?;
+        } else {
+            sink.record(Mutation::ListPopBack { key })?;
+        }
+    } else {
+        let take = take as i64;
+        let (start, stop) = if from_left {
+            (take, -1)
+        } else {
+            (0, -(take + 1))
+        };
 
-    sink.record(Mutation::Transaction {
-        mutations: &operations,
-    })?;
+        sink.record(Mutation::ListTrim { key, start, stop })?;
+    }
 
     let mut values = Vec::with_capacity(take);
 

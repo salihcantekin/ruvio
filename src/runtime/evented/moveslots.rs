@@ -271,7 +271,14 @@ impl CopyBatch {
             let count = u32_at(&self.bytes, at)?;
 
             at += 4;
-            let mut frames = Vec::with_capacity(count);
+
+            // Each frame carries a 4-byte length: a count the batch cannot hold is
+            // damaged, not a reason to reserve memory for it.
+            if count.saturating_mul(4) > self.bytes.len() - at {
+                return None;
+            }
+
+            let mut frames = Vec::with_capacity(count.min(1024));
 
             for _ in 0..count {
                 let frame_length = u32_at(&self.bytes, at)?;

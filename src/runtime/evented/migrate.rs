@@ -924,7 +924,14 @@ impl Link {
             Some(b'-') => Err(format!("the target refused: {}", &text[1..])),
             Some(b'$') => {
                 // Not sent by these commands; read it whole so the link stays in step.
+                // The peer is a host the caller named, so the length is untrusted: cap it
+                // rather than size a buffer from it.
+                const REPLY_MAX: i64 = 1 << 20;
                 let length: i64 = text[1..].parse().unwrap_or(-1);
+
+                if length > REPLY_MAX {
+                    return Err(format!("the target answered a {length}-byte bulk reply"));
+                }
 
                 if length >= 0 {
                     let mut rest = vec![0; length as usize + 2];
@@ -1513,8 +1520,12 @@ pub(super) fn replicated(state: &ShardState, mutation: &crate::OwnedMutation, se
                 warn!(%error, "a replica could not record a range given to another node");
             }
             // A range this replica served from the primary's end record goes back to what
-            // its map says, as the primary's table does.
-            if let Some(topology) = forwarding.fabric.topology().map(|shared| shared.get()) {
+            // its map says, as the primary's table does. Only a range the history accepted
+            // is applied: an out-of-range last slot is outside the placement table, and
+            // indexing it panics the shard.
+            if recorded.is_ok()
+                && let Some(topology) = forwarding.fabric.topology().map(|shared| shared.get())
+            {
                 let count = forwarding.fabric.shard_count();
                 let placement = topology.placement(count);
                 let table = forwarding.fabric.slot_table();

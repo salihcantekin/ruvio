@@ -69,10 +69,21 @@ pub fn command(args: &[&[u8]]) -> Vec<u8> {
 }
 
 const MAX_BULK: usize = 64 * 1024 * 1024;
+/// Deepest array nesting a frame may have; a command is one level.
+const MAX_DEPTH: usize = 32;
+
 const MAX_ITEMS: usize = 1024 * 1024;
 
 /// Reads one reply. `None` at a clean end of stream.
 pub async fn read_value<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<Option<Value>> {
+    read_value_at(reader, 0).await
+}
+
+/// A frame nested deeper than [`MAX_DEPTH`] is refused before it recurses.
+async fn read_value_at<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    depth: usize,
+) -> io::Result<Option<Value>> {
     let mut line = String::new();
 
     if reader.read_line(&mut line).await? == 0 {
@@ -122,8 +133,12 @@ pub async fn read_value<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<O
                 }
                 let mut items = Vec::with_capacity(count.min(64));
 
+                if depth >= MAX_DEPTH {
+                    return Err(invalid());
+                }
+
                 for _ in 0..count {
-                    let item = Box::pin(read_value(reader))
+                    let item = Box::pin(read_value_at(reader, depth + 1))
                         .await?
                         .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
 
@@ -225,6 +240,18 @@ mod tests {
 
         assert_eq!(read_value(&mut reader).await.unwrap(), Some(value));
         assert_eq!(read_value(&mut reader).await.unwrap(), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_deeply_nested_frame_is_refused_before_it_recurses() {
+        // Each `*1` is four bytes and one stack frame; a client that never authenticates
+        // reaches this parser first.
+        let mut bytes = b"*1\r\n".repeat(200);
+        bytes.extend_from_slice(b"$1\r\na\r\n");
+
+        let mut reader = BufReader::new(bytes.as_slice());
+
+        assert!(read_value(&mut reader).await.is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
