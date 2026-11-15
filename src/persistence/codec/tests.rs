@@ -1515,3 +1515,18 @@ fn a_collection_count_the_payload_cannot_hold_is_corruption() {
         Err(PersistenceError::Corruption(_))
     ));
 }
+
+#[test]
+fn a_nested_transaction_record_is_refused_without_recursing() {
+    // One transaction holding one child, and that child names TRANSACTION again: each
+    // level is six payload bytes, so a chain of them used to recurse once per level.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&super::record::TRANSACTION.to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+
+    assert!(matches!(
+        super::decode_payload(super::record::TRANSACTION, &payload, ProtocolLimits::default()),
+        Err(PersistenceError::Corruption(_))
+    ));
+}
