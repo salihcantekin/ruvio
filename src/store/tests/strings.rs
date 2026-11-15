@@ -158,3 +158,27 @@ fn visiting_the_ends_of_a_missing_key_or_another_type() {
     assert_eq!(shard.sorted_set_remove_popped(b"none", &[b"m"]), Ok(0));
     assert_eq!(seen, 0);
 }
+
+#[test]
+fn a_key_larger_than_a_log_page_round_trips() {
+    // A key record over one page takes the large-span path, whose offsets are
+    // tagged block ids rather than byte addresses.
+    let mut shard = KvShard::new();
+    let key = vec![b'k'; 5_000];
+
+    assert_eq!(shard.insert(&key, b"value"), None);
+    assert_eq!(shard.get(&key), Some(&b"value"[..]));
+    assert_eq!(shard.remove(&key).as_deref(), Some(&b"value"[..]));
+    assert!(shard.is_empty());
+}
+
+#[test]
+fn a_key_at_the_header_limit_round_trips() {
+    let mut shard = KvShard::new();
+    let key = vec![b'k'; usize::from(u16::MAX)];
+
+    assert_eq!(shard.insert(&key, b"value"), None);
+    assert_eq!(shard.get(&key), Some(&b"value"[..]));
+    assert_eq!(shard.remove(&key).as_deref(), Some(&b"value"[..]));
+    assert!(shard.is_empty());
+}

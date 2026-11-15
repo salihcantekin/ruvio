@@ -1,7 +1,11 @@
 use super::*;
 
+pub(super) const KEY_LEN_MAX: usize = u16::MAX as usize;
+
 pub(super) fn validate_key(key: &[u8], limits: ProtocolLimits) -> Result<(), ProtocolError> {
-    if key.len() > limits.max_key_bytes {
+    // The key record stores its key length in one u16, so a longer key would be
+    // truncated and read back as a different key.
+    if key.len() > limits.max_key_bytes || key.len() > KEY_LEN_MAX {
         return Err(ProtocolError::LimitExceeded("key is too large"));
     }
 

@@ -790,7 +790,7 @@ impl AHashIndex {
     /// Key length and meta word (kind, TTL hint, payload length) of the record at `addr`.
     #[inline(always)]
     fn header(keys: &ValueLog, addr: Addr) -> (u16, u16) {
-        let raw = keys.slice(addr.0, HEADER_LEN as u16);
+        let raw = keys.span(addr.0, 0, HEADER_LEN as usize);
 
         (
             u16::from_le_bytes([raw[0], raw[1]]),
@@ -810,7 +810,7 @@ impl AHashIndex {
     }
 
     fn set_ttl_hint(keys: &mut ValueLog, addr: Addr, on: bool) {
-        let raw = keys.slice(addr.0, HEADER_LEN as u16);
+        let raw = keys.span(addr.0, 0, HEADER_LEN as usize);
         let mut meta = u16::from_le_bytes([raw[2], raw[3]]);
 
         if on {
@@ -819,12 +819,12 @@ impl AHashIndex {
             meta &= !TTL_HINT;
         }
 
-        keys.write_at(addr.0 + 2, &meta.to_le_bytes());
+        keys.write_span(addr.0, 2, &meta.to_le_bytes());
     }
 
     #[inline]
-    fn payload_at(addr: Addr, key_len: u16) -> u32 {
-        addr.0 + HEADER_LEN + u32::from(key_len)
+    fn payload_in(key_len: u16) -> usize {
+        HEADER_LEN as usize + usize::from(key_len)
     }
 
     fn occupied(key_len: u16, payload_len: u16) -> u32 {
@@ -837,10 +837,12 @@ impl AHashIndex {
 
         header[0..2].copy_from_slice(&key_len.to_le_bytes());
         header[2..4].copy_from_slice(&meta.to_le_bytes());
-        keys.write_at(addr.0, &header);
+        keys.write_span(addr.0, 0, &header);
     }
 
     fn alloc_record(&mut self, key: &[u8], kind: u16, payload: &[u8]) -> Addr {
+        debug_assert!(key.len() <= usize::from(u16::MAX), "key longer than the record header");
+
         let addr = Addr(self.keys.alloc_span(4 + key.len() + payload.len()));
 
         self.access.clear((addr.0 >> 3) as usize);
@@ -852,9 +854,9 @@ impl AHashIndex {
             kind,
             payload.len() as u16,
         );
-        self.keys.write_at(addr.0 + HEADER_LEN, key);
+        self.keys.write_span(addr.0, HEADER_LEN as usize, key);
         self.keys
-            .write_at(Self::payload_at(addr, key.len() as u16), payload);
+            .write_span(addr.0, Self::payload_in(key.len() as u16), payload);
         addr
     }
 
@@ -886,18 +888,18 @@ impl AHashIndex {
     fn hash_record(keys: &ValueLog, hasher: &RandomState, addr: &Addr) -> u64 {
         let (key_len, _, _) = Self::decode(keys, *addr);
 
-        hasher.hash_one(keys.slice(addr.0 + HEADER_LEN, key_len))
+        hasher.hash_one(keys.span(addr.0, HEADER_LEN as usize, key_len as usize))
     }
 
     #[inline(always)]
     fn same_key(keys: &ValueLog, addr: &Addr, key: &[u8]) -> bool {
         let (key_len, _) = Self::header(keys, *addr);
 
-        keys.slice(addr.0 + HEADER_LEN, key_len) == key
+        keys.span(addr.0, HEADER_LEN as usize, key_len as usize) == key
     }
 
-    fn read_u32(keys: &ValueLog, offset: u32) -> u32 {
-        let raw = keys.slice(offset, 4);
+    fn read_u32_in(keys: &ValueLog, addr: Addr, at: usize) -> u32 {
+        let raw = keys.span(addr.0, at, 4);
 
         u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])
     }
@@ -935,11 +937,11 @@ impl AHashIndex {
         objects: &'a Chunked<Option<Entry>>,
         slabs: &'a SlabPages,
     ) -> IndexRef<'a> {
-        let payload = Self::payload_at(addr, key_len);
+        let payload = Self::payload_in(key_len);
 
         match kind {
             TAG_LOG => {
-                let raw = keys.slice(payload, 6);
+                let raw = keys.span(addr.0, payload, 6);
                 let offset = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
                 let len = u16::from_le_bytes([raw[4], raw[5]]);
 
@@ -947,21 +949,22 @@ impl AHashIndex {
             }
 
             TAG_INTEGER => {
-                let raw = keys.slice(payload, 8);
+                let raw = keys.span(addr.0, payload, 8);
                 let mut bytes = [0u8; 8];
 
                 bytes.copy_from_slice(raw);
                 IndexRef::Integer(i64::from_le_bytes(bytes))
             }
 
-            _ => Self::view_stored(kind, payload, keys, heaps, objects, slabs),
+            _ => Self::view_stored(addr, kind, payload, keys, heaps, objects, slabs),
         }
     }
 
     #[inline(never)]
     fn view_stored<'a>(
+        addr: Addr,
         kind: u16,
-        payload: u32,
+        payload: usize,
         keys: &'a ValueLog,
         heaps: &'a Chunked<Option<Vec<u8>>>,
         objects: &'a Chunked<Option<Entry>>,
@@ -969,18 +972,18 @@ impl AHashIndex {
     ) -> IndexRef<'a> {
         match kind {
             TAG_HEAP => IndexRef::Heap(
-                heaps[Self::read_u32(keys, payload) as usize]
+                heaps[Self::read_u32_in(keys, addr, payload) as usize]
                     .as_ref()
                     .expect("heap value"),
             ),
             TAG_OBJECT => IndexRef::Object(
-                objects[Self::read_u32(keys, payload) as usize]
+                objects[Self::read_u32_in(keys, addr, payload) as usize]
                     .as_ref()
                     .expect("collection"),
             ),
-            TAG_SET_SLAB => IndexRef::SetSlab(slabs.slot(Self::read_u32(keys, payload))),
-            TAG_ZSET_SLAB => IndexRef::SortedSlab(slabs.slot(Self::read_u32(keys, payload))),
-            TAG_COLL_SLAB => IndexRef::CollSlab(slabs.slot(Self::read_u32(keys, payload))),
+            TAG_SET_SLAB => IndexRef::SetSlab(slabs.slot(Self::read_u32_in(keys, addr, payload))),
+            TAG_ZSET_SLAB => IndexRef::SortedSlab(slabs.slot(Self::read_u32_in(keys, addr, payload))),
+            TAG_COLL_SLAB => IndexRef::CollSlab(slabs.slot(Self::read_u32_in(keys, addr, payload))),
             _ => unreachable!("record kind"),
         }
     }
@@ -1022,7 +1025,7 @@ impl AHashIndex {
         }
 
         self.keys
-            .write_at(Self::payload_at(addr, key_len), &id.to_le_bytes());
+            .write_span(addr.0, Self::payload_in(key_len), &id.to_le_bytes());
     }
 
     fn promote_at(&mut self, addr: Addr) {
@@ -1032,7 +1035,7 @@ impl AHashIndex {
             return;
         }
 
-        let id = Self::read_u32(&self.keys, Self::payload_at(addr, key_len));
+        let id = Self::read_u32_in(&self.keys, addr, Self::payload_in(key_len));
         let slot = self.slabs.slot(id);
         let entry = match kind {
             TAG_COLL_SLAB => Entry::from_slab_coll(slot),
@@ -1054,11 +1057,11 @@ impl AHashIndex {
 
     fn unpack(&mut self, addr: Addr) -> Entry {
         let (key_len, kind, _) = Self::decode(&self.keys, addr);
-        let payload = Self::payload_at(addr, key_len);
+        let payload = Self::payload_in(key_len);
 
         match kind {
             TAG_LOG => {
-                let raw = self.keys.slice(payload, 6);
+                let raw = self.keys.span(addr.0, payload, 6);
                 let offset = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
                 let len = u16::from_le_bytes([raw[4], raw[5]]);
 
@@ -1066,7 +1069,7 @@ impl AHashIndex {
             }
 
             TAG_INTEGER => {
-                let raw = self.keys.slice(payload, 8);
+                let raw = self.keys.span(addr.0, payload, 8);
                 let mut bytes = [0u8; 8];
 
                 bytes.copy_from_slice(raw);
@@ -1074,11 +1077,11 @@ impl AHashIndex {
             }
 
             TAG_HEAP => Entry::from_packed_bytes(PackedBytes::Heap(
-                self.take_heap(Self::read_u32(&self.keys, payload)),
+                self.take_heap(Self::read_u32_in(&self.keys, addr, payload)),
             )),
-            TAG_OBJECT => self.take_object(Self::read_u32(&self.keys, payload)),
+            TAG_OBJECT => self.take_object(Self::read_u32_in(&self.keys, addr, payload)),
             TAG_SET_SLAB => {
-                let id = Self::read_u32(&self.keys, payload);
+                let id = Self::read_u32_in(&self.keys, addr, payload);
                 let entry = Entry::from_slab_set(self.slabs.slot(id));
 
                 self.slabs.free(id);
@@ -1086,7 +1089,7 @@ impl AHashIndex {
             }
 
             TAG_ZSET_SLAB => {
-                let id = Self::read_u32(&self.keys, payload);
+                let id = Self::read_u32_in(&self.keys, addr, payload);
                 let entry = Entry::from_slab_sorted(self.slabs.slot(id));
 
                 self.slabs.free(id);
@@ -1094,7 +1097,7 @@ impl AHashIndex {
             }
 
             TAG_COLL_SLAB => {
-                let id = Self::read_u32(&self.keys, payload);
+                let id = Self::read_u32_in(&self.keys, addr, payload);
                 let entry = Entry::from_slab_coll(self.slabs.slot(id));
 
                 self.slabs.free(id);
@@ -1325,7 +1328,7 @@ impl StorageIndex for AHashIndex {
             return None;
         }
 
-        let index = Self::read_u32(&self.keys, Self::payload_at(found, key_len));
+        let index = Self::read_u32_in(&self.keys, found, Self::payload_in(key_len));
 
         self.objects[index as usize].as_mut()
     }
@@ -1346,7 +1349,7 @@ impl StorageIndex for AHashIndex {
             return;
         }
 
-        let index = Self::read_u32(&self.keys, Self::payload_at(addr, key_len));
+        let index = Self::read_u32_in(&self.keys, addr, Self::payload_in(key_len));
         let Some((tag, record)) = self.objects[index as usize]
             .as_ref()
             .and_then(Entry::slab_body)
@@ -1377,7 +1380,7 @@ impl StorageIndex for AHashIndex {
                 let (key_len, _, _) = Self::decode(keys, *addr);
 
                 (
-                    keys.slice(addr.0 + HEADER_LEN, key_len),
+                    keys.span(addr.0, HEADER_LEN as usize, key_len as usize),
                     Self::view(*addr, keys, heaps, objects, slabs),
                 )
             })
@@ -1392,16 +1395,16 @@ impl StorageIndex for AHashIndex {
 
         if let Some(addr) = existing {
             let (key_len, kind, _) = Self::decode(&self.keys, addr);
-            let payload = Self::payload_at(addr, key_len);
+            let payload = Self::payload_in(key_len);
 
             if kind == TAG_INTEGER
                 && let Packed::Bytes(PackedBytes::Integer(value)) = entry.clone().into_packed()
             {
-                let raw = self.keys.slice(payload, 8);
+                let raw = self.keys.span(addr.0, payload, 8);
                 let mut bytes = [0u8; 8];
 
                 bytes.copy_from_slice(raw);
-                self.keys.write_at(payload, &value.to_le_bytes());
+                self.keys.write_span(addr.0, payload, &value.to_le_bytes());
 
                 return Some(Entry::from_packed_bytes(PackedBytes::Integer(
                     i64::from_le_bytes(bytes),
@@ -1411,14 +1414,14 @@ impl StorageIndex for AHashIndex {
             let entry = if kind == TAG_LOG || kind == TAG_HEAP {
                 match entry.into_packed() {
                     Packed::Bytes(PackedBytes::Log { offset, len }) if kind == TAG_LOG => {
-                        let raw = self.keys.slice(payload, 6);
+                        let raw = self.keys.span(addr.0, payload, 6);
                         let old_offset = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
                         let old_len = u16::from_le_bytes([raw[4], raw[5]]);
                         let mut bytes = [0u8; 6];
 
                         bytes[0..4].copy_from_slice(&offset.to_le_bytes());
                         bytes[4..6].copy_from_slice(&len.to_le_bytes());
-                        self.keys.write_at(payload, &bytes);
+                        self.keys.write_span(addr.0, payload, &bytes);
 
                         return Some(Entry::from_packed_bytes(PackedBytes::Log {
                             offset: old_offset,
@@ -1427,7 +1430,7 @@ impl StorageIndex for AHashIndex {
                     }
 
                     Packed::Bytes(PackedBytes::Heap(data)) if kind == TAG_HEAP => {
-                        let index = Self::read_u32(&self.keys, payload);
+                        let index = Self::read_u32_in(&self.keys, addr, payload);
                         let previous = self.heaps[index as usize]
                             .replace(data)
                             .expect("heap value");
@@ -1546,7 +1549,7 @@ impl StorageIndex for AHashIndex {
 
             let (key_len, tag, _) = Self::decode(&self.keys, addr);
 
-            (tag == TAG_OBJECT).then(|| Self::read_u32(&self.keys, Self::payload_at(addr, key_len)))
+            (tag == TAG_OBJECT).then(|| Self::read_u32_in(&self.keys, addr, Self::payload_in(key_len)))
         });
 
         match found {
@@ -1575,7 +1578,7 @@ impl StorageIndex for AHashIndex {
         (start..start.saturating_add(slots)).map(|slot| {
             self.table.get_bucket(slot).map(|addr| {
                 let (key_len, _, _) = Self::decode(&self.keys, *addr);
-                self.keys.slice(addr.0 + HEADER_LEN, key_len)
+                self.keys.span(addr.0, HEADER_LEN as usize, key_len as usize)
             })
         })
     }
@@ -1604,7 +1607,7 @@ impl StorageIndex for AHashIndex {
                 excluded.contains(&Some(addr.0))
             } else {
                 let (key_len, _, _) = Self::decode(&self.keys, addr);
-                exclude.contains(&self.keys.slice(addr.0 + HEADER_LEN, key_len))
+                exclude.contains(&self.keys.span(addr.0, HEADER_LEN as usize, key_len as usize))
             };
 
             if skip {
@@ -1646,7 +1649,7 @@ impl StorageIndex for AHashIndex {
                 let (key_len, _, _) = Self::decode(log, *addr);
 
                 visit(
-                    log.slice(addr.0 + HEADER_LEN, key_len),
+                    log.span(addr.0, HEADER_LEN as usize, key_len as usize),
                     Self::view(*addr, log, heaps, objects, slabs),
                     Some(addr.0),
                 );
@@ -1668,7 +1671,7 @@ impl StorageIndex for AHashIndex {
             let (key_len, _, _) = Self::decode(keys, *addr);
 
             (
-                keys.slice(addr.0 + HEADER_LEN, key_len),
+                keys.span(addr.0, HEADER_LEN as usize, key_len as usize),
                 Self::view(*addr, keys, heaps, objects, slabs),
             )
         })
@@ -1686,11 +1689,11 @@ impl StorageIndex for AHashIndex {
 
         table.into_iter().map(move |addr| {
             let (key_len, kind, _) = Self::decode(&keys, addr);
-            let payload = Self::payload_at(addr, key_len);
+            let payload = Self::payload_in(key_len);
 
             match kind {
                 TAG_LOG => {
-                    let raw = keys.slice(payload, 6);
+                    let raw = keys.span(addr.0, payload, 6);
                     let offset = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
                     let len = u16::from_le_bytes([raw[4], raw[5]]);
 
@@ -1698,7 +1701,7 @@ impl StorageIndex for AHashIndex {
                 }
 
                 TAG_INTEGER => {
-                    let raw = keys.slice(payload, 8);
+                    let raw = keys.span(addr.0, payload, 8);
                     let mut bytes = [0u8; 8];
 
                     bytes.copy_from_slice(raw);
@@ -1706,18 +1709,18 @@ impl StorageIndex for AHashIndex {
                 }
 
                 TAG_HEAP => Entry::from_packed_bytes(PackedBytes::Heap(
-                    heaps[Self::read_u32(&keys, payload) as usize]
+                    heaps[Self::read_u32_in(&keys, addr, payload) as usize]
                         .take()
                         .expect("heap value"),
                 )),
-                TAG_OBJECT => objects[Self::read_u32(&keys, payload) as usize]
+                TAG_OBJECT => objects[Self::read_u32_in(&keys, addr, payload) as usize]
                     .take()
                     .expect("collection"),
-                TAG_SET_SLAB => Entry::from_slab_set(slabs.slot(Self::read_u32(&keys, payload))),
+                TAG_SET_SLAB => Entry::from_slab_set(slabs.slot(Self::read_u32_in(&keys, addr, payload))),
                 TAG_ZSET_SLAB => {
-                    Entry::from_slab_sorted(slabs.slot(Self::read_u32(&keys, payload)))
+                    Entry::from_slab_sorted(slabs.slot(Self::read_u32_in(&keys, addr, payload)))
                 }
-                TAG_COLL_SLAB => Entry::from_slab_coll(slabs.slot(Self::read_u32(&keys, payload))),
+                TAG_COLL_SLAB => Entry::from_slab_coll(slabs.slot(Self::read_u32_in(&keys, addr, payload))),
 
                 _ => unreachable!("record kind"),
             }
@@ -1740,7 +1743,7 @@ impl StorageIndex for AHashIndex {
                 .map(|addr| {
                     let (key_len, found, _) = Self::decode(keys, addr);
 
-                    (found, Self::read_u32(keys, Self::payload_at(addr, key_len)))
+                    (found, Self::read_u32_in(keys, addr, Self::payload_in(key_len)))
                 })
         };
 
@@ -1793,7 +1796,7 @@ impl StorageIndex for AHashIndex {
                         kind,
                         addr,
                         key_len,
-                        Self::read_u32(keys, Self::payload_at(addr, key_len)),
+                        Self::read_u32_in(keys, addr, Self::payload_in(key_len)),
                     )
                 })
         };
@@ -1815,7 +1818,7 @@ impl StorageIndex for AHashIndex {
         };
 
         self.keys
-            .write_at(Self::payload_at(addr, key_len), &stored.to_le_bytes());
+            .write_span(addr.0, Self::payload_in(key_len), &stored.to_le_bytes());
         true
     }
 
@@ -1831,7 +1834,7 @@ impl StorageIndex for AHashIndex {
             return None;
         }
 
-        let id = Self::read_u32(&self.keys, Self::payload_at(addr, key_len));
+        let id = Self::read_u32_in(&self.keys, addr, Self::payload_in(key_len));
         let bytes = self.slabs.slot(id).to_vec();
 
         self.slabs.free(id);
@@ -1856,7 +1859,7 @@ impl StorageIndex for AHashIndex {
                 .map(|addr| {
                     let (key_len, _, _) = Self::decode(keys, addr);
 
-                    Self::read_u32(keys, Self::payload_at(addr, key_len))
+                    Self::read_u32_in(keys, addr, Self::payload_in(key_len))
                 })
         }?;
 
@@ -1890,7 +1893,7 @@ impl StorageIndex for AHashIndex {
 
         raw[..4].copy_from_slice(&offset.to_le_bytes());
         raw[4..].copy_from_slice(&len.to_le_bytes());
-        self.keys.write_at(Self::payload_at(addr, key_len), &raw);
+        self.keys.write_span(addr.0, Self::payload_in(key_len), &raw);
         true
     }
 
@@ -1909,15 +1912,15 @@ impl StorageIndex for AHashIndex {
                 .and_then(|addr| {
                     let (key_len, kind, _) = Self::decode(keys, *addr);
 
-                    (kind == TAG_INTEGER).then(|| Self::payload_at(*addr, key_len))
+                    (kind == TAG_INTEGER).then(|| (*addr, Self::payload_in(key_len)))
                 })
         };
 
-        let Some(payload) = payload else {
+        let Some((addr, payload)) = payload else {
             return false;
         };
 
-        self.keys.write_at(payload, &value.to_le_bytes());
+        self.keys.write_span(addr.0, payload, &value.to_le_bytes());
         true
     }
 
@@ -1944,7 +1947,7 @@ impl StorageIndex for AHashIndex {
         let addr = Addr(address);
         let (key_len, _, _) = Self::decode(&self.keys, addr);
 
-        Some(self.keys.slice(addr.0 + HEADER_LEN, key_len))
+        Some(self.keys.span(addr.0, HEADER_LEN as usize, key_len as usize))
     }
 
     fn charged_bytes(&self) -> usize {
@@ -2061,13 +2064,13 @@ impl StorageIndex for AHashIndex {
                 let (key_len, kind, payload_len) = Self::decode(&self.keys, addr);
 
                 if kind == TAG_LOG {
-                    let payload = Self::payload_at(addr, key_len);
-                    let raw = self.keys.slice(payload, 6);
+                    let payload = Self::payload_in(key_len);
+                    let raw = self.keys.span(addr.0, payload, 6);
                     let offset = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
                     let len = u16::from_le_bytes([raw[4], raw[5]]);
 
                     if let Some(next) = value(offset, len) {
-                        self.keys.write_at(payload, &next.to_le_bytes());
+                        self.keys.write_span(addr.0, payload, &next.to_le_bytes());
                     }
                 }
 

@@ -1445,6 +1445,37 @@ impl ValueLog {
         self.bytes(offset, len as usize)
     }
 
+    /// Bytes `at..at+len` of the span that starts at `offset`.
+    ///
+    /// A page span is one contiguous byte range, so `at` is just an addition.
+    /// A large span is a tagged block id (`LOG_LARGE | id`), not an address: adding
+    /// `at` to it would index a different block, so the offset stays inside the
+    /// block instead.
+    #[inline(always)]
+    pub(crate) fn span(&self, offset: u32, at: usize, len: usize) -> &[u8] {
+        if offset & LOG_LARGE == 0 {
+            return self.bytes(offset + at as u32, len);
+        }
+
+        &self.large.as_ref().expect("large span").blocks[(offset ^ LOG_LARGE) as usize]
+            .as_ref()
+            .expect("large span")[at..at + len]
+    }
+
+    /// Writes `value` at `at` within the span that starts at `offset`.
+    #[inline(always)]
+    pub(crate) fn write_span(&mut self, offset: u32, at: usize, value: &[u8]) {
+        if offset & LOG_LARGE == 0 {
+            self.write_at(offset + at as u32, value);
+            return;
+        }
+
+        self.large.as_mut().expect("large span").blocks[(offset ^ LOG_LARGE) as usize]
+            .as_mut()
+            .expect("large span")[at..at + value.len()]
+            .copy_from_slice(value);
+    }
+
     pub(super) fn read_integer(&self, offset: u32) -> i64 {
         let mut bytes = [0u8; 8];
 
