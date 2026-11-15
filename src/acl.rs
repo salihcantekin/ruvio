@@ -1041,6 +1041,9 @@ fn exposes_any_key_name(command: &Command<'_>) -> bool {
         | Command::FlushAll
         | Command::SwapDb(_, _) => true,
         Command::Changes(_) | Command::ChangesSubscribe(_) => true,
+        // An index runs over every key of its PREFIX (empty means every key), and FIND
+        // answers with the key names it matched, so these are keyspace-wide like KEYS.
+        Command::JsonIndex { .. } => true,
         Command::Ruvio(Some(word)) => {
             word.eq_ignore_ascii_case(b"hotkeys") || word.eq_ignore_ascii_case(b"bigkeys")
         }
@@ -1621,6 +1624,18 @@ mod tests {
             Command::SwapDb(0, 1),
             Command::Ruvio(Some(Cow::Borrowed(b"hotkeys"))),
             Command::Ruvio(Some(Cow::Borrowed(b"BIGKEYS"))),
+            Command::JsonIndex {
+                op: crate::protocol::JsonIndexKind::Find,
+                args: Vec::new(),
+            },
+            Command::JsonIndex {
+                op: crate::protocol::JsonIndexKind::Create,
+                args: Vec::new(),
+            },
+            Command::JsonIndex {
+                op: crate::protocol::JsonIndexKind::List,
+                args: Vec::new(),
+            },
             Command::Subscribe(vec![Cow::Borrowed(b"__keyspace@0__:secret")]),
             Command::Subscribe(vec![
                 Cow::Borrowed(b"news"),
