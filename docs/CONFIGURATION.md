@@ -29,7 +29,7 @@ shutdown_grace_ms = 30000
 
 [protocol]
 max_arguments = 1048576
-max_key_bytes = 1048576
+max_key_bytes = 1048576      # the index stores at most 4084 bytes per key whatever this says
 max_value_bytes = 16777216
 max_command_bytes = 67108864
 max_pipeline_commands = 1024

@@ -2343,3 +2343,16 @@ fn huge_bulk_lengths_are_refused_not_read() {
         );
     }
 }
+
+#[test]
+fn a_key_that_would_not_fit_one_log_page_is_refused() {
+    let limits = ProtocolLimits::default();
+    let longest = vec![b'k'; super::validate::KEY_BYTES_MAX];
+    let too_long = vec![b'k'; super::validate::KEY_BYTES_MAX + 1];
+
+    assert!(super::validate::validate_key(&longest, limits).is_ok());
+    assert!(matches!(
+        super::validate::validate_key(&too_long, limits),
+        Err(ProtocolError::LimitExceeded("key is too large"))
+    ));
+}
