@@ -871,3 +871,35 @@ fn a_push_handed_to_a_blocked_client_replies_the_length_before_the_hand_off() {
     assert_eq!(reply, Response::Integer(1));
     assert!(slot.take().is_some());
 }
+
+#[test]
+fn a_repeated_random_member_draw_stops_at_the_byte_budget() {
+    let mut shard = KvShard::new();
+    let mut waiters = ();
+    let member = vec![b'm'; 1 << 20];
+
+    assert_eq!(
+        execute_with_waiters(
+            &mut shard,
+            command_of(&[b"SADD", b"s", &member]),
+            &mut NoopMutationSink,
+            &mut waiters,
+        )
+        .unwrap(),
+        Response::Integer(1)
+    );
+
+    let reply = execute_with_waiters(
+        &mut shard,
+        command_of(&[b"SRANDMEMBER", b"s", b"-1000"]),
+        &mut NoopMutationSink,
+        &mut waiters,
+    )
+    .unwrap();
+
+    // 64 MiB of copies of one 1 MiB member, not a thousand of them.
+    match reply {
+        Response::Array(items) => assert_eq!(items.len(), 64),
+        other => panic!("{other:?}"),
+    }
+}

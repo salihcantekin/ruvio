@@ -53,6 +53,10 @@ pub(super) fn decode_set(bytes: &[u8]) -> Vec<Vec<u8>> {
 /// `take` members of `set` drawn uniformly: distinct ones (at most all) when `distinct`,
 /// otherwise independent draws. Cost follows `take` for every encoding but the spilled
 /// table, which has no bucket access and is walked once.
+///
+/// Independent draws are capped at [`MAX_RANDOM_REPLY_BYTES`]: `-1000000` on a set holding
+/// a 16 MiB member used to copy that member a million times before the reply limit was
+/// applied, so the reply now stops growing once the budget is spent.
 fn sample_members(set: SetView<'_>, take: usize, distinct: bool) -> Vec<Vec<u8>> {
     let width = set.len();
 
@@ -60,51 +64,79 @@ fn sample_members(set: SetView<'_>, take: usize, distinct: bool) -> Vec<Vec<u8>>
         return Vec::new();
     }
 
-    let positions = || {
-        if distinct {
-            distinct_positions(width, take)
-        } else {
-            (0..take).map(|_| random_below(width)).collect()
-        }
+    let positions: Vec<usize> = if distinct {
+        distinct_positions(width, take)
+    } else {
+        (0..take).map(|_| random_below(width)).collect()
     };
-    let flat = |bytes: &[u8]| {
-        let members: Vec<&[u8]> = SetMembers {
-            bytes,
-            at: 2,
-            left: flat_count(bytes),
-        }
-        .collect();
-
-        positions()
-            .into_iter()
-            .map(|at| members[at].to_vec())
-            .collect()
+    // A distinct draw copies each member at most once, so it cannot exceed the collection.
+    let budget = if distinct {
+        usize::MAX
+    } else {
+        MAX_RANDOM_REPLY_BYTES
     };
+    let mut picked = Vec::with_capacity(positions.len().min(width));
+    let mut bytes = 0usize;
 
     match set {
-        SetView::Bytes(bytes) => flat(bytes),
+        SetView::Bytes(raw) => sample_flat(raw, &positions, budget, &mut picked, &mut bytes),
         SetView::Value(value) => match &value.body {
-            SetBody::Flat(bytes) => flat(bytes),
-            SetBody::Int(ints) => positions()
-                .into_iter()
-                .map(|at| format_i64(ints.get(at), &mut [0u8; 20]).to_vec())
-                .collect(),
-            SetBody::Arena(table) => {
-                let mut picked = Vec::with_capacity(take.min(width));
+            SetBody::Flat(raw) => sample_flat(raw, &positions, budget, &mut picked, &mut bytes),
+            SetBody::Int(ints) => {
+                let mut digits = [0u8; 20];
 
-                table.sample(take, distinct, |member, _| picked.push(member.to_vec()));
-                picked
+                for at in positions {
+                    let member = format_i64(ints.get(at), &mut digits);
+
+                    if !push_member(&mut picked, &mut bytes, member, budget) {
+                        break;
+                    }
+                }
+            }
+            SetBody::Arena(table) => {
+                table.sample(take, distinct, |member, _| {
+                    let _ = push_member(&mut picked, &mut bytes, member, budget);
+                });
             }
             SetBody::Table(members) => {
                 let members: Vec<&[u8]> = members.iter().map(|member| &**member).collect();
 
-                positions()
-                    .into_iter()
-                    .map(|at| members[at].to_vec())
-                    .collect()
+                for at in positions {
+                    if !push_member(&mut picked, &mut bytes, members[at], budget) {
+                        break;
+                    }
+                }
             }
         },
     }
+
+    picked
+}
+
+fn sample_flat(raw: &[u8], positions: &[usize], budget: usize, picked: &mut Vec<Vec<u8>>, bytes: &mut usize) {
+    let members: Vec<&[u8]> = SetMembers {
+        bytes: raw,
+        at: 2,
+        left: flat_count(raw),
+    }
+    .collect();
+
+    for &at in positions {
+        if !push_member(picked, bytes, members[at], budget) {
+            break;
+        }
+    }
+}
+
+/// Pushes a copy of `member` unless it would take the reply past `budget` bytes.
+fn push_member(picked: &mut Vec<Vec<u8>>, bytes: &mut usize, member: &[u8], budget: usize) -> bool {
+    if bytes.saturating_add(member.len()) > budget {
+        return false;
+    }
+
+    *bytes += member.len();
+    picked.push(member.to_vec());
+    true
 }
 
 pub(super) fn set_contains(bytes: &[u8], member: &[u8]) -> bool {
