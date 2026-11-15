@@ -108,7 +108,12 @@ pub fn parse_command_with_limits(
     // Every limit `validate_command_payloads` checks is on argument bytes (alone or summed
     // with a small constant), all of which fit in the frame: a frame no larger than the
     // smaller limit cannot fail any of them, so the per-command walk is skipped.
-    if consumed > limits.max_key_bytes.min(limits.max_value_bytes) {
+    if consumed
+        > limits
+            .max_key_bytes
+            .min(limits.max_value_bytes)
+            .min(validate::KEY_BYTES_MAX)
+    {
         match validate_command_payloads(&command, limits) {
             // The whole frame is in hand: refuse the command and keep the connection.
             Err(ProtocolError::LimitExceeded(message)) => {

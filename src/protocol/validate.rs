@@ -1,7 +1,12 @@
 use super::*;
 
+/// Longest key the index stores. A record is a 4-byte header, the key and at most 8 payload
+/// bytes, and it must fit one 4 KiB value-log page: a record that crossed a page took the
+/// large-span path, which the index does not address, and the process panicked.
+pub(crate) const KEY_BYTES_MAX: usize = 4096 - 4 - 8;
+
 pub(super) fn validate_key(key: &[u8], limits: ProtocolLimits) -> Result<(), ProtocolError> {
-    if key.len() > limits.max_key_bytes {
+    if key.len() > limits.max_key_bytes.min(KEY_BYTES_MAX) {
         return Err(ProtocolError::LimitExceeded("key is too large"));
     }
 
