@@ -871,3 +871,53 @@ fn a_push_handed_to_a_blocked_client_replies_the_length_before_the_hand_off() {
     assert_eq!(reply, Response::Integer(1));
     assert!(slot.take().is_some());
 }
+
+#[test]
+fn lmpop_records_one_trim_for_a_multi_element_pop() {
+    let mut shard = KvShard::new();
+    let mut waiters = ();
+    let mut element = Vec::new();
+
+    for value in 0..1_000u32 {
+        element.clear();
+        element.extend_from_slice(value.to_string().as_bytes());
+
+        let reply = execute_with_waiters(
+            &mut shard,
+            command_of(&[b"RPUSH", b"l", &element]),
+            &mut NoopMutationSink,
+            &mut waiters,
+        )
+        .unwrap();
+
+        assert_eq!(reply, Response::Integer(value as i64 + 1));
+    }
+
+    let mut log = DatabaseLog::default();
+    let reply = execute_with_waiters(
+        &mut shard,
+        command_of(&[b"LMPOP", b"1", b"l", b"LEFT", b"COUNT", b"1000"]),
+        &mut log,
+        &mut waiters,
+    )
+    .unwrap();
+
+    assert_eq!(
+        reply,
+        Response::Exec(vec![
+            Response::Bulk(Some(Cow::Borrowed(b"l"))),
+            Response::Array(
+                (0..1_000u32)
+                    .map(|value| Some(Cow::Owned(value.to_string().into_bytes())))
+                    .collect()
+            ),
+        ])
+    );
+    assert_eq!(log.records.len(), 1, "one record for the whole run");
+    assert!(
+        matches!(log.records[0].1, OwnedMutation::ListTrim { .. }),
+        "{:?}",
+        log.records[0].1
+    );
+    assert!(!shard.contains_key(b"l"));
+}
