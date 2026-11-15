@@ -1909,8 +1909,22 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         if let HashRead::Value(value) = hash
             && let Some(table) = value.arena()
         {
+            let mut bytes = 0usize;
+
             table.sample(take, !repeats, |field, value| {
-                picked.push((field.to_vec(), value.to_vec()))
+                if !repeats {
+                    picked.push((field.to_vec(), value.to_vec()));
+                    return;
+                }
+
+                let cost = field.len().saturating_add(value.len());
+
+                if bytes.saturating_add(cost) > MAX_RANDOM_REPLY_BYTES {
+                    return;
+                }
+
+                bytes += cost;
+                picked.push((field.to_vec(), value.to_vec()));
             });
 
             return Ok(picked);
@@ -1931,9 +1945,17 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
             distinct_positions(pairs.len(), take)
         };
 
+        let mut bytes = 0usize;
+
         for at in positions {
             let (field, value) = pairs[at];
+            let cost = field.len().saturating_add(value.len());
 
+            if repeats && bytes.saturating_add(cost) > MAX_RANDOM_REPLY_BYTES {
+                break;
+            }
+
+            bytes = bytes.saturating_add(cost);
             picked.push((field.to_vec(), value.to_vec()));
         }
 

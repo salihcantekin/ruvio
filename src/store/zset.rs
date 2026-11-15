@@ -1668,7 +1668,24 @@ impl<C: Clock, I: StorageIndex> KvShard<C, I> {
         }
 
         if count.is_some_and(|count| count < 0) || count.is_none() {
-            return Ok((0..take).filter_map(|_| at(random_below(card))).collect());
+            // Independent draws repeat one member, so the reply is bounded by bytes.
+            let mut picked = Vec::new();
+            let mut bytes = 0usize;
+
+            for _ in 0..take {
+                let Some((member, score)) = at(random_below(card)) else {
+                    continue;
+                };
+
+                if bytes.saturating_add(member.len()) > MAX_RANDOM_REPLY_BYTES {
+                    break;
+                }
+
+                bytes += member.len();
+                picked.push((member, score));
+            }
+
+            return Ok(picked);
         }
 
         let ranks = distinct_positions(card, take);
