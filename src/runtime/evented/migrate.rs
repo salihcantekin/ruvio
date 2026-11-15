@@ -1513,8 +1513,12 @@ pub(super) fn replicated(state: &ShardState, mutation: &crate::OwnedMutation, se
                 warn!(%error, "a replica could not record a range given to another node");
             }
             // A range this replica served from the primary's end record goes back to what
-            // its map says, as the primary's table does.
-            if let Some(topology) = forwarding.fabric.topology().map(|shared| shared.get()) {
+            // its map says, as the primary's table does. Only a range the history accepted
+            // is applied: an out-of-range last slot is outside the placement table, and
+            // indexing it panics the shard.
+            if recorded.is_ok()
+                && let Some(topology) = forwarding.fabric.topology().map(|shared| shared.get())
+            {
                 let count = forwarding.fabric.shard_count();
                 let placement = topology.placement(count);
                 let table = forwarding.fabric.slot_table();
