@@ -2013,7 +2013,7 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
         -6,
         WRITE | DENYOOM,
         (1, 1, 1),
-        &["read", "write", "geo", "slow"],
+        &["write", "geo", "slow"],
         commands::cmd_georadius,
     ),
     CommandSpec::migrated(
@@ -2021,7 +2021,7 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
         -5,
         WRITE | DENYOOM,
         (1, 1, 1),
-        &["read", "write", "geo", "slow"],
+        &["write", "geo", "slow"],
         commands::cmd_georadiusbymember,
     ),
     CommandSpec::migrated(
