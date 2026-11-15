@@ -1765,6 +1765,21 @@ mod tests {
         assert!(reader.rules.authorize(&Command::ConfigRewrite).is_err());
     }
 
+    /// `GEORADIUS ... STORE dest` writes `dest`, so the command is `@write` like in Redis;
+    /// a read-only user keeps `GEOSEARCH`, which cannot write.
+    #[test]
+    fn georadius_is_not_in_the_read_category() {
+        let read = commands_in_category("read");
+
+        assert!(!read.contains(&"georadius"));
+        assert!(!read.contains(&"georadiusbymember"));
+        assert!(read.contains(&"geosearch"));
+
+        let write = commands_in_category("write");
+
+        assert!(write.contains(&"georadius"));
+    }
+
     /// A rule on a subcommand no command maps to is refused: it could never match, and each
     /// distinct name used to be kept for the life of the process (issue #38).
     #[test]
