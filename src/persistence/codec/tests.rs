@@ -1526,7 +1526,11 @@ fn a_nested_transaction_record_is_refused_without_recursing() {
     payload.extend_from_slice(&0u32.to_le_bytes());
 
     assert!(matches!(
-        super::decode_payload(super::record::TRANSACTION, &payload, ProtocolLimits::default()),
+        super::decode_payload(
+            super::record::TRANSACTION,
+            &payload,
+            ProtocolLimits::default()
+        ),
         Err(PersistenceError::Corruption(_))
     ));
 }

@@ -75,9 +75,7 @@ const MAX_DEPTH: usize = 32;
 const MAX_ITEMS: usize = 1024 * 1024;
 
 /// Reads one reply. `None` at a clean end of stream.
-pub async fn read_value<R: AsyncBufRead + Unpin>(
-    reader: &mut R,
-) -> io::Result<Option<Value>> {
+pub async fn read_value<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<Option<Value>> {
     read_value_at(reader, 0).await
 }
 

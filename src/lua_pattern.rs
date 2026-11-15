@@ -250,9 +250,13 @@ impl MatchState<'_> {
     }
 
     /// Whether `c` is in the class `[...]` from `p` (the `[`) to `ec` (the `]`).
-    fn match_bracket_class(&mut self, c: u8, mut p: usize, ec: usize) -> Result<bool, PatternError> {
+    fn match_bracket_class(
+        &mut self,
+        c: u8,
+        mut p: usize,
+        ec: usize,
+    ) -> Result<bool, PatternError> {
         self.charge(ec - p)?;
-
 
         let mut sig = true;
 
@@ -628,7 +632,14 @@ mod tests {
         let subject = "a".repeat(200_000);
         let mut steps = 8_000_000u64;
         let mut found = Found::new();
-        let outcome = search(subject.as_bytes(), pattern.as_bytes(), 0, Anchor::Leading, &mut steps, &mut found);
+        let outcome = search(
+            subject.as_bytes(),
+            pattern.as_bytes(),
+            0,
+            Anchor::Leading,
+            &mut steps,
+            &mut found,
+        );
 
         assert_eq!(outcome, Err(PatternError::Quota));
     }

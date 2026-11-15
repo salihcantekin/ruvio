@@ -113,7 +113,13 @@ fn sample_members(set: SetView<'_>, take: usize, distinct: bool) -> Vec<Vec<u8>>
     picked
 }
 
-fn sample_flat(raw: &[u8], positions: &[usize], budget: usize, picked: &mut Vec<Vec<u8>>, bytes: &mut usize) {
+fn sample_flat(
+    raw: &[u8],
+    positions: &[usize],
+    budget: usize,
+    picked: &mut Vec<Vec<u8>>,
+    bytes: &mut usize,
+) {
     let members: Vec<&[u8]> = SetMembers {
         bytes: raw,
         at: 2,

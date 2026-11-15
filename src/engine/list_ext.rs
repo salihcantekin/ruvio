@@ -394,7 +394,11 @@ pub(super) fn list_mpop<'a, C: Clock, I: StorageIndex, S: MutationSink>(
         }
     } else {
         let take = take as i64;
-        let (start, stop) = if from_left { (take, -1) } else { (0, -(take + 1)) };
+        let (start, stop) = if from_left {
+            (take, -1)
+        } else {
+            (0, -(take + 1))
+        };
 
         sink.record(Mutation::ListTrim { key, start, stop })?;
     }
