@@ -407,6 +407,21 @@ pub fn apply_mutation(
     database: u8,
     mutation: &OwnedMutation,
 ) -> Result<(), PersistenceError> {
+    // A log written before keys were limited to one value-log page can hold a record the
+    // index cannot store, and storing it aborts the process. The write that logged it never
+    // got a reply, so skipping it loses nothing a client was told.
+    let mut too_long = false;
+
+    mutation.for_each_write_key(&mut |key| too_long |= key.len() > crate::protocol::KEY_BYTES_MAX);
+
+    if too_long {
+        tracing::warn!(
+            limit = crate::protocol::KEY_BYTES_MAX,
+            "skipped a replayed record whose key is longer than the key limit"
+        );
+        return Ok(());
+    }
+
     let previous = shard.active_database();
 
     shard.enter(database);
@@ -1167,6 +1182,34 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+
+    /// A log written before keys were limited can name a key the index cannot store; replay
+    /// skips that record instead of aborting, and applies the ones around it.
+    #[test]
+    fn replay_skips_a_record_whose_key_is_longer_than_the_limit() {
+        let mut shard = crate::store::KvShard::new();
+        let long = vec![b'k'; crate::protocol::KEY_BYTES_MAX + 1];
+        let set = |key: &[u8]| OwnedMutation::SetBytes {
+            key: key.to_vec(),
+            value: b"v".to_vec(),
+        };
+
+        apply_mutation(&mut shard, 0, &set(b"before")).unwrap();
+        apply_mutation(&mut shard, 0, &set(&long)).unwrap();
+        apply_mutation(
+            &mut shard,
+            0,
+            &OwnedMutation::Transaction {
+                mutations: vec![set(&long)],
+            },
+        )
+        .unwrap();
+        apply_mutation(&mut shard, 0, &set(b"after")).unwrap();
+
+        assert_eq!(shard.get(b"before"), Some(&b"v"[..]));
+        assert_eq!(shard.get(b"after"), Some(&b"v"[..]));
+        assert_eq!(shard.get(&long), None);
     }
 
     /// A replica applies the primary's frames with `apply_mutation` while its own background

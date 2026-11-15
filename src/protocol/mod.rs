@@ -21,6 +21,8 @@ pub(crate) mod consistency;
 mod tests;
 mod validate;
 
+pub(crate) use validate::KEY_BYTES_MAX;
+
 pub(crate) use command::*;
 pub use hot::*;
 pub use one_or_many::OneOrMany;
