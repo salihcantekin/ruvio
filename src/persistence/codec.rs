@@ -1852,7 +1852,9 @@ impl<'a> Decoder<'a> {
     ) -> Result<Vec<Vec<u8>>, PersistenceError> {
         let count = self.u32()? as usize;
 
-        if count > maximum_count {
+        // Each element needs a 4-byte length before its bytes: a count the payload cannot
+        // hold is corruption, not a reason to reserve memory for it.
+        if count > maximum_count || count.saturating_mul(4) > self.remaining.len() {
             return Err(PersistenceError::Corruption(
                 "WAL collection count exceeds configured limit".into(),
             ));
@@ -1874,7 +1876,7 @@ impl<'a> Decoder<'a> {
     ) -> Result<Vec<OwnedScoreMember>, PersistenceError> {
         let count = self.u32()? as usize;
 
-        if count > maximum_count {
+        if count > maximum_count || count.saturating_mul(12) > self.remaining.len() {
             return Err(PersistenceError::Corruption(
                 "WAL sorted-set pair count exceeds configured limit".into(),
             ));
@@ -1896,7 +1898,7 @@ impl<'a> Decoder<'a> {
     ) -> Result<Vec<OwnedBytePair>, PersistenceError> {
         let count = self.u32()? as usize;
 
-        if count > maximum_count {
+        if count > maximum_count || count.saturating_mul(8) > self.remaining.len() {
             return Err(PersistenceError::Corruption(
                 "WAL pair count exceeds configured limit".into(),
             ));

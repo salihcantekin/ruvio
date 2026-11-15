@@ -1488,3 +1488,30 @@ fn a_slot_copy_larger_than_any_command_still_decodes() {
 
     assert_eq!(decode_record(&record, 0, small).unwrap().mutation, copy);
 }
+
+#[test]
+fn a_collection_count_the_payload_cannot_hold_is_corruption() {
+    // 4,294,967,295 elements, and not one byte of element behind the count: the decoder
+    // must refuse before it reserves an element per count.
+    let bytes = u32::MAX.to_le_bytes();
+    let mut decoder = crate::persistence::codec::Decoder::new(&bytes);
+
+    assert!(matches!(
+        decoder.byte_list(usize::MAX, 1024),
+        Err(PersistenceError::Corruption(_))
+    ));
+
+    let mut decoder = crate::persistence::codec::Decoder::new(&bytes);
+
+    assert!(matches!(
+        decoder.pair_list(usize::MAX, 1024),
+        Err(PersistenceError::Corruption(_))
+    ));
+
+    let mut decoder = crate::persistence::codec::Decoder::new(&bytes);
+
+    assert!(matches!(
+        decoder.score_member_list(usize::MAX, 1024),
+        Err(PersistenceError::Corruption(_))
+    ));
+}
