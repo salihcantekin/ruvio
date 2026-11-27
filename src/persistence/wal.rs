@@ -57,6 +57,9 @@ pub struct RecoveryReport {
     pub records_replayed: u64,
     pub last_sequence: u64,
     pub torn_tail_bytes: u64,
+    /// Last segments without a complete header that recovery dropped (or, read-only, would
+    /// have dropped): such a segment may be empty, so it adds nothing to `torn_tail_bytes`.
+    pub dropped_segments: u32,
 }
 
 /// Replayed WAL records with the database each one belongs to.

@@ -2,18 +2,6 @@
 
 use super::*;
 
-/// The last segment has no header, or only zeros where it is: normally a crash right after
-/// the segment was created. A log cut to nothing by something else looks the same, and an
-/// empty segment adds no bytes to the report, so this line is how it shows.
-fn warn_dropped_segment(path: &Path, bytes: u64) {
-    tracing::warn!(
-        segment = %path.display(),
-        bytes,
-        "dropped the last WAL segment: it has no complete header; normally a crash right after it \
-         was created, otherwise the log was cut and acknowledged writes may be missing"
-    );
-}
-
 pub(super) fn recover_segments(
     paths: &[PathBuf],
     shard_id: u32,
@@ -54,7 +42,7 @@ pub(super) fn recover_segments(
             }
 
             report.torn_tail_bytes += physical_length;
-            warn_dropped_segment(path, physical_length);
+            report.dropped_segments += 1;
 
             if !read_only {
                 fs::remove_file(path)?;
@@ -96,7 +84,7 @@ pub(super) fn recover_segments(
         {
             drop(file);
             report.torn_tail_bytes += physical_length;
-            warn_dropped_segment(path, physical_length);
+            report.dropped_segments += 1;
 
             if !read_only {
                 fs::remove_file(path)?;

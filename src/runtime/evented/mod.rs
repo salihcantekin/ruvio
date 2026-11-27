@@ -1374,15 +1374,17 @@ async fn serve_async(
         tokio::task::spawn_local(remote_loop(Rc::clone(&state), shutdown.clone()));
     }
 
-    if state.recovery.torn_tail_bytes > 0 {
+    if state.recovery.torn_tail_bytes > 0 || state.recovery.dropped_segments > 0 {
         // Recovery removes the end of the log a crash cut off (a record being written, or a
-        // segment created but not yet given its header). Nothing in it was acknowledged. A
-        // log cut by something else (a file system that lost its tail, a copy that stopped
-        // early) looks the same, and then acknowledged writes are missing: the line is how an
-        // operator finds out.
+        // segment created but not yet given its header). Under `always` nothing in it was
+        // acknowledged; under `everysec` a write acknowledged shortly before a power cut can
+        // be in it. A log cut by something else (a file system that lost its tail, a copy
+        // that stopped early) looks the same, and then acknowledged writes are missing: the
+        // line is how an operator finds out.
         warn!(
             shard_id,
             torn_tail_bytes = state.recovery.torn_tail_bytes,
+            dropped_segments = state.recovery.dropped_segments,
             recovered_records = state.recovery.records_replayed,
             "recovery dropped an unfinished end of the WAL; if the server was not killed or \
              powered off while writing, check the data directory for a truncated log"

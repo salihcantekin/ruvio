@@ -246,7 +246,7 @@ def scenario_diskfull(options, base: Path) -> list[dict]:
                 break
         check(results, "the disk filled and a write was refused", refused_at is not None, len(acked))
         check(results, "the refused write is answered with an error that says the outcome is unknown",
-              refusal is not None and refusal[0] == "error reply" and "outcome of this write is unknown" in refusal[1], refusal)
+              refusal is not None and refusal[0] == "error reply" and "its outcome is unknown" in refusal[1], refusal)
         check(results, "the server is still running", node.alive(), node.log_tail())
         if node.alive():
             try:

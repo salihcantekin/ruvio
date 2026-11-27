@@ -51,8 +51,10 @@ the log as it is and lets startup replay what reached the disk.
 Under `always`, scripts (`EVAL`, `EVALSHA`, `FCALL`) and `MULTI`/`EXEC` share a
 connection's batch sync and behave like plain writes in it (except when one port
 forwards commands between shards: there each one is synced on its own). When that sync
-fails, their client gets one `ERR persistence failed: the outcome of this write is
-unknown, it may be applied` and is cut off, and the shard refuses writes
+fails, their client gets one `ERR persistence did not confirm this write: its outcome
+is unknown, it may be applied` and is cut off (without it when part of an earlier reply
+is on the wire, or when the batch failed in the middle of a large pipeline), and the
+shard refuses writes
 until a restart, but what the script or transaction changed stays visible to
 readers in memory until then, like any write of the refused batch. A failed
 write of their record (not a failed sync) is different: it is refused before

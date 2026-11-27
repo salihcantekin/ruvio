@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Scan a Ruvio checkout for text that must not reach the public repository:
-# internal planning identifiers, Turkish text and test names that break each
-# language's naming convention.
+# internal planning identifiers, Turkish text, test names that break each
+# language's naming convention, and merge conflict markers.
 #
 #   scripts/check_hygiene.sh [repo-root] [git-base-ref]
 #
@@ -36,6 +36,19 @@ scan() { # label pattern
   if [ -n "$out" ]; then echo "== $1"; echo "$out"; found=1; fi
 }
 
+# Merge conflict markers, in every file (tests and docs included): a merge that
+# conflicted in more than one file has been committed with the markers left in.
+scan_everywhere() { # label pattern
+  local out
+  if [ -n "$base" ]; then
+    out=$({ git diff -U0 "$base"...HEAD -- . ':!scripts/check_hygiene.sh'; git diff -U0 HEAD -- . ':!scripts/check_hygiene.sh'; } | grep -E '^\+[^+]' | grep -E "$2" | head -40)
+  else
+    out=$(git grep -nE "$2" -- . ':!scripts/check_hygiene.sh' | head -40)
+  fi
+  if [ -n "$out" ]; then echo "== $1"; echo "$out"; found=1; fi
+}
+
+scan_everywhere "merge conflict markers" '^\+?(<{7}|>{7}) '
 scan "planning/decision ids" "$ids"
 scan "Turkish characters" "$tr_chars"
 if [ -z "$base" ]; then

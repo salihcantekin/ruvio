@@ -1435,7 +1435,7 @@ pub(super) fn flush_threshold(unsent: usize, maximum: usize) -> usize {
 /// dropped for this one error and the connection ends, as the client cannot tell which
 /// of its commands the error answers.
 pub(super) const UNCONFIRMED_WRITE_ERROR: &[u8] =
-    b"-ERR persistence failed: the outcome of this write is unknown, it may be applied\r\n";
+    b"-ERR persistence did not confirm this write: its outcome is unknown, it may be applied\r\n";
 
 #[cold]
 async fn fail_unconfirmed(
@@ -1444,8 +1444,16 @@ async fn fail_unconfirmed(
     error: io::Error,
     write_timeout: Duration,
 ) -> io::Result<()> {
+    // Part of an earlier reply may already be on the wire with its rest at the front of
+    // `output`: an error written after it would be read as that reply's payload, so the
+    // connection just closes, as it did before the error existed.
+    let cut = output.front_cut();
+
     output.clear();
-    let _ = write_timed(stream, UNCONFIRMED_WRITE_ERROR, write_timeout).await;
+
+    if !cut {
+        let _ = write_timed(stream, UNCONFIRMED_WRITE_ERROR, write_timeout).await;
+    }
 
     Err(error)
 }
