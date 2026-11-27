@@ -64,6 +64,7 @@ cargo test --lib --bins --tests
 `.github/workflows/nightly.yml` (every night at 02:17 UTC from `main`, and by manual dispatch) runs the coordinator fault scenarios on real
 processes and real network partitions, each scenario three times by default (`runs` input):
 
+- `scripts/upgrade_rollback.py --old DIR --new DIR --legacy DIR`: an upgrade and a rollback between two releases side by side (see `docs/evidence/2026-11-27-upgrade-rollback.md`).
 - `scripts/coordinator_faults.py ./ruvio partition leader minority restart loss durable stall coord-partition`:
   three data nodes, three coordinators and TCP proxies on one machine. `durable` expects no
   acknowledged write lost; `loss` allows only the last writes before the crash to be lost.
