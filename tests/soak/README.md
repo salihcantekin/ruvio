@@ -178,6 +178,30 @@ increment is timed from the `INCR` replies the history records: a reply at or be
 came back before it was sent shows where the counter went back. A history without those replies
 falls back to its newest acknowledged increments, which put the loss at the end of the run.
 
+## Correctness of LEASE, SEMAPHORE, TRANSFER and IDEM
+
+With `load.primitives` in the plan (see `plans/local-primitives.json`) the same run also drives
+the primitives that make a correctness promise, in both profiles, under the same faults:
+
+| Workload | What the check says |
+| --- | --- |
+| `LEASE`, `SEMAPHORE` + `RELEASE` | tokens never repeat and grow across grants that do not overlap; no grant lands while a holder certainly holds a full lock; the history of every lock key is linearizable (Porcupine) |
+| `TRANSFER` between accounts of one slot | the final balances add up to what was put in; no balance below 0; each account ends within what its acknowledged and unknown transfers allow |
+| `IDEM BEGIN` raced by several workers | one `acquired` per request, one effect per request, a `completed` answer replays the completed result |
+
+`python3 tests/soak/run.py check-primitives history.jsonl` repeats the check on a recorded history.
+The rule checks are Python (`ruvio_soak/primitives_check.py`); the linearizability check is the Go
+program in [`porcupine/`](porcupine) (`go run . history.jsonl`, needs Go and the Porcupine module).
+Without Go the check is reported as not run, which is a `warn`, never a pass. The model assumes a
+holder that never released expires at its time to live at the earliest; it may miss a violation but
+never reports one that did not happen. Violations that no failover can explain (a changed sum, a
+repeated token, two `acquired`) fail in every profile; lost or doubled holds fail in `durable` and warn in `default`.
+
+Locally `isolate-host` works when the controller runs as root with `iptables`: every host's processes
+run as their own user id, and packets between two hosts are dropped in both directions while the
+controller still reaches every node (`--out` must be below a directory other users can search, for
+example `/var/tmp`).
+
 ## Run it locally
 
 ```bash

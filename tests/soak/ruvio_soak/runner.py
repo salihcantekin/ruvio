@@ -50,6 +50,7 @@ from pathlib import Path
 from . import history as checker
 from . import report as reporter
 from . import workload
+from . import primitives, primitives_check, workload
 from .backends import Unsupported
 from .background import Background
 from .cluster import COORDINATOR, Cluster
@@ -657,6 +658,8 @@ class Runner:
             Flusher(self.latency, self.stop_metrics).start()
             self.workers = workers = workload.start(self.history, self.cluster.seeds(), self.cluster.password,
                                      plan.get("load", {}), self.stop_load, self.run_id.replace("-", ""), self.latency)
+            workers += primitives.start(self.history, self.cluster.seeds(), self.cluster.password,
+                                        plan.get("load", {}), self.stop_load, self.run_id.replace("-", ""))
             self.save_status("warmup")
             self.stop_load.wait(float(plan.get("warmup_s", 10)))
             self.save_status("load")
@@ -753,6 +756,8 @@ class Runner:
         if not ok:
             self.status.problem(f"the cluster was not healthy before the final reads: {reason}")
         unread = workload.final_reads(self.history, self.cluster.seeds(), self.cluster.password)
+        if self.plan.get("load", {}).get("primitives"):
+            unread += primitives.final_reads(self.history, self.cluster.seeds(), self.cluster.password)
         self.event("final-reads", unread=unread)
         self.events.flush()
         # The evidence goes out before the check, which is the slowest step and the one most
@@ -774,6 +779,15 @@ class Runner:
             return
         result["attribution"] = checker.attribute(result, checker.fault_windows(self.directory / "events.jsonl"))
         findings = result.pop("findings", [])
+        if self.plan.get("load", {}).get("primitives"):
+            extra = primitives_check.check_history(self.history.paths())
+            (self.directory / "check-primitives.json").write_text(json.dumps(extra, indent=2))
+            result["problems"] += [f"primitives: {text}" for text in extra["problems"]]
+            result["primitives"] = extra
+            order = ("ok", "warn", "fail")
+            if order.index(extra["verdict"]) > order.index(result["verdict"]):
+                result["verdict"] = extra["verdict"]
+            self.upload("check-primitives.json")
         self.event("checked", seconds=round(time.monotonic() - started, 1), operations=result["operations"])
         (self.directory / "check.json").write_text(json.dumps(result, indent=2))
         with open(self.directory / "findings.jsonl", "w") as file:
