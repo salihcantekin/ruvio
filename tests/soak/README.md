@@ -65,6 +65,8 @@ controller has a public IP, and SSH reaches it only from one address.
 | `netem` | `tc netem` on one host (`faults.netem`, for example `delay 50ms 20ms loss 2%`) | ssh |
 | `partition-coordinator-leader` | nftables cuts the leading coordinator's Raft port from the other coordinators; it still reaches the data nodes | ssh |
 | `migrate-slots` | `COORDINATOR MOVE` of `faults.migrate_range` (default `4096-4607`) to the other group under load, back the next time; healed when every member names the new owner | local, ssh |
+| `slot-churn` | `faults.churn_moves` (default 4) pieces of `faults.migrate_range`, each `COORDINATOR MOVE`d to the other group one after another, then each back | local, ssh |
+| `rebalance-slots` | `faults.rebalance_skew` (default 512) slots moved to the other group, then `COORDINATOR REBALANCE`; healed when the rebalance is `done` and every group holds its configured number of slots again | local, ssh |
 | `restart-all-data` | SIGKILL to every data node at once; the primary the coordinators name starts first | local, ssh |
 
 Faults run between `faults.start_s` and `faults.stop_s` (seconds after the load started), so a
@@ -94,6 +96,8 @@ today.
 | `findings.jsonl`, `check.json` | end | Every anomaly with its time and key; `check.json` ties each to the fault window it fell in (`attribution`) |
 | `report.json`, `report.md` | end | `run.py report`: the readiness criteria below, each `pass`, `fail` or `not_measured` |
 
+`load.hot_slots` (for example `["4096-4607"]`) gives every other key of a worker (`load.hot_fraction`, default 0.5) a hash tag that puts it inside those slots, so the checked operations are the ones a slot move touches. Each `slot-move` event holds how long the move took and how many `MOVED` and `ASK` replies the workers' clients followed meanwhile; `status.json` has the totals under `redirects`. `plans/local-slot-moves.json` (10 minutes, local, no other fault) runs the three move kinds under this load.
+
 `load.official` adds a `client` profile that runs counters and registers through the official
 Python client (`clients/python`, cluster mode); its operations are checked like the others.
 
@@ -109,8 +113,8 @@ its load instead.
 | 1 | `durable`: no lost, excess, phantom, duplicate, out-of-order, unread, stale or backwards read |
 | 2 | `default`, `client`: none of excess, phantom, duplicate, order, unread; losses and stale reads only inside a fault window, or from 10 s before a failover no fault caused to 30 s after it (criterion 8 fails that failover) |
 | 3 | After `restart-all-data`: no acknowledged write lost on the `always` group |
-| 4 | No anomaly inside a `migrate-slots` window |
-| 5 | Every fault healed; counted from the end of the fault (the plan draws its length at random), recovery max <= 15 s, median <= 5 s; a `migrate-slots` move <= 60 s in all |
+| 4 | No anomaly inside a slot-move window (`migrate-slots`, `slot-churn`, `rebalance-slots`), and no failed or unknown operation 5 to 7 s after any single move landed (`fails_after_5s` of the `slot-move` event) |
+| 5 | Every fault healed; counted from the end of the fault (the plan draws its length at random), recovery max <= 15 s, median <= 5 s; each single slot move <= 60 s |
 | 6 | No unexpected process exit, no panic in the logs |
 | 7 | No failed or unknown operation outside fault windows |
 | 8 | Failovers (`failovers_total`) at most two per fault that hits a primary, and none (`last_failover_unix_ms`) outside a fault window |
@@ -124,7 +128,6 @@ its load instead.
 | 16 | Coordinator data grows less than 64 MiB |
 | 17 | Metric gaps < 1 %, clock offset < 10 ms, controller CPU p95 < 70 %, check finished |
 
-<<<<<<< HEAD
 ## Disk and crash scenarios on this machine
 
 `python3 tests/soak/local_disk.py <scenario> --binary target/debug/ruvio` runs on loop-mounted ext4 disks and needs root, `losetup`, `mkfs.ext4`, `mount` and `fsfreeze` (it prints `skipped` and exits 2 without them). No cloud, nothing to pay, each under ten minutes. A loop disk freezes cleanly and a cloud disk does not, so this shows what the server does when a disk stops or fails, not how an Azure disk behaves.
@@ -137,7 +140,7 @@ its load instead.
 | `walcorrupt` | A log with the last record cut, one damaged byte, and an emptied segment | No key ever has a wrong value; a server that refuses to start says why |
 
 `results.json` in `--base` lists every check. Scenarios record some outcomes without judging them: what a client sees when the disk is full (an error reply or a closed connection), whether a restart on a full disk starts, and how many keys an emptied segment leaves.
-=======
+
 ### Is the environment fit to judge?
 
 Before a run on Azure, `python3 tests/soak/run.py preflight --hosts <node addresses> --seconds 120 --target-iops <n> --out <run directory>` writes 8 KiB blocks with `fdatasync` on every node's data disk at the same time (the write-ahead log's pattern). A node fails the check when it reaches under 80 % of `--target-iops` syncs per second or one sync takes over a second; replace the VMs and run it again instead of starting the run. Without `--target-iops` only a stall fails. `preflight.json` in the run directory is read by the report. Run on this machine without `--hosts` (`--dir` picks the disk).
@@ -150,7 +153,6 @@ The report's `environment` block counts what the machines did during the load: h
 - a node failed its preflight.
 
 A failure of criteria 1-4 (acknowledged writes lost, stale reads, anomalies in a restart or a slot move) is never put down to the environment: the verdict stays `fail`. The exit code of `report` is 1 for `invalid_environment`. Not covered yet: a criterion for how fast a node is back to normal after a stall.
->>>>>>> origin/dev
 
 ## The history check
 

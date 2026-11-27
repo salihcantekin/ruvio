@@ -19,7 +19,10 @@ never takes the run's evidence with it.
 Fault kinds: kill-primary, kill-replica, stall-replica, kill-coordinator-leader, kill-host,
 isolate-host, netem, partition-coordinator-leader (the leader's Raft port cut from the other
 coordinators), migrate-slots (`COORDINATOR MOVE` of `faults.migrate_range` from the group that
-holds it to the other one, and back the next time), restart-all-data (every data node killed at
+holds it to the other one, and back the next time), slot-churn (`faults.churn_moves` moves of
+`faults.migrate_range`'s pieces to the other group and back, one after another), rebalance-slots
+(`faults.rebalance_skew` slots moved to the other group, then `COORDINATOR REBALANCE` evens them
+out), restart-all-data (every data node killed at
 once, then started again). A kind the backend cannot inject is recorded as skipped.
 
 Schedule: faults are injected only between `faults.start_s` and `faults.stop_s` (seconds after
@@ -71,6 +74,16 @@ def probe_key(slots: str) -> str:
     raise ValueError(f"no probe key for slots {slots}")
 
 
+def _status_fields(reply) -> dict[str, str]:
+    """`COORDINATOR STATUS` as a dict: it answers `key value` lines, or a flat key/value array."""
+    text = _text(reply)
+    fields: dict[str, str] = {}
+    words = text.replace("\n", " ").replace("=", " ").split()
+    for i in range(len(words) - 1):
+        fields.setdefault(words[i], words[i + 1])
+    return fields
+
+
 def _text(reply) -> str:
     """A reply as readable text (bytes decoded, arrays joined)."""
     if isinstance(reply, bytes):
@@ -92,7 +105,7 @@ class Runner:
         self.stop_metrics = threading.Event()
         faults = plan.get("faults", {})
         self.recovery_timeout = float(faults.get("recovery_timeout_s", 60))
-        self.migrated = False  # migrate-slots: whether the range sits on the other group now
+        self.workers: list = []
         self.background = None
         self.log_since: dict[tuple[int, str], float] = {}
         self.log_offsets: dict[tuple[int, str], int] = {}
@@ -147,7 +160,7 @@ class Runner:
             if primary is None:
                 return f"coordinators do not agree on {g.name}'s primary"
             owner = self.cluster.address(primary, g.name)
-            first_slot = int(g.slots.split("-")[0])
+            first_slot = int(g.slots.split("-")[0]) if g.slots.startswith("0-") else int(g.slots.split("-")[1])
             for host in range(len(self.cluster.hosts)):
                 info = node_info(self.cluster, host, g.name)
                 role = info.get("replication_role") if info else None
@@ -272,6 +285,10 @@ class Runner:
             killed.extend((h, g.name) for h in hosts for g in self.cluster.groups)
         elif kind == "migrate-slots":
             return self.migrate(kind)
+        elif kind == "slot-churn":
+            return self.churn(kind)
+        elif kind == "rebalance-slots":
+            return self.rebalance(kind)
         else:
             raise ValueError(f"unknown fault kind {kind}")
 
@@ -315,59 +332,175 @@ class Runner:
         return ok
 
     def migrate(self, kind: str) -> bool:
-        """`COORDINATOR MOVE` of the plan's range to the other group (shard 0), and back the next
-        time; healed once every member of both groups names the new owner for the range's first
-        slot and the usual health check passes."""
+        """`COORDINATOR MOVE` of the plan's range to the group that does not hold its first slot
+        now (shard 0); healed once every member of both groups names the new owner and the usual
+        health check passes."""
         faults = self.plan.get("faults", {})
         first, last = (int(x) for x in faults.get("migrate_range", "4096-4607").split("-"))
-        groups = [g.name for g in self.cluster.groups]
-        home = next(g.name for g in self.cluster.groups if self.in_range(g.slots, first))
-        away = next(name for name in groups if name != home)
-        source, target = (away, home) if self.migrated else (home, away)
-        leader = self.leader()
-        target_primary = self.primary(target)
-        if leader is None or target_primary is None:
-            self.event("fault-skipped", kind=kind, reason="no single leader or no agreed primary")
+        source = self.owner_group(first)
+        if source is None or self.leader() is None or self.primary(source) is None:
+            self.event("fault-skipped", kind=kind, reason="no single leader or no agreed owner")
             self.status.fault(kind, injected=False)
             return False
+        target = next(g.name for g in self.cluster.groups if g.name != source)
         started = time.monotonic()
         self.event("fault", kind=kind, group=target, killed=[], stalled=[], host=None, down_s=0,
                    range=f"{first}-{last}", source=source, target=target)
+        ok, reason, took, seen = self.move_range(first, last, target, started + self.recovery_timeout)
+        self.event("slot-move", kind=kind, range=f"{first}-{last}", to=target, ok=ok, s=round(took, 2), **seen)
+        return self.finish_slot_fault(kind, started, ok, reason if not ok else "", range=f"{first}-{last}")
+
+    def redirects(self) -> dict[str, int]:
+        """MOVED and ASK replies the workers' clients followed so far (the official client's
+        workers keep their own count and are not included)."""
+        clients = [w.client for w in self.workers if hasattr(w.client, "moved")]
+        return {"moved": sum(c.moved for c in clients), "ask": sum(c.asked for c in clients),
+                "retries": sum(c.retries for c in clients)}
+
+    def owner_group(self, slot: int) -> str | None:
+        """The group whose primary the first member names as `slot`'s owner."""
+        owner = self.slot_owner(0, self.cluster.groups[0].name, slot)
+        for g in self.cluster.groups:
+            primary = self.primary(g.name)
+            if primary is not None and owner == self.cluster.address(primary, g.name):
+                return g.name
+        return None
+
+    def move_range(self, first: int, last: int, target: str, deadline: float) -> tuple[bool, str, float, dict]:
+        """`COORDINATOR MOVE first last target 0`, then waits until every member of every group
+        names the target's primary as the owner of `first` and `last`. Returns (moved, reason,
+        seconds, the redirects the clients followed meanwhile)."""
+        started = time.monotonic()
+        before = self.redirects()
+        leader = self.leader()
+        if leader is None:
+            return False, "no single leader", 0.0, {}
         try:
             reply = call_once(self.cluster.address(leader, COORDINATOR), "COORDINATOR", "MOVE", first, last, target, 0,
                               password=self.cluster.secret)
         except (OSError, ReplyError, Unknown) as error:
-            reply = error
-        if isinstance(reply, Exception):
-            self.event("not-healed", kind=kind, recovery_s=0, reason=f"MOVE refused: {reply}")
-            self.status.problem(f"{kind}: COORDINATOR MOVE {first} {last} {target} 0 refused: {reply}")
-            self.status.fault(kind, injected=True, recovery_s=0)
-            return False
-        owner = None
-        deadline = started + self.recovery_timeout
-        moved = False
+            return False, f"MOVE {first}-{last} refused: {error}", 0.0, {}
+        groups = [g.name for g in self.cluster.groups]
         while time.monotonic() < deadline and not self.stop_load.is_set():
             primary = self.primary(target)
             owner = self.cluster.address(primary, target) if primary is not None else None
-            if owner and all(self.slot_owner(h, g, first) == owner
-                             for h in range(len(self.cluster.hosts)) for g in groups):
-                moved = True
+            if owner and all(self.slot_owner(h, g, slot) == owner
+                             for h in range(len(self.cluster.hosts)) for g in groups for slot in (first, last)):
+                took = time.monotonic() - started
+                after = self.redirects()
+                seen = {k: after[k] - before[k] for k in after}
+                # Clients must have recovered 5 s after the move landed: count the operations
+                # that fail or end unknown between 5 s and 7 s after it.
+                failed = lambda: self.history.counts["fail"] + self.history.counts["info"]  # noqa: E731
+                self.stop_load.wait(5.0)
+                late = failed()
+                self.stop_load.wait(2.0)
+                seen["fails_after_5s"] = failed() - late
+                return True, _text(reply), took, seen
+            time.sleep(0.25)
+        return False, f"MOVE {first}-{last} to {target} did not land", time.monotonic() - started, {}
+
+    def finish_slot_fault(self, kind: str, started: float, ok: bool, reason: str, **fields) -> bool:
+        deadline = started + self.recovery_timeout
+        if ok:
+            ok, _, reason = self.wait_healthy(max(1.0, deadline - time.monotonic()))
+        recovery = time.monotonic() - started
+        self.status.fault(kind, injected=True, recovery_s=recovery)
+        self.event("healed" if ok else "not-healed", kind=kind, recovery_s=round(recovery, 2), reason=reason, **fields)
+        if not ok:
+            self.status.problem(f"{kind}: not healed within {self.recovery_timeout:.0f}s ({reason})")
+        return ok
+
+    def churn(self, kind: str) -> bool:
+        """`faults.churn_moves` (default 4) pieces of `faults.migrate_range`, each moved to the
+        other group, one after another, then each moved back; healed once the usual health check
+        passes. Every move must land within the recovery timeout."""
+        faults = self.plan.get("faults", {})
+        first, last = (int(x) for x in faults.get("migrate_range", "4096-4607").split("-"))
+        pieces = int(faults.get("churn_moves", 4))
+        size = (last - first + 1) // pieces
+        ranges = [(first + i * size, first + (i + 1) * size - 1 if i + 1 < pieces else last) for i in range(pieces)]
+        groups = [g.name for g in self.cluster.groups]
+        started = time.monotonic()
+        self.event("fault", kind=kind, group=None, killed=[], stalled=[], host=None, down_s=0, ranges=ranges)
+        trips, moves = [], []
+        for low, high in ranges:
+            home = self.owner_group(low)
+            if home is None:
+                return self.finish_slot_fault(kind, started, False, f"no owner for slot {low}")
+            trips.append((low, high, home, next(n for n in groups if n != home)))
+        for low, high, home, away in trips + [(l, h, a, hm) for l, h, hm, a in reversed(trips)]:
+            # The second half swaps the two: `away` there is the group the range came from.
+            ok, reason, took, seen = self.move_range(low, high, away, started + self.recovery_timeout * 2)
+            moves.append({"range": f"{low}-{high}", "to": away, "ok": ok, "s": round(took, 2), **seen})
+            self.event("slot-move", kind=kind, **moves[-1])
+            if not ok:
+                return self.finish_slot_fault(kind, started, False, reason, moves=moves)
+        return self.finish_slot_fault(kind, started, True, "", moves=moves)
+
+    def rebalance(self, kind: str) -> bool:
+        """Moves `faults.rebalance_skew` (default 512) slots at the start of `migrate_range`'s
+        owner to the other group, then runs `COORDINATOR REBALANCE` and waits until `rebalance`
+        is `done` and every group holds its configured number of slots again."""
+        faults = self.plan.get("faults", {})
+        first = int(faults.get("migrate_range", "4096-4607").split("-")[0])
+        skew = int(faults.get("rebalance_skew", 512))
+        groups = [g.name for g in self.cluster.groups]
+        home = self.owner_group(first)
+        started = time.monotonic()
+        self.event("fault", kind=kind, group=None, killed=[], stalled=[], host=None, down_s=0, skew=skew)
+        if home is None:
+            return self.finish_slot_fault(kind, started, False, f"no owner for slot {first}")
+        away = next(n for n in groups if n != home)
+        ok, reason, took, seen = self.move_range(first, first + skew - 1, away, started + self.recovery_timeout)
+        self.event("slot-move", kind=kind, range=f"{first}-{first + skew - 1}", to=away, ok=ok, s=round(took, 2), **seen)
+        if not ok:
+            return self.finish_slot_fault(kind, started, False, reason)
+        leader = self.leader()
+        before = self.redirects()
+        try:
+            planned = call_once(self.cluster.address(leader, COORDINATOR), "COORDINATOR", "REBALANCE", password=self.cluster.secret)
+        except (OSError, ReplyError, Unknown, TypeError) as error:
+            return self.finish_slot_fault(kind, started, False, f"REBALANCE refused: {error}")
+        status = {}
+        deadline = started + self.recovery_timeout * 2
+        done = False
+        while time.monotonic() < deadline and not self.stop_load.is_set():
+            try:
+                reply = call_once(self.cluster.address(leader, COORDINATOR), "COORDINATOR", "STATUS", password=self.cluster.secret)
+                status = _status_fields(reply)
+            except (OSError, ReplyError, Unknown):
+                status = {}
+            if status.get("rebalance") in ("done", "failed", "cancelled", "stopped"):
+                done = status["rebalance"] == "done"
                 break
             time.sleep(0.5)
-        if moved:
-            self.migrated = not self.migrated
-        ok, _, reason = self.wait_healthy(max(1.0, deadline - time.monotonic())) if moved else (False, 0, "the range did not move")
-        recovery = time.monotonic() - started
+        counts = self.slot_counts()
+        want = {g.name: sum(int(b) - int(a) + 1 for a, b in [g.slots.split("-")]) for g in self.cluster.groups}
+        balanced = counts == want
+        after = self.redirects()
+        seen = {k: after[k] - before[k] for k in after}
+        reason = "" if done and balanced else f"rebalance={status.get('rebalance')} left={status.get('rebalance_left')} slots={counts} want={want}"
+        return self.finish_slot_fault(kind, started, done and balanced, reason, planned=_text(planned),
+                                      rebalance_moves=status.get("rebalance_moves"), redirects=seen)
+
+    def slot_counts(self) -> dict[str, int]:
+        """Slots each group holds, by its primary's address in the first member's CLUSTER SLOTS."""
         try:
-            status = call_once(self.cluster.address(leader, COORDINATOR), "COORDINATOR", "STATUS", password=self.cluster.secret)
-        except (OSError, ReplyError, Unknown) as error:
-            status = str(error)
-        self.status.fault(kind, injected=True, recovery_s=recovery)
-        self.event("healed" if ok else "not-healed", kind=kind, recovery_s=round(recovery, 2), reason=reason,
-                   move_id=_text(reply), coordinator_status=_text(status)[:400])
-        if not ok:
-            self.status.problem(f"{kind}: slots {first}-{last} did not reach {target} within {self.recovery_timeout:.0f}s ({reason})")
-        return ok
+            ranges = call_once(self.cluster.address(0, self.cluster.groups[0].name), "CLUSTER", "SLOTS", password=self.cluster.password)
+        except (OSError, ReplyError, Unknown):
+            return {}
+        counts: dict[str, int] = {}
+        by_address = {}
+        for g in self.cluster.groups:
+            primary = self.primary(g.name)
+            if primary is not None:
+                by_address[self.cluster.address(primary, g.name)] = g.name
+        for entry in ranges or []:
+            name = by_address.get(f"{entry[2][0].decode()}:{entry[2][1]}")
+            if name:
+                counts[name] = counts.get(name, 0) + entry[1] - entry[0] + 1
+        return counts
 
     @staticmethod
     def in_range(slots: str, slot: int) -> bool:
@@ -459,6 +592,7 @@ class Runner:
         if phase:
             self.status.data["phase"] = phase
         self.status.data["operations"] = dict(self.history.counts)
+        self.status.data["redirects"] = self.redirects()
         window = float(self.plan.get("rss_min_window_s", 1800))
         slopes = self.collector.rss_slopes(window)
         charged = self.collector.charged_slopes(window)
@@ -521,7 +655,7 @@ class Runner:
                 self.event("background-started", processes=len(self.background.processes))
             self.collector.start()
             Flusher(self.latency, self.stop_metrics).start()
-            workers = workload.start(self.history, self.cluster.seeds(), self.cluster.password,
+            self.workers = workers = workload.start(self.history, self.cluster.seeds(), self.cluster.password,
                                      plan.get("load", {}), self.stop_load, self.run_id.replace("-", ""), self.latency)
             self.save_status("warmup")
             self.stop_load.wait(float(plan.get("warmup_s", 10)))
