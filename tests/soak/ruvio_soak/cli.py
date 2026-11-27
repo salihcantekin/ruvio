@@ -42,7 +42,7 @@ def run(options) -> int:
     save(cluster, directory / "cluster.json")
     (directory / "plan.json").write_text(json.dumps(plan, indent=2))
     if options.backend == "local":
-        backend = LocalBackend(cluster, options.binary, directory / "nodes")
+        backend = LocalBackend(cluster, options.binary, Path(options.work) if options.work else directory / "nodes")
     else:
         backend = SshBackend(cluster, options.binary, options.ssh_user, options.ssh_key)
     uploader = BlobUploader.from_file(Path(options.blob_sas_file) if options.blob_sas_file else DEFAULT_SAS_FILE, run_id)
@@ -151,6 +151,7 @@ def main(argv=None) -> int:
     p.add_argument("--ssh-key")
     p.add_argument("--out", default=str(Path(tempfile.gettempdir()) / "ruvio-soak-runs"))
     p.add_argument("--duration", type=float, help="override the plan's duration_s")
+    p.add_argument("--work", help="local backend: the directory the nodes run in (default: nodes/ in the run directory); mount a disk at host0, host1, host2 there to run on it")
     p.add_argument("--blob-sas-file", help=f"file holding a container SAS URL (default {DEFAULT_SAS_FILE})")
     p.add_argument("--strict", action="store_true", help="exit 1 on warn too")
     p.add_argument("--delete-resource-group", metavar="NAME",
