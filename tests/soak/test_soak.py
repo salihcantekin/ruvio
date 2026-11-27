@@ -726,5 +726,24 @@ class LongRunPieces(unittest.TestCase):
         self.assertEqual(len(result["criteria"]), 17)
 
 
+class LocalDiskRig(unittest.TestCase):
+    def test_the_freeze_plan_has_no_faults_and_the_azure_cluster_settings(self):
+        import local_disk
+
+        plan = local_disk.freeze_plan(420)
+        self.assertEqual(plan["faults"]["kinds"], [])
+        self.assertEqual(plan["cluster"]["down_after_ms"], 3000)
+        Cluster.from_json({**plan["cluster"], "hosts": ["127.0.0.1"] * 3, "local": True})
+        self.assertEqual(plan["duration_s"], 420)
+
+    def test_a_machine_without_root_skips(self):
+        from unittest import mock
+
+        import local_disk
+
+        with mock.patch.object(local_disk.os, "geteuid", return_value=1000):
+            self.assertEqual(local_disk.main(["kill9", "--binary", "/bin/true"]), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

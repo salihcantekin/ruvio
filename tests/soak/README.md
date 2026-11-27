@@ -124,6 +124,19 @@ its load instead.
 | 16 | Coordinator data grows less than 64 MiB |
 | 17 | Metric gaps < 1 %, clock offset < 10 ms, controller CPU p95 < 70 %, check finished |
 
+## Disk and crash scenarios on this machine
+
+`python3 tests/soak/local_disk.py <scenario> --binary target/debug/ruvio` runs on loop-mounted ext4 disks and needs root, `losetup`, `mkfs.ext4`, `mount` and `fsfreeze` (it prints `skipped` and exits 2 without them). No cloud, nothing to pay, each under ten minutes. A loop disk freezes cleanly and a cloud disk does not, so this shows what the server does when a disk stops or fails, not how an Azure disk behaves.
+
+| Scenario | What it does | Passes when |
+| --- | --- | --- |
+| `freeze` | Three hosts, each on its own disk, a soak run without plan faults (`--duration`, default 420 s); each host's disk is frozen twice for 8 s (`run.py run --work` puts the nodes on the mounted disks) | Soak criteria 1, 2, 6 and 8: no anomaly of the durable profile, no loss outside faults, no process exit, no failover without a fault |
+| `kill9` | One node with `always` and a checkpoint every 300 ms; `kill -9` at random moments while a writer sets keys (`--rounds`, default 40) | Every acknowledged key is there after every restart |
+| `diskfull` | The server on a 24 MiB disk is written until the disk is full, then restarted full, then restarted with space freed | Reads keep working and the server stays up; the log names the cause; a restart that cannot write says so; acknowledged keys survive; writes work again with space |
+| `walcorrupt` | A log with the last record cut, one damaged byte, and an emptied segment | No key ever has a wrong value; a server that refuses to start says why |
+
+`results.json` in `--base` lists every check. Scenarios record some outcomes without judging them: what a client sees when the disk is full (an error reply or a closed connection), whether a restart on a full disk starts, and how many keys an emptied segment leaves.
+
 ## The history check
 
 `python3 tests/soak/run.py check history-*.jsonl [--buckets 16] [--events events.jsonl]` (also run at the end of every run, written to
