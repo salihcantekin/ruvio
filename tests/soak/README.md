@@ -288,6 +288,8 @@ with `ttlHours=16` and the backstop at 16 hours.
 
 `plans/azure-1h-tools.json` is a one-hour trial of what the 24-hour run adds: a 9-fault sequence with `slot-churn`, `rebalance-slots`, `partition-coordinator-leader`, `kill-host` and `restart-all-data`, the `LEASE`/`SEMAPHORE`/`TRANSFER`/`IDEM` load with the Porcupine check, and the preflight and Azure Monitor export steps. It proves the tools on real nodes before the long run; its quiet windows are short, so criteria 9 and 13 are judged loosely.
 
+`plans/azure-10m-check.json` is ten minutes: four faults (one slot rebalance, one slot move) and the lock load with the Porcupine check, to see a fix to the load or the checker on real nodes. Its quiet windows are too short for the performance and memory criteria; read criteria 1, 2, 4, 5, 6, 8 and 18.
+
 `plans/azure-1h.json` is the same in one hour: 18 quiet minutes, a fault every 150-170 s for
 24 minutes (each kind about once), 18 quiet minutes. Its quiet windows are under the 10 minutes
 a memory slope needs, so criterion 13 judges only the first and last window there.
