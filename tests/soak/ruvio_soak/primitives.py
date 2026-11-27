@@ -31,6 +31,8 @@ from .resp import ClusterClient, Refused, ReplyError, Unknown
 from .workload import History, Worker, _setup
 
 LOCK_TTL_MS = 30_000
+IDEM_TTL_MS = 3_600_000
+IDEM_EPOCH_S = 1800   # half the record's time to live
 _init_ids = itertools.count(1)
 _accounts: dict[str, str] = {}  # account key -> profile, for the final reads
 _requests: dict[str, str] = {}  # IDEM request key -> profile
@@ -112,18 +114,24 @@ class IdemWorker(PrimitiveWorker):
 
     def step(self):
         number = random.randrange(len(self.requests))
-        key = self.requests[number]
-        fingerprint = f"fp-{number}"
+        # A request is only started again while its record must still be there: the request
+        # keys change every IDEM_EPOCH_S, so no key outlives IDEM_TTL_MS in a long run (a second
+        # `acquired` after the record expired is correct, not a double acquire).
+        epoch = int(time.time() // IDEM_EPOCH_S)
+        key = f"{self.requests[number]}e{epoch}"
+        _requests.setdefault(key, self.profile)
+        suffix = key.rsplit(":", 1)[1]
+        fingerprint = f"fp-{suffix}"
         owner = f"{self.name}-{self.op + 1}"
         reply = self.record("begin", key, [fingerprint, owner],
-                            lambda: self.client.execute(key, "IDEM", key, "BEGIN", fingerprint, owner, 3_600_000))
+                            lambda: self.client.execute(key, "IDEM", key, "BEGIN", fingerprint, owner, IDEM_TTL_MS))
         if not reply or reply[0] != b"acquired":
             return
         counter = effect_key(key)
         if self.record("effect", key, None, lambda: self.client.execute(counter, "INCR", counter)) is None:
             return
-        self.record("complete", key, [fingerprint, owner, f"done-{number}"],
-                    lambda: self.client.execute(key, "IDEM", key, "COMPLETE", fingerprint, owner, f"done-{number}"))
+        self.record("complete", key, [fingerprint, owner, f"done-{suffix}"],
+                    lambda: self.client.execute(key, "IDEM", key, "COMPLETE", fingerprint, owner, f"done-{suffix}"))
 
 
 def effect_key(request_key: str) -> str:

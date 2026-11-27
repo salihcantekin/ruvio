@@ -29,7 +29,7 @@ def percentile(sorted_values: list[float], fraction: float) -> float:
     return sorted_values[min(len(sorted_values) - 1, int(fraction * len(sorted_values)))]
 
 
-def measure(directory: str, seconds: float, clock=time.perf_counter, sync=os.fdatasync) -> dict:
+def measure(directory: str, seconds: float, clock=time.perf_counter, sync=getattr(os, "fdatasync", os.fsync)) -> dict:
     """Writes and syncs blocks in a file under `directory` for `seconds`, then removes it."""
     path = os.path.join(directory, f".ruvio-preflight-{os.getpid()}")
     block = os.urandom(BLOCK)

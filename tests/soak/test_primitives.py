@@ -209,5 +209,46 @@ class Idem(unittest.TestCase):
         self.assertEqual(check.check_file(r.write())["counts"]["durable"]["lost_effect"], 1)
 
 
+class IdemKeys(unittest.TestCase):
+    """The workers never start a request again after its record's time to live."""
+
+    def keys_at(self, moments):
+        from unittest import mock
+
+        from ruvio_soak import primitives
+
+        class Stub(primitives.IdemWorker):
+            name = "idem0"   # replaces the Thread property; no thread is started
+
+            def __init__(self):
+                self.requests, self.profile, self.op = ["soak:t:default:idem:7"], "default", 0
+
+        worker = Stub()
+        seen = []
+        worker.record = lambda f, key, value, call: seen.append((f, key, value)) or None
+        for now in moments:
+            with mock.patch.object(primitives.time, "time", return_value=now):
+                worker.step()
+        return seen
+
+    def test_a_key_lives_within_one_epoch_and_the_next_epoch_uses_a_new_key(self):
+        from ruvio_soak import primitives
+
+        epoch = primitives.IDEM_EPOCH_S
+        seen = self.keys_at([10 * epoch + 1, 10 * epoch + epoch - 1, 11 * epoch + 1])
+        keys = [key for _, key, _ in seen]
+        self.assertEqual(keys[0], keys[1])
+        self.assertNotEqual(keys[1], keys[2])
+        self.assertEqual(keys[0], "soak:t:default:idem:7e10")
+        self.assertEqual(seen[0][2][0], "fp-7e10")
+        self.assertIn(keys[2], primitives._requests)
+        self.assertGreater(primitives.IDEM_TTL_MS / 1000, 2 * epoch - 1)
+
+    def test_the_checker_still_matches_the_replayed_result_to_the_key(self):
+        # `done-<suffix>` is what the worker completes with and what the checker expects.
+        key = "soak:t:default:idem:7e10"
+        self.assertEqual(f"done-{key.rsplit(':', 1)[1]}", "done-7e10")
+
+
 if __name__ == "__main__":
     unittest.main()
