@@ -65,6 +65,8 @@ controller has a public IP, and SSH reaches it only from one address.
 | `netem` | `tc netem` on one host (`faults.netem`, for example `delay 50ms 20ms loss 2%`) | ssh |
 | `partition-coordinator-leader` | nftables cuts the leading coordinator's Raft port from the other coordinators; it still reaches the data nodes | ssh |
 | `migrate-slots` | `COORDINATOR MOVE` of `faults.migrate_range` (default `4096-4607`) to the other group under load, back the next time; healed when every member names the new owner | local, ssh |
+| `slot-churn` | `faults.churn_moves` (default 4) pieces of `faults.migrate_range`, each `COORDINATOR MOVE`d to the other group one after another, then each back | local, ssh |
+| `rebalance-slots` | `faults.rebalance_skew` (default 512) slots moved to the other group, then `COORDINATOR REBALANCE`; healed when the rebalance is `done` and every group holds its configured number of slots again | local, ssh |
 | `restart-all-data` | SIGKILL to every data node at once; the primary the coordinators name starts first | local, ssh |
 
 Faults run between `faults.start_s` and `faults.stop_s` (seconds after the load started), so a
@@ -94,6 +96,8 @@ today.
 | `findings.jsonl`, `check.json` | end | Every anomaly with its time and key; `check.json` ties each to the fault window it fell in (`attribution`) |
 | `report.json`, `report.md` | end | `run.py report`: the readiness criteria below, each `pass`, `fail` or `not_measured` |
 
+`load.hot_slots` (for example `["4096-4607"]`) gives every other key of a worker (`load.hot_fraction`, default 0.5) a hash tag that puts it inside those slots, so the checked operations are the ones a slot move touches. Each `slot-move` event holds how long the move took and how many `MOVED` and `ASK` replies the workers' clients followed meanwhile; `status.json` has the totals under `redirects`. `plans/local-slot-moves.json` (10 minutes, local, no other fault) runs the three move kinds under this load.
+
 `load.official` adds a `client` profile that runs counters and registers through the official
 Python client (`clients/python`, cluster mode); its operations are checked like the others.
 
@@ -109,8 +113,8 @@ its load instead.
 | 1 | `durable`: no lost, excess, phantom, duplicate, out-of-order, unread, stale or backwards read |
 | 2 | `default`, `client`: none of excess, phantom, duplicate, order, unread; losses and stale reads only inside a fault window, or from 10 s before a failover no fault caused to 30 s after it (criterion 8 fails that failover) |
 | 3 | After `restart-all-data`: no acknowledged write lost on the `always` group |
-| 4 | No anomaly inside a `migrate-slots` window |
-| 5 | Every fault healed; counted from the end of the fault (the plan draws its length at random), recovery max <= 15 s, median <= 5 s; a `migrate-slots` move <= 60 s in all |
+| 4 | No anomaly inside a slot-move window (`migrate-slots`, `slot-churn`, `rebalance-slots`), and no failed or unknown operation 5 to 7 s after any single move landed (`fails_after_5s` of the `slot-move` event) |
+| 5 | Every fault healed; counted from the end of the fault (the plan draws its length at random), recovery max <= 15 s, median <= 5 s; each single slot move <= 60 s |
 | 6 | No unexpected process exit, no panic in the logs |
 | 7 | No failed or unknown operation outside fault windows |
 | 8 | Failovers (`failovers_total`) at most two per fault that hits a primary, and none (`last_failover_unix_ms`) outside a fault window |

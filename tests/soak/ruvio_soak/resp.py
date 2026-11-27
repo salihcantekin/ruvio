@@ -160,6 +160,8 @@ class ClusterClient:
         self.connections: dict[str, Connection] = {}
         self.slots: list[str | None] = [None] * SLOTS
         self.retries = 0
+        self.moved = 0  # MOVED replies followed
+        self.asked = 0  # ASK replies followed
 
     def _connection(self, address: str) -> Connection:
         connection = self.connections.get(address)
@@ -236,10 +238,12 @@ class ClusterClient:
                         asking = None
                         if code == "MOVED":
                             self.slots[slot] = str(error).split()[2]
+                            self.moved += 1
                             self.retries += 1
                             continue
                         if code == "ASK":
                             asking = str(error).split()[2]
+                            self.asked += 1
                             self.retries += 1
                             continue
                         if code in UNKNOWN_ERRORS:

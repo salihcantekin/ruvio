@@ -202,12 +202,16 @@ def evaluate(run: Run) -> dict:
                     and any(w[2] == "restart-all-data" for w in run.windows if _mono_in(run, f[2], w))]
             criterion(results, 3, "full restart: no acknowledged write lost on the `always` group", "fail" if lost else "pass",
                       len(lost), 0, {"restarts": len(restarts)})
-        moves = [w for w in run.windows if w[2] == "migrate-slots"]
+        moves = [w for w in run.windows if w[2] in MOVE_KINDS]
         if not moves:
-            criterion(results, 4, "slot moves: no anomaly during a move", "not_measured", details="no migrate-slots fault ran")
+            criterion(results, 4, "slot moves: no anomaly during a move", "not_measured", details="no slot-move fault ran")
         else:
-            during = sum(v["by_fault"].get("migrate-slots", 0) for p in attribution.values() for v in p.values())
-            criterion(results, 4, "slot moves: no anomaly during a move", "fail" if during else "pass", during, 0, {"moves": len(moves)})
+            during = sum(v["by_fault"].get(k, 0) for p in attribution.values() for v in p.values() for k in MOVE_KINDS)
+            late = [e for e in run.events if e["event"] == "slot-move" and e.get("fails_after_5s")]
+            criterion(results, 4, "slot moves: no anomaly during a move, clients recovered 5 s after each",
+                      "fail" if during or late else "pass", {"anomalies": during, "moves_with_failures_after_5s": len(late)},
+                      {"anomalies": 0, "moves_with_failures_after_5s": 0},
+                      {"moves": len(moves), "slot_moves": sum(1 for e in run.events if e["event"] == "slot-move")})
 
     # 5-8: availability
     healed = [e for e in run.events if e["event"] == "healed"]
@@ -220,8 +224,10 @@ def evaluate(run: Run) -> dict:
         for kind, seconds in after:
             by_kind[kind].append(seconds)
         # A slot move is not a down time: the whole move counts, and it has its own ceiling.
-        moves = by_kind.get("migrate-slots", [])
-        rest = [seconds for kind, seconds in after if kind != "migrate-slots"]
+        # A churn or a rebalance is many moves; each one counts against the ceiling.
+        moves = [e["s"] for e in run.events if e["event"] == "slot-move" and "s" in e]
+        moves += [x for k in MOVE_KINDS if k == "migrate-slots" for x in by_kind.get(k, [])]
+        rest = [seconds for kind, seconds in after if kind not in MOVE_KINDS]
         worst = max(rest, default=0)
         median = statistics.median(rest) if rest else None
         ok = (not not_healed and worst <= RECOVERY_MAX_S and (median or 0) <= RECOVERY_MEDIAN_S
@@ -489,6 +495,7 @@ RECOVERY_NAME = "every fault recovers: after the fault ends, max <= 15 s, median
 RECOVERY_MAX_S = 15
 RECOVERY_MEDIAN_S = 5
 MOVE_MAX_S = 60
+MOVE_KINDS = ("migrate-slots", "slot-churn", "rebalance-slots")
 
 
 def _recovery_after_fault(run: Run) -> list[tuple[str, float]]:
