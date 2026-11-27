@@ -4,7 +4,7 @@ Notable changes to the Ruvio server (`ruvio`, `ruvio-ctl`, the Docker image and 
 
 ## Unreleased
 
-- Docs: a measurement record of one Azure run (`docs/evidence/2026-11-27-azure-short-check.md`): `hot_path` instruction counts equal the baseline for all six commands, and eight commands against Redis 8.10.2 at pipeline 16 (0.98× to 1.26×) and 1 (harness-bound). One round only; not measured: latency, durability, more than one shard.
+- Server: under `everysec`, a reply that only read is answered when the WAL writer fails while it waits, as one that arrives after the failure already was; a reply whose connection wrote still fails with the log. Documentation: shutdown has no time limit of its own on a stalled disk. Tests added for a write followed by `PING` or `ROLE` in one pipeline while the disk stalls. Verified by the new unit and server tests; not measured on a real stalled disk.
 - Soak tool (`tests/soak`): the faults `slot-churn` (several ranges moved to the other group and back, one after another) and `rebalance-slots` (a skew, then `COORDINATOR REBALANCE`) join `migrate-slots`; `load.hot_slots` puts the checked keys inside the moved slots; each move records its time and the `MOVED`/`ASK` replies the clients followed, and criterion 4 also fails when an operation fails or ends unknown 5 to 7 s after a move landed. Plan `local-slot-moves.json` runs it locally in 10 minutes. Also fixes unresolved merge markers left in this file and in the soak README.
 - Tests: `scripts/upgrade_rollback.py --old DIR --new DIR [--legacy DIR]` runs an upgrade and a rollback between two releases as local processes (3 data nodes, 3 coordinators, a client writing with `CLIENT DURABILITY REPLICAS 1` all the time): coordinators first, replicas, the old primary, the wrong order (primary first), a planned switchover, and the way back from a backup; it checks every acknowledged write on every node. Recorded run in `docs/evidence/2026-11-27-upgrade-rollback.md`.
 - Soak tool (`tests/soak`): `load.primitives` drives `LEASE`, `SEMAPHORE`, `TRANSFER` and `IDEM` under the same faults and checks fencing tokens, double holders, the `TRANSFER` sum and one `IDEM` effect per request; every lock key's history is checked for linearizability with Porcupine (Go). `isolate-host` now also works locally with `iptables`.
@@ -49,6 +49,7 @@ Notable changes to the Ruvio server (`ruvio`, `ruvio-ctl`, the Docker image and 
 
 - Site: a new link preview image (`og:image`) in the site's dark theme, with current facts; the old one still showed the light theme and an outdated command count.
 - Docs: the README opens with a short terminal recording of `LEASE`, `LIMIT`, `INCRBY ... MAX` and `ZMOVEDUE`, and `docs/COORDINATOR.md` shows a recorded failover with a client that keeps writing.
+- Docs: a measurement record of one Azure run (`docs/evidence/2026-11-27-azure-short-check.md`): `hot_path` instruction counts equal the baseline for all six commands, and eight commands against Redis 8.10.2 at pipeline 16 (0.98× to 1.26×) and 1 (harness-bound). One round only; not measured: latency, durability, more than one shard.
 
 ## 0.4.0 - 2026-10-29
 
