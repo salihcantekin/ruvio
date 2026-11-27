@@ -1,0 +1,73 @@
+{
+  "name": "local-primitives",
+  "seed": 7,
+  "duration_s": 150,
+  "warmup_s": 5,
+  "cluster": {
+    "ping_interval_ms": 200,
+    "down_after_ms": 1000
+  },
+  "load": {
+    "rate_per_worker": 10,
+    "keys_per_worker": 2,
+    "counters": 0,
+    "appenders": 0,
+    "registers": 0,
+    "profiles": {
+      "default": {},
+      "durable": {
+        "replicas": 1
+      }
+    },
+    "primitives": {
+      "leases": 2,
+      "semaphores": 2,
+      "semaphore_max": 3,
+      "lock_workers": 3,
+      "transfer_groups": 2,
+      "accounts": 5,
+      "transfer_workers": 3,
+      "idem_requests": 40,
+      "idem_workers": 3,
+      "rate_per_worker": 10
+    }
+  },
+  "faults": {
+    "interval_s": [
+      5,
+      8
+    ],
+    "down_s": [
+      4,
+      8
+    ],
+    "recovery_timeout_s": 30,
+    "sequence": [
+      {
+        "kind": "isolate-host"
+      },
+      {
+        "kind": "kill-primary"
+      },
+      {
+        "kind": "isolate-host"
+      },
+      {
+        "kind": "kill-host"
+      },
+      {
+        "kind": "stall-replica"
+      }
+    ],
+    "kinds": [
+      "isolate-host",
+      "kill-primary",
+      "kill-replica",
+      "kill-host",
+      "kill-coordinator-leader"
+    ]
+  },
+  "metrics_interval_s": 2,
+  "status_interval_s": 10,
+  "startup_timeout_s": 30
+}
