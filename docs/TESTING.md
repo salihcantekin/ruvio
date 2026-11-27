@@ -64,6 +64,7 @@ cargo test --lib --bins --tests
 `.github/workflows/nightly.yml` (every night at 02:17 UTC from `main`, and by manual dispatch) runs the coordinator fault scenarios on real
 processes and real network partitions, each scenario three times by default (`runs` input):
 
+- `scripts/upgrade_rollback.py --old DIR --new DIR --legacy DIR`: an upgrade and a rollback between two releases side by side (see `docs/evidence/2026-11-27-upgrade-rollback.md`).
 - `scripts/coordinator_faults.py ./ruvio partition leader minority restart loss durable stall coord-partition`:
   three data nodes, three coordinators and TCP proxies on one machine. `durable` expects no
   acknowledged write lost; `loss` allows only the last writes before the crash to be lost.
@@ -166,7 +167,11 @@ come on a schedule, and after the run every key is read back and the history is 
 lost acknowledged writes, duplicates, values never written, order violations and stale reads.
 A run writes `status.json` (and uploads it to Azure Blob when a SAS URL is configured). The
 checker's unit tests run in the PR gate (`python3 tests/soak/test_soak.py`); the runs themselves
-are started by hand. Local, debug build: `plans/local-smoke.json` (60 s, every local fault kind) ends with
+are started by hand. With `load.primitives`, `LEASE`, `SEMAPHORE`, `TRANSFER` and `IDEM` are driven
+under the same faults and checked for linearizable lock histories (Porcupine, in Go), monotonic
+fencing tokens, no double holder, a constant `TRANSFER` sum and one `IDEM` effect per request
+(`plans/local-primitives.json`: 150 s, a host cut off with iptables, kills and a stall; verdict `ok`
+once on this build, which does not prove the absence of a fault). Local, debug build: `plans/local-smoke.json` (60 s, every local fault kind) ends with
 no durable write lost (lost `default` writes around a killed primary are counted as warnings); `plans/local-restart-as-configured.json` reproduces
 [#142](https://github.com/salihcantekin/ruvio/issues/142). On four Azure VMs, a 12-hour run
 (`plans/azure-12h.json`: 25.2 million recorded operations, 34 faults of ten kinds, a background
