@@ -124,6 +124,7 @@ its load instead.
 | 16 | Coordinator data grows less than 64 MiB |
 | 17 | Metric gaps < 1 %, clock offset < 10 ms, controller CPU p95 < 70 %, check finished |
 
+<<<<<<< HEAD
 ## Disk and crash scenarios on this machine
 
 `python3 tests/soak/local_disk.py <scenario> --binary target/debug/ruvio` runs on loop-mounted ext4 disks and needs root, `losetup`, `mkfs.ext4`, `mount` and `fsfreeze` (it prints `skipped` and exits 2 without them). No cloud, nothing to pay, each under ten minutes. A loop disk freezes cleanly and a cloud disk does not, so this shows what the server does when a disk stops or fails, not how an Azure disk behaves.
@@ -136,6 +137,20 @@ its load instead.
 | `walcorrupt` | A log with the last record cut, one damaged byte, and an emptied segment | No key ever has a wrong value; a server that refuses to start says why |
 
 `results.json` in `--base` lists every check. Scenarios record some outcomes without judging them: what a client sees when the disk is full (an error reply or a closed connection), whether a restart on a full disk starts, and how many keys an emptied segment leaves.
+=======
+### Is the environment fit to judge?
+
+Before a run on Azure, `python3 tests/soak/run.py preflight --hosts <node addresses> --seconds 120 --target-iops <n> --out <run directory>` writes 8 KiB blocks with `fdatasync` on every node's data disk at the same time (the write-ahead log's pattern). A node fails the check when it reaches under 80 % of `--target-iops` syncs per second or one sync takes over a second; replace the VMs and run it again instead of starting the run. Without `--target-iops` only a stall fails. `preflight.json` in the run directory is read by the report. Run on this machine without `--hosts` (`--dir` picks the disk).
+
+The report's `environment` block counts what the machines did during the load: host stalls (a sample in which a host waited on its disk or lost its CPU for more than half of the time; consecutive ones are one stall, and a stall counts the share of the sample it covered), steal, and the preflight result. The verdict is `invalid_environment` instead of `pass`, `fail` or `incomplete` when:
+
+- the stalls add up to more than 10 % of the load, or
+- one stall lasts over 60 s, or
+- any sample shows CPU steal, or
+- a node failed its preflight.
+
+A failure of criteria 1-4 (acknowledged writes lost, stale reads, anomalies in a restart or a slot move) is never put down to the environment: the verdict stays `fail`. The exit code of `report` is 1 for `invalid_environment`. Not covered yet: a criterion for how fast a node is back to normal after a stall.
+>>>>>>> origin/dev
 
 ## The history check
 
@@ -280,7 +295,7 @@ disk, or with its CPU taken by the hypervisor.
 
 | Path | What |
 | --- | --- |
-| `run.py` | Entry point: `run`, `check`, `report`, `render` |
+| `run.py` | Entry point: `run`, `check`, `report`, `preflight`, `render` |
 | `ruvio_soak/cluster.py` | Topology and the configs it renders |
 | `ruvio_soak/backends.py` | Local processes, or systemd units over SSH with nftables and netem faults |
 | `ruvio_soak/resp.py` | RESP connection and the slot-routing client that classifies outcomes |
@@ -289,7 +304,8 @@ disk, or with its CPU taken by the hypervisor.
 | `ruvio_soak/runner.py` | Health check, fault schedule, final reads |
 | `ruvio_soak/metrics.py`, `ruvio_soak/status.py` | Metrics, `status.json` and the Blob upload |
 | `ruvio_soak/latency.py`, `ruvio_soak/background.py` | Latency histograms; the background load |
-| `ruvio_soak/report.py` | The readiness criteria |
+| `ruvio_soak/report.py` | The readiness criteria and the environment block |
+| `ruvio_soak/preflight.py` | The disk check before a run (stdlib only; sent to the nodes over ssh) |
 | `ruvio_soak/azure.py` | The controller deleting its own resource group |
 | `plans/` | Run plans |
 | `azure/main.bicep` | The run's network, NSG, four VMs, data disks, auto-shutdown |

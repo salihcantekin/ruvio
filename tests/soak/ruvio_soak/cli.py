@@ -7,11 +7,13 @@ import hashlib
 import json
 import secrets
 import sys
+import shlex
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import history, report
+from . import history, preflight, report
 from .backends import LocalBackend, SshBackend
 from .cluster import Cluster, save
 from .runner import Runner
@@ -88,6 +90,37 @@ def report_command(options) -> int:
     return 0 if result["verdict"] == "pass" else 1
 
 
+def preflight_command(options) -> int:
+    """Checks the data disk of this machine (`--dir`) or of every node over ssh (`--hosts`), at
+    the same time, and writes `preflight.json` to `--out` when given."""
+    results: dict[str, dict] = {}
+    if options.hosts:
+        hosts = options.hosts.split(",")
+        backend = SshBackend(Cluster(hosts=hosts), "", options.ssh_user, options.ssh_key)
+        source = Path(preflight.__file__).read_bytes()
+        arguments = f"--dir {shlex.quote(options.dir)} --seconds {options.seconds:g}"
+        if options.target_iops:
+            arguments += f" --target-iops {options.target_iops:g}"
+
+        def one(address: str) -> dict:
+            try:
+                reply = backend.run(address, f"sudo python3 - {arguments}", stdin=source)
+                return json.loads(reply.strip().splitlines()[-1])
+            except (RuntimeError, ValueError, IndexError, OSError) as error:
+                return {"ok": False, "problems": [f"preflight did not run: {error}"]}
+
+        with ThreadPoolExecutor(max_workers=len(hosts)) as pool:
+            for address, result in zip(hosts, pool.map(one, hosts)):
+                results[address] = result
+    else:
+        results["local"] = preflight.judge(preflight.measure(options.dir, options.seconds), options.target_iops)
+    print(json.dumps(results, indent=2))
+    if options.out:
+        Path(options.out).mkdir(parents=True, exist_ok=True)
+        (Path(options.out) / "preflight.json").write_text(json.dumps(results, indent=2))
+    return 0 if all(r["ok"] for r in results.values()) else 1
+
+
 def render(options) -> int:
     """Prints the configs one host would get (secrets replaced), to review them."""
     plan = json.loads(Path(options.plan).read_text()) if options.plan else {}
@@ -139,6 +172,16 @@ def main(argv=None) -> int:
     p.add_argument("directory")
     p.add_argument("--settle", type=float, default=3600, help="seconds left out at the start of each quiet window")
     p.set_defaults(handler=report_command)
+
+    p = commands.add_parser("preflight", help="check the data disk before a run (this machine, or every node over ssh)")
+    p.add_argument("--dir", default="/var/lib/ruvio", help="a directory on the disk to check")
+    p.add_argument("--seconds", type=float, default=120)
+    p.add_argument("--target-iops", type=float, help="the disk must reach 80 %% of this many syncs per second")
+    p.add_argument("--hosts", help="ssh: the node VMs' addresses, checked at the same time (default: this machine)")
+    p.add_argument("--ssh-user", default="soak")
+    p.add_argument("--ssh-key")
+    p.add_argument("--out", help="a run directory (or any directory): writes preflight.json there")
+    p.set_defaults(handler=preflight_command)
 
     p = commands.add_parser("render", help="print one host's configs")
     p.add_argument("--plan")
