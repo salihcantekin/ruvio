@@ -359,10 +359,13 @@ class SshBackend:
             command += ["-i", self.key]
         return command + [f"{self.user}@{address}"]
 
-    def _ssh(self, address: str, command: str, stdin: bytes | None = None) -> str:
-        result = subprocess.run(
-            self._ssh_base(address) + [command], input=stdin, capture_output=True, timeout=120
-        )
+    def _ssh(self, address: str, command: str, stdin: bytes | None = None, timeout: float = 120) -> str:
+        try:
+            result = subprocess.run(
+                self._ssh_base(address) + [command], input=stdin, capture_output=True, timeout=timeout
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"ssh {address}: {command.split()[0:3]} did not finish in {timeout:g} s") from None
         if result.returncode != 0:
             raise RuntimeError(f"ssh {address}: {command.split()[0:3]} exited {result.returncode}: {result.stderr[-300:]!r}")
         return result.stdout.decode(errors="replace")

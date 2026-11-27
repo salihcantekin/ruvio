@@ -143,7 +143,7 @@ its load instead.
 
 ### Is the environment fit to judge?
 
-Before a run on Azure, `python3 tests/soak/run.py preflight --hosts <node addresses> --seconds 120 --target-iops <n> --out <run directory>` writes 8 KiB blocks with `fdatasync` on every node's data disk at the same time (the write-ahead log's pattern). A node fails the check when it reaches under 80 % of `--target-iops` syncs per second or one sync takes over a second; replace the VMs and run it again instead of starting the run. Without `--target-iops` only a stall fails. `preflight.json` in the run directory is read by the report. Run on this machine without `--hosts` (`--dir` picks the disk).
+Before a run on Azure, `python3 tests/soak/run.py preflight --hosts <node addresses> --seconds 120 --target-iops <n> --out <run directory>` writes 8 KiB blocks with `fdatasync` on every node's data disk at the same time (the write-ahead log's pattern). A node fails the check when it reaches under 80 % of `--target-iops` syncs per second or one sync takes over a second; replace the VMs and run it again instead of starting the run. Without `--target-iops` only a stall fails. `preflight.json` in the run directory is read by the report. Run on this machine without `--hosts` (`--dir` picks the disk). Start the run with `run.py run ... --preflight <that preflight.json>`: a failed node stops the run before it starts, and the file is copied into the run directory (the run directory's name is only known once the run starts, so `--out` of the preflight cannot point there). Over ssh the check takes `--seconds` plus a minute of margin; it needs Python 3 and passwordless `sudo` on the node.
 
 The report's `environment` block counts what the machines did during the load: host stalls (a sample in which a host waited on its disk or lost its CPU for more than half of the time; consecutive ones are one stall, and a stall counts the share of the sample it covered), steal, and the preflight result. The verdict is `invalid_environment` instead of `pass`, `fail` or `incomplete` when:
 
@@ -276,7 +276,7 @@ times in between (three full restarts), the background load and the official cli
 a bigger controller and disk (`controllerSize=Standard_D8as_v6 controllerDiskSizeGb=128`) and,
 to delete its own VMs at the end, `selfDelete=true` and
 `run.py run ... --delete-resource-group rg-ruvio-soak` (the group is deleted only once every
-file is in Blob; the auto-shutdown stays as the backstop). `plans/local-rehearsal.json` runs
+file is in Blob; the auto-shutdown stays as the backstop). Before deleting, the controller saves Azure Monitor's view of each node (how much of the VM's and the disk's IOPS and bandwidth limit was used, queue depth, CPU; one-minute points for the whole run) as `azure-monitor.json` in the run directory and in Blob, through its managed identity (`ruvio_soak/azure_monitor.py`). The file informs, it decides nothing, and an export that fails is printed and does not keep the group from being deleted. A metric name Azure does not offer is listed under `missing`. `plans/local-rehearsal.json` runs
 the same machinery locally in about 12 minutes.
 
 `plans/azure-12h.json` is the same in 12 hours: 2 quiet hours, a fault every 10-15 minutes from
@@ -333,6 +333,7 @@ disk, or with its CPU taken by the hypervisor.
 | `ruvio_soak/report.py` | The readiness criteria and the environment block |
 | `ruvio_soak/preflight.py` | The disk check before a run (stdlib only; sent to the nodes over ssh) |
 | `ruvio_soak/azure.py` | The controller deleting its own resource group |
+| `ruvio_soak/azure_monitor.py` | The controller saving Azure Monitor's disk and VM metrics before that |
 | `plans/` | Run plans |
 | `azure/main.bicep` | The run's network, NSG, four VMs, data disks, auto-shutdown |
 | `azure/storage.bicep`, `azure/budget.bicep` | Results storage (90-day retention) and the monthly budget alert |
