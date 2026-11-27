@@ -726,5 +726,126 @@ class LongRunPieces(unittest.TestCase):
         self.assertEqual(len(result["criteria"]), 17)
 
 
+    def env_hosts(self, directory, stalled, steal_at=()):
+        """hosts.jsonl: one node host sampled every 10 s from 0 to 9990 s; each time in
+        `stalled` is a sample interval in which every task waited on the disk the whole time."""
+        io, rows = 0, []
+        for t in range(0, 10000, 10):
+            if t in stalled:
+                io += 10_000_000
+            rows.append({"t": t, "host": "host0", "io_full_us": io, "clk_tck": 100,
+                         "cpu_steal_ticks": 5 if t in steal_at else 0})
+        (directory / "hosts.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+    def environment_run(self, stalled=(), steal_at=(), preflight=None, lost=False):
+        from ruvio_soak import report
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            self.report_run(directory, [], events=[{"event": "load-start", "t": 1, "mono": 10**9},
+                                                   {"event": "load-stop", "t": 10000, "mono": 10000 * 10**9}])
+            self.env_hosts(directory, set(stalled), set(steal_at))
+            if preflight is not None:
+                (directory / "preflight.json").write_text(json.dumps(preflight))
+            if lost:
+                (directory / "check.json").write_text(json.dumps({"profiles": {"durable": {"lost": 1}}, "attribution": {}}))
+            return report.write(directory)
+
+    def test_a_quiet_run_is_not_an_invalid_environment(self):
+        result = self.environment_run(stalled=range(100, 200, 20))
+        self.assertFalse(result["environment"]["invalid"], result["environment"])
+        self.assertEqual(result["environment"]["stalls"], 5)
+        self.assertEqual(result["environment"]["longest_stall_s"], 10.0)
+        self.assertNotEqual(result["verdict"], "invalid_environment")
+
+    def test_too_much_stalled_time_makes_the_run_invalid(self):
+        # 130 separate 10 s stalls: 13 % of a 10,000 s load, none of them long.
+        result = self.environment_run(stalled=range(20, 2620, 20))
+        env = result["environment"]
+        self.assertEqual((env["stalls"], env["longest_stall_s"]), (130, 10.0))
+        self.assertTrue(env["invalid"])
+        self.assertEqual(result["verdict"], "invalid_environment")
+        self.assertIn("13.0%", env["reasons"][0])
+
+    def test_one_long_stall_makes_the_run_invalid(self):
+        # Seven consecutive stalled samples are one 70 s stall.
+        result = self.environment_run(stalled=range(500, 570, 10))
+        env = result["environment"]
+        self.assertEqual((env["stalls"], env["longest_stall_s"]), (1, 70.0))
+        self.assertEqual(result["verdict"], "invalid_environment")
+
+    def test_steal_and_a_failed_preflight_make_the_run_invalid(self):
+        self.assertEqual(self.environment_run(steal_at=[300])["verdict"], "invalid_environment")
+        failed = self.environment_run(preflight={"10.0.0.2": {"ok": False}, "10.0.0.1": {"ok": True}})
+        self.assertEqual(failed["verdict"], "invalid_environment")
+        self.assertEqual(failed["environment"]["preflight"], "fail")
+        passed = self.environment_run(preflight={"10.0.0.1": {"ok": True}})
+        self.assertEqual(passed["environment"]["preflight"], "pass")
+        self.assertFalse(passed["environment"]["invalid"])
+
+    def test_a_lost_write_is_never_put_down_to_the_environment(self):
+        result = self.environment_run(stalled=range(500, 570, 10), lost=True)
+        self.assertTrue(result["environment"]["invalid"])
+        self.assertEqual(result["verdict"], "fail")
+
+
+class Preflight(unittest.TestCase):
+    def test_measure_counts_syncs_and_removes_its_file(self):
+        from ruvio_soak import preflight
+
+        now = [0.0]
+
+        def clock():
+            now[0] += 0.01   # each sync takes 20 ms: two clock reads
+            return now[0]
+        with tempfile.TemporaryDirectory() as directory:
+            result = preflight.measure(directory, 1.0, clock=clock, sync=lambda fd: None)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+        self.assertGreater(result["syncs"], 10)
+        self.assertEqual(result["stalls_over_1s"], 0)
+        self.assertAlmostEqual(result["p50_ms"], 10.0, delta=1)
+
+    def test_a_slow_disk_and_a_stall_fail_the_check(self):
+        from ruvio_soak import preflight
+
+        good = {"syncs": 10, "seconds": 1, "iops": 900.0, "p50_ms": 1, "p99_ms": 2, "max_ms": 9, "stalls_over_1s": 0}
+        self.assertTrue(preflight.judge(good, 1000)["ok"])          # 90 % of the target
+        self.assertTrue(preflight.judge(good, None)["ok"])          # no target: only stalls fail
+        slow = preflight.judge({**good, "iops": 700.0}, 1000)
+        self.assertFalse(slow["ok"])
+        self.assertIn("under 80%", slow["problems"][0])
+        stalled = preflight.judge({**good, "stalls_over_1s": 1, "max_ms": 2500}, 1000)
+        self.assertFalse(stalled["ok"])
+        self.assertFalse(preflight.judge({**good, "syncs": 0, "iops": 0.0}, None)["ok"])
+
+    def test_every_node_is_checked_over_ssh_with_the_script_on_stdin(self):
+        from unittest import mock
+
+        from ruvio_soak import cli
+
+        calls = []
+
+        class Fake:
+            def __init__(self, cluster, binary, user, key=None):
+                pass
+
+            def run(self, address, command, stdin=None):
+                calls.append((address, command, stdin))
+                if address == "10.0.0.3":
+                    raise RuntimeError("ssh 10.0.0.3: exited 255")
+                return json.dumps({"ok": True, "iops": 900.0}) + "\n"
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(cli, "SshBackend", Fake):
+            options = SimpleNamespace(hosts="10.0.0.1,10.0.0.2,10.0.0.3", dir="/var/lib/ruvio", seconds=30.0,
+                                      target_iops=800.0, ssh_user="soak", ssh_key=None, out=directory)
+            code = cli.preflight_command(options)
+            written = json.loads((Path(directory) / "preflight.json").read_text())
+        self.assertEqual(code, 1)
+        self.assertEqual(sorted(c[0] for c in calls), ["10.0.0.1", "10.0.0.2", "10.0.0.3"])
+        self.assertEqual(calls[0][1], "sudo python3 - --dir /var/lib/ruvio --seconds 30 --target-iops 800")
+        self.assertIn(b"def measure", calls[0][2])
+        self.assertTrue(written["10.0.0.1"]["ok"])
+        self.assertFalse(written["10.0.0.3"]["ok"])
+
+
 if __name__ == "__main__":
     unittest.main()

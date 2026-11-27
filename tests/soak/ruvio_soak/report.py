@@ -373,7 +373,12 @@ def evaluate(run: Run) -> dict:
 
     statuses = [r["status"] for r in results]
     verdict = "fail" if "fail" in statuses else ("incomplete" if "not_measured" in statuses else "pass")
-    return {"run_id": run.status.get("run_id"), "verdict": verdict, "windows": {
+    env = environment(run)
+    # A run the machines spoiled is neither a pass nor a fail, unless a data criterion failed:
+    # a lost acknowledged write is never put down to the environment.
+    if env["invalid"] and not any(r["id"] in (1, 2, 3, 4) and r["status"] == "fail" for r in results):
+        verdict = "invalid_environment"
+    return {"run_id": run.status.get("run_id"), "verdict": verdict, "environment": env, "windows": {
         "load": run.load, "quiet_a": run.quiet_a, "quiet_b": run.quiet_b, "faults": len(run.windows)},
         "criteria": results, "hourly": _hourly(run), "host_stalls": _host_stalls(run),
         "host_stall_windows": len(stalls)}
@@ -396,11 +401,9 @@ def _overlaps(windows, start: float, end: float) -> bool:
     return any(w[0] < end and start < w[1] for w in windows)
 
 
-def _host_stalls(run: Run, share: float = 0.5) -> list[dict]:
-    """Sample intervals in which a node host spent more than `share` of the time with every
-    task waiting for the disk (`io_full_us` from `/proc/pressure/io`) or the hypervisor gave
-    its CPU away (`cpu_steal_ticks`): what a stall of all processes of one host looks like. Not a
-    criterion; it says whether a fault-free failover or a latency spike came from the machine."""
+def _host_intervals(run: Run) -> list[dict]:
+    """Every sample interval of every node host with its `io_full_share` (`io_full_us` from
+    `/proc/pressure/io`), `steal_share` (`cpu_steal_ticks`) and the disk counters' rates."""
     out = []
     last: dict[str, dict] = {}
     for h in sorted((h for h in run.hosts if h.get("host") != "controller"), key=lambda h: h["t"]):
@@ -420,9 +423,66 @@ def _host_stalls(run: Run, share: float = 0.5) -> list[dict]:
             pair = number(h.get(field)), number(before.get(field))
             if None not in pair:
                 entry[field + "_per_s"] = round((pair[0] - pair[1]) / seconds, 1)
-        if entry.get("io_full_share", 0) > share or entry.get("steal_share", 0) > share:
-            out.append(entry)
+        out.append(entry)
     return out
+
+
+def _host_stalls(run: Run, share: float = 0.5) -> list[dict]:
+    """Sample intervals in which a node host spent more than `share` of the time with every
+    task waiting for the disk or the hypervisor gave its CPU away: what a stall of all
+    processes of one host looks like. It says whether a fault-free failover or a latency spike
+    came from the machine."""
+    return [e for e in _host_intervals(run) if e.get("io_full_share", 0) > share or e.get("steal_share", 0) > share]
+
+
+# What makes a run unfit to be judged: the machine, not the server, decided its result.
+ENV_MAX_STALLED_SHARE = 0.10   # stalled seconds / load seconds
+ENV_MAX_STALL_S = 60.0         # one stall (consecutive stalled samples of a host)
+ENV_PREFLIGHT_FILE = "preflight.json"
+
+
+def environment(run: Run) -> dict:
+    """What the machines did during the load, apart from any criterion. `stalled_s` of a
+    sample is its stall share times its length (a 10 s stall in a 30 s sample counts 10 s at
+    share 1.0, not 30 s); consecutive stalled samples of one host make one stall. Steal is
+    judged on every interval: any steal at all marks the run, because a VM that gave its CPU
+    away makes every latency number a statement about the neighbour."""
+    start, stop = run.load
+    seconds = (stop - start) if start and stop and stop > start else None
+    intervals = [e for e in _host_intervals(run) if not start or not stop or start <= e["t"] <= stop + 60]
+    stalls, current = [], {}
+    for e in intervals:
+        share = max(e.get("io_full_share", 0), e.get("steal_share", 0))
+        host = e["host"]
+        if share > STALL_SHARE:
+            stalled = share * e["seconds"]
+            open_ = current.get(host)
+            if open_ and e["t"] - e["seconds"] <= open_["end"] + 1:
+                open_["end"], open_["stalled_s"] = e["t"], open_["stalled_s"] + stalled
+            else:
+                open_ = current[host] = {"host": host, "start": e["t"] - e["seconds"], "end": e["t"], "stalled_s": stalled}
+                stalls.append(open_)
+    for stall in stalls:
+        stall["stalled_s"] = round(stall["stalled_s"], 1)
+    total = sum(s["stalled_s"] for s in stalls)
+    longest = max((s["stalled_s"] for s in stalls), default=0.0)
+    steal = [e for e in intervals if e.get("steal_share", 0) > 0]
+    preflight_path = run.directory / ENV_PREFLIGHT_FILE
+    preflight = json.loads(preflight_path.read_text()) if preflight_path.exists() else None
+    preflight_failed = sorted(h for h, r in (preflight or {}).items() if not r.get("ok"))
+    reasons = []
+    if seconds and total / seconds > ENV_MAX_STALLED_SHARE:
+        reasons.append(f"host stalls took {total / seconds:.1%} of the load (limit {ENV_MAX_STALLED_SHARE:.0%})")
+    if longest > ENV_MAX_STALL_S:
+        reasons.append(f"one host stall lasted {longest:.0f} s (limit {ENV_MAX_STALL_S:.0f} s)")
+    if steal:
+        reasons.append(f"CPU steal on {len(steal)} sample intervals")
+    if preflight_failed:
+        reasons.append(f"preflight failed on {', '.join(preflight_failed)}")
+    return {"load_s": round(seconds, 1) if seconds else None, "stalls": len(stalls), "stalled_s": round(total, 1),
+            "stalled_share": round(total / seconds, 4) if seconds else None, "longest_stall_s": longest,
+            "steal_intervals": len(steal), "preflight": "missing" if preflight is None else ("fail" if preflight_failed else "pass"),
+            "invalid": bool(reasons), "reasons": reasons, "events": stalls[:200]}
 
 
 RECOVERY_NAME = "every fault recovers: after the fault ends, max <= 15 s, median <= 5 s; a slot move <= 60 s"
@@ -797,6 +857,12 @@ def markdown(report: dict) -> str:
               "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for h in report["hourly"]:
         lines.append(f"| {h['hour']} | {h['p50_ms']} | {h['p99_ms']} | {h['p999_ms']} | {h['max_ms']} | {h['ok']} | {h['not_ok']} | {h['faults']} | {h['data_anon_mean_kib']} |")
+    env = report.get("environment") or {}
+    if env:
+        lines += ["", "## Environment", "",
+                  f"Stalls: {env['stalls']} ({env['stalled_s']} s, {env['stalled_share']} of the load), longest {env['longest_stall_s']} s; "
+                  f"steal intervals: {env['steal_intervals']}; preflight: {env['preflight']}.",
+                  "Invalid environment: " + ("**yes** - " + "; ".join(env["reasons"]) if env["invalid"] else "no")]
     stalls = report.get("host_stalls") or []
     lines += ["", "## Host stalls", "", f"{len(stalls)} sample intervals in which a node host waited on its disk "
               "or its hypervisor for more than half the time.", ""]
