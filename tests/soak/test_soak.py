@@ -508,6 +508,35 @@ class LongRunPieces(unittest.TestCase):
         self.assertEqual(memory["status"], "pass", memory)
         self.assertEqual(disk["status"], "pass", disk)
 
+    def test_hot_tags_land_in_the_moved_range_and_differ(self):
+        from ruvio_soak import workload
+        from ruvio_soak.resp import key_slot
+
+        tags = [workload.hot_tag(["4096-4607"], n) for n in range(6)]
+        self.assertEqual(len(set(tags)), 6)
+        self.assertTrue(all(4096 <= key_slot("{" + t + "}") <= 4607 for t in tags))
+        self.assertEqual(workload.hot_tag(["4096-4607", "9000-9100"], 1) != workload.hot_tag(["4096-4607"], 1), True)
+        self.assertTrue(9000 <= key_slot("{" + workload.hot_tag(["4096-4607", "9000-9100"], 1) + "}") <= 9100)
+
+    def test_a_move_with_failures_after_five_seconds_fails_criterion_4(self):
+        from ruvio_soak import report
+
+        def run_with(fails):
+            events = [
+                {"event": "load-start", "t": 1, "mono": 10**9},
+                {"event": "fault", "kind": "slot-churn", "t": 3000, "down_s": 0, "mono": 3000 * 10**9},
+                {"event": "slot-move", "kind": "slot-churn", "t": 3005, "s": 1.2, "fails_after_5s": fails, "mono": 3005 * 10**9},
+                {"event": "healed", "kind": "slot-churn", "t": 3020, "recovery_s": 20, "mono": 3020 * 10**9},
+                {"event": "load-stop", "t": 10000, "mono": 10000 * 10**9},
+            ]
+            with tempfile.TemporaryDirectory() as directory:
+                self.report_run(Path(directory), [], events=events)
+                return {c["id"]: c for c in report.write(Path(directory))["criteria"]}
+
+        self.assertEqual(run_with(0)[4]["status"], "pass")
+        self.assertEqual(run_with(3)[4]["status"], "fail")
+        self.assertEqual(run_with(0)[5]["value"]["move_max_s"], 1.2)
+
     def test_recovery_is_counted_from_the_end_of_the_fault(self):
         from ruvio_soak import report
 
