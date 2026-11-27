@@ -1,0 +1,160 @@
+{
+  "date": "2026-11-27",
+  "host": {
+    "os": "Linux 7.0.0-1020-azure",
+    "arch": "x86_64",
+    "cpu": "AMD EPYC 9V74 80-Core Processor",
+    "cores": 4
+  },
+  "build": {
+    "commit": "",
+    "dirty": false
+  },
+  "redis_version": "Redis server v=8.10.2 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=150b3555848062aa",
+  "redis_benchmark_version": "redis-benchmark 8.10.2",
+  "config": {
+    "rounds": 1,
+    "clients": 50,
+    "pipeline": 1,
+    "data_size": 64,
+    "memory_keys": 200000,
+    "requests": {
+      "set": 1000000,
+      "get": 1000000,
+      "incr": 1000000,
+      "lpush": 1000000,
+      "lpop": 1000000,
+      "sadd": 1000000,
+      "hset": 1000000,
+      "zadd": 1000000
+    }
+  },
+  "lrange_list_lengths": {},
+  "rows": [
+    {
+      "test": "set",
+      "label": "SET",
+      "ruvio": 94885.66,
+      "redis": 97059.1,
+      "samples": {
+        "ruvio": [
+          94885.66
+        ],
+        "redis": [
+          97059.1
+        ]
+      }
+    },
+    {
+      "test": "get",
+      "label": "GET",
+      "ruvio": 95247.17,
+      "redis": 96450.62,
+      "samples": {
+        "ruvio": [
+          95247.17
+        ],
+        "redis": [
+          96450.62
+        ]
+      }
+    },
+    {
+      "test": "incr",
+      "label": "INCR",
+      "ruvio": 94091.08,
+      "redis": 97115.66,
+      "samples": {
+        "ruvio": [
+          94091.08
+        ],
+        "redis": [
+          97115.66
+        ]
+      }
+    },
+    {
+      "test": "lpush",
+      "label": "LPUSH",
+      "ruvio": 96144.6,
+      "redis": 96796.05,
+      "samples": {
+        "ruvio": [
+          96144.6
+        ],
+        "redis": [
+          96796.05
+        ]
+      }
+    },
+    {
+      "test": "lpop",
+      "label": "LPOP",
+      "ruvio": 96320.55,
+      "redis": 97732.6,
+      "samples": {
+        "ruvio": [
+          96320.55
+        ],
+        "redis": [
+          97732.6
+        ]
+      }
+    },
+    {
+      "test": "sadd",
+      "label": "SADD",
+      "ruvio": 96432.02,
+      "redis": 96590.36,
+      "samples": {
+        "ruvio": [
+          96432.02
+        ],
+        "redis": [
+          96590.36
+        ]
+      }
+    },
+    {
+      "test": "hset",
+      "label": "HSET",
+      "ruvio": 95310.72,
+      "redis": 96927.4,
+      "samples": {
+        "ruvio": [
+          95310.72
+        ],
+        "redis": [
+          96927.4
+        ]
+      }
+    },
+    {
+      "test": "zadd",
+      "label": "ZADD",
+      "ruvio": 96043.03,
+      "redis": 95969.29,
+      "samples": {
+        "ruvio": [
+          96043.03
+        ],
+        "redis": [
+          95969.29
+        ]
+      }
+    }
+  ],
+  "memory": {
+    "ruvio": {
+      "idle_kib": 11932,
+      "loaded_kib": 30392,
+      "delta_kib": 18460
+    },
+    "redis": {
+      "idle_kib": 8696,
+      "loaded_kib": 34912,
+      "delta_kib": 26216
+    }
+  },
+  "seconds": 171.2
+}

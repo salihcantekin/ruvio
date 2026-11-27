@@ -4,6 +4,7 @@ Notable changes to the Ruvio server (`ruvio`, `ruvio-ctl`, the Docker image and 
 
 ## Unreleased
 
+- Docs: a measurement record of one Azure run (`docs/evidence/2026-11-27-azure-short-check.md`): `hot_path` instruction counts equal the baseline for all six commands, and eight commands against Redis 8.10.2 at pipeline 16 (0.98× to 1.26×) and 1 (harness-bound). One round only; not measured: latency, durability, more than one shard.
 <<<<<<< HEAD
 - Soak tool (`tests/soak`): `local_disk.py` runs disk and crash scenarios on loop-mounted ext4 disks (root and `fsfreeze` needed, about ten minutes each, no cloud): `freeze` (each of three hosts' disks frozen twice for 8 s under a soak load), `kill9` (40 `kill -9` rounds on an `always` node with a checkpoint every 300 ms), `diskfull` and `walcorrupt` (a cut last record, one damaged byte, an emptied segment). `run.py run --work DIR` puts the local nodes in a given directory. Verified on a debug build: freeze (six freezes, no failover, no loss in the soak criteria); 80 operations timed out while a disk was frozen; kill9 22,140 acknowledged writes, none lost; diskfull and walcorrupt as listed in the pull request. Not verified: Azure disks, which stall differently from a loop disk.
 =======
