@@ -3058,3 +3058,47 @@ fn a_clean_sync_after_a_failed_one_is_not_counted_as_durable() {
     assert!(matches!(outcome, SyncOutcome::Failed(_)));
     assert_eq!(sink.durable.load(Ordering::Acquire), durable);
 }
+
+/// A reply that only read is answered when the writer fails while it waits, as one that
+/// arrives after the failure is, while a reply whose connection wrote fails with it.
+#[test]
+fn a_waiting_read_is_answered_and_a_waiting_write_fails_when_the_writer_fails() {
+    let directory = tempdir().unwrap();
+    let config = config(directory.path(), DurabilityProfile::Everysec);
+    let (mut sink, _, _) = WalSink::open(config, 0, ProtocolLimits::default()).unwrap();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+
+    // The writer holds here, so the records below are still waiting when it fails.
+    sink.writer
+        .task(Box::new(move |physical, shared| {
+            let _ = released.recv_timeout(Duration::from_secs(10));
+            physical.fail(shared, "injected writer failure".into());
+        }))
+        .unwrap();
+    set(&mut sink, b"one", b"v").unwrap();
+    sink.publish_before_reply().unwrap();
+    let through = sink.last_sequence();
+    let read = sink.written_wait(through, false).expect("a read waits");
+    let write = sink.written_wait(through, true).expect("a write waits");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+
+    let (read, write) = local.block_on(&runtime, async {
+        let waits = async { tokio::join!(read.wait(), write.wait()) };
+        let (_, waited) = tokio::join!(
+            async {
+                tokio::task::yield_now().await;
+                release.send(()).unwrap();
+            },
+            tokio::time::timeout(Duration::from_secs(10), waits),
+        );
+
+        waited.expect("a wait outlived the failed writer")
+    });
+
+    read.expect("a reply that only read is answered");
+    assert!(write.is_err(), "a reply that wrote fails with the log");
+}

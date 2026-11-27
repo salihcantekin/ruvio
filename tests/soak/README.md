@@ -136,10 +136,10 @@ its load instead.
 | --- | --- | --- |
 | `freeze` | Three hosts, each on its own disk, a soak run without plan faults (`--duration`, default 420 s); each host's disk is frozen twice for 8 s (`run.py run --work` puts the nodes on the mounted disks) | Soak criteria 1, 2, 6 and 8: no anomaly of the durable profile, no loss outside faults, no process exit, no failover without a fault |
 | `kill9` | One node with `always` and a checkpoint every 300 ms; `kill -9` at random moments while a writer sets keys (`--rounds`, default 40) | Every acknowledged key is there after every restart |
-| `diskfull` | The server on a 24 MiB disk is written until the disk is full, then restarted full, then restarted with space freed | Reads keep working and the server stays up; the log names the cause; a restart that cannot write says so; acknowledged keys survive; writes work again with space |
-| `walcorrupt` | A log with the last record cut, one damaged byte, and an emptied segment | No key ever has a wrong value; a server that refuses to start says why |
+| `diskfull` | The server on a 24 MiB disk is written until the disk is full, then restarted full, then restarted with space freed | The refused write gets an error that says its outcome is unknown; reads keep working and the server stays up; the log names the cause; a restart that cannot write says so; acknowledged keys survive; writes work again with space |
+| `walcorrupt` | A log with the last record cut, one damaged byte, and an emptied segment | No key ever has a wrong value; a server that refuses to start says why; a dropped end of the log is in the log |
 
-`results.json` in `--base` lists every check. Scenarios record some outcomes without judging them: what a client sees when the disk is full (an error reply or a closed connection), whether a restart on a full disk starts, and how many keys an emptied segment leaves.
+`results.json` in `--base` lists every check. Scenarios record some outcomes without judging them: whether a restart on a full disk starts, and how many keys an emptied segment leaves.
 
 ### Is the environment fit to judge?
 

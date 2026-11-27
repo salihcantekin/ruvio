@@ -1806,6 +1806,14 @@ class Checker:
 
     # -- completion
     def complete(self, op):
+        if any(isinstance(r, Err) and "did not confirm this write" in r.msg for r in flatten(op.replies)):
+            # The log write failed: the command may or may not be applied, like a dead connection.
+            if not self.fault:
+                raise Failure("refused", f"#{op.id} {op.label}: the server could not confirm a write "
+                              "while no fault was injected", op.line())
+            self.stats["unconfirmed"] += 1
+            self.finish_unknown(op)
+            return
         self.ev += 1
         op.recv_ev = self.ev
         op.recv_t = time.time() * 1000

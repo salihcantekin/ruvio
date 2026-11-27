@@ -1354,7 +1354,12 @@ pub(super) async fn handle_client(
 
         // The local group goes to the sync worker before waiting for the owners of forwarded
         // commands, so the two durability waits overlap instead of running one after the other.
-        let durability = wal_group.commit_deferred().await?;
+        let durability = match wal_group.commit_deferred().await {
+            Ok(durability) => durability,
+            Err(error) => {
+                return fail_unconfirmed(&mut stream, &mut output, error, timeouts.write).await;
+            }
+        };
 
         settle(
             &state,
@@ -1367,8 +1372,10 @@ pub(super) async fn handle_client(
         )
         .await?;
 
-        if let Some(durability) = durability {
-            durability.wait(&state).await?;
+        if let Some(durability) = durability
+            && let Err(error) = durability.wait(&state).await
+        {
+            return fail_unconfirmed(&mut stream, &mut output, error, timeouts.write).await;
         }
 
         if session.durability.is_some() {
@@ -1421,6 +1428,34 @@ pub(super) fn flush_threshold(unsent: usize, maximum: usize) -> usize {
     PIPELINE_FLUSH_BYTES
         .max(unsent.saturating_mul(2))
         .min(maximum / 2)
+}
+
+/// The reply to a batch whose log write or sync failed or timed out: its writes are applied in
+/// memory and may or may not be on disk, so none of its replies is true. The held replies are
+/// dropped for this one error and the connection ends, as the client cannot tell which
+/// of its commands the error answers.
+pub(super) const UNCONFIRMED_WRITE_ERROR: &[u8] =
+    b"-ERR persistence did not confirm this write: its outcome is unknown, it may be applied\r\n";
+
+#[cold]
+async fn fail_unconfirmed(
+    stream: &mut ClientStream,
+    output: &mut BoundedOutput,
+    error: io::Error,
+    write_timeout: Duration,
+) -> io::Result<()> {
+    // Part of an earlier reply may already be on the wire with its rest at the front of
+    // `output`: an error written after it would be read as that reply's payload, so the
+    // connection just closes, as it did before the error existed.
+    let cut = output.front_cut();
+
+    output.clear();
+
+    if !cut {
+        let _ = write_timed(stream, UNCONFIRMED_WRITE_ERROR, write_timeout).await;
+    }
+
+    Err(error)
 }
 
 /// Answers a frame that cannot be parsed, ending the connection. The batch's group is

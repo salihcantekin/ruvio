@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::evented::connection::UNCONFIRMED_WRITE_ERROR;
 
 #[test]
 fn evented_wal_group_policy_checks_execution_path_and_session() {
@@ -267,9 +268,11 @@ fn grouped_script_or_transaction_whose_sync_fails_is_refused_and_cut(worker: boo
             .lock()
             .unwrap()
             .retain(|dir| dir != directory.path());
-        // The client whose sync failed loses its connection before any reply.
-        assert!(
-            refused.is_empty(),
+        // The client whose sync failed gets one error, whose outcome is unknown, and loses
+        // its connection: no reply of its batch is an OK.
+        assert_eq!(
+            refused,
+            UNCONFIRMED_WRITE_ERROR,
             "{:?}",
             String::from_utf8_lossy(&refused)
         );
@@ -359,8 +362,13 @@ fn a_pop_served_by_a_grouped_script_whose_sync_fails_is_refused() {
         .lock()
         .unwrap()
         .retain(|(dir, _)| dir != directory.path());
-    // The pusher is cut before any reply.
-    assert!(pushed.is_empty(), "{:?}", String::from_utf8_lossy(&pushed));
+    // The pusher gets the unknown-outcome error and is cut.
+    assert_eq!(
+        pushed,
+        UNCONFIRMED_WRITE_ERROR,
+        "{:?}",
+        String::from_utf8_lossy(&pushed)
+    );
     // The pop was answered before its read timeout (a pop never served would answer nil
     // after its own): refused by closing its connection, or with an error, never with the
     // element.
@@ -944,7 +952,10 @@ fn evented_worker_keeps_answering_reads_after_a_wal_append_failure() {
     });
     assert!(ready, "fault-injection server failed to start");
     // The write hits the injected failure and is never acknowledged.
-    assert!(request(address, &resp(&[&[b"SET", b"failed", b"no"]])).is_empty());
+    assert_eq!(
+        request(address, &resp(&[&[b"SET", b"failed", b"no"]])),
+        UNCONFIRMED_WRITE_ERROR
+    );
     // After the failure a batch that writes nothing is still answered.
     assert_eq!(request(address, &resp(&[&[b"PING"]])), b"+PONG\r\n");
     assert_eq!(
@@ -1009,7 +1020,10 @@ fn evented_shutdown_after_wal_append_failure_keeps_memory_and_log_consistent() {
     });
     assert!(ready, "fault-injection server failed to start");
     // The write is never acknowledged...
-    assert!(request(address, &resp(&[&[b"SET", b"failed", b"no"]])).is_empty());
+    assert_eq!(
+        request(address, &resp(&[&[b"SET", b"failed", b"no"]])),
+        UNCONFIRMED_WRITE_ERROR
+    );
     // ...but what memory holds after it is what the log holds after a restart.
     let in_memory = request(address, &resp(&[&[b"GET", b"failed"]]));
     stop.request();
@@ -1563,9 +1577,11 @@ fn an_everysec_grouped_script_or_transaction_whose_write_fails_acts_like_a_plain
             .lock()
             .unwrap()
             .retain(|(dir, _, _)| dir != directory.path());
-        // The group's one write failed: no reply at all, not even the plain write's.
-        assert!(
-            refused.is_empty(),
+        // The group's one write failed: the one error and no other reply, not even the plain
+        // write's.
+        assert_eq!(
+            refused,
+            UNCONFIRMED_WRITE_ERROR,
             "{:?}",
             String::from_utf8_lossy(&refused)
         );
@@ -1863,6 +1879,100 @@ fn a_routing_node_answers_health_checks_while_its_wal_writes_are_stalled() {
 
     writer.read_exact(&mut replies).unwrap();
     assert_eq!(replies, b"+OK\r\n".repeat(32));
+    stop.request();
+    join_within(left, PATIENCE).unwrap();
+    join_within(right, PATIENCE).unwrap();
+}
+
+/// A batch is quiet only until a command that can reveal or write data runs. A write
+/// followed by `PING` or `ROLE` on the same connection must not be acknowledged before its
+/// record reaches the kernel, whatever the quiet command after it does.
+fn assert_unanswered_while_stalled(stream: &mut StdTcpStream) {
+    // A bounded read, not a sleep: nothing may arrive within the window.
+    stream
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let mut reply = [0u8; 1];
+    let early = stream.read(&mut reply);
+
+    assert!(
+        matches!(&early, Err(error) if matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        )),
+        "a reply left while the write was stalled: {early:?}"
+    );
+    stream.set_read_timeout(Some(PATIENCE)).unwrap();
+}
+
+#[test]
+fn an_everysec_write_followed_by_a_quiet_command_waits_for_the_stalled_disk() {
+    let directory = tempfile::tempdir().unwrap();
+    let persistence = PersistenceConfig {
+        profile: crate::DurabilityProfile::Everysec,
+        data_dir: directory.path().to_path_buf(),
+        ..PersistenceConfig::default()
+    };
+    let (address, stop, server) = serve_with(|config| config.persistence = persistence.clone());
+
+    assert_eq!(
+        request(address, &resp(&[&[b"SET", b"before", b"v"]])),
+        b"+OK\r\n"
+    );
+    let stalled = StalledWrites::new(directory.path());
+    let mut client = StdTcpStream::connect(address).unwrap();
+    let mut pipeline = resp(&[&[b"SET", b"during", b"v"]]);
+
+    pipeline.extend(resp(&[&[b"PING"]]));
+    client.set_read_timeout(Some(PATIENCE)).unwrap();
+    client.write_all(&pipeline).unwrap();
+    assert_unanswered_while_stalled(&mut client);
+
+    drop(stalled);
+    let mut replies = vec![0u8; b"+OK\r\n+PONG\r\n".len()];
+
+    client.read_exact(&mut replies).unwrap();
+    assert_eq!(replies, b"+OK\r\n+PONG\r\n");
+    assert_eq!(
+        logged_keys(directory.path()),
+        [b"before".to_vec(), b"during".to_vec()]
+    );
+    stop.request();
+    join_within(server, PATIENCE).unwrap();
+}
+
+#[test]
+fn a_routing_node_holds_a_write_before_a_quiet_command_while_the_disk_is_stalled() {
+    let directory = tempfile::tempdir().unwrap();
+    let persistence = PersistenceConfig {
+        profile: crate::DurabilityProfile::Everysec,
+        data_dir: directory.path().to_path_buf(),
+        snapshot_interval: Duration::from_secs(3600),
+        ..PersistenceConfig::default()
+    };
+    let (address, _, stop, left, right) = serve_two_shards_with(|config| {
+        config.persistence = persistence.clone();
+    });
+    let key = key_on_shard(0, "held");
+
+    assert_eq!(
+        request(address, &resp(&[&[b"SET", b"before", b"v"]])),
+        b"+OK\r\n"
+    );
+    let stalled = StalledWrites::new(directory.path());
+    let mut client = StdTcpStream::connect(address).unwrap();
+    let mut pipeline = resp(&[&[b"SET", key.as_bytes(), b"v"]]);
+
+    pipeline.extend(resp(&[&[b"ROLE"]]));
+    client.set_read_timeout(Some(PATIENCE)).unwrap();
+    client.write_all(&pipeline).unwrap();
+    assert_unanswered_while_stalled(&mut client);
+
+    drop(stalled);
+    let mut first = [0u8; 5];
+
+    client.read_exact(&mut first).unwrap();
+    assert_eq!(&first, b"+OK\r\n");
     stop.request();
     join_within(left, PATIENCE).unwrap();
     join_within(right, PATIENCE).unwrap();
