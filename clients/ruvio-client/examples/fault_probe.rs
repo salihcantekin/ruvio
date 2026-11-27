@@ -11,8 +11,8 @@
 use ruvio_client::{Client, ClientOptions, Durability};
 use std::{
     io::BufRead,
-    sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
     thread,
     time::Duration,
 };
