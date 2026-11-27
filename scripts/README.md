@@ -51,6 +51,7 @@ Most scripts take the path to a built `ruvio` binary and start their own server.
 | --- | --- |
 | `model_check.py` (+ `model_check_shim.c`, `model_check_mutants/`, `model_check_repros/`) | Model-based randomized checker with crashes and fault injection |
 | `durability_scenarios.py`, `kill9_harness.py`, `kill9_shards.py` | Crash and restart checks per durability profile |
+| `client_faults.py` | Six clients (Rust, C#, Go, Java, Python, Node) write and read through two failovers on 3 nodes + 3 coordinators, TLS off and on; build the probes first (headers in `clients/*/` `fault_probe`, `FaultProbe`, `faultprobe`); about 30 s per client and mode |
 | `coordinator_faults.py` | `ruvio coordinator` failover under partitions (TCP proxy), a killed coordinator leader, no majority, restart and load; under a minute |
 | `upgrade_rollback.py` | Upgrade and rollback between two releases as local processes (3 nodes, 3 coordinators, a writer with `CLIENT DURABILITY REPLICAS 1`): rolling order, wrong order, planned switchover, restore from a backup, a release before the coordinator; about two minutes in a debug build |
 | `disk_faults.py`, `enospc_check.py` | WAL write errors, slow and full disks (Linux, root) |
@@ -69,6 +70,7 @@ Most scripts take the path to a built `ruvio` binary and start their own server.
 | `bench_matrix.py`, `perf_matrix.py`, `benchmark.sh`, `benchmark_regression.py`, `pinned_run.py` | Throughput matrices and repeatable samples |
 | `bench_added_commands.py`, `bench_scripted_equivalents.py`, `bench_checkpoint_latency.py`, `bench_concurrency_durability.py`, `json_compare.py` | Feature, checkpoint, durability and JSON costs |
 | `benchmark_shards.py`, `benchmark_shard_skew.py`, `fairness_multishard.py`, `fairness_probe.py` | Shard scaling and tail fairness |
+| `eviction_cgroup.py` | Sustained writes at the `maxmemory` ceiling inside a cgroup memory limit, once per policy, with a redis-server comparison (Linux, root) |
 | `memory_churn.py`, `churn_benchmark.py`, `compare_lru_reads.py`, `rss_docker.py`, `mixed_docker.py` | Memory, eviction and mixed workloads |
 | `ceiling.sh`, `ceiling_compare.py`, `ceiling_logic.sh` | Single-core ceiling |
 | `perf_compare.py`, `command_cost.py`, `mac_cost.py`, `profile_linux.sh` | Instructions, counters and CPU per request |
