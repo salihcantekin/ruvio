@@ -24,7 +24,7 @@ import threading
 import time
 from pathlib import Path
 
-from .resp import ClusterClient, Refused, ReplyError, Unknown
+from .resp import ClusterClient, Refused, ReplyError, Unknown, key_slot
 
 WRITES = ("incr", "append", "write")
 
@@ -251,6 +251,20 @@ class OfficialRegisterReader(OfficialMixin, RegisterReader):
     pass
 
 
+def hot_tag(ranges: list[str], index: int) -> str:
+    """A hash tag whose key slot lies in one of `ranges` ("first-last"), the one `index` picks;
+    the same index always gives the same tag, and different indexes give different tags."""
+    first, last = (int(x) for x in ranges[index % len(ranges)].split("-"))
+    found = 0
+    for n in range(1 << 20):
+        tag = f"h{n}"
+        if first <= key_slot("{" + tag + "}") <= last:
+            if found == index // len(ranges):
+                return tag
+            found += 1
+    raise ValueError(f"no tag for slots {ranges[index % len(ranges)]}")
+
+
 def start(history, seeds, password, load: dict, stop: threading.Event, run_tag: str, latency=None) -> list[Worker]:
     """Starts the workers the plan's `load` section asks for, for each profile. `load.official`
     ({"path": "clients/python", "counters": n, "registers": n, "readers_per_register": n})
@@ -259,10 +273,22 @@ def start(history, seeds, password, load: dict, stop: threading.Event, run_tag: 
     rate = float(load.get("rate_per_worker", 20))
     keys_per_worker = int(load.get("keys_per_worker", 4))
     max_len = int(load.get("max_list_len", 0))
+    # `hot_slots`: slot ranges ("4096-4607") the plan moves; every other key of a worker (a share
+    # of `hot_fraction`, default one half) gets a hash tag that puts it inside one of them, so the
+    # checked operations are the ones a slot move touches.
+    hot = list(load.get("hot_slots", []))
+    hot_every = max(1, round(1 / float(load.get("hot_fraction", 0.5)))) if hot else 0
+    counter = [0]
+
+    def tagged(name: str, k: int) -> str:
+        if not hot or k % hot_every:
+            return name
+        counter[0] += 1
+        return f"{name}:{{{hot_tag(hot, counter[0] - 1)}}}"
     for profile, settings in load.get("profiles", {"default": {}}).items():
         replicas = int(settings.get("replicas", 1))
         args = lambda name: (f"{profile}-{name}", history, seeds, password, profile, replicas, rate, stop, latency)  # noqa: E731
-        key = lambda kind, w, k: f"soak:{run_tag}:{profile}:{kind}:{w}:{k}"  # noqa: E731
+        key = lambda kind, w, k: tagged(f"soak:{run_tag}:{profile}:{kind}:{w}:{k}", k)  # noqa: E731
         for w in range(int(load.get("counters", 1))):
             workers.append(CounterWorker(*args(f"counter{w}"), keys=[key("counter", w, k) for k in range(keys_per_worker)]))
         for w in range(int(load.get("appenders", 1))):

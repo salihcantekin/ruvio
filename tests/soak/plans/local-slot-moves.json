@@ -1,0 +1,86 @@
+{
+  "name": "local-slot-moves",
+  "seed": 3,
+  "duration_s": 600,
+  "warmup_s": 20,
+  "restart_as": "replica",
+  "cluster": {
+    "ping_interval_ms": 200,
+    "down_after_ms": 3000,
+    "primary_lease_ms": 2000,
+    "snapshot_interval_ms": 10000
+  },
+  "load": {
+    "rate_per_worker": 30,
+    "keys_per_worker": 4,
+    "counters": 1,
+    "appenders": 1,
+    "registers": 1,
+    "readers_per_register": 2,
+    "max_list_len": 500,
+    "profiles": {
+      "default": {},
+      "durable": {
+        "replicas": 2
+      }
+    },
+    "background": {
+      "processes": 1,
+      "rate": 200,
+      "keys": 20000,
+      "value_bytes": 100
+    },
+    "hot_slots": [
+      "4096-4607"
+    ],
+    "hot_fraction": 0.5
+  },
+  "faults": {
+    "start_s": 60,
+    "stop_s": 520,
+    "interval_s": [
+      5,
+      10
+    ],
+    "recovery_timeout_s": 90,
+    "migrate_range": "4096-4607",
+    "churn_moves": 4,
+    "rebalance_skew": 512,
+    "sequence": [
+      {
+        "kind": "slot-churn"
+      },
+      {
+        "kind": "rebalance-slots"
+      },
+      {
+        "kind": "migrate-slots"
+      },
+      {
+        "kind": "migrate-slots"
+      },
+      {
+        "kind": "slot-churn"
+      },
+      {
+        "kind": "rebalance-slots"
+      }
+    ],
+    "kinds": [
+      "migrate-slots",
+      "slot-churn",
+      "rebalance-slots"
+    ]
+  },
+  "metrics_interval_s": 5,
+  "full_info_every": 6,
+  "status_interval_s": 30,
+  "artifact_interval_s": 120,
+  "history_segment_s": 120,
+  "log_interval_s": 120,
+  "check_buckets": 4,
+  "report_settle_s": 60,
+  "rss_min_window_s": 120,
+  "rss_warn_percent_per_hour": 1000.0,
+  "startup_timeout_s": 90
+}
