@@ -2,8 +2,9 @@
 //! hands the bytes, segment changes and file removals to this thread in order, so its own
 //! thread never waits for the disk on the write path. A disk that stops answering for a few
 //! seconds then holds only this thread: the shard keeps answering reads, health checks and
-//! replication, `everysec` writes keep being acknowledged until `WAL_WRITER_QUEUE_BYTES` are
-//! waiting, and `always` replies wait for their sync as before.
+//! replication. An `everysec` reply waits until the writer has written its records (`WrittenWait`),
+//! so a stalled disk holds those replies, not the shard, and the shard waits itself only once
+//! `WAL_WRITER_QUEUE_BYTES` are queued. `always` replies wait for their sync as before.
 //!
 //! What a log must see on disk first (a sync, a truncation, recovery after a failure) waits
 //! for the queue to empty (`Writer::drain`) and then works on [`Physical`] directly, as the
