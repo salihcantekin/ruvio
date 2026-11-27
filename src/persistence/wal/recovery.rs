@@ -42,6 +42,7 @@ pub(super) fn recover_segments(
             }
 
             report.torn_tail_bytes += physical_length;
+            report.dropped_segments += 1;
 
             if !read_only {
                 fs::remove_file(path)?;
@@ -83,6 +84,7 @@ pub(super) fn recover_segments(
         {
             drop(file);
             report.torn_tail_bytes += physical_length;
+            report.dropped_segments += 1;
 
             if !read_only {
                 fs::remove_file(path)?;

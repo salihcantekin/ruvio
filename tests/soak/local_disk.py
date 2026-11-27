@@ -16,7 +16,8 @@ random moments while one writer sets keys, with a checkpoint every 300 ms; every
 key must be there after the restart. `diskfull`: the server on a 24 MiB disk is written until the
 disk is full: it must refuse writes with an error, stay up and serve reads, and write again once
 space is freed. `walcorrupt`: a log with a cut last record, one damaged byte and an empty
-segment: the server must not answer with a wrong value, whether it starts or refuses to."""
+segment: the server must not answer with a wrong value, whether it starts or refuses to, and a dropped
+unfinished end of the log must be in its log."""
 
 from __future__ import annotations
 
@@ -244,9 +245,8 @@ def scenario_diskfull(options, base: Path) -> list[dict]:
                 refused_at, refusal = i, ("closed connection", str(error))
                 break
         check(results, "the disk filled and a write was refused", refused_at is not None, len(acked))
-        # What the client sees is a finding, not a verdict: an error reply is the clearer of the two.
-        results.append({"check": "how the refusal reaches the client", "ok": True, "detail": refusal})
-        print(f"       refusal reaches the client as: {refusal}", flush=True)
+        check(results, "the refused write is answered with an error that says the outcome is unknown",
+              refusal is not None and refusal[0] == "error reply" and "its outcome is unknown" in refusal[1], refusal)
         check(results, "the server is still running", node.alive(), node.log_tail())
         if node.alive():
             try:
@@ -312,7 +312,7 @@ def scenario_walcorrupt(options, base: Path) -> list[dict]:
     if not segments:
         return results
 
-    def variant(name: str, damage) -> None:
+    def variant(name: str, damage, warns: bool = False) -> None:
         copy = base / f"data-{name}"
         shutil.copytree(reference, copy)
         damage(wal_segments(copy)[-1])
@@ -334,6 +334,9 @@ def scenario_walcorrupt(options, base: Path) -> list[dict]:
             cc.close()
         n.kill9()
         tail = n.log_tail(4)
+        if warns:
+            check(results, f"{name}: the log says the unfinished end of the WAL was dropped",
+                  any(w in n.log.read_text(errors="replace") for w in ("unfinished end of the WAL", "dropped the last WAL segment")), n.log_tail(6))
         check(results, f"{name}: no key has a wrong value", not wrong, wrong[:5])
         check(results, f"{name}: the server either started or said why it did not",
               started or any(w in tail.lower() for w in ("wal", "log", "corrupt", "checksum", "record")), tail)
@@ -363,9 +366,9 @@ def scenario_walcorrupt(options, base: Path) -> list[dict]:
         with open(path, "r+b") as f:
             f.truncate(0)
 
-    variant("cut-last-record", cut_last_bytes)
+    variant("cut-last-record", cut_last_bytes, warns=True)
     variant("damaged-byte", flip_middle_byte)
-    variant("empty-segment", empty_segment)
+    variant("empty-segment", empty_segment, warns=True)
     return results
 
 

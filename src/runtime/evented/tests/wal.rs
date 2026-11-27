@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::evented::connection::UNCONFIRMED_WRITE_ERROR;
 
 #[test]
 fn evented_wal_group_policy_checks_execution_path_and_session() {
@@ -267,9 +268,11 @@ fn grouped_script_or_transaction_whose_sync_fails_is_refused_and_cut(worker: boo
             .lock()
             .unwrap()
             .retain(|dir| dir != directory.path());
-        // The client whose sync failed loses its connection before any reply.
-        assert!(
-            refused.is_empty(),
+        // The client whose sync failed gets one error, whose outcome is unknown, and loses
+        // its connection: no reply of its batch is an OK.
+        assert_eq!(
+            refused,
+            UNCONFIRMED_WRITE_ERROR,
             "{:?}",
             String::from_utf8_lossy(&refused)
         );
@@ -359,8 +362,13 @@ fn a_pop_served_by_a_grouped_script_whose_sync_fails_is_refused() {
         .lock()
         .unwrap()
         .retain(|(dir, _)| dir != directory.path());
-    // The pusher is cut before any reply.
-    assert!(pushed.is_empty(), "{:?}", String::from_utf8_lossy(&pushed));
+    // The pusher gets the unknown-outcome error and is cut.
+    assert_eq!(
+        pushed,
+        UNCONFIRMED_WRITE_ERROR,
+        "{:?}",
+        String::from_utf8_lossy(&pushed)
+    );
     // The pop was answered before its read timeout (a pop never served would answer nil
     // after its own): refused by closing its connection, or with an error, never with the
     // element.
@@ -944,7 +952,10 @@ fn evented_worker_keeps_answering_reads_after_a_wal_append_failure() {
     });
     assert!(ready, "fault-injection server failed to start");
     // The write hits the injected failure and is never acknowledged.
-    assert!(request(address, &resp(&[&[b"SET", b"failed", b"no"]])).is_empty());
+    assert_eq!(
+        request(address, &resp(&[&[b"SET", b"failed", b"no"]])),
+        UNCONFIRMED_WRITE_ERROR
+    );
     // After the failure a batch that writes nothing is still answered.
     assert_eq!(request(address, &resp(&[&[b"PING"]])), b"+PONG\r\n");
     assert_eq!(
@@ -1009,7 +1020,10 @@ fn evented_shutdown_after_wal_append_failure_keeps_memory_and_log_consistent() {
     });
     assert!(ready, "fault-injection server failed to start");
     // The write is never acknowledged...
-    assert!(request(address, &resp(&[&[b"SET", b"failed", b"no"]])).is_empty());
+    assert_eq!(
+        request(address, &resp(&[&[b"SET", b"failed", b"no"]])),
+        UNCONFIRMED_WRITE_ERROR
+    );
     // ...but what memory holds after it is what the log holds after a restart.
     let in_memory = request(address, &resp(&[&[b"GET", b"failed"]]));
     stop.request();
@@ -1563,9 +1577,11 @@ fn an_everysec_grouped_script_or_transaction_whose_write_fails_acts_like_a_plain
             .lock()
             .unwrap()
             .retain(|(dir, _, _)| dir != directory.path());
-        // The group's one write failed: no reply at all, not even the plain write's.
-        assert!(
-            refused.is_empty(),
+        // The group's one write failed: the one error and no other reply, not even the plain
+        // write's.
+        assert_eq!(
+            refused,
+            UNCONFIRMED_WRITE_ERROR,
             "{:?}",
             String::from_utf8_lossy(&refused)
         );

@@ -10,6 +10,9 @@ pub(crate) struct BoundedOutput {
     /// Bytes at the front already cleared to leave: sent in part, or passed by an earlier
     /// durability wait. A later wait that times out refuses only the replies after them.
     approved: usize,
+    /// Part of a reply left the socket: the front of the buffer may be the rest of it, so
+    /// nothing may be written ahead of it. Cleared when the buffer is emptied.
+    front_cut: bool,
 }
 
 impl BoundedOutput {
@@ -19,6 +22,7 @@ impl BoundedOutput {
             maximum,
             exceeded: false,
             approved: 0,
+            front_cut: false,
         }
     }
 
@@ -26,17 +30,28 @@ impl BoundedOutput {
         self.bytes.clear();
         self.exceeded = false;
         self.approved = 0;
+        self.front_cut = false;
     }
 
     /// Drops the first `count` bytes, which were sent; the limit then counts only the rest.
     pub(crate) fn consume_front(&mut self, count: usize) {
         self.bytes.drain(..count);
         self.approved = self.approved.saturating_sub(count);
+
+        if count > 0 {
+            self.front_cut = !self.bytes.is_empty();
+        }
+    }
+
+    /// Whether the front of the buffer may be the unsent tail of a reply whose start left.
+    pub(crate) fn front_cut(&self) -> bool {
+        self.front_cut && !self.bytes.is_empty()
     }
 
     pub(crate) fn truncate_to(&mut self, length: usize) {
         self.bytes.truncate(length);
         self.approved = self.approved.min(length);
+        self.front_cut &= length > 0;
     }
 
     /// Where the replies not yet cleared by a durability wait begin.
@@ -194,5 +209,34 @@ mod tests {
         output.write_all(b"6789").unwrap();
         assert!(!output.exceeded());
         assert_eq!(&*output, b"56789");
+    }
+
+    #[test]
+    fn a_partly_sent_front_is_known_until_the_buffer_empties() {
+        let mut output = BoundedOutput::with_capacity(0, 64);
+
+        output.write_all(b"$5\r\nhello\r\n").unwrap();
+        assert!(!output.front_cut());
+        output.consume_front(4);
+        assert!(output.front_cut());
+        // Later replies behind it do not make it whole again.
+        output.write_all(b"+OK\r\n").unwrap();
+        assert!(output.front_cut());
+        output.consume_front(0);
+        assert!(output.front_cut());
+        // Everything sent: nothing is cut any more.
+        let all = output.len();
+        output.consume_front(all);
+        assert!(!output.front_cut());
+        // A cut front dropped with `clear` or truncated to nothing is gone too.
+        output.write_all(b"abcdef").unwrap();
+        output.consume_front(2);
+        output.clear();
+        assert!(!output.front_cut());
+        output.write_all(b"abcdef").unwrap();
+        output.consume_front(2);
+        output.truncate_to(0);
+        output.write_all(b"x").unwrap();
+        assert!(!output.front_cut());
     }
 }

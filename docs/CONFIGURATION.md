@@ -369,7 +369,14 @@ a second. There is no separate `everyminute` profile; the contract stays
 `everysec` and the number is the user's. Stalls can make the window longer.
 `always` ignores `sync_interval_ms` and `fdatasync`s a client batch before the
 replies are sent. A persistence write or sync failure puts that shard into a
-visible error state and further mutations return `MISCONF`. After a failed
+visible error state and further mutations return `MISCONF`. The batch whose
+write or sync failed, or was not confirmed in time, gets one error, `ERR
+persistence did not confirm this write: its outcome is unknown, it may be
+applied`, and its connection is closed: the write is applied in memory and may
+or may not be on disk, so a client must not retry it blindly (an `INCR`
+retried could count twice). A connection that has part of an earlier reply on
+the wire, or whose batch failed in the middle of a large pipeline, is closed
+without the error. After a failed
 write (for example a full disk) the shard resumes by itself once the disk
 accepts writes again. After a failed `fdatasync` it does not: the kernel may
 have dropped the unsynced pages and report a later sync as clean, so mutations
