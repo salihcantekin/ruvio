@@ -1884,6 +1884,100 @@ fn a_routing_node_answers_health_checks_while_its_wal_writes_are_stalled() {
     join_within(right, PATIENCE).unwrap();
 }
 
+/// A batch is quiet only until a command that can reveal or write data runs. A write
+/// followed by `PING` or `ROLE` on the same connection must not be acknowledged before its
+/// record reaches the kernel, whatever the quiet command after it does.
+fn assert_unanswered_while_stalled(stream: &mut StdTcpStream) {
+    // A bounded read, not a sleep: nothing may arrive within the window.
+    stream
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let mut reply = [0u8; 1];
+    let early = stream.read(&mut reply);
+
+    assert!(
+        matches!(&early, Err(error) if matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        )),
+        "a reply left while the write was stalled: {early:?}"
+    );
+    stream.set_read_timeout(Some(PATIENCE)).unwrap();
+}
+
+#[test]
+fn an_everysec_write_followed_by_a_quiet_command_waits_for_the_stalled_disk() {
+    let directory = tempfile::tempdir().unwrap();
+    let persistence = PersistenceConfig {
+        profile: crate::DurabilityProfile::Everysec,
+        data_dir: directory.path().to_path_buf(),
+        ..PersistenceConfig::default()
+    };
+    let (address, stop, server) = serve_with(|config| config.persistence = persistence.clone());
+
+    assert_eq!(
+        request(address, &resp(&[&[b"SET", b"before", b"v"]])),
+        b"+OK\r\n"
+    );
+    let stalled = StalledWrites::new(directory.path());
+    let mut client = StdTcpStream::connect(address).unwrap();
+    let mut pipeline = resp(&[&[b"SET", b"during", b"v"]]);
+
+    pipeline.extend(resp(&[&[b"PING"]]));
+    client.set_read_timeout(Some(PATIENCE)).unwrap();
+    client.write_all(&pipeline).unwrap();
+    assert_unanswered_while_stalled(&mut client);
+
+    drop(stalled);
+    let mut replies = vec![0u8; b"+OK\r\n+PONG\r\n".len()];
+
+    client.read_exact(&mut replies).unwrap();
+    assert_eq!(replies, b"+OK\r\n+PONG\r\n");
+    assert_eq!(
+        logged_keys(directory.path()),
+        [b"before".to_vec(), b"during".to_vec()]
+    );
+    stop.request();
+    join_within(server, PATIENCE).unwrap();
+}
+
+#[test]
+fn a_routing_node_holds_a_write_before_a_quiet_command_while_the_disk_is_stalled() {
+    let directory = tempfile::tempdir().unwrap();
+    let persistence = PersistenceConfig {
+        profile: crate::DurabilityProfile::Everysec,
+        data_dir: directory.path().to_path_buf(),
+        snapshot_interval: Duration::from_secs(3600),
+        ..PersistenceConfig::default()
+    };
+    let (address, _, stop, left, right) = serve_two_shards_with(|config| {
+        config.persistence = persistence.clone();
+    });
+    let key = key_on_shard(0, "held");
+
+    assert_eq!(
+        request(address, &resp(&[&[b"SET", b"before", b"v"]])),
+        b"+OK\r\n"
+    );
+    let stalled = StalledWrites::new(directory.path());
+    let mut client = StdTcpStream::connect(address).unwrap();
+    let mut pipeline = resp(&[&[b"SET", key.as_bytes(), b"v"]]);
+
+    pipeline.extend(resp(&[&[b"ROLE"]]));
+    client.set_read_timeout(Some(PATIENCE)).unwrap();
+    client.write_all(&pipeline).unwrap();
+    assert_unanswered_while_stalled(&mut client);
+
+    drop(stalled);
+    let mut first = [0u8; 5];
+
+    client.read_exact(&mut first).unwrap();
+    assert_eq!(&first, b"+OK\r\n");
+    stop.request();
+    join_within(left, PATIENCE).unwrap();
+    join_within(right, PATIENCE).unwrap();
+}
+
 /// Under `always` with the sync worker a write's reply still waits for its record to be on
 /// disk, and so do replies that could reveal it, but the shard itself does not: a
 /// coordinator's `ROLE` and `INFO` are answered meanwhile, so it does not fail the shard over.
