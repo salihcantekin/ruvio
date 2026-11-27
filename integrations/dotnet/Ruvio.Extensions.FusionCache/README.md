@@ -26,7 +26,7 @@ The package does not create a connection. It uses the registered `IRuvioClient`,
 
 - Messages are not stored. A node whose connection dropped misses what was published meanwhile; its in-memory copies then live until they expire. Give entries a modest `Duration` (and use FusionCache's own auto-recovery where it applies).
 - This package does not detect a reconnect of the Pub/Sub socket. The client subscribes again by itself when `RuvioClientOptions.Reconnect` is on, but FusionCache is not told (`IsReconnection` is always false).
-- After a failover, give the client every node of the group (`Seeds`) or the coordinators (`SentinelMaster`). A client that knows only the old primary cannot reach the new one, and neither can its Pub/Sub subscription. In one local run (a primary killed, the replica promoted by the coordinators) the commands worked again within a second and the subscription about 30 seconds later; messages sent in between were lost.
+- After a failover the backplane stops delivering. Command sockets follow the new primary when the client has the group's addresses (`Seeds`) or the coordinators (`SentinelMaster`), but the Pub/Sub subscriber socket keeps retrying the address of the old primary and gives up after `MaxReconnectAttempts` (8, about 7 seconds). In one local run (a primary killed, the replica promoted by the coordinators) no message reached the subscriber in the next 50 seconds. Until the client follows the failover, restart the app nodes (or recreate the cache) after one, and give entries a modest `Duration` so stale copies expire.
 - Needs a Ruvio server with sharded Pub/Sub (`SPUBLISH`) and `Ruvio.Client` 0.4.0.
 - Needs FusionCache 2.1.0 or newer.
 
