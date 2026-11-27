@@ -124,7 +124,6 @@ its load instead.
 | 16 | Coordinator data grows less than 64 MiB |
 | 17 | Metric gaps < 1 %, clock offset < 10 ms, controller CPU p95 < 70 %, check finished |
 
-<<<<<<< HEAD
 ## Disk and crash scenarios on this machine
 
 `python3 tests/soak/local_disk.py <scenario> --binary target/debug/ruvio` runs on loop-mounted ext4 disks and needs root, `losetup`, `mkfs.ext4`, `mount` and `fsfreeze` (it prints `skipped` and exits 2 without them). No cloud, nothing to pay, each under ten minutes. A loop disk freezes cleanly and a cloud disk does not, so this shows what the server does when a disk stops or fails, not how an Azure disk behaves.
@@ -137,7 +136,7 @@ its load instead.
 | `walcorrupt` | A log with the last record cut, one damaged byte, and an emptied segment | No key ever has a wrong value; a server that refuses to start says why |
 
 `results.json` in `--base` lists every check. Scenarios record some outcomes without judging them: what a client sees when the disk is full (an error reply or a closed connection), whether a restart on a full disk starts, and how many keys an emptied segment leaves.
-=======
+
 ### Is the environment fit to judge?
 
 Before a run on Azure, `python3 tests/soak/run.py preflight --hosts <node addresses> --seconds 120 --target-iops <n> --out <run directory>` writes 8 KiB blocks with `fdatasync` on every node's data disk at the same time (the write-ahead log's pattern). A node fails the check when it reaches under 80 % of `--target-iops` syncs per second or one sync takes over a second; replace the VMs and run it again instead of starting the run. Without `--target-iops` only a stall fails. `preflight.json` in the run directory is read by the report. Run on this machine without `--hosts` (`--dir` picks the disk).
@@ -150,7 +149,6 @@ The report's `environment` block counts what the machines did during the load: h
 - a node failed its preflight.
 
 A failure of criteria 1-4 (acknowledged writes lost, stale reads, anomalies in a restart or a slot move) is never put down to the environment: the verdict stays `fail`. The exit code of `report` is 1 for `invalid_environment`. Not covered yet: a criterion for how fast a node is back to normal after a stall.
->>>>>>> origin/dev
 
 ## The history check
 
@@ -175,6 +173,30 @@ lost list value or register version has the time its write was acknowledged. A l
 increment is timed from the `INCR` replies the history records: a reply at or below one that
 came back before it was sent shows where the counter went back. A history without those replies
 falls back to its newest acknowledged increments, which put the loss at the end of the run.
+
+## Correctness of LEASE, SEMAPHORE, TRANSFER and IDEM
+
+With `load.primitives` in the plan (see `plans/local-primitives.json`) the same run also drives
+the primitives that make a correctness promise, in both profiles, under the same faults:
+
+| Workload | What the check says |
+| --- | --- |
+| `LEASE`, `SEMAPHORE` + `RELEASE` | tokens never repeat and grow across grants that do not overlap; no grant lands while a holder certainly holds a full lock; the history of every lock key is linearizable (Porcupine) |
+| `TRANSFER` between accounts of one slot | the final balances add up to what was put in; no balance below 0; each account ends within what its acknowledged and unknown transfers allow |
+| `IDEM BEGIN` raced by several workers | one `acquired` per request, one effect per request, a `completed` answer replays the completed result |
+
+`python3 tests/soak/run.py check-primitives history.jsonl` repeats the check on a recorded history.
+The rule checks are Python (`ruvio_soak/primitives_check.py`); the linearizability check is the Go
+program in [`porcupine/`](porcupine) (`go run . history.jsonl`, needs Go and the Porcupine module).
+Without Go the check is reported as not run, which is a `warn`, never a pass. The model assumes a
+holder that never released expires at its time to live at the earliest; it may miss a violation but
+never reports one that did not happen. Violations that no failover can explain (a changed sum, a
+repeated token, two `acquired`) fail in every profile; lost or doubled holds fail in `durable` and warn in `default`.
+
+Locally `isolate-host` works when the controller runs as root with `iptables`: every host's processes
+run as their own user id, and packets between two hosts are dropped in both directions while the
+controller still reaches every node (`--out` must be below a directory other users can search, for
+example `/var/tmp`).
 
 ## Run it locally
 
