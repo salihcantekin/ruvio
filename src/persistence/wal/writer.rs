@@ -353,6 +353,7 @@ impl Writer {
         Some(WrittenWait {
             shared: Arc::clone(&self.shared),
             sequence,
+            wrote,
         })
     }
 
@@ -368,6 +369,8 @@ impl Writer {
 pub(crate) struct WrittenWait {
     shared: Arc<WriterShared>,
     sequence: u64,
+    /// The reply's connection may have written some of the records (see `written_wait`).
+    wrote: bool,
 }
 
 impl WrittenWait {
@@ -381,7 +384,7 @@ impl WrittenWait {
             let notified = shared.written_local.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if let Some(result) = shared.written_outcome(self.sequence) {
+            if let Some(result) = shared.written_outcome(self.sequence, self.wrote) {
                 return result;
             }
             if !shared.watching.swap(true, Ordering::AcqRel) {
@@ -433,11 +436,16 @@ async fn watch_written(shared: Arc<WriterShared>) {
 
 impl WriterShared {
     /// `Some` once a reply waiting for records up to `sequence` can leave or must fail.
-    fn written_outcome(&self, sequence: u64) -> Option<io::Result<()>> {
+    /// A reply that only read (`wrote` false) is answered when the writer fails while it
+    /// waits, as one that arrives after the failure is (`Writer::written_wait`).
+    fn written_outcome(&self, sequence: u64, wrote: bool) -> Option<io::Result<()>> {
         if self.written.load(Ordering::Acquire) >= sequence {
             return Some(Ok(()));
         }
         if self.failed.load(Ordering::Acquire) {
+            if !wrote {
+                return Some(Ok(()));
+            }
             let message = self
                 .failure
                 .lock()
