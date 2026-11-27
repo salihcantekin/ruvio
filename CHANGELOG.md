@@ -49,6 +49,7 @@ Notable changes to the Ruvio server (`ruvio`, `ruvio-ctl`, the Docker image and 
 
 - Site: a new link preview image (`og:image`) in the site's dark theme, with current facts; the old one still showed the light theme and an outdated command count.
 - Docs: the README opens with a short terminal recording of `LEASE`, `LIMIT`, `INCRBY ... MAX` and `ZMOVEDUE`, and `docs/COORDINATOR.md` shows a recorded failover with a client that keeps writing.
+- Docs: a measurement record of one Azure run (`docs/evidence/2026-11-27-azure-short-check.md`): `hot_path` instruction counts equal the baseline for all six commands, and eight commands against Redis 8.10.2 at pipeline 16 (0.98× to 1.26×) and 1 (harness-bound). One round only; not measured: latency, durability, more than one shard.
 
 ## 0.4.0 - 2026-10-29
 

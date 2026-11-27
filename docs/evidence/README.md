@@ -8,6 +8,7 @@ Current numbers are on the [performance](https://ruviodb.com/benchmarks/) and [m
 
 | Date | Record | What it measured |
 | --- | --- | --- |
+| 2026-11-27 | [Azure short check](2026-11-27-azure-short-check.md) | `hot_path` instruction counts against the baseline, and eight commands at pipeline 16 and 1 against Redis 8.10.2, one round on one Azure EPYC 9V74 VM |
 | 2026-10-28 | [Mac after the hot-path changes](2026-10-28-mac-hot-path.md) | 60 commands and 12 data structures against Redis on a Mac, the `dev` head after the hot-path pull requests next to the commit before them and the 2026-10-14 record |
 | 2026-10-26 | [Shard scaling](2026-10-26-azure-shard-scaling.md) | `SET`/`GET` at 1, 4 and 8 shards with a cluster-aware client against Redis and a Redis Cluster, the one-port forwarding path before and after its fix, and one-shard rows, on one Azure EPYC 9V74 VM |
 | 2026-10-16 | [Eight shards against Redis](2026-10-16-azure-8-shards.md) | 60 commands and 12 data structures, Ruvio with eight shards against one Redis core and an eight-node Redis Cluster on one Azure EPYC 9V74 VM; one-shard control run |
