@@ -2552,8 +2552,8 @@ fn a_refused_hot_key_write_leaves_the_old_value_for_every_shard() {
     let failed = request(left_addr, &resp(&[&[b"SET", b"lock:b", b"x"]]));
 
     // Its write fails on the WAL writer thread while the reply waits for it: the connection
-    // closes with no reply, as for a failed grouped write.
-    assert!(failed.is_empty(), "{failed:?}");
+    // closes with the unknown-outcome error, as for a failed grouped write.
+    assert_eq!(failed, UNCONFIRMED_WRITE_ERROR, "{failed:?}");
     wait_persistence_error(left_addr);
     for refused in [
         &[&b"SET"[..], b"lock:a", b"new"][..],
@@ -2613,8 +2613,8 @@ fn a_hot_key_write_whose_log_write_failed_is_written_when_the_log_resumes() {
     wait_persistence_error(left_addr);
     stop_failing_writes(directory.path());
     // Its write fails on the WAL writer thread while the reply waits for it: the connection
-    // closes with no reply, as for a failed grouped write.
-    assert!(failed.is_empty(), "{failed:?}");
+    // closes with the unknown-outcome error, as for a failed grouped write.
+    assert_eq!(failed, UNCONFIRMED_WRITE_ERROR, "{failed:?}");
     assert_eq!(
         request(right_addr, &resp(&[&[b"GET", b"lock:a"]])),
         b"$4\r\nkept\r\n"

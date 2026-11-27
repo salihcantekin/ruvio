@@ -1377,8 +1377,9 @@ fn a_forwarded_push_that_only_served_a_pop_keeps_its_reply_when_the_batch_sync_f
         stop.request();
         let _ = join_within(server, PATIENCE);
 
-        // On the owning shard the pusher's connection is closed instead; nothing to check.
-        if replies.is_empty() {
+        // On the owning shard the pusher gets the unknown-outcome error and is closed
+        // instead; nothing more to check.
+        if replies.is_empty() || replies == UNCONFIRMED_WRITE_ERROR {
             continue;
         }
 
