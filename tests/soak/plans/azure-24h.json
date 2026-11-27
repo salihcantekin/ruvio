@@ -35,6 +35,18 @@
       "rate": 1000,
       "keys": 1000000,
       "value_bytes": 100
+    },
+    "primitives": {
+      "leases": 2,
+      "semaphores": 2,
+      "semaphore_max": 3,
+      "lock_workers": 3,
+      "transfer_groups": 2,
+      "accounts": 5,
+      "transfer_workers": 3,
+      "idem_requests": 40,
+      "idem_workers": 3,
+      "rate_per_worker": 2
     }
   },
   "faults": {
@@ -80,61 +92,10 @@
         "kind": "migrate-slots"
       },
       {
-        "kind": "restart-all-data"
+        "kind": "slot-churn"
       },
       {
-        "kind": "kill-primary"
-      },
-      {
-        "kind": "kill-replica"
-      },
-      {
-        "kind": "stall-replica"
-      },
-      {
-        "kind": "kill-coordinator-leader"
-      },
-      {
-        "kind": "kill-host"
-      },
-      {
-        "kind": "isolate-host"
-      },
-      {
-        "kind": "netem"
-      },
-      {
-        "kind": "partition-coordinator-leader"
-      },
-      {
-        "kind": "migrate-slots"
-      },
-      {
-        "kind": "kill-primary"
-      },
-      {
-        "kind": "kill-replica"
-      },
-      {
-        "kind": "stall-replica"
-      },
-      {
-        "kind": "kill-coordinator-leader"
-      },
-      {
-        "kind": "kill-host"
-      },
-      {
-        "kind": "isolate-host"
-      },
-      {
-        "kind": "netem"
-      },
-      {
-        "kind": "partition-coordinator-leader"
-      },
-      {
-        "kind": "migrate-slots"
+        "kind": "rebalance-slots"
       },
       {
         "kind": "restart-all-data"
@@ -167,6 +128,12 @@
         "kind": "migrate-slots"
       },
       {
+        "kind": "slot-churn"
+      },
+      {
+        "kind": "rebalance-slots"
+      },
+      {
         "kind": "kill-primary"
       },
       {
@@ -192,6 +159,81 @@
       },
       {
         "kind": "migrate-slots"
+      },
+      {
+        "kind": "slot-churn"
+      },
+      {
+        "kind": "rebalance-slots"
+      },
+      {
+        "kind": "restart-all-data"
+      },
+      {
+        "kind": "kill-primary"
+      },
+      {
+        "kind": "kill-replica"
+      },
+      {
+        "kind": "stall-replica"
+      },
+      {
+        "kind": "kill-coordinator-leader"
+      },
+      {
+        "kind": "kill-host"
+      },
+      {
+        "kind": "isolate-host"
+      },
+      {
+        "kind": "netem"
+      },
+      {
+        "kind": "partition-coordinator-leader"
+      },
+      {
+        "kind": "migrate-slots"
+      },
+      {
+        "kind": "slot-churn"
+      },
+      {
+        "kind": "rebalance-slots"
+      },
+      {
+        "kind": "kill-primary"
+      },
+      {
+        "kind": "kill-replica"
+      },
+      {
+        "kind": "stall-replica"
+      },
+      {
+        "kind": "kill-coordinator-leader"
+      },
+      {
+        "kind": "kill-host"
+      },
+      {
+        "kind": "isolate-host"
+      },
+      {
+        "kind": "netem"
+      },
+      {
+        "kind": "partition-coordinator-leader"
+      },
+      {
+        "kind": "migrate-slots"
+      },
+      {
+        "kind": "slot-churn"
+      },
+      {
+        "kind": "rebalance-slots"
       },
       {
         "kind": "restart-all-data"
@@ -206,8 +248,12 @@
       "isolate-host",
       "netem",
       "partition-coordinator-leader",
-      "migrate-slots"
-    ]
+      "migrate-slots",
+      "slot-churn",
+      "rebalance-slots"
+    ],
+    "churn_moves": 4,
+    "rebalance_skew": 512
   },
   "metrics_interval_s": 10,
   "full_info_every": 6,

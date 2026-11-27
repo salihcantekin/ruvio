@@ -780,6 +780,71 @@ class LongRunPieces(unittest.TestCase):
                 (directory / "check.json").write_text(json.dumps({"profiles": {"durable": {"lost": 1}}, "attribution": {}}))
             return report.write(directory)
 
+    def recovery_report(self, bad_minute=None, extra_stall=None):
+        """One 10 s host stall ending at 5000 s; latency and background minutes around it."""
+        from ruvio_soak import report
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            self.report_run(directory, [], events=[{"event": "load-start", "t": 1, "mono": 10**9},
+                                                   {"event": "load-stop", "t": 10000, "mono": 10000 * 10**9}])
+            self.env_hosts(directory, {5000} | set(extra_stall or ()))
+            fast, slow = {str(latency.bucket(1000)): 100}, {str(latency.bucket(50_000)): 100}
+            (directory / "latency.jsonl").write_text("".join(json.dumps(
+                {"t": t, "series": "durable:set", "counts": {"ok": 100}, "hist": slow if t == bad_minute else fast}) + "\n"
+                for t in range(60, 10000, 60)))
+            (directory / "background-latency-0.jsonl").write_text("".join(json.dumps(
+                {"t": t, "series": "bg:get", "counts": {"ok": 400 if t == bad_minute else 1000}}) + "\n"
+                for t in range(60, 10000, 60)))
+            return {c["id"]: c for c in report.write(directory, settle_s=100)["criteria"]}[19]
+
+    def test_a_stall_followed_by_a_normal_minute_passes_the_recovery_criterion(self):
+        criterion = self.recovery_report()
+        self.assertEqual(criterion["status"], "pass", criterion)
+        self.assertEqual(criterion["value"]["judged"], 1)
+
+    def test_slow_latency_or_low_throughput_after_a_stall_fails_it(self):
+        criterion = self.recovery_report(bad_minute=5040)
+        self.assertEqual(criterion["status"], "fail", criterion)
+        self.assertEqual(criterion["value"]["slow"], 1)
+        self.assertEqual(criterion["details"][0]["min_minute_share"], 0.4)
+
+    def test_two_stalls_close_together_are_not_judged(self):
+        # The slow minute 5040 follows the first stall, but the second one starts 50 s after it:
+        # only the second is judged (its own minutes are normal).
+        criterion = self.recovery_report(bad_minute=5040, extra_stall={5060})
+        self.assertEqual((criterion["status"], criterion["value"]["stalls"], criterion["value"]["judged"]), ("pass", 2, 1), criterion)
+
+    def test_a_run_without_a_stall_passes_it_and_an_old_run_has_no_such_criterion(self):
+        from ruvio_soak import report
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            self.report_run(directory, [], events=[{"event": "load-start", "t": 1, "mono": 10**9},
+                                                   {"event": "load-stop", "t": 10000, "mono": 10000 * 10**9}])
+            self.assertNotIn(19, {c["id"] for c in report.write(directory)["criteria"]})
+            self.env_hosts(directory, set())
+            self.assertEqual({c["id"]: c for c in report.write(directory)["criteria"]}[19]["status"], "pass")
+
+    def test_the_lock_and_transfer_check_becomes_criterion_18_only_for_plans_that_run_it(self):
+        from ruvio_soak import report
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            self.report_run(directory, [])
+            self.assertNotIn(18, {c["id"] for c in report.write(directory)["criteria"]})
+            (directory / "plan.json").write_text(json.dumps({"load": {"primitives": {"leases": 1}}}))
+            ids = lambda: {c["id"]: c for c in report.write(directory)["criteria"]}[18]["status"]
+            self.assertEqual(ids(), "not_measured")                       # no file: not run
+            checked = {"verdict": "ok", "problems": [], "linearizability": {"ran": True, "illegal": [], "unknown": []}}
+            (directory / "check-primitives.json").write_text(json.dumps(checked))
+            self.assertEqual(ids(), "pass")
+            (directory / "check-primitives.json").write_text(json.dumps({**checked, "linearizability": {"ran": False, "reason": "no go toolchain"}}))
+            self.assertEqual(ids(), "not_measured")                       # never a pass without the checker
+            (directory / "check-primitives.json").write_text(json.dumps(
+                {**checked, "verdict": "fail", "problems": ["x"], "linearizability": {"ran": True, "illegal": ["lease:a"], "unknown": []}}))
+            self.assertEqual(ids(), "fail")
+
     def test_a_quiet_run_is_not_an_invalid_environment(self):
         result = self.environment_run(stalled=range(100, 200, 20))
         self.assertFalse(result["environment"]["invalid"], result["environment"])
@@ -858,7 +923,7 @@ class Preflight(unittest.TestCase):
             def __init__(self, cluster, binary, user, key=None):
                 pass
 
-            def run(self, address, command, stdin=None):
+            def run(self, address, command, stdin=None, timeout=None):
                 calls.append((address, command, stdin))
                 if address == "10.0.0.3":
                     raise RuntimeError("ssh 10.0.0.3: exited 255")
@@ -874,6 +939,134 @@ class Preflight(unittest.TestCase):
         self.assertIn(b"def measure", calls[0][2])
         self.assertTrue(written["10.0.0.1"]["ok"])
         self.assertFalse(written["10.0.0.3"]["ok"])
+
+class AzurePlans(unittest.TestCase):
+    def plan(self, name):
+        return json.loads((Path(__file__).parent / "plans" / name).read_text())
+
+    def test_the_long_azure_plans_run_the_slot_churn_and_the_lock_check(self):
+        for name in ("azure-24h.json", "azure-1h-tools.json"):
+            plan = self.plan(name)
+            kinds = {s["kind"] for s in plan["faults"]["sequence"]}
+            self.assertTrue({"slot-churn", "rebalance-slots", "migrate-slots"} <= kinds, name)
+            self.assertTrue({"slot-churn", "rebalance-slots"} <= set(plan["faults"]["kinds"]), name)
+            self.assertTrue(plan["load"]["primitives"], name)
+            Cluster.from_json({**plan["cluster"], "hosts": ["10.0.0.1", "10.0.0.2", "10.0.0.3"]})
+
+    def test_the_controller_has_a_go_toolchain_for_the_lock_check(self):
+        text = (Path(__file__).parent / "azure" / "cloud-init" / "controller.yaml").read_text()
+        self.assertIn("  - golang-go\n", text)
+
+
+class PreflightOverSsh(unittest.TestCase):
+    """The preflight script as the ssh path sends it: its source on the stdin of `python3 -`."""
+
+    def local_backend(self, seen):
+        import subprocess
+
+        class Local:
+            def __init__(self, cluster, binary, user, key=None):
+                pass
+
+            def run(self, address, command, stdin=None, timeout=None):
+                seen.append(timeout)
+                self_command = command.replace("sudo ", "", 1).split()
+                result = subprocess.run(["python3", "-I", *self_command[1:]], input=stdin, capture_output=True, timeout=60)
+                if result.returncode:
+                    raise RuntimeError(result.stderr.decode()[-300:])
+                return result.stdout.decode()
+        return Local
+
+    def test_the_script_runs_from_stdin_and_the_ssh_timeout_covers_its_length(self):
+        from unittest import mock
+
+        from ruvio_soak import cli
+
+        seen = []
+        with tempfile.TemporaryDirectory() as data, tempfile.TemporaryDirectory() as out, \
+                mock.patch.object(cli, "SshBackend", self.local_backend(seen)):
+            options = SimpleNamespace(hosts="a,b", dir=data, seconds=1.0, target_iops=None, ssh_user="soak", ssh_key=None, out=out)
+            code = cli.preflight_command(options)
+            written = json.loads((Path(out) / "preflight.json").read_text())
+            self.assertEqual(list(Path(data).iterdir()), [])
+        self.assertEqual(code, 0)
+        self.assertTrue(all(r["ok"] and r["syncs"] > 0 for r in written.values()), written)
+        self.assertEqual(seen, [91.0, 91.0])   # seconds + 90: the 120 s default cut a 120 s check off
+
+    def test_a_real_ssh_timeout_becomes_a_failed_node_not_a_crash(self):
+        import subprocess
+        from unittest import mock
+
+        backend = SshBackend(Cluster(hosts=["10.0.0.1"]), "", "soak")
+        with mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("ssh", 5)):
+            with self.assertRaises(RuntimeError) as caught:
+                backend.run("10.0.0.1", "sudo python3 - --dir /x", timeout=5)
+        self.assertIn("did not finish in 5 s", str(caught.exception))
+
+    def test_a_failed_preflight_file_stops_a_run_before_it_starts(self):
+        from ruvio_soak import cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            bad = Path(directory) / "preflight.json"
+            bad.write_text(json.dumps({"10.0.0.1": {"ok": True}, "10.0.0.2": {"ok": False, "problems": ["slow"]}}))
+            options = SimpleNamespace(plan=str(Path(directory) / "none.json"), duration=None, preflight=str(bad), out=directory)
+            plan = Path(directory) / "none.json"
+            plan.write_text("{}")
+            self.assertEqual(cli.run(options), 2)
+            self.assertEqual([p.name for p in Path(directory).iterdir() if p.is_dir()], [])
+
+
+class AzureMonitorExport(unittest.TestCase):
+    VM = {"name": "node0", "id": "/subscriptions/s/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/node0",
+          "properties": {"hardwareProfile": {"vmSize": "Standard_D4ads_v6"}}}
+
+    def fakes(self, offered, fail_metrics=False):
+        calls = []
+
+        def imds(path, **params):
+            return ({"resourceGroupName": "rg", "subscriptionId": "s", "name": "ctl"} if path == "instance/compute"
+                    else {"access_token": "tok"})
+
+        def get(url, token):
+            calls.append(url)
+            assert token == "tok"
+            if "virtualMachines?" in url:
+                return {"value": [self.VM]}
+            if "metricDefinitions" in url:
+                return {"value": [{"name": {"value": n}} for n in offered]}
+            if fail_metrics:
+                raise OSError("boom")
+            return {"value": [{"name": {"value": "Data Disk IOPS Consumed Percentage"}, "timeseries": [{"data": [
+                {"timeStamp": "2026-11-28T10:00:00Z", "average": 90.0, "maximum": 100.0},
+                {"timeStamp": "2026-11-28T10:01:00Z", "average": 50.0, "maximum": 60.0}]}]}]}
+        return get, imds, calls
+
+    def test_metrics_are_read_by_name_and_a_missing_name_is_listed(self):
+        from ruvio_soak import azure_monitor
+
+        get, imds, calls = self.fakes(["Data Disk IOPS Consumed Percentage", "Percentage CPU"])
+        document = azure_monitor.export("RG", "2026-11-28T10:00:00Z", "2026-11-28T11:00:00Z", get=get, imds=imds, log=lambda *a: None)
+        vm = document["vms"]["node0"]
+        self.assertEqual(vm["summary"]["Data Disk IOPS Consumed Percentage"],
+                         {"points": 2, "avg": 70.0, "max": 100.0, "last_point": "2026-11-28T10:01:00Z"})
+        self.assertIn("Data Disk Queue Depth", vm["missing"])
+        self.assertNotIn("Percentage CPU", vm["missing"])
+        query = calls[-1]
+        self.assertIn("metricnames=Percentage%20CPU%2CData%20Disk%20IOPS", query.replace("+", "%20"))
+        self.assertIn("timespan=2026-11-28T10%3A00%3A00Z%2F2026-11-28T11%3A00%3A00Z", query)
+
+    def test_a_failed_read_is_recorded_not_raised_and_another_group_is_refused(self):
+        from ruvio_soak import azure_monitor
+
+        get, imds, _ = self.fakes(["Percentage CPU"], fail_metrics=True)
+        document = azure_monitor.export("rg", "a", "b", get=get, imds=imds, log=lambda *a: None)
+        self.assertIn("OSError", document["vms"]["node0"]["error"])
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertIsNone(azure_monitor.export_to(directory, "other-group", "a", "b", get=get, imds=imds))
+            self.assertEqual(list(Path(directory).iterdir()), [])
+            self.assertIsNotNone(azure_monitor.export_to(directory, "rg", "a", "b", get=get, imds=imds, log=lambda *a: None))
+            self.assertTrue((Path(directory) / "azure-monitor.json").exists())
+
 
 class LocalDiskRig(unittest.TestCase):
     def test_the_freeze_plan_has_no_faults_and_the_azure_cluster_settings(self):

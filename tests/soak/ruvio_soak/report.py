@@ -377,6 +377,11 @@ def evaluate(run: Run) -> dict:
         status = "pass" if gap < 0.01 and max(offsets) < 0.01 and _p(busy, 0.95) < 0.7 and check is not None else "fail"
     criterion(results, 17, "measurement complete: gaps < 1 %, clock < 10 ms, controller CPU p95 < 70 %, check done", status, value)
 
+    # 18-19: what the newer tools measure
+    if run.plan.get("load", {}).get("primitives"):
+        _primitives_criterion(run, results)
+    _stall_recovery_criterion(run, results, base)
+
     statuses = [r["status"] for r in results]
     verdict = "fail" if "fail" in statuses else ("incomplete" if "not_measured" in statuses else "pass")
     env = environment(run)
@@ -388,6 +393,74 @@ def evaluate(run: Run) -> dict:
         "load": run.load, "quiet_a": run.quiet_a, "quiet_b": run.quiet_b, "faults": len(run.windows)},
         "criteria": results, "hourly": _hourly(run), "host_stalls": _host_stalls(run),
         "host_stall_windows": len(stalls)}
+
+
+PRIMITIVES_NAME = "LEASE, SEMAPHORE, TRANSFER, IDEM: rules hold and every lock key is linearizable"
+STALL_RECOVERY_NAME = ("after each host disk stall: from 30 s after it ends, p99 within 1.6 x the quiet baseline "
+                       "and background throughput >= 75 % of the quiet median")
+STALL_RECOVERY_AFTER_S = 30
+STALL_RECOVERY_WINDOW_S = 120
+STALL_RECOVERY_MIN_RATE = 0.75
+
+
+def _primitives_criterion(run: Run, results: list) -> None:
+    path = run.directory / "check-primitives.json"
+    if not path.exists():
+        criterion(results, 18, PRIMITIVES_NAME, "not_measured", details="no check-primitives.json")
+        return
+    check = json.loads(path.read_text())
+    linear = check.get("linearizability", {})
+    if not linear.get("ran"):
+        criterion(results, 18, PRIMITIVES_NAME, "not_measured", details=f"linearizability not checked: {linear.get('reason')}")
+    elif check.get("verdict") == "fail" or linear.get("illegal"):
+        criterion(results, 18, PRIMITIVES_NAME, "fail", check.get("problems"), 0, {"illegal": linear.get("illegal")})
+    elif linear.get("unknown"):
+        criterion(results, 18, PRIMITIVES_NAME, "not_measured", details=f"undecided (timeout) for {len(linear['unknown'])} keys")
+    else:
+        criterion(results, 18, PRIMITIVES_NAME, "pass", 0, 0, {"operations": check.get("operations")})
+
+
+def _stall_recovery_criterion(run: Run, results: list, base) -> None:
+    """A disk stall may slow a host while it lasts (the everysec writes wait: the accepted cost
+    of not losing an acknowledged write). Once it ends the cluster must be back to normal
+    within 30 s. A stall that ends inside a fault window, or within two minutes of another
+    stall, is left out: the cause of a slow minute there is not the stall alone."""
+    if not run.hosts or not run.load[0]:
+        return  # runs from before the host samples: criterion 17 and the others still apply
+    stalls = environment(run)["events"]
+    limit = lat.summary(base)["p99_ms"] * 1.6 + 0.2 if base else None
+    quiet = [e for e in run.background if Run.inside(e["t"], run.quiet_a) or Run.inside(e["t"], run.quiet_b)] if run.quiet_a or run.quiet_b else []
+    per_minute = defaultdict(int)
+    for e in quiet:
+        per_minute[int(e["t"])] += e["counts"].get("ok", 0)
+    median = statistics.median(per_minute.values()) if per_minute else None
+    totals = defaultdict(int)
+    for e in run.background:
+        totals[int(e["t"])] += e["counts"].get("ok", 0)
+    judged, slow = 0, []
+    for stall in stalls:
+        window = (stall["end"] + STALL_RECOVERY_AFTER_S, stall["end"] + STALL_RECOVERY_WINDOW_S)
+        others = [s for s in stalls if s is not stall and s["start"] < window[1] + STALL_PAD_S and s["end"] > window[0] - STALL_PAD_S]
+        if run.in_fault(stall["start"], window[1]) or others:
+            continue
+        entries = [e for e in run.latency if window[0] <= e["t"] < window[1]]
+        minutes = [m for m in totals if window[0] <= m and m + 60 <= window[1]]
+        if not entries and not minutes:
+            continue
+        judged += 1
+        p99 = lat.summary(merged(run.latency, window)).get("p99_ms") if entries else None
+        slow_p99 = limit is not None and p99 is not None and p99 > limit
+        slow_rate = bool(median) and any(totals[m] < STALL_RECOVERY_MIN_RATE * median for m in minutes)
+        if slow_p99 or slow_rate:
+            slow.append({"host": stall["host"], "end": stall["end"], "p99_ms": p99,
+                         "min_minute_share": round(min((totals[m] for m in minutes), default=0) / median, 2) if median and minutes else None})
+    if not stalls:
+        criterion(results, 19, STALL_RECOVERY_NAME, "pass", 0, 0, "no host disk stall in this run")
+    elif not judged:
+        criterion(results, 19, STALL_RECOVERY_NAME, "not_measured", details=f"{len(stalls)} stalls, none with a clean window after it")
+    else:
+        criterion(results, 19, STALL_RECOVERY_NAME, "fail" if slow else "pass", {"stalls": len(stalls), "judged": judged, "slow": len(slow)},
+                  {"p99_ms": round(limit, 2) if limit else None, "min_rate": STALL_RECOVERY_MIN_RATE}, slow[:20] or None)
 
 
 STALL_SHARE = 0.5  # this disk's baseline io_full share is 0.2-0.4; lower values exclude half the load

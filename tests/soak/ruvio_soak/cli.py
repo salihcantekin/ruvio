@@ -35,12 +35,21 @@ def run(options) -> int:
     plan = json.loads(Path(options.plan).read_text())
     if options.duration is not None:
         plan["duration_s"] = options.duration
+    preflight_json = None
+    if options.preflight:
+        preflight_json = json.loads(Path(options.preflight).read_text())
+        failed = sorted(h for h, r in preflight_json.items() if not r.get("ok"))
+        if failed:
+            print(f"not starting: the disk preflight failed on {', '.join(failed)}; replace those VMs and check again", flush=True)
+            return 2
     run_id = time.strftime("%Y%m%d-%H%M%S-", time.gmtime()) + secrets.token_hex(2)
     directory = Path(options.out) / run_id
     directory.mkdir(parents=True)
     cluster = _cluster(options, plan)
     save(cluster, directory / "cluster.json")
     (directory / "plan.json").write_text(json.dumps(plan, indent=2))
+    if preflight_json is not None:
+        (directory / "preflight.json").write_text(json.dumps(preflight_json, indent=2))
     if options.backend == "local":
         backend = LocalBackend(cluster, options.binary, Path(options.work) if options.work else directory / "nodes")
     else:
@@ -52,6 +61,15 @@ def run(options) -> int:
     status = runner.run()
     print(json.dumps({k: status[k] for k in ("verdict", "problems", "faults", "operations")}, indent=2))
     if options.delete_resource_group:
+        # Azure's own disk numbers go with the VMs, so they are saved first; a failure here
+        # is printed and never keeps the group from being deleted.
+        from . import azure_monitor  # noqa: PLC0415 (only on the controller)
+
+        started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.strptime(run_id[:15], "%Y%m%d-%H%M%S"))
+        azure_monitor.export_to(directory, options.delete_resource_group, started, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        runner.upload("azure-monitor.json")
+        if runner.__dict__.get("confirmed", {}).pop("azure-monitor.json", True) is False:
+            print("azure monitor: the export did not upload (it stays in the run directory only)", flush=True)
         missing = runner.missing_uploads() if status.get("phase") == "done" else ["(the run did not finish)"]
         if missing:
             print(f"not deleting {options.delete_resource_group}: not uploaded: {missing}", flush=True)
@@ -104,7 +122,8 @@ def preflight_command(options) -> int:
 
         def one(address: str) -> dict:
             try:
-                reply = backend.run(address, f"sudo python3 - {arguments}", stdin=source)
+                # The check itself lasts `--seconds`; the ssh default of 120 s would cut it off.
+                reply = backend.run(address, f"sudo python3 - {arguments}", stdin=source, timeout=options.seconds + 90)
                 return json.loads(reply.strip().splitlines()[-1])
             except (RuntimeError, ValueError, IndexError, OSError) as error:
                 return {"ok": False, "problems": [f"preflight did not run: {error}"]}
@@ -162,6 +181,7 @@ def main(argv=None) -> int:
     p.add_argument("--work", help="local backend: the directory the nodes run in (default: nodes/ in the run directory); mount a disk at host0, host1, host2 there to run on it")
     p.add_argument("--blob-sas-file", help=f"file holding a container SAS URL (default {DEFAULT_SAS_FILE})")
     p.add_argument("--strict", action="store_true", help="exit 1 on warn too")
+    p.add_argument("--preflight", metavar="FILE", help="the preflight.json of `run.py preflight`: a failed node stops the run before it starts; the file goes into the run directory for the report")
     p.add_argument("--delete-resource-group", metavar="NAME",
                    help="Azure controller only: when every result is in Blob, delete this resource group (the one the controller runs in)")
     p.set_defaults(handler=run)

@@ -15,6 +15,7 @@ packages:
   - sysstat
   - tmux
   - jq
+  - golang-go
 
 write_files:
   - path: /etc/sysctl.d/90-ruvio.conf
