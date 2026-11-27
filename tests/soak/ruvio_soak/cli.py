@@ -1,4 +1,4 @@
-"""Command line: `run`, `check`, `render`. See tests/soak/README.md."""
+"""Command line: `run`, `check`, `check-primitives`, `render`. See tests/soak/README.md."""
 
 from __future__ import annotations
 
@@ -121,6 +121,14 @@ def preflight_command(options) -> int:
     return 0 if all(r["ok"] for r in results.values()) else 1
 
 
+def check_primitives(options) -> int:
+    from . import primitives_check
+
+    result = primitives_check.check_history(Path(options.history))
+    print(json.dumps(result, indent=2))
+    return 0 if result["verdict"] != "fail" else 1
+
+
 def render(options) -> int:
     """Prints the configs one host would get (secrets replaced), to review them."""
     plan = json.loads(Path(options.plan).read_text()) if options.plan else {}
@@ -182,6 +190,10 @@ def main(argv=None) -> int:
     p.add_argument("--ssh-key")
     p.add_argument("--out", help="a run directory (or any directory): writes preflight.json there")
     p.set_defaults(handler=preflight_command)
+
+    p = commands.add_parser("check-primitives", help="check the LEASE/SEMAPHORE/TRANSFER/IDEM part of a history file")
+    p.add_argument("history")
+    p.set_defaults(handler=check_primitives)
 
     p = commands.add_parser("render", help="print one host's configs")
     p.add_argument("--plan")

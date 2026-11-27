@@ -14,6 +14,7 @@ import shutil
 import signal
 import subprocess
 import time
+import threading
 from pathlib import Path
 
 from .cluster import COORDINATOR, Cluster, env_file
@@ -146,11 +147,27 @@ class LocalBackend:
         self.cluster, self.binary, self.work = cluster, binary, work
         self.processes: dict[tuple[int, str], subprocess.Popen] = {}
 
+    # Host `i` runs as user id NODE_UID_BASE + i when the controller is root and iptables works,
+    # so the packet filter can tell which host a packet comes from (see `isolate`).
+    NODE_UID_BASE = 41000
+
+    def partitions(self) -> bool:
+        if not hasattr(self, "_partitions"):
+            self._partitions = os.geteuid() == 0 and shutil.which("iptables") is not None
+        return self._partitions
+
     def supports(self, fault: str) -> bool:
+        if fault == "isolate-host":
+            return self.partitions()
         return fault not in NETWORK_FAULTS
 
     def deploy(self) -> None:
         self.work.mkdir(parents=True, exist_ok=True)
+        if self.partitions():
+            # The nodes run as other users and must reach their directory.
+            for parent in [self.work, *self.work.resolve().parents]:
+                if not parent.stat().st_mode & 0o001:
+                    raise RuntimeError(f"{parent} is not searchable by other users; use an --out below /var/tmp")
         (self.work / "topology.toml").write_text(self.cluster.topology_toml())
         for host in range(len(self.cluster.hosts)):
             directory = self.work / f"host{host}"
@@ -159,6 +176,9 @@ class LocalBackend:
                 self.cluster.coordinator_toml(host, str(directory / "coordinator"))
             )
             (directory / "coordinator.toml").chmod(0o600)
+            if self.partitions():
+                os.chown(directory, self.NODE_UID_BASE + host, -1)
+                os.chown(directory / "coordinator.toml", self.NODE_UID_BASE + host, -1)
 
     def _command(self, host: int, role: str, follow: str | None, as_primary: bool = False):
         directory = self.work / f"host{host}"
@@ -176,7 +196,8 @@ class LocalBackend:
         log = open(self.work / f"host{host}-{role}.log", "ab")
         # The server looks for ruvio.toml in its working directory (and may write one there).
         self.processes[(host, role)] = subprocess.Popen(
-            command, env=env, cwd=self.work / f"host{host}", stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+            command, env=env, cwd=self.work / f"host{host}", stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+            user=self.NODE_UID_BASE + host if self.partitions() else None,
         )
         log.close()
 
@@ -243,9 +264,50 @@ class LocalBackend:
             return path.read_text(errors="replace")
         except OSError:
             return ""
+    IPT_CHAIN = "RUVIO_SOAK"
+
+    def _ports(self, host: int) -> str:
+        """Every TCP port host `host` listens on, as a multiport list."""
+        ports = [self.cluster.address(host, role).rsplit(":", 1)[1] for role in self.cluster.roles()]
+        ports += [self.cluster.replication_address(host, g.name).rsplit(":", 1)[1] for g in self.cluster.groups]
+        return ",".join(ports)
+
+    def _iptables(self, *arguments: str, check: bool = True) -> int:
+        return subprocess.run(["iptables", *arguments], check=check, capture_output=True).returncode
 
     def isolate(self, host: int, seconds: int) -> None:
-        raise Unsupported("isolate-host needs the ssh backend")
+        """Drops every packet between the processes of `host` and those of the other hosts, in
+        both directions, while the controller (user id 0) still reaches all of them. Every
+        process of host `h` runs as user `NODE_UID_BASE + h`. A connection started by a node is
+        marked with its host (conntrack mark 100 + h) so a server's replies can be matched to the
+        host that asked. Removed by `heal`, or after `seconds` at the latest."""
+        if not self.partitions():
+            raise Unsupported("isolate-host needs root and iptables")
+        self.heal(host)
+        base = self.NODE_UID_BASE
+        hosts = range(len(self.cluster.hosts))
+        for table in (["-t", "mangle"], []):
+            self._iptables(*table, "-N", self.IPT_CHAIN)
+            self._iptables(*table, "-I", "OUTPUT", "-j", self.IPT_CHAIN)
+        for h in hosts:
+            self._iptables(
+                "-t", "mangle", "-A", self.IPT_CHAIN, "-p", "tcp", "--syn", "-m", "owner", "--uid-owner",
+                str(base + h), "-j", "CONNMARK", "--set-mark", str(100 + h),
+            )
+
+        def drop(uid_host: int, *match: str) -> None:
+            self._iptables("-A", self.IPT_CHAIN, "-p", "tcp", "-m", "owner", "--uid-owner", str(base + uid_host), *match, "-j", "DROP")
+
+        for other in (h for h in hosts if h != host):
+            # Requests, from the isolated host to the other's servers and the other way round.
+            drop(host, "-m", "multiport", "--dports", self._ports(other))
+            drop(other, "-m", "multiport", "--dports", self._ports(host))
+            # Replies of a server to a connection the other side started.
+            drop(host, "-m", "multiport", "--sports", self._ports(host), "-m", "connmark", "--mark", str(100 + other))
+            drop(other, "-m", "multiport", "--sports", self._ports(other), "-m", "connmark", "--mark", str(100 + host))
+        timer = threading.Timer(seconds, self.heal, args=(host,))
+        timer.daemon = True
+        timer.start()
 
     def partition_coordinator(self, host: int, seconds: int) -> None:
         raise Unsupported("partition-coordinator-leader needs the ssh backend")
@@ -254,7 +316,12 @@ class LocalBackend:
         raise Unsupported("netem needs the ssh backend")
 
     def heal(self, host: int) -> None:
-        pass
+        if not self.partitions():
+            return
+        for table in (["-t", "mangle"], []):
+            self._iptables(*table, "-D", "OUTPUT", "-j", self.IPT_CHAIN, check=False)
+            self._iptables(*table, "-F", self.IPT_CHAIN, check=False)
+            self._iptables(*table, "-X", self.IPT_CHAIN, check=False)
 
     def stop_all(self) -> None:
         for process in self.processes.values():
