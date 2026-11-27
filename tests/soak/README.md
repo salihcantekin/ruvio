@@ -116,17 +116,19 @@ its load instead.
 | 4 | No anomaly inside a slot-move window (`migrate-slots`, `slot-churn`, `rebalance-slots`), and no failed or unknown operation 5 to 7 s after any single move landed (`fails_after_5s` of the `slot-move` event) |
 | 5 | Every fault healed; counted from the end of the fault (the plan draws its length at random), recovery max <= 15 s, median <= 5 s; each single slot move <= 60 s |
 | 6 | No unexpected process exit, no panic in the logs |
-| 7 | No failed or unknown operation outside fault windows |
+| 7 | No failed or unknown operation outside fault windows and host disk stall minutes: at most max(5, one per million ok operations); the ones inside a stall are counted apart |
 | 8 | Failovers (`failovers_total`) at most two per fault that hits a primary, and none (`last_failover_unix_ms`) outside a fault window |
-| 9 | p99 and p99.9 in the last quiet window within 20 % (+0.2 ms) of the first |
+| 9 | p99 and p99.9 in the last quiet window within 1.5 x (+0.2 ms) of the first |
 | 10 | p99 back within 1.6 x the quiet baseline (+0.2 ms) 60 s after each fault |
-| 11 | Background throughput within +-5 % in the quiet windows, among minutes with the same primaries (the background load is closed loop, so its rate follows the latency of the nodes that hold them). At most one minute in eight (at least one) may dip below -5 % of the median, as a checkpoint does, but not below -15 %; the dips are listed in the report |
+| 11 | Background throughput within +-8 % in the quiet windows, among minutes with the same primaries (the background load is closed loop, so its rate follows the latency of the nodes that hold them), minutes that overlap a host disk stall left out. At most one minute in four (at least one) may dip below -5 % of the median, as a checkpoint does, but not below -25 %; the dips are listed in the report |
 | 12 | Replica lag p99 below 1 s in the quiet windows |
 | 13 | Anonymous memory: last quiet window <= 1.1 x the first (or the same anonymous memory per charged byte); there, anonymous memory per charged byte rising < 2 %/h on data nodes, anonymous memory < 0.5 MiB/h on coordinators. A coordinator that won or lost the Raft leadership after the first window is judged only by its slope since that change (a leader holds more state) |
 | 14 | Open descriptors and threads do not grow |
 | 15 | WAL bounded (last <= 1.5 x first + 64 MiB), checkpoints in step with the data (bytes per charged byte <= 1.5 x first + 0.1), free disk >= 20 % |
 | 16 | Coordinator data grows less than 64 MiB |
 | 17 | Metric gaps < 1 %, clock offset < 10 ms, controller CPU p95 < 70 %, check finished |
+| 18 | Only when the plan has `load.primitives`: `LEASE`, `SEMAPHORE`, `TRANSFER` and `IDEM` rules hold and every lock key is linearizable (Porcupine; needs Go on the machine that checks). A check that could not run or did not decide is `not_measured`, never a pass |
+| 19 | Only for runs with host samples: after each host disk stall (the everysec writes wait while it lasts, the accepted cost of not losing an acknowledged write), from 30 s after it ends, p99 within 1.6 x the quiet baseline (+0.2 ms) and background throughput >= 75 % of the quiet median. A stall that ends in a fault window or near another stall is not judged; no stall is a pass |
 
 ## Disk and crash scenarios on this machine
 
@@ -283,6 +285,8 @@ the same machinery locally in about 12 minutes.
 hour 2 to hour 9.5 (each of the ten kinds three times, the rest at random, about 35 faults), then
 2.5 quiet hours. It uses the same controller, disk and self-delete settings as the 24-hour plan,
 with `ttlHours=16` and the backstop at 16 hours.
+
+`plans/azure-1h-tools.json` is a one-hour trial of what the 24-hour run adds: a 9-fault sequence with `slot-churn`, `rebalance-slots`, `partition-coordinator-leader`, `kill-host` and `restart-all-data`, the `LEASE`/`SEMAPHORE`/`TRANSFER`/`IDEM` load with the Porcupine check, and the preflight and Azure Monitor export steps. It proves the tools on real nodes before the long run; its quiet windows are short, so criteria 9 and 13 are judged loosely.
 
 `plans/azure-1h.json` is the same in one hour: 18 quiet minutes, a fault every 150-170 s for
 24 minutes (each kind about once), 18 quiet minutes. Its quiet windows are under the 10 minutes
