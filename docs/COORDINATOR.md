@@ -701,7 +701,7 @@ Checked with one binary (3 data nodes, 3 coordinators as local processes, `ping_
 the promoted replica took writes 1.2 seconds after the primary stopped (2.1 seconds of paused writes in
 all, the replica restarts included), and the old primary came back as a replica holding every write,
 without the runtime `min-replicas-to-write`. Not run with `primary-lease yes`, nor with two different
-releases side by side, so the refused handshake itself was not part of the run. Way B was not run.
+releases side by side, so the refused handshake itself was not part of the run. Way B was not run. A later run with two releases side by side (the previous `main` and this one) is recorded in [the upgrade and rollback evidence](evidence/2026-11-27-upgrade-rollback.md): `COORDINATOR SWITCHOVER` is refused while the primary is still of the older release, because it lacks `RUVIO FENCE`.
 
 ## Limits of this version
 
